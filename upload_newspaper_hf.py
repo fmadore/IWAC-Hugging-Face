@@ -186,15 +186,21 @@ class OmekaApiClient:
         items = list(first)
         per = 100
         if len(first) == per:
+            # Estimate total pages if possible, or use an indefinite progress bar
+            # This part requires knowing the total number of items or pages,
+            # which might not be available directly from the first call.
+            # For now, let's assume we don't know the total and use a simple counter.
             page = 2
-            while True:
-                batch = await self.fetch_items_page(rcid, page)
-                if not batch:
-                    break
-                items.extend(batch)
-                if len(batch) < per:
-                    break
-                page += 1
+            with tqdm(desc="Fetching item pages", unit="page") as pbar:
+                while True:
+                    batch = await self.fetch_items_page(rcid, page)
+                    if not batch:
+                        break
+                    items.extend(batch)
+                    pbar.update(1)
+                    if len(batch) < per:
+                        break
+                    page += 1
         logger.info("%d items récupérés pour la classe %d", len(items), rcid)
         return items
 
@@ -286,8 +292,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Publie les articles de journaux IWAC sur le Hub HF")
-    parser.add_argument("--repo", required=True, help="Nom du repo Hugging Face, ex. fmadore/iwac-newspaper-articles")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
     args = parser.parse_args()
 
-    asyncio.run(build_and_push(Config(), repo=args.repo, shard_size=args.max_shard_size))
+    asyncio.run(build_and_push(Config(), repo="fmadore/iwac-newspaper-articles", shard_size=args.max_shard_size))
