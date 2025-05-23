@@ -32,6 +32,7 @@ BURKINA_FASO_NEWSPAPERS = [
 ]
 
 COTE_DIVOIRE_NEWSPAPERS = [
+    "Alif",
     "Agence Ivoirienne de Presse",
     "Fraternité Hebdo",
     "Fraternité Matin",
@@ -45,6 +46,7 @@ COTE_DIVOIRE_NEWSPAPERS = [
     "Le Patriote",
     "Notre Temps",
     "Notre Voie",
+    "Plume Libre",
 ]
 
 NIGER_NEWSPAPERS = [
