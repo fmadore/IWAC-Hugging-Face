@@ -283,7 +283,7 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
     return {
         "o:id": item["o:id"],
         "identifier": _get_value(item, "dcterms:identifier"),
-        "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}", # This URL might need to be generalized if not for afrique_ouest
+        "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "PDF": primary_url,
         "title": _get_value(item, "dcterms:title"),
         "author": _join(item, "dcterms:creator"),
