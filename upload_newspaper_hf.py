@@ -42,6 +42,9 @@ import pandas as pd
 from datasets import Dataset
 from huggingface_hub import login
 
+# Disable symlinks warning from huggingface_hub
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
 # ---------------------------------------------------------------------------
 # Configuration & journalisation
 # ---------------------------------------------------------------------------
@@ -245,16 +248,20 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
 
     return {
         "o:id": item["o:id"],
+        "identifier": _get_value(item, "dcterms:identifier"),
         "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "o:primary_media": primary_url,
         "o:media/file": _get_media_ids(item),
-        "dcterms:title": _get_value(item, "dcterms:title"),
-        "dcterms:creator": _join(item, "dcterms:creator"),
-        "dcterms:publisher": _join(item, "dcterms:publisher"),
-        "dcterms:date": _get_value(item, "dcterms:date"),
-        "dcterms:subject": _join(item, "dcterms:subject"),
-        "dcterms:language": _get_value(item, "dcterms:language"),
+        "Title": _get_value(item, "dcterms:title"),
+        "Author": _join(item, "dcterms:creator"),
+        "Newspaper": _join(item, "dcterms:publisher"),
+        "Date": _get_value(item, "dcterms:date"),
+        "DescriptionAI": _get_value(item, "bibo:shortDescription"),
+        "Subject": _join(item, "dcterms:subject"),
+        "Spatial": _get_value(item, "dcterms:spatial"),
+        "Language": _get_value(item, "dcterms:language"),
         "fabio:hasURL": _get_value(item, "fabio:hasURL"),
+        "Source": _get_value(item, "dcterms:source"),
         "bibo:content": _get_value(item, "bibo:content"),
     }
 
