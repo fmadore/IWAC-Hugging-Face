@@ -67,29 +67,66 @@ def lemmatise_batch(
     text_col: str,
     lemma_col: str,
     clean_col: str,
+    process_choice: str,  # Added process_choice
 ) -> dict:
     """Apply lemmatisation and stop‑word removal to one batch of examples."""
 
-    texts: List[str] = batch[text_col]
-    lemmas, clean = [], []
+    texts_in_batch: List[str] = batch[text_col]
+    num_items_in_batch = len(texts_in_batch)
 
-    for doc in nlp.pipe(texts, batch_size=32, n_process=1):
-        # Full lemmatised text (punctuation kept out, case‑folded)
-        lemma_tokens = [tok.lemma_.lower() for tok in doc if tok.is_alpha]
-        lemmas.append(" ".join(lemma_tokens))
+    # Initialize final lists to hold results for the entire batch
+    final_lemmas: List[str] = [""] * num_items_in_batch
+    final_clean: List[str] = [""] * num_items_in_batch
 
-        # Lemmas without French stop‑words
-        nostop_tokens = [tok for tok in lemma_tokens if tok not in nlp.Defaults.stop_words]
-        clean.append(" ".join(nostop_tokens))
+    indices_to_process = []
+    content_to_process = []
 
-    return {lemma_col: lemmas, clean_col: clean}
+    # Determine which items in the batch need processing
+    if process_choice == "empty" and lemma_col in batch:
+        for i in range(num_items_in_batch):
+            # Check if existing lemma is present and not just whitespace
+            if batch[lemma_col][i] and batch[lemma_col][i].strip():
+                final_lemmas[i] = batch[lemma_col][i]
+                # If lemma exists, clean version should also exist from a previous run
+                if clean_col in batch and i < len(batch[clean_col]):
+                    final_clean[i] = batch[clean_col][i]
+                else:
+                    # This case (lemma exists, clean does not) implies inconsistency
+                    # or clean_col is new. For safety, it will remain "" or be generated
+                    # if we decide to regenerate clean if missing.
+                    # For now, it will be "" if not in batch[clean_col]
+                    pass # final_clean[i] remains "" as initialized
+            else:
+                indices_to_process.append(i)
+                content_to_process.append(texts_in_batch[i])
+    else:  # Process all items if 'all' or if lemma_col doesn't exist yet
+        indices_to_process = list(range(num_items_in_batch))
+        content_to_process = texts_in_batch
+
+    # Perform lemmatisation only on the content that needs it
+    if content_to_process:
+        processed_lemmas_for_subset = []
+        processed_clean_for_subset = []
+        for doc in nlp.pipe(content_to_process, batch_size=32, n_process=1):
+            lemma_tokens = [tok.lemma_.lower() for tok in doc if tok.is_alpha]
+            processed_lemmas_for_subset.append(" ".join(lemma_tokens))
+
+            nostop_tokens = [tok for tok in lemma_tokens if tok not in nlp.Defaults.stop_words]
+            processed_clean_for_subset.append(" ".join(nostop_tokens))
+        
+        # Populate the final lists with the newly processed data at correct original indices
+        for idx_in_subset, original_batch_idx in enumerate(indices_to_process):
+            final_lemmas[original_batch_idx] = processed_lemmas_for_subset[idx_in_subset]
+            final_clean[original_batch_idx] = processed_clean_for_subset[idx_in_subset]
+
+    return {lemma_col: final_lemmas, clean_col: final_clean}
 
 
 def main():
     configure_logging()
 
     parser = argparse.ArgumentParser(description="Add lemmatised columns to a Hugging Face dataset")
-    parser.add_argument("--repo", required=True, help="Dataset repo on the Hugging Face Hub (e.g. fmadore/iwac-newspaper-articles)")
+    parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles", help="Dataset repo on the Hugging Face Hub (e.g. fmadore/iwac-newspaper-articles)")
     parser.add_argument("--text-column", default="OCR", help="Name of the column containing the raw French text to process")
     parser.add_argument("--lemma-column", default="lemma_text", help="Column name for the lemmatised text")
     parser.add_argument("--clean-column", default="lemma_nostop", help="Column name for the lemmatised text with stop‑words removed")
@@ -117,6 +154,34 @@ def main():
         )
 
     # ------------------------------------------------------------------
+    # Ask user for processing preference
+    # ------------------------------------------------------------------
+    while True:
+        process_choice = input(
+            f"Process all articles or only those with empty '{args.lemma_column}'? (all/empty): "
+        ).lower()
+        if process_choice in ["all", "empty"]:
+            break
+        logging.warning("Invalid choice. Please enter 'all' or 'empty'.")
+
+    if process_choice == "empty":
+        if args.lemma_column not in ds.column_names:
+            logging.warning(
+                f"Lemma column '{args.lemma_column}' not found. Processing all articles instead."
+            )
+        else:
+            logging.info(f"Filtering dataset to process only articles with empty '{args.lemma_column}' column…")
+            # Filter out rows where the lemma column is not empty (i.e., already processed)
+            # An empty string or None would indicate an empty lemma field.
+            original_row_count = len(ds)
+            ds = ds.filter(lambda example: not example[args.lemma_column] or example[args.lemma_column].strip() == "")
+            filtered_row_count = len(ds)
+            logging.info(f"Selected {filtered_row_count} articles out of {original_row_count} for processing.")
+            if filtered_row_count == 0:
+                logging.info(f"No articles found with an empty '{args.lemma_column}'. Exiting.")
+                return
+
+    # ------------------------------------------------------------------
     # Load the spaCy model once
     # ------------------------------------------------------------------
     logging.info("Loading spaCy model '%s'…", args.spacy_model)
@@ -129,12 +194,13 @@ def main():
     ds = ds.map(
         lemmatise_batch,
         batched=True,
-        batch_size=1000,
+        batch_size=1000,  # Reverted to larger batch size for full processing
         fn_kwargs={
             "nlp": nlp,
             "text_col": args.text_column,
             "lemma_col": args.lemma_column,
             "clean_col": args.clean_column,
+            "process_choice": process_choice,  # Pass process_choice to the map function
         },
         desc="lemmatising",
     )
@@ -147,7 +213,7 @@ def main():
         args.repo,
         token=token,
         max_shard_size=args.max_shard_size,
-        commit_message=f"Add columns '{args.lemma_column}' and '{args.clean_column}' (French lemmatisation)",
+        commit_message=f"Add/update columns '{args.lemma_column}' and '{args.clean_column}' (French lemmatisation, mode: {process_choice})",
     )
 
     logging.info("Done. New columns: %s, %s", args.lemma_column, args.clean_column)
