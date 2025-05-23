@@ -261,7 +261,7 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
         "Language": _get_value(item, "dcterms:language"),
         "fabio:hasURL": _get_value(item, "fabio:hasURL"),
         "Source": _get_value(item, "dcterms:source"),
-        "bibo:content": _get_value(item, "bibo:content"),
+        "OCR": _get_value(item, "bibo:content"),
     }
 
 
