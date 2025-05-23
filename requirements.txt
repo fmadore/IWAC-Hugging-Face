@@ -1,0 +1,8 @@
+aiohttp
+aiofiles
+python-dotenv
+tqdm
+pandas
+pyarrow
+datasets
+huggingface_hub
