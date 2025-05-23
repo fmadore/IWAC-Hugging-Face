@@ -251,6 +251,26 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
     newspaper_name = _join(item, "dcterms:publisher")
     country = get_country_from_newspaper(newspaper_name)
 
+    # Custom logic to extract URL from fabio:hasURL, prioritizing @id
+    fabio_has_url_data = item.get("fabio:hasURL")
+    extracted_fabio_url = ""
+    if isinstance(fabio_has_url_data, list):
+        urls = []
+        for v_item in fabio_has_url_data:
+            if isinstance(v_item, dict):
+                id_val = v_item.get("@id")
+                if id_val and isinstance(id_val, str): # Ensure it's a non-empty string
+                    urls.append(id_val)
+        if urls:
+            extracted_fabio_url = "|".join(urls)
+    elif isinstance(fabio_has_url_data, dict):
+        id_val = fabio_has_url_data.get("@id")
+        if id_val and isinstance(id_val, str): # Ensure it's a non-empty string
+            extracted_fabio_url = id_val
+    elif isinstance(fabio_has_url_data, str) and fabio_has_url_data: # If it's already a non-empty string
+        extracted_fabio_url = fabio_has_url_data
+    # If none of the above, extracted_fabio_url remains ""
+
     return {
         "o:id": item["o:id"],
         "identifier": _get_value(item, "dcterms:identifier"),
@@ -266,7 +286,7 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
         "spatial": _get_value(item, "dcterms:spatial"),
         "language": _get_value(item, "dcterms:language"),
         "nb_pages": _get_value(item, "bibo:numPages"),
-        "URL": _get_value(item, "fabio:hasURL"),
+        "URL": extracted_fabio_url, # Use the specifically extracted URL
         "source": _get_value(item, "dcterms:source"),
         "OCR": _get_value(item, "bibo:content"),
     }
@@ -300,8 +320,8 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
         if os.getenv("HF_TOKEN") is None and not hf_utils.is_notebook():
             login()
         try:
-            ds.push_to_hub(repo, max_shard_size=shard_size)
-            logger.info(f"Empty dataset pushed to {repo}.")
+            ds.push_to_hub(repo, max_shard_size=shard_size, config_name="articles") # Added config_name
+            logger.info(f"Empty dataset pushed to {repo} with config 'articles'.")
         except Exception as e_push_empty:
             logger.error(f"Failed to push empty dataset: {e_push_empty}")
         await conn_manager.close()
@@ -405,9 +425,9 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
         try:
             # Before pushing, ensure the local HuggingFace cache for this repo is cleared if needed,
             # or use a specific commit message. For simplicity, direct push_to_hub is used.
-            logger.info(f"Pushing dataset to {repo}...")
-            ds.push_to_hub(repo, max_shard_size=shard_size)
-            logger.info(f"Dataset published/updated on {repo}")
+            logger.info(f"Pushing dataset to {repo} with config 'articles'...")
+            ds.push_to_hub(repo, max_shard_size=shard_size, config_name="articles") # Added config_name
+            logger.info(f"Dataset published/updated on {repo} with config 'articles'")
         except Exception as e:
             logger.error(f"Failed to push dataset to Hub: {e}")
             logger.error("Details of the exception:", exc_info=True)
