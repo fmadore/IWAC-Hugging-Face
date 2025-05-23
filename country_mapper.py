@@ -3,12 +3,14 @@
 BENIN_NEWSPAPERS = [
     "24h au Bénin",
     "Agence Bénin Presse",
+    "ASSALAM",
     "Banouto",
     "Bénin Intelligent",
     "Boulevard des Infos",
     "Daho-Express",
     "Ehuzu",
     "Fraternité",
+    "Islam Hebdo",
     "L'Evénement Précis",
     "La Nation",
     "La Nouvelle Tribune",
@@ -18,13 +20,21 @@ BENIN_NEWSPAPERS = [
 ]
 
 BURKINA_FASO_NEWSPAPERS = [
+    "Al Mawadda",
+    "An-Nasr Trimestriel",
+    "An-Nasr Vendredi",
     "Burkina 24",
     "Carrefour africain",
     "FasoZine",
+    "L'Appel",
+    "L'Autre Regard",
     "L'Evénement",
     "L'Observateur",
     "L'Observateur Paalga",
+    "La Preuve",
+    "Le CERFIste",
     "Le Pays",
+    "Le vrai visage de l'islam",
     "LeFaso.net",
     "Mutations",
     "San Finna",
@@ -32,6 +42,9 @@ BURKINA_FASO_NEWSPAPERS = [
 ]
 
 COTE_DIVOIRE_NEWSPAPERS = [
+    "AJMCI Infos",
+    "Al Minbar",
+    "Al Muwassat Info",
     "Alif",
     "Agence Ivoirienne de Presse",
     "Fraternité Hebdo",
@@ -47,9 +60,17 @@ COTE_DIVOIRE_NEWSPAPERS = [
     "Notre Temps",
     "Notre Voie",
     "Plume Libre",
+    "Al-Azan",
+    "Allahou Akbar",
+    "Bulletin d'information du CNI",
+    "Islam Info",
+    "Les Échos de l'AEEMCI",
 ]
 
 NIGER_NEWSPAPERS = [
+    "Al Maoulid Info",
+    "Al Maoulid Magazine",
+    "Al Maoulid Magazine (arabe)",
     "Le Sahel",
 ]
 
@@ -62,6 +83,8 @@ TOGO_NEWSPAPERS = [
     "La Lettre de Tchaoudjo",
     "La Nouvelle Marche",
     "Le Démocrate",
+    "Le Pacific",
+    "Le Rendez-Vous",
     "Togo-Presse",
 ]
 
