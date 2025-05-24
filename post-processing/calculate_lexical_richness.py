@@ -8,20 +8,15 @@ lisibilité (score de Flesch) à un dataset Hugging Face existant, basées sur
 la colonne 'OCR'. Le script charge un dataset, calcule ces métriques, et ajoute
 les scores dans de nouvelles colonnes.
 
-L'utilisateur est invité à choisir la configuration ('articles' ou 'publications')
-et doit spécifier les noms des nouvelles colonnes via des arguments CLI.
+L'utilisateur est invité à choisir la configuration ('articles' ou 'publications').
+Les noms des nouvelles colonnes sont codés en dur : "Richesse_Lexicale_OCR" et "Lisibilite_OCR".
 
 Usage
 -----
-    python post-processing/calculate_lexical_richness.py \
-        --repo MON_USER/MON_DATASET \
-        --richness-column Richesse_Lexicale_OCR \
-        --readability-column Lisibilite_OCR
+    python post-processing/calculate_lexical_richness.py [--repo MON_USER/MON_DATASET]
 
 Exemple:
-    python post-processing/calculate_lexical_richness.py \
-        --richness-column Richesse_Lexicale_OCR \
-        --readability-column Lisibilite_OCR
+    python post-processing/calculate_lexical_richness.py
     (Le script demandera ensuite la configuration et le nom du repo si non fourni)
 
 Variables d'environnement
@@ -113,10 +108,8 @@ def main():
     
     textstat.set_lang('fr') # Configurer la langue pour textstat globalement
 
-    parser = argparse.ArgumentParser(description="Ajoute des colonnes de richesse lexicale (TTR) et de lisibilité à un dataset Hugging Face, basées sur la colonne 'OCR'.")
+    parser = argparse.ArgumentParser(description="Ajoute des colonnes de richesse lexicale ('Richesse_Lexicale_OCR') et de lisibilité ('Lisibilite_OCR') à un dataset Hugging Face, basées sur la colonne 'OCR'.")
     parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles", help="ID du repository sur le Hugging Face Hub (ex: utilisateur/nom_dataset).")
-    parser.add_argument("--richness-column", required=True, help="Nom de la nouvelle colonne pour stocker les scores TTR (ex: Richesse_Lexicale_OCR).")
-    parser.add_argument("--readability-column", required=True, help="Nom de la nouvelle colonne pour stocker les scores de lisibilité (ex: Lisibilite_OCR).")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille maximale des shards Parquet lors du push vers le Hub.")
     parser.add_argument("--batch-size", type=int, default=1000, help="Taille des batchs pour le traitement .map().")
     
@@ -124,8 +117,8 @@ def main():
 
     repo_id = args.repo
     text_column_name = "OCR"  # Hardcoded
-    richness_column_name = args.richness_column
-    readability_column_name = args.readability_column # Nouvelle colonne
+    richness_column_name = "Richesse_Lexicale_OCR"  # Hardcoded
+    readability_column_name = "Lisibilite_OCR"      # Hardcoded
     max_shard_size = args.max_shard_size
     batch_size = args.batch_size
 
@@ -183,60 +176,36 @@ def main():
     logger.info(f"Calcul du TTR (col: '{richness_column_name}') et de la lisibilité (col: '{readability_column_name}') pour la colonne '{text_column_name}'...")
     
     ds_processed = ds.map(
-        add_text_metrics_batch, # Fonction de batch mise à jour
+        add_text_metrics_batch,
+        fn_kwargs={"text_col": text_column_name, "richness_col": richness_column_name, "readability_col": readability_column_name},
         batched=True,
         batch_size=batch_size,
-        fn_kwargs={
-            "text_col": text_column_name,
-            "richness_col": richness_column_name,
-            "readability_col": readability_column_name # Passer la nouvelle colonne
-        },
-        desc=f"Calcul des métriques pour '{text_column_name}'"
+        desc="Calcul des métriques textuelles",
     )
+
     logger.info(f"Calcul du TTR terminé. Aperçu (premiers 5) pour '{richness_column_name}': {ds_processed[richness_column_name][:5]}")
     logger.info(f"Calcul de la lisibilité terminé. Aperçu (premiers 5) pour '{readability_column_name}': {ds_processed[readability_column_name][:5]}")
 
-    # --- Réorganisation des colonnes (optionnel mais recommandé) ---
+    # --- Réorganisation des colonnes ---
     logger.info(f"Réorganisation des colonnes pour placer '{richness_column_name}' et '{readability_column_name}' après '{text_column_name}'.")
-    current_columns = list(ds_processed.column_names) # Convertir en liste pour pouvoir utiliser remove()
-    
-    # Retirer les nouvelles colonnes si elles existent pour les réinsérer
-    if richness_column_name in current_columns:
-        current_columns.remove(richness_column_name)
-    if readability_column_name in current_columns:
-        current_columns.remove(readability_column_name)
-    
-    try:
-        text_col_index = current_columns.index(text_column_name)
-        # Insérer les nouvelles colonnes après text_column_name
-        new_column_order = current_columns[:text_col_index+1] + [richness_column_name, readability_column_name] + current_columns[text_col_index+1:]
-        ds_processed = ds_processed.select_columns(new_column_order)
-        logger.info(f"Nouvel ordre des colonnes: {ds_processed.column_names}")
-    except ValueError:
-        logger.error(f"La colonne de référence '{text_column_name}' n'a pas été trouvée pour la réorganisation. Le dataset sera poussé sans réorganisation spécifique des colonnes.")
-        # S'assurer que les colonnes sont présentes même si la réorganisation échoue
-        final_columns_check = list(ds_processed.column_names)
-        if richness_column_name not in final_columns_check:
-            logger.warning(f"La colonne {richness_column_name} semble manquer après une tentative de réorganisation échouée.")
-        if readability_column_name not in final_columns_check:
-            logger.warning(f"La colonne {readability_column_name} semble manquer après une tentative de réorganisation échouée.")
+    column_order = [text_column_name, richness_column_name, readability_column_name] + [col for col in ds_processed.column_names if col not in [text_column_name, richness_column_name, readability_column_name]]
+    ds_processed = ds_processed.select(column_order)
 
-    # --- Push du dataset mis à jour vers le Hub ---
-    logger.info(f"Push du dataset mis à jour vers '{repo_id}' (configuration '{config_name_choice}')...")
+    # --- Sauvegarde du dataset traité ---
+    logger.info(f"Sauvegarde du dataset traité vers le Hub Hugging Face (repo: '{repo_id}')...")
     try:
         commit_message = f"Ajout colonnes '{richness_column_name}' (TTR) et '{readability_column_name}' (Lisibilité) basées sur '{text_column_name}' (config: {config_name_choice})"
         ds_processed.push_to_hub(
             repo_id,
-            config_name=config_name_choice,
+            commit_message=commit_message,
             token=token,
             max_shard_size=max_shard_size,
-            commit_message=commit_message,
         )
-        logger.info("Dataset poussé avec succès vers le Hub.")
     except Exception as e:
-        logger.error(f"Erreur lors du push du dataset vers le Hub: {e}")
+        logger.error(f"Erreur lors de la sauvegarde du dataset sur le Hub: {e}")
+        return
 
-    logger.info("Script terminé.")
+    logger.info("Dataset traité et sauvegardé avec succès.")
 
 if __name__ == "__main__":
     main()
