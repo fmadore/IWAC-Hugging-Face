@@ -8,3 +8,5 @@ datasets
 huggingface_hub
 spacy
 textstat
+transformers
+google.genai
