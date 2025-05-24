@@ -4,31 +4,26 @@ calculate_word_count.py
 =======================
 
 Ajoute une colonne avec le nombre de mots à un dataset Hugging Face existant.
-Le script charge un dataset, compte les mots dans la colonne 'OCR',
-et ajoute ces comptes en tant que nouvelle colonne d'entiers. Le dataset mis à
-jour est ensuite poussé vers le Hub.
+Le script charge un dataset depuis le repository Hugging Face 'fmadore/iwac-newspaper-articles',
+compte les mots dans la colonne 'OCR', et ajoute ces comptes dans une nouvelle
+colonne nommée 'nb_mots'. Le dataset mis à jour est ensuite poussé vers le Hub.
 
 L'utilisateur est invité à choisir la configuration ('articles' ou 'publications')
 à traiter.
 
 Usage
 -----
-    python post-processing/calculate_word_count.py \
-        --repo NOM_DU_REPO \
-        --count-column NOUVELLE_COLONNE_COMPTE \
-        --max-shard-size 1GB
+    python post-processing/calculate_word_count.py
 
 Exemple:
-    python post-processing/calculate_word_count.py \
-        --repo fmadore/iwac-newspaper-articles \
-        --count-column word_count_OCR
+    python post-processing/calculate_word_count.py
+    (Le script demandera ensuite la configuration)
 
 Variables d'environnement
 ---------------------
 HF_TOKEN   Jeton d'accès personnel pour le Hugging Face Hub (sinon, une
            connexion interactive sera demandée).
 """
-import argparse
 import logging
 import os
 import re
@@ -76,13 +71,12 @@ def main():
     configure_logging()
     logger = logging.getLogger(__name__)
 
-    parser = argparse.ArgumentParser(description="Ajoute une colonne de comptage de mots à un dataset Hugging Face.")
-    parser.add_argument("--repo", required=True, help="ID du repository sur le Hugging Face Hub (ex: fmadore/iwac-newspaper-articles).")
-    parser.add_argument("--count-column", required=True, help="Nom de la nouvelle colonne pour stocker les comptes de mots (ex: word_count_OCR).")
-    parser.add_argument("--max-shard-size", default="1GB", help="Taille maximale des shards Parquet lors du push vers le Hub (ex: 500MB, 1GB).")
-    parser.add_argument("--batch-size", type=int, default=1000, help="Taille des batchs pour le traitement avec .map().")
-
-    args = parser.parse_args()
+    # Hardcoded values
+    repo_id = "fmadore/iwac-newspaper-articles"
+    text_column_fixed = "OCR"
+    count_column_name = "nb_mots"  # Changed here
+    max_shard_size = "1GB"
+    batch_size = 1000
 
     # --- Choix de la configuration par l'utilisateur ---
     config_name_choice = ""
@@ -99,7 +93,7 @@ def main():
             return
     
     logger.info(f"Configuration sélectionnée: {config_name_choice}")
-    text_column_fixed = "OCR" # Colonne de texte fixée
+    # text_column_fixed = "OCR" # Déjà défini plus haut
 
     # --- Authentification avec le Hub ---
     token = os.getenv("HF_TOKEN") or HfFolder.get_token()
@@ -112,9 +106,9 @@ def main():
             return
 
     # --- Chargement du dataset ---
-    logger.info(f"Chargement du dataset '{args.repo}', configuration '{config_name_choice}'...")
+    logger.info(f"Chargement du dataset '{repo_id}', configuration '{config_name_choice}'...")
     try:
-        ds = load_dataset(args.repo, name=config_name_choice, split="train", token=token, trust_remote_code=True)
+        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token, trust_remote_code=True)
     except Exception as e:
         logger.error(f"Erreur lors du chargement du dataset: {e}")
         return
@@ -126,50 +120,50 @@ def main():
         logger.error(f"La colonne de texte '{text_column_fixed}' n'existe pas dans le dataset. Colonnes disponibles: {ds.column_names}")
         return
 
-    if args.count_column in ds.column_names:
-        logger.warning(f"La colonne de comptage '{args.count_column}' existe déjà. Elle sera écrasée.")
+    if count_column_name in ds.column_names:
+        logger.warning(f"La colonne de comptage '{count_column_name}' existe déjà. Elle sera écrasée.")
 
     # --- Application du comptage de mots ---
-    logger.info(f"Calcul du nombre de mots pour la colonne '{text_column_fixed}' et stockage dans '{args.count_column}'...")
+    logger.info(f"Calcul du nombre de mots pour la colonne '{text_column_fixed}' et stockage dans '{count_column_name}'...")
     
     ds_processed = ds.map(
         add_word_count_batch,
         batched=True,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         fn_kwargs={
             "text_col": text_column_fixed,
-            "count_col": args.count_column,
+            "count_col": count_column_name,
         },
         desc=f"Comptage des mots dans '{text_column_fixed}'"
     )
-    logger.info(f"Comptage des mots terminé. Aperçu de la nouvelle colonne (premiers 5) pour '{args.count_column}': {ds_processed[args.count_column][:5]}")
+    logger.info(f"Comptage des mots terminé. Aperçu de la nouvelle colonne (premiers 5) pour '{count_column_name}': {ds_processed[count_column_name][:5]}")
 
     # --- Réorganisation des colonnes ---
-    logger.info(f"Réorganisation des colonnes pour placer '{args.count_column}' après '{text_column_fixed}'.")
+    logger.info(f"Réorganisation des colonnes pour placer '{count_column_name}' après '{text_column_fixed}'.")
     current_columns = ds_processed.column_names
     
     # Enlever la colonne de comptage de sa position actuelle (généralement à la fin)
     # pour la réinsérer au bon endroit. Si elle n'y est pas pour une raison quelconque, pas de souci.
-    if args.count_column in current_columns:
-        current_columns.remove(args.count_column)
+    if count_column_name in current_columns:
+        current_columns.remove(count_column_name)
     
     try:
         ocr_index = current_columns.index(text_column_fixed)
-        new_column_order = current_columns[:ocr_index+1] + [args.count_column] + current_columns[ocr_index+1:]
+        new_column_order = current_columns[:ocr_index+1] + [count_column_name] + current_columns[ocr_index+1:]
         ds_processed = ds_processed.select_columns(new_column_order)
         logger.info(f"Nouvel ordre des colonnes: {ds_processed.column_names}")
     except ValueError:
         logger.error(f"La colonne de référence '{text_column_fixed}' n'a pas été trouvée pour la réorganisation. Le dataset sera poussé sans réorganisation des colonnes.")
 
     # --- Push du dataset mis à jour vers le Hub ---
-    logger.info(f"Push du dataset mis à jour vers '{args.repo}' (configuration '{config_name_choice}')...")
+    logger.info(f"Push du dataset mis à jour vers '{repo_id}' (configuration '{config_name_choice}')...")
     try:
         ds_processed.push_to_hub(
-            args.repo,
+            repo_id,
             config_name=config_name_choice,
             token=token,
-            max_shard_size=args.max_shard_size,
-            commit_message=f"Ajout de la colonne de comptage de mots '{args.count_column}' basée sur '{text_column_fixed}' (config: {config_name_choice})",
+            max_shard_size=max_shard_size,
+            commit_message=f"Ajout de la colonne de comptage de mots '{count_column_name}' basée sur '{text_column_fixed}' (config: {config_name_choice})",
         )
         logger.info("Dataset poussé avec succès vers le Hub.")
     except Exception as e:
