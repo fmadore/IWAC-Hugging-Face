@@ -238,6 +238,16 @@ def _get_value(item: Dict[str, Any], field: str) -> str:
     return str(val)
 
 
+def _to_int(value: str) -> Optional[int]:
+    """Safely convert a string to an integer, returning None if conversion fails."""
+    if not value or not value.strip():
+        return None
+    try:
+        return int(value.strip())
+    except (ValueError, TypeError):
+        return None
+
+
 def _join(item: Dict[str, Any], field: str) -> str:
     return _get_value(item, field)
 
@@ -294,7 +304,7 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
         "subject": _join(item, "dcterms:subject"),
         "spatial": _get_value(item, "dcterms:spatial"),
         "language": _get_value(item, "dcterms:language"),
-        "nb_pages": _get_value(item, "bibo:numPages"),
+        "nb_pages": _to_int(_get_value(item, "bibo:numPages")),
         "URL": extracted_fabio_url, 
         "source": _get_value(item, "dcterms:source"),
         "OCR": _get_value(item, "bibo:content"),
