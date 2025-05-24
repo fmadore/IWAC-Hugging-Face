@@ -34,6 +34,8 @@ import os
 import argparse
 import logging
 from typing import List
+import re # Added import
+import unicodedata # Added import
 
 import datasets
 from datasets import Dataset
@@ -47,6 +49,19 @@ def configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
+
+
+# Preprocessing constants and function
+RE_DASH  = re.compile(r"[–—−]")
+RE_SPACE = re.compile(r"\\s{2,}")
+MAP_QUOTES = str.maketrans("‘’‚‛“”„‟«»",  "''''\"\"\"\"\"\"")
+MAP_LIG   = str.maketrans({"œ":"oe","Œ":"OE","æ":"ae","Æ":"AE"})
+
+def normalize(text: str) -> str:
+    text = unicodedata.normalize("NFC", text)
+    text = text.translate(MAP_QUOTES).translate(MAP_LIG)
+    text = RE_DASH.sub("-", text).replace("\\u00A0", " ")
+    return RE_SPACE.sub(" ", text).strip()
 
 
 def load_spacy_model(name: str):
@@ -105,9 +120,12 @@ def lemmatise_batch(
 
     # Perform lemmatisation only on the content that needs it
     if content_to_process:
+        # Normalize text before spaCy processing
+        normalized_content_to_process = [normalize(text) for text in content_to_process]
+
         processed_lemmas_for_subset = []
         processed_clean_for_subset = []
-        for doc in nlp.pipe(content_to_process, batch_size=32, n_process=1):
+        for doc in nlp.pipe(normalized_content_to_process, batch_size=32, n_process=1): # Use normalized content
             lemma_tokens = [tok.lemma_.lower() for tok in doc if tok.is_alpha]
             processed_lemmas_for_subset.append(" ".join(lemma_tokens))
 
@@ -145,8 +163,8 @@ def main():
     # ------------------------------------------------------------------
     # Load dataset from the Hub
     # ------------------------------------------------------------------
-    logging.info("Loading dataset '%s'…", args.repo)
-    ds: Dataset = datasets.load_dataset(args.repo, split="train", token=token)
+    logging.info("Loading dataset '%s' (config 'articles')…", args.repo)
+    ds: Dataset = datasets.load_dataset(args.repo, name="articles", split="train", token=token) # Added name="articles"
 
     if args.text_column not in ds.column_names:
         raise ValueError(
@@ -208,9 +226,10 @@ def main():
     # ------------------------------------------------------------------
     # Push updated dataset to the Hub
     # ------------------------------------------------------------------
-    logging.info("Pushing updated dataset back to %s…", args.repo)
+    logging.info("Pushing updated dataset back to %s (config 'articles')…", args.repo)
     ds.push_to_hub(
         args.repo,
+        config_name="articles", # Added config_name
         token=token,
         max_shard_size=args.max_shard_size,
         commit_message=f"Add/update columns '{args.lemma_column}' and '{args.clean_column}' (French lemmatisation, mode: {process_choice})",
