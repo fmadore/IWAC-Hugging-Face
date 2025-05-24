@@ -33,14 +33,14 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Union, Type
 
+import pandas as pd # Added import
 import aiohttp
-import aiofiles  # pour la mise en cache
+import aiofiles # Added import for async file operations
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as async_tqdm
 from dotenv import load_dotenv
-import pandas as pd
-from datasets import Dataset
-from huggingface_hub import login, HfFolder, utils as hf_utils # Modified import
+from datasets import Dataset, load_dataset # Modified import
+from huggingface_hub import login, HfFolder, utils as hf_utils
 import huggingface_hub
 from country_mapper import get_country_from_newspaper # Added import
 
@@ -353,38 +353,27 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
     omeka_items_raw = await api.fetch_items(36)  # Newspaper articles seulement
 
     if not omeka_items_raw:
-        logger.info("No items found from Omeka API. Attempting to clear the dataset on the Hub.")
-        empty_df = pd.DataFrame(columns=['o:id']) # Define a minimal schema, ensure 'o:id' or a placeholder
-        # Attempt to get column names from a potentially existing dataset to create a truly empty version of it
-        try:
-            existing_meta_ds = Dataset.load_dataset(repo, split="train", token=HfFolder.get_token(), trust_remote_code=True, download_mode="force_redownload", ignore_verifications=True)
-            if existing_meta_ds.num_rows > 0: # Check if dataset info could be fetched
-                 empty_df = pd.DataFrame(columns=existing_meta_ds.column_names)
-            logger.info(f"Using schema from existing Hub dataset for empty push: {empty_df.columns.tolist()}")
-        except Exception as e_load_meta:
-            logger.warning(f"Could not load existing dataset schema to create a targeted empty dataset (error: {e_load_meta}). Using minimal 'o:id' schema.")
-
-        ds = Dataset.from_pandas(empty_df, preserve_index=False)
-        logger.info("Pushing an empty or schema-based empty dataset to the Hub.")
-        if os.getenv("HF_TOKEN") is None and not hf_utils.is_notebook():
-            login()
-        try:
-            ds.push_to_hub(repo, max_shard_size=shard_size, config_name="articles") # Added config_name
-            logger.info(f"Empty dataset pushed to {repo} with config 'articles'.")
-        except Exception as e_push_empty:
-            logger.error(f"Failed to push empty dataset: {e_push_empty}")
-        await conn_manager.close()
+        logger.warning("No items returned from Omeka API. Exiting.")
         return
 
     logger.info(f"Fetched {len(omeka_items_raw)} items from Omeka.")
     omeka_records_list = []
-    for it in async_tqdm(omeka_items_raw, desc="Mapping Omeka articles"):
-        omeka_records_list.append(await map_newspaper_article(it, api))
+    # Use a standard tqdm here if the inner operations are not heavily async and blocking
+    for it in tqdm(omeka_items_raw, desc="Mapping Omeka articles"):
+        try:
+            record = await map_newspaper_article(it, api)
+            omeka_records_list.append(record)
+        except Exception as e:
+            logger.error(f"Error mapping item {it.get('o:id', 'Unknown ID')}: {e}", exc_info=True)
+            # Optionally, append a partial record or skip
     
+    if not omeka_records_list:
+        logger.error("No records were successfully mapped. Exiting.")
+        return
+        
     new_omeka_df = pd.DataFrame(omeka_records_list)
     if 'o:id' not in new_omeka_df.columns or new_omeka_df['o:id'].isnull().any():
-        logger.error("'o:id' column is missing or contains null values in mapped Omeka data. This ID is crucial for updates. Cannot proceed.")
-        await conn_manager.close()
+        logger.error("Critical: 'o:id' column is missing or contains null values in new Omeka data after mapping. Cannot proceed.")
         return
     new_omeka_df['o:id'] = new_omeka_df['o:id'].astype(str) # Ensure consistent type for merging
 
@@ -396,63 +385,48 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
 
     try:
         logger.info(f"Attempting to load existing dataset from Hugging Face Hub: {repo}")
-        existing_ds = Dataset.load_dataset(repo, split="train", token=token_to_use, trust_remote_code=True, download_mode="force_redownload", ignore_verifications=True)
+        # Corrected call to load_dataset
+        existing_ds = load_dataset(repo, name="articles", split="train", token=token_to_use, download_mode="force_redownload", verification_mode="no_checks")
         existing_df = existing_ds.to_pandas()
-        if 'o:id' not in existing_df.columns:
-            logger.warning("'o:id' column not found in existing Hub dataset. Treating as if Hub dataset is empty for merge.")
-            existing_df = pd.DataFrame() # Reset to empty if 'o:id' is missing
+        
+        if 'o:id' not in existing_df.columns or existing_df['o:id'].isnull().all():
+            logger.warning("'o:id' column missing or all null in existing Hub dataset. Treating as empty.")
+            existing_df = pd.DataFrame() 
         else:
-            existing_df['o:id'] = existing_df['o:id'].astype(str) # Ensure consistent type
-            logger.info(f"Successfully loaded existing dataset with {len(existing_df)} records and columns: {existing_df.columns.tolist()}")
+            # Ensure 'o:id' is string type for consistent merging
+            existing_df['o:id'] = existing_df['o:id'].astype(str)
+            logger.info(f"Successfully loaded {len(existing_df)} records from {repo}. Existing columns: {existing_df.columns.tolist()}")
+            
     except Exception as e:
-        logger.warning(f"Could not load existing dataset from {repo} (may be first run, error: {e}). Proceeding as if Hub dataset is empty.")
-        existing_df = pd.DataFrame()
+        logger.warning(f"Could not load existing dataset from {repo} (may be first run or other issue, error: {e}). Proceeding as if Hub dataset is empty.")
+        existing_df = pd.DataFrame() # Ensure it's an empty DataFrame on error
 
     # 3. Merge logic
     if existing_df.empty:
-        final_df = new_omeka_df.copy()
-        logger.info("No existing data on Hub or 'o:id' missing; using new Omeka data directly.")
+        logger.info("No existing data on Hub, 'o:id' missing in existing data, or error loading existing data; using new Omeka data directly.")
+        final_df = new_omeka_df
     else:
-        # Identify Omeka-derived columns (all columns present in new_omeka_df)
-        omeka_derived_cols = new_omeka_df.columns.tolist()
+        logger.info(f"Merging new Omeka data ({len(new_omeka_df)} records) with existing Hub data ({len(existing_df)} records).")
         
-        # Identify Hub-specific columns (present in existing_df but not in new_omeka_df, excluding 'o:id' if it's already primary)
-        hub_specific_cols = existing_df.columns.difference(new_omeka_df.columns).tolist()
-        if 'o:id' in hub_specific_cols: # 'o:id' should be primary, not treated as purely hub-specific if also in omeka_df
-            hub_specific_cols.remove('o:id')
-
-        # Create a base for the merge from new_omeka_df (all current Omeka items)
-        # This ensures all items from Omeka are included, and their Omeka-derived fields are up-to-date.
-        merged_df = new_omeka_df.copy()
-
-        if hub_specific_cols:
-            # If there are hub-specific columns, merge them from the existing dataset
-            # We only want to bring over the hub-specific columns for matching 'o:id's
-            cols_to_preserve_from_existing = ['o:id'] + hub_specific_cols
-            existing_data_to_preserve = existing_df[cols_to_preserve_from_existing]
-            
-            # Update merged_df with the hub_specific_columns from existing_data_to_preserve
-            # This is like a left join but more of an update operation for specific columns.
-            # We can do this by setting 'o:id' as index and using update, then reset_index.
-            merged_df = merged_df.set_index('o:id')
-            existing_data_to_preserve = existing_data_to_preserve.set_index('o:id')
-            merged_df.update(existing_data_to_preserve[hub_specific_cols], join='left', overwrite=False) # overwrite=False to keep new Omeka data if col name overlaps
-            merged_df = merged_df.reset_index()
-            logger.info(f"Merged new Omeka data, preserving/updating {len(hub_specific_cols)} hub-specific columns: {hub_specific_cols}")
+        # Identify columns in existing_df that are NOT in new_omeka_df. These are "extra" columns to preserve.
+        extra_cols_to_preserve = [col for col in existing_df.columns if col not in new_omeka_df.columns]
+        
+        if extra_cols_to_preserve:
+            logger.info(f"Preserving these columns from existing dataset: {extra_cols_to_preserve}")
+            # Select these columns plus 'o:id' from existing_df for the merge
+            cols_from_existing_for_merge = ['o:id'] + extra_cols_to_preserve
+            final_df = pd.merge(new_omeka_df, existing_df[cols_from_existing_for_merge], on='o:id', how='left')
         else:
-            logger.info("No unique hub-specific columns to preserve from existing dataset. Using new Omeka data.")
-        
-        final_df = merged_df
+            logger.info("No unique columns to preserve from existing dataset. New Omeka data will form the basis of the updated dataset.")
+            final_df = new_omeka_df
 
-        # Ensure all columns from both sources are present, filling NaNs where appropriate
-        # This handles cases where new_omeka_df might have new Omeka columns not yet on the Hub,
-        # or existing_df had columns that are no longer in Omeka (those would be dropped if not in hub_specific_cols).
-        # The current logic should handle this by starting with new_omeka_df and adding hub_specific_cols.
-        
-        # Make sure final_df has all columns that were in existing_df (if they are hub-specific)
-        # and all columns from new_omeka_df.
-        # This can be complex if schemas diverge significantly. The current approach prioritizes new_omeka_df schema
-        # and adds hub-specific columns.
+        logger.info(f"Merge complete. Resulting dataset has {len(final_df)} records. Final columns: {final_df.columns.tolist()}")
+        if extra_cols_to_preserve:
+            for col_name in extra_cols_to_preserve:
+                if col_name in final_df.columns:
+                    nan_count = final_df[col_name].isnull().sum()
+                    if nan_count > 0:
+                        logger.info(f"Column '{col_name}' has {nan_count} null values after merge (these are likely new items from Omeka that will need lemmatization).")
 
     # 4. Conversion to Dataset and Push
     if not final_df.empty:
