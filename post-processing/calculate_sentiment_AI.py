@@ -235,9 +235,9 @@ def analyze_text_with_gemini(
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
-                model=f"models/{model_name}", # Ensure model name is prefixed with "models/"
+                model=model_name, # Corrected: No "models/" prefix
                 contents=contents,
-                generation_config=generation_config
+                config=generation_config # Corrected: Renamed 'generation_config' to 'config'
             )
 
             if not response.text:
@@ -269,30 +269,18 @@ def analyze_text_with_gemini(
                 time.sleep(initial_backoff * (2 ** attempt))
                 continue
 
-        except errors.DeadlineExceededError as e: # Specific to google.genai.errors
-            logger.warning(f"Timeout Gemini (essai {attempt + 1}/{max_retries}): {e}")
+        # Corrected Error Handling based on google-genai SDK v1.16.1 documentation
+        except errors.APIError as e: # Catch specific API errors from google.genai
+            error_code_str = f" (Code: {e.code})" if hasattr(e, 'code') else ""
+            error_message_str = f" (Message: {e.message})" if hasattr(e, 'message') else ""
+            logger.error(f"Erreur API Gemini (essai {attempt + 1}/{max_retries}): {e}{error_code_str}{error_message_str}. Texte (début): {article_text[:200]}")
+            
+            # You might want to inspect e.code or e.message for more specific retry logic
+            # For example, specific codes for rate limits might warrant longer backoff.
+            # For now, using the standard backoff.
             if attempt == max_retries - 1:
-                return {**default_error_result, "gemini_analysis_error": f"DeadlineExceededError: {e}"}
-            time.sleep(initial_backoff * (2 ** attempt) * 2)
-        except errors.ResourceExhaustedError as e: # Specific to google.genai.errors (rate limiting)
-            logger.warning(f"Quota Gemini/limite de taux (essai {attempt + 1}/{max_retries}): {e}")
-            if attempt == max_retries - 1:
-                return {**default_error_result, "gemini_analysis_error": f"ResourceExhaustedError: {e}"}
-            time.sleep(initial_backoff * (2 ** attempt) * 5)
-        # google.genai.errors might not have BlockedPromptException directly.
-        # It might be a generic APIError with details.
-        except errors.APIError as e: # Catch other specific API errors from google.genai
-            # Check for prompt feedback or specific error details if available
-            # Example: if e.details and 'PROMPT_BLOCKED' in str(e.details):
-            logger.error(f"Erreur API Gemini (essai {attempt + 1}/{max_retries}): {e}. Texte (début): {article_text[:200]}")
-            # You might want to inspect e.error_code or e.message for more details
-            error_message = f"APIError: {e}"
-            # Attempt to extract prompt feedback if available (structure might vary)
-            # if hasattr(e, 'response') and hasattr(e.response, 'prompt_feedback'):
-            #    error_message += f" Prompt Feedback: {e.response.prompt_feedback}"
-            if attempt == max_retries - 1:
-                return {**default_error_result, "gemini_analysis_error": error_message}
-            time.sleep(initial_backoff * (2 ** attempt))
+                return {**default_error_result, "gemini_analysis_error": f"APIError: {e}{error_code_str}{error_message_str}"}
+            time.sleep(initial_backoff * (2 ** attempt) * 3) # Slightly longer backoff for general API errors
         except Exception as e: # Catch-all for other unexpected errors
             logger.error(f"Erreur inattendue lors de l'appel à Gemini (essai {attempt + 1}/{max_retries}): {e}")
             if attempt == max_retries - 1:
@@ -309,12 +297,15 @@ def process_batch_with_gemini_analysis(
     cache: Dict[str, Any], 
     cache_file_path: Path, 
     logger: logging.Logger,
-    text_column_name: str
+    text_column_name: str,
+    id_column_name: str = "o:id" # Added id_column_name argument
 ) -> Dict[str, List[Any]]:
     """
     Applique l'analyse de sentiment Gemini à un batch d'exemples, utilisant et mettant à jour un cache.
+    Utilise la colonne spécifiée par id_column_name comme clé de cache.
     """
     ocr_texts = batch[text_column_name]
+    ids = batch[id_column_name] # Retrieve IDs
     
     # Initialiser les listes pour les nouvelles colonnes
     results_centralite_islam_musulmans = []
@@ -326,16 +317,14 @@ def process_batch_with_gemini_analysis(
     # results_gemini_analysis_error = [] # Supprimé
 
     processed_in_batch = 0
-    for text in ocr_texts:
-        # Utiliser le texte OCR comme clé de cache. Pour des textes très longs ou non uniques,
-        # une autre stratégie de clé (ex: hash, ID de ligne si disponible et unique) pourrait être envisagée.
-        cache_key = str(text) # Assurer que la clé est une chaîne
+    for record_id, text in zip(ids, ocr_texts): # Iterate over IDs and texts
+        cache_key = str(record_id) # Use ID as cache key
 
         if cache_key in cache:
             analysis_result = cache[cache_key]
-            logger.debug(f"Résultat trouvé dans le cache pour le texte (début): {text[:50]}...")
+            logger.debug(f"Résultat trouvé dans le cache pour l'ID '{cache_key}'.")
         else:
-            logger.debug(f"Analyse Gemini pour le texte (début): {text[:50]}...")
+            logger.debug(f"Analyse Gemini pour l'ID '{cache_key}' (texte début): {text[:50]}...")
             analysis_result = analyze_text_with_gemini(text, google_api_key, model_name, logger) # Pass key and model
             cache[cache_key] = analysis_result # analysis_result contient 'gemini_analysis_error'
             processed_in_batch +=1
@@ -381,6 +370,7 @@ def main():
     parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles", help="ID du repository sur le Hugging Face Hub (ex: utilisateur/nom_dataset).")
     parser.add_argument("--config-name", type=str, default=None, help="Nom de la configuration à traiter (ex: 'articles', 'publications'). Sera demandé si non fourni.")
     parser.add_argument("--text-column", default="OCR", help="Nom de la colonne contenant le texte à analyser.")
+    parser.add_argument("--id-column", default="o:id", help="Nom de la colonne contenant les identifiants uniques pour le cache.") # Added argument for id column
     parser.add_argument("--cache-file", default=str(script_dir / CACHE_FILE_DEFAULT_NAME), help=f"Chemin vers le fichier cache JSON. Défaut: {CACHE_FILE_DEFAULT_NAME} dans le dossier du script.")
     parser.add_argument("--batch-size", type=int, default=10, help="Taille des batchs pour le traitement .map(). Attention: un batch size élevé avec des appels API peut être lent ou atteindre des limites.")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille maximale des shards Parquet lors du push vers le Hub.")
@@ -389,6 +379,7 @@ def main():
 
     repo_id = args.repo
     text_column_name = args.text_column
+    id_column_name = args.id_column # Get id_column_name from args
     cache_file_path = Path(args.cache_file)
     batch_size = args.batch_size
     max_shard_size = args.max_shard_size
@@ -460,6 +451,10 @@ def main():
     if text_column_name not in ds.column_names:
         logger.error(f"La colonne texte '{text_column_name}' n'existe pas dans le dataset. Colonnes disponibles: {ds.column_names}")
         return
+    
+    if id_column_name not in ds.column_names: # Check if id_column_name exists
+        logger.error(f"La colonne ID '{id_column_name}' n'existe pas dans le dataset. Colonnes disponibles: {ds.column_names}")
+        return
 
     # --- Application de l'analyse Gemini ---
     logger.info(f"Début de l'analyse Gemini pour la colonne '{text_column_name}'...")
@@ -474,7 +469,8 @@ def main():
         "cache": cache_data,
         "cache_file_path": cache_file_path,
         "logger": logger,
-        "text_column_name": text_column_name
+        "text_column_name": text_column_name,
+        "id_column_name": id_column_name # Pass id_column_name to map function
     }
 
     ds_processed = ds.map(
