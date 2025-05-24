@@ -7,3 +7,4 @@ pyarrow
 datasets
 huggingface_hub
 spacy
+textstat
