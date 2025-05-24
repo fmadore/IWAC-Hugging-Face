@@ -239,6 +239,38 @@ def _get_media_ids(item: Dict[str, Any]) -> str:
     return ""
 
 
+@async_retry(max_tries=3, exceptions=(aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError))
+async def fetch_iiif_thumbnail_url(omeka_id: Union[str, int], session: aiohttp.ClientSession) -> str:
+    """Fetches and extracts the thumbnail URL from an IIIF manifest."""
+    manifest_url = f"https://islam.zmo.de/iiif/3/{omeka_id}/manifest"
+    thumbnail_url = ""
+    try:
+        # Use a shorter timeout for this specific, potentially numerous, request type
+        async with session.get(manifest_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                # It's crucial to handle potential JSONDecodeError here if the response is not valid JSON
+                try:
+                    manifest = await resp.json()
+                    thumbnails = manifest.get("thumbnail")
+                    if isinstance(thumbnails, list) and thumbnails:
+                        thumbnail_info = thumbnails[0]
+                        if isinstance(thumbnail_info, dict):
+                            thumbnail_url = thumbnail_info.get("id", "")
+                except json.JSONDecodeError as e_json:
+                    logger.warning(f"JSON decoding error for IIIF manifest {omeka_id}: {e_json}. URL: {manifest_url}")
+            # Log other non-200 responses that are not exceptions handled by async_retry
+            elif resp.status not in [408, 429, 500, 502, 503, 504]: # Avoid redundant logs for retryable http errors
+                logger.warning(f"IIIF manifest request for {omeka_id} returned status {resp.status}. URL: {manifest_url}")
+    except asyncio.TimeoutError: # Specifically catch timeout
+        logger.warning(f"Timeout fetching IIIF manifest for {omeka_id}. URL: {manifest_url}")
+    except aiohttp.ClientError as e_client: # Specifically catch client errors
+        logger.warning(f"Client error fetching IIIF manifest for {omeka_id}: {e_client}. URL: {manifest_url}")
+    # Catching general Exception for unexpected issues, though specific ones are better
+    except Exception as e_general:
+        logger.error(f"Unexpected error fetching IIIF manifest for {omeka_id}: {e_general}. URL: {manifest_url}")
+    return thumbnail_url
+
+
 async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item Omeka en dict plat pour HF datasets."""
 
@@ -271,11 +303,28 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
         extracted_fabio_url = fabio_has_url_data
     # If none of the above, extracted_fabio_url remains ""
 
+    # Convert nb_pages to int
+    nb_pages_str = _get_value(item, "bibo:numPages")
+    nb_pages_int = 0
+    if nb_pages_str:
+        try:
+            nb_pages_int = int(nb_pages_str)
+        except ValueError:
+            logger.warning(
+                f"Could not convert nb_pages '{nb_pages_str}' to int for item {item['o:id']}. Defaulting to 0."
+            )
+            # nb_pages_int remains 0
+
+    # Fetch thumbnail URL
+    session = await conn_manager.get()
+    thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
+
     return {
         "o:id": item["o:id"],
         "identifier": _get_value(item, "dcterms:identifier"),
         "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "PDF": primary_url,
+        "thumbnail": thumbnail_url, # Added thumbnail field
         "title": _get_value(item, "dcterms:title"),
         "author": _join(item, "dcterms:creator"),
         "newspaper": newspaper_name,
@@ -285,7 +334,7 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
         "subject": _join(item, "dcterms:subject"),
         "spatial": _get_value(item, "dcterms:spatial"),
         "language": _get_value(item, "dcterms:language"),
-        "nb_pages": _get_value(item, "bibo:numPages"),
+        "nb_pages": nb_pages_int, # Use converted integer value
         "URL": extracted_fabio_url, # Use the specifically extracted URL
         "source": _get_value(item, "dcterms:source"),
         "OCR": _get_value(item, "bibo:content"),
