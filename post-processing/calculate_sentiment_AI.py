@@ -84,7 +84,7 @@ class SentimentAnalysisOutput(BaseModel):
     polarite_justification: str
 
 # --- Gemini Configuration ---
-GEMINI_MODEL_NAME = "gemini-1.5-flash-latest" # Model name to be used
+GEMINI_MODEL_NAME = "gemini-2.5-flash-preview-05-20" # Model name to be used
 
 # --- Cache Configuration ---
 CACHE_FILE_DEFAULT_NAME = "gemini_sentiment_cache.json"
