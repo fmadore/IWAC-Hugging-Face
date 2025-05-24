@@ -144,6 +144,23 @@ def main():
     )
     logger.info(f"Comptage des mots terminé. Aperçu de la nouvelle colonne (premiers 5) pour '{args.count_column}': {ds_processed[args.count_column][:5]}")
 
+    # --- Réorganisation des colonnes ---
+    logger.info(f"Réorganisation des colonnes pour placer '{args.count_column}' après '{text_column_fixed}'.")
+    current_columns = ds_processed.column_names
+    
+    # Enlever la colonne de comptage de sa position actuelle (généralement à la fin)
+    # pour la réinsérer au bon endroit. Si elle n'y est pas pour une raison quelconque, pas de souci.
+    if args.count_column in current_columns:
+        current_columns.remove(args.count_column)
+    
+    try:
+        ocr_index = current_columns.index(text_column_fixed)
+        new_column_order = current_columns[:ocr_index+1] + [args.count_column] + current_columns[ocr_index+1:]
+        ds_processed = ds_processed.select_columns(new_column_order)
+        logger.info(f"Nouvel ordre des colonnes: {ds_processed.column_names}")
+    except ValueError:
+        logger.error(f"La colonne de référence '{text_column_fixed}' n'a pas été trouvée pour la réorganisation. Le dataset sera poussé sans réorganisation des colonnes.")
+
     # --- Push du dataset mis à jour vers le Hub ---
     logger.info(f"Push du dataset mis à jour vers '{args.repo}' (configuration '{config_name_choice}')...")
     try:
