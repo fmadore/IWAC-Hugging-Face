@@ -187,16 +187,48 @@ def main():
     logger.info(f"Calcul de la lisibilité terminé. Aperçu (premiers 5) pour '{readability_column_name}': {ds_processed[readability_column_name][:5]}")
 
     # --- Réorganisation des colonnes ---
-    logger.info(f"Réorganisation des colonnes pour placer '{richness_column_name}' et '{readability_column_name}' après '{text_column_name}'.")
-    column_order = [text_column_name, richness_column_name, readability_column_name] + [col for col in ds_processed.column_names if col not in [text_column_name, richness_column_name, readability_column_name]]
-    ds_processed = ds_processed.select(column_order)
+    insert_after_col = "nb_mots"  # Colonne après laquelle insérer les nouvelles métriques
+    logger.info(f"Réorganisation des colonnes pour placer '{richness_column_name}' et '{readability_column_name}' après '{insert_after_col}'.")
+    
+    existing_columns = list(ds_processed.column_names)
+    
+    if insert_after_col not in existing_columns:
+        logger.warning(f"La colonne '{insert_after_col}' n'a pas été trouvée. Les nouvelles colonnes seront ajoutées à la fin.")
+        # Fallback: ajouter les nouvelles colonnes à la fin si 'nb_mots' n'existe pas
+        ordered_columns = [col for col in existing_columns if col not in [richness_column_name, readability_column_name]]
+        if richness_column_name in existing_columns:
+            ordered_columns.append(richness_column_name)
+        if readability_column_name in existing_columns:
+            ordered_columns.append(readability_column_name)
+    else:
+        ordered_columns = []
+        for col in existing_columns:
+            if col == richness_column_name or col == readability_column_name: # Ne pas ajouter les nouvelles colonnes pour l'instant
+                continue
+            ordered_columns.append(col)
+            if col == insert_after_col:
+                # Insérer les nouvelles colonnes après 'insert_after_col'
+                if richness_column_name in existing_columns:
+                    ordered_columns.append(richness_column_name)
+                if readability_column_name in existing_columns:
+                    ordered_columns.append(readability_column_name)
+    
+    # Vérifier si toutes les colonnes d'origine sont présentes et dans le bon ordre
+    if len(ordered_columns) == len(existing_columns) and set(ordered_columns) == set(existing_columns):
+        ds_processed = ds_processed.select_columns(ordered_columns)
+        logger.info(f"Nouvel ordre des colonnes: {ds_processed.column_names}")
+    else:
+        logger.warning("La réorganisation des colonnes a été sautée car une incohérence a été détectée. "
+                         f"Colonnes attendues: {existing_columns}, Colonnes réorganisées proposées: {ordered_columns}. "
+                         "Vérifiez les noms des colonnes et la logique de réorganisation.")
 
-    # --- Sauvegarde du dataset traité ---
-    logger.info(f"Sauvegarde du dataset traité vers le Hub Hugging Face (repo: '{repo_id}')...")
+    # --- Sauvegarde du dataset traité --- 
+    logger.info(f"Sauvegarde du dataset traité vers le Hub Hugging Face (repo: '{repo_id}', config: '{config_name_choice}')...")
     try:
         commit_message = f"Ajout colonnes '{richness_column_name}' (TTR) et '{readability_column_name}' (Lisibilité) basées sur '{text_column_name}' (config: {config_name_choice})"
         ds_processed.push_to_hub(
-            repo_id,
+            repo_id=repo_id,
+            config_name=config_name_choice, # S'assurer que config_name est bien passé ici
             commit_message=commit_message,
             token=token,
             max_shard_size=max_shard_size,
