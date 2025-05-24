@@ -24,25 +24,25 @@ Variables d'environnement
 
 import os
 import sys # Add sys import
-import json
-import io
-import gzip
-import hashlib
-import asyncio
-import logging
+import json # Added import
+import io # Added import
+import gzip # Added import
+import hashlib # Added import
+import asyncio # Added import
+import logging # Added import
+import argparse # Added import
+import pandas as pd # Added import
+import aiohttp # Added import
+import aiofiles # Added import
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Union, Type
 
-import aiohttp
-import aiofiles  # pour la mise en cache
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as async_tqdm
 from dotenv import load_dotenv
-import pandas as pd
-from datasets import Dataset
+from datasets import Dataset, load_dataset # ENSURED load_dataset is imported
 from huggingface_hub import login, HfFolder, utils as hf_utils # Modified import
-import huggingface_hub
 
 # Adjust sys.path to include the parent directory for country_mapper import
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -238,6 +238,73 @@ def _get_value(item: Dict[str, Any], field: str) -> str:
     return str(val)
 
 
+@async_retry(max_tries=3, exceptions=(aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError))
+async def fetch_iiif_thumbnail_url(omeka_id: Union[str, int], session: aiohttp.ClientSession) -> str:
+    """Tente de récupérer l'URL de la vignette depuis le manifest IIIF."""
+    # Assuming the IIIF manifest URL structure is consistent
+    manifest_url = f"https://islam.zmo.de/iiif/{omeka_id}/manifest"
+    try:
+        async with session.get(manifest_url) as resp:
+            resp.raise_for_status()
+            manifest_data = await resp.json()
+            
+            thumbnail_url = ""
+            # IIIF Presentation API 3.0: manifest.thumbnail is an array of objects
+            if isinstance(manifest_data.get("thumbnail"), list):
+                if manifest_data["thumbnail"]:
+                    thumb_obj = manifest_data["thumbnail"][0]
+                    if isinstance(thumb_obj, dict):
+                        thumbnail_url = thumb_obj.get("id", "")
+            # IIIF Presentation API 2.0: manifest.thumbnail is an object
+            elif isinstance(manifest_data.get("thumbnail"), dict):
+                thumbnail_url = manifest_data["thumbnail"].get("@id", "")
+            # Direct URL string
+            elif isinstance(manifest_data.get("thumbnail"), str):
+                 thumbnail_url = manifest_data.get("thumbnail")
+
+            # Fallback: try sequences -> canvases -> thumbnail or images -> resource @id
+            if not thumbnail_url and manifest_data.get("sequences"):
+                if manifest_data["sequences"] and isinstance(manifest_data["sequences"], list):
+                    seq = manifest_data["sequences"][0]
+                    if seq.get("canvases") and isinstance(seq["canvases"], list) and seq["canvases"]:
+                        can = seq["canvases"][0]
+                        # Check if canvas itself has a thumbnail
+                        if can.get("thumbnail"):
+                            if isinstance(can["thumbnail"], list) and can["thumbnail"]:
+                                 thumb_obj = can["thumbnail"][0]
+                                 if isinstance(thumb_obj, dict): thumbnail_url = thumb_obj.get("id", "")
+                            elif isinstance(can["thumbnail"], dict): thumbnail_url = can["thumbnail"].get("@id", "")
+                            elif isinstance(can["thumbnail"], str): thumbnail_url = can["thumbnail"]
+                        # Else, try images on canvas
+                        elif can.get("images") and isinstance(can["images"], list) and can["images"]:
+                            img = can["images"][0]
+                            if img.get("resource") and isinstance(img["resource"], dict) and img["resource"].get("@type") == "dctypes:Image":
+                                base_uri = img["resource"].get("@id", "")
+                                # Attempt to construct a common IIIF image API URL for a thumbnail
+                                if base_uri:
+                                    # Remove existing IIIF parameters if present to avoid duplication
+                                    base_uri = base_uri.split('/full/')[0].split('/square/')[0].split('/!')[0]
+                                    thumbnail_url = f"{base_uri}/full/!200,200/0/default.jpg"
+            
+            if thumbnail_url:
+                logger.debug(f"Found thumbnail for Omeka ID {omeka_id}: {thumbnail_url}")
+                return thumbnail_url
+            else:
+                logger.warning(f"Thumbnail not found in IIIF manifest for Omeka ID {omeka_id} at {manifest_url}")
+                return ""
+    except aiohttp.ClientResponseError as e:
+        if e.status == 404:
+            logger.warning(f"IIIF Manifest not found for Omeka ID {omeka_id} (404 at {manifest_url})")
+        else:
+            logger.error(f"HTTP error fetching IIIF manifest for {omeka_id}: {e.status} {e.message} at {manifest_url}")
+        return ""
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error for IIIF manifest for {omeka_id} at {manifest_url}: {e}")
+        return ""
+    except Exception as e:
+        logger.error(f"Unexpected error fetching thumbnail for {omeka_id} from {manifest_url}: {e}", exc_info=True)
+        return ""
+
 def _to_int(value: str) -> Optional[int]:
     """Safely convert a string to an integer, returning None if conversion fails."""
     if not value or not value.strip():
@@ -263,9 +330,15 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
 
     primary_url = ""
     if item.get("o:primary_media"):
-        mid = item["o:primary_media"]["@id"].split("/")[-1]
-        mdata = await api.fetch_media_data(mid)
-        primary_url = mdata.get("o:original_url", "")
+        try:
+            media_id_url = item["o:primary_media"]["@id"]
+            media_id = media_id_url.split("/")[-1]
+            media_data = await api.fetch_media_data(media_id) # Ensure api object is passed and used
+            primary_url = media_data.get("o:original_url", "")
+        except Exception as e:
+            logger.error(f"Error fetching primary media for item {item.get('o:id')}: {e}")
+            primary_url = ""
+
 
     publisher_name = _join(item, "dcterms:publisher") # Changed newspaper_name to publisher_name for clarity
     country = get_country_from_newspaper(publisher_name) # Assumes country_mapper is generic enough
@@ -290,17 +363,29 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
         extracted_fabio_url = fabio_has_url_data
     # If none of the above, extracted_fabio_url remains ""
 
+    # Fetch thumbnail URL
+    thumbnail_url = ""
+    if item.get("o:id"):
+        try:
+            session = await conn_manager.get()
+            thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
+        except Exception as e:
+            logger.error(f"Error fetching thumbnail for item {item['o:id']}: {e}")
+            thumbnail_url = ""
+
+
     return {
         "o:id": item["o:id"],
         "identifier": _get_value(item, "dcterms:identifier"),
         "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "PDF": primary_url,
+        "thumbnail": thumbnail_url, # Added thumbnail field
         "title": _get_value(item, "dcterms:title"),
         "author": _join(item, "dcterms:creator"),
-        "newspaper": publisher_name,
+        "newspaper": publisher_name, # This was 'newspaper', for publications might be 'journal' or 'publisher'
         "country": country,
         "pub_date": _get_value(item, "dcterms:date"),
-        "issue": _get_value(item, "bibo:issue"),
+        "issue": _get_value(item, "bibo:issue"), # Added issue field
         "subject": _join(item, "dcterms:subject"),
         "spatial": _get_value(item, "dcterms:spatial"),
         "language": _get_value(item, "dcterms:language"),
@@ -323,32 +408,72 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
     omeka_items_raw = await api.fetch_items(60)  # Publications islamiques seulement
 
     if not omeka_items_raw:
-        logger.info("No items found from Omeka API. Attempting to clear the dataset on the Hub.")
-        empty_df = pd.DataFrame(columns=['o:id']) 
+        logger.warning("No items returned from Omeka API. Attempting to clear or use empty dataset on the Hub.")
+        # Try to get schema from existing dataset or define a default one
+        final_df = pd.DataFrame() # Default to empty
         try:
-            # Try to load with the target config name
-            existing_meta_ds = Dataset.load_dataset(repo, name="publications", split="train", token=HfFolder.get_token(), trust_remote_code=True, download_mode="force_redownload", ignore_verifications=True)
-            if existing_meta_ds.num_rows > 0: 
-                 empty_df = pd.DataFrame(columns=existing_meta_ds.column_names)
-            logger.info(f"Using schema from existing Hub dataset (config 'publications') for empty push: {empty_df.columns.tolist()}")
-        except Exception as e_load_meta:
-            logger.warning(f"Could not load existing dataset schema for config 'publications' (error: {e_load_meta}). Using minimal 'o:id' schema.")
+            # Corrected call to load_dataset
+            existing_ds = load_dataset(repo, name="publications", split="train", token=token_to_use, download_mode="force_redownload", verification_mode="no_checks")
+            if existing_ds.num_rows > 0:
+                # If dataset exists and has rows, create an empty df with same schema
+                final_df = pd.DataFrame(columns=existing_ds.column_names)
+                logger.info(f"Existing dataset on Hub has columns: {existing_ds.column_names}. Creating empty dataset with this schema.")
+            else: # Dataset exists but is empty
+                logger.info("Existing dataset on Hub is empty. Will push a new empty dataset if no Omeka items.")
+                # Define a minimal schema or the full expected schema if possible
+                # For now, let's stick to a truly empty one if Omeka returns nothing and Hub is empty.
+                # Or, more robustly, define the expected columns for an empty dataset:
+                expected_cols = [
+                    "o:id", "identifier", "url", "PDF", "thumbnail", "title", "author", 
+                    "newspaper", "country", "pub_date", "issue", "subject", "spatial", 
+                    "language", "nb_pages", "URL", "source", "OCR"
+                ]
+                final_df = pd.DataFrame(columns=expected_cols)
 
-        ds = Dataset.from_pandas(empty_df, preserve_index=False)
-        logger.info("Pushing an empty or schema-based empty dataset to the Hub (config 'publications').")
-        if os.getenv("HF_TOKEN") is None and not hf_utils.is_notebook():
-            login()
-        try:
-            ds.push_to_hub(repo, max_shard_size=shard_size, config_name="publications") # Use "publications"
-            logger.info(f"Empty dataset pushed to {repo} with config 'publications'.")
-        except Exception as e_push_empty:
-            logger.error(f"Failed to push empty dataset: {e_push_empty}")
+        except Exception as e_load_meta:
+            logger.warning(f"Could not load existing dataset from {repo} to determine schema (error: {e_load_meta}). Will push a truly empty dataset if no Omeka items.")
+            # Define a minimal or full schema if dataset doesn't exist at all
+            expected_cols = [
+                "o:id", "identifier", "url", "PDF", "thumbnail", "title", "author", 
+                "newspaper", "country", "pub_date", "issue", "subject", "spatial", 
+                "language", "nb_pages", "URL", "source", "OCR"
+            ] # Ensure 'o:id' is present for consistency
+            final_df = pd.DataFrame(columns=expected_cols)
+        
+        # Ensure 'o:id' is string if it's part of the schema for an empty df
+        if 'o:id' in final_df.columns:
+            final_df['o:id'] = final_df['o:id'].astype(str)
+
+        # Push this empty or schema-defined DataFrame
+        if not final_df.empty or (final_df.empty and not omeka_items_raw) : # Push if df has schema or if it's truly empty because no omeka items
+            logger.info("Preparing to push an empty or schema-based dataset to the Hub (config 'publications').")
+            dataset_to_push = Dataset.from_pandas(final_df, preserve_index=False)
+            
+            hf_token_env = os.getenv("HF_TOKEN")
+            hf_token_stored = HfFolder.get_token()
+            token_to_use = hf_token_env if hf_token_env else hf_token_stored
+            if not token_to_use and not hf_utils.is_notebook(): # Check if login is needed
+                login()
+                token_to_use = HfFolder.get_token()
+
+            try:
+                dataset_to_push.push_to_hub(
+                    repo,
+                    config_name="publications",
+                    token=token_to_use,
+                    max_shard_size=shard_size,
+                    commit_message="Dataset cleared or initialized as empty (no Omeka items found)"
+                )
+                logger.info("Successfully pushed empty/schema dataset to the Hub.")
+            except Exception as e_push_empty:
+                logger.error(f"Failed to push empty/schema dataset: {e_push_empty}", exc_info=True)
         await conn_manager.close()
-        return
+        return # Exit after handling no Omeka items
 
     logger.info(f"Fetched {len(omeka_items_raw)} items from Omeka.")
     omeka_records_list = []
-    for it in async_tqdm(omeka_items_raw, desc="Mapping Islamic publications"): # Updated description
+    # Use a standard tqdm here if the inner operations are not heavily async and blocking
+    for it in tqdm(omeka_items_raw, desc="Mapping Islamic publications"):
         omeka_records_list.append(await map_islamic_publication_item(it, api)) # Call renamed function
     
     new_omeka_df = pd.DataFrame(omeka_records_list)
