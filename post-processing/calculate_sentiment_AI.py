@@ -323,7 +323,7 @@ def process_batch_with_gemini_analysis(
     results_subjectivite_justification = []
     results_polarite = []
     results_polarite_justification = []
-    results_gemini_analysis_error = []
+    # results_gemini_analysis_error = [] # Supprimé
 
     processed_in_batch = 0
     for text in ocr_texts:
@@ -337,7 +337,7 @@ def process_batch_with_gemini_analysis(
         else:
             logger.debug(f"Analyse Gemini pour le texte (début): {text[:50]}...")
             analysis_result = analyze_text_with_gemini(text, google_api_key, model_name, logger) # Pass key and model
-            cache[cache_key] = analysis_result
+            cache[cache_key] = analysis_result # analysis_result contient 'gemini_analysis_error'
             processed_in_batch +=1
         
         results_centralite_islam_musulmans.append(analysis_result.get("centralite_islam_musulmans"))
@@ -346,7 +346,7 @@ def process_batch_with_gemini_analysis(
         results_subjectivite_justification.append(analysis_result.get("subjectivite_justification"))
         results_polarite.append(analysis_result.get("polarite"))
         results_polarite_justification.append(analysis_result.get("polarite_justification"))
-        results_gemini_analysis_error.append(analysis_result.get("gemini_analysis_error"))
+        # results_gemini_analysis_error.append(analysis_result.get("gemini_analysis_error")) # Supprimé
 
     if processed_in_batch > 0 : # Save cache if new items were processed
         save_cache(cache_file_path, cache, logger)
@@ -358,7 +358,7 @@ def process_batch_with_gemini_analysis(
     batch["gemini_subjectivite_justification"] = results_subjectivite_justification
     batch["gemini_polarite"] = results_polarite
     batch["gemini_polarite_justification"] = results_polarite_justification
-    batch["gemini_analysis_error"] = results_gemini_analysis_error
+    # batch["gemini_analysis_error"] = results_gemini_analysis_error # Supprimé
     
     return batch
 
@@ -493,12 +493,12 @@ def main():
     # Les nouvelles colonnes sont:
     # gemini_centralite_islam_musulmans, gemini_centralite_justification, 
     # gemini_subjectivite_score, gemini_subjectivite_justification,
-    # gemini_polarite, gemini_polarite_justification, gemini_analysis_error
+    # gemini_polarite, gemini_polarite_justification
     
     new_gemini_cols = [
         "gemini_centralite_islam_musulmans", "gemini_centralite_justification",
         "gemini_subjectivite_score", "gemini_subjectivite_justification",
-        "gemini_polarite", "gemini_polarite_justification", "gemini_analysis_error"
+        "gemini_polarite", "gemini_polarite_justification" # "gemini_analysis_error" supprimé
     ]
     
     insert_after_col = "sentiment_score" # Colonne CamemBERT après laquelle insérer
