@@ -301,19 +301,17 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
             extracted_fabio_url = id_val
     elif isinstance(fabio_has_url_data, str) and fabio_has_url_data: # If it's already a non-empty string
         extracted_fabio_url = fabio_has_url_data
-    # If none of the above, extracted_fabio_url remains ""
-
-    # Convert nb_pages to int
+    # If none of the above, extracted_fabio_url remains ""    # Convert nb_pages to int
     nb_pages_str = _get_value(item, "bibo:numPages")
-    nb_pages_int = 0
+    nb_pages_int = None
     if nb_pages_str:
         try:
             nb_pages_int = int(nb_pages_str)
         except ValueError:
             logger.warning(
-                f"Could not convert nb_pages '{nb_pages_str}' to int for item {item['o:id']}. Defaulting to 0."
+                f"Could not convert nb_pages '{nb_pages_str}' to int for item {item['o:id']}. Defaulting to null."
             )
-            # nb_pages_int remains 0
+            # nb_pages_int remains None
 
     # Fetch thumbnail URL
     session = await conn_manager.get()
