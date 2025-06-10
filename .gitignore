@@ -2,3 +2,5 @@
 .venv
 .cache_omk
 __pycache__
+data/iwac_articles.csv
+data/iwac_publications.csv
