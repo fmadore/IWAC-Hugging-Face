@@ -1,7 +1,2 @@
-| Axe d’enrichissement             | Colonnes suggérées                               | Modèles/outils recommandés                                                 | Pourquoi c’est utile                                                                        |
-| -------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| **Géo-référencement**            | `lat`, `lon`, `adm1`                             | Geopy + Wikidata SPARQL                                                    | Générer des cartes de la couverture médiatique.                                             |
 | **Représentations vectorielles** | `embedding_camembert` (list\[float])             | `sentence-transformers/paraphrase-multilingual-mpnet-base-v2`              | Recherche sémantique et clustering rapides.                                                 |
 | **Modélisation de sujets**       | `topic_id`, `topic_prob`, `topic_label`          | BERTopic + CamemBERT                                                       | Comparer l’évolution thématique (séculier → sécurité, etc.).                                |
-
-| **Réseaux d’acteurs**            | `co_mentions` (JSON de couples) ou table dérivée | Extraction d’entités + NetworkX                                            | Construire des graphes de co-apparition « imams-partis politiques ».                        |
