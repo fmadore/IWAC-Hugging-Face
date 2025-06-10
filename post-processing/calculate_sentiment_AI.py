@@ -313,16 +313,28 @@ def process_batch_with_gemini_analysis(
     results_subjectivite_score = []
     results_subjectivite_justification = []
     results_polarite = []
-    results_polarite_justification = []
-    # results_gemini_analysis_error = [] # Supprimé
+    results_polarite_justification = []    # results_gemini_analysis_error = [] # Supprimé
 
     processed_in_batch = 0
     for record_id, text in zip(ids, ocr_texts): # Iterate over IDs and texts
         cache_key = str(record_id) # Use ID as cache key
 
+        # Vérifier si l'entrée existe dans le cache ET n'a pas d'erreur
         if cache_key in cache:
-            analysis_result = cache[cache_key]
-            logger.debug(f"Résultat trouvé dans le cache pour l'ID '{cache_key}'.")
+            cached_result = cache[cache_key]
+            # Ignorer le cache si l'entrée contient une erreur d'analyse
+            has_error = (cached_result.get("centralite_islam_musulmans") == "ERREUR_ANALYSE" or
+                        cached_result.get("polarite") == "ERREUR_ANALYSE" or
+                        cached_result.get("gemini_analysis_error") is not None)
+            
+            if has_error:
+                logger.info(f"Entrée avec erreur trouvée dans le cache pour l'ID '{cache_key}', ré-analyse en cours...")
+                analysis_result = analyze_text_with_gemini(text, google_api_key, model_name, logger)
+                cache[cache_key] = analysis_result
+                processed_in_batch += 1
+            else:
+                analysis_result = cached_result
+                logger.debug(f"Résultat trouvé dans le cache pour l'ID '{cache_key}'.")
         else:
             logger.debug(f"Analyse Gemini pour l'ID '{cache_key}' (texte début): {text[:50]}...")
             analysis_result = analyze_text_with_gemini(text, google_api_key, model_name, logger) # Pass key and model
