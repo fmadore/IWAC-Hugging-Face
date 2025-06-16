@@ -18,7 +18,21 @@ HF_TOKEN   Jeton d'accès personnel pour le Hugging Face Hub
 
 Dépendances
 -----------
-    pip install bertopic sentence-transformers umap-learn hdbscan scikit-learn
+    pip install bertopic sentence-transformers umap-learn hdbscan scikit-learn tqdm torch
+
+Modèles d'embedding français recommandés
+---------------------------------------
+    --embedding-model dangvantuan/sentence-camembert-base     # Modèle base (110M params)
+    --embedding-model dangvantuan/sentence-camembert-large    # Modèle large (336M params, meilleur)
+    --embedding-model Lajavaness/sentence-camembert-large     # Alternative optimisée
+
+Optimisations CPU
+-----------------
+    Pour machines sans GPU, utilisez les options :
+    --cpu-only                    # Force l'utilisation du CPU
+    --max-documents 10000         # Limite le nombre de documents pour tests
+    --embedding-batch-size 16     # Réduit la taille des batches si mémoire limitée
+    --min-topic-size 20           # Augmente la taille min des sujets pour réduire le bruit
 """
 import argparse
 import logging
@@ -34,6 +48,8 @@ from sklearn.feature_extraction.text import CountVectorizer
 from umap import UMAP
 from hdbscan import HDBSCAN
 from collections import Counter
+from tqdm import tqdm
+import torch
 
 def configure_logging() -> None:
     logging.basicConfig(
@@ -96,22 +112,30 @@ def choose_modeling_mode() -> str:
             print("\nOpération annulée.")
             exit(0)
 
-def create_bertopic_model(embedding_model_name: str, min_topic_size: int = 10) -> BERTopic:
-    embedding_model = SentenceTransformer(embedding_model_name)
+def create_bertopic_model(embedding_model_name: str, min_topic_size: int = 10, 
+                         cpu_only: bool = False, embedding_batch_size: int = 32) -> BERTopic:
+    # Configuration pour CPU si demandé
+    device = "cpu" if cpu_only else "cuda" if torch.cuda.is_available() else "cpu"
+    
+    embedding_model = SentenceTransformer(embedding_model_name, device=device)
     
     umap_model = UMAP(
         n_neighbors=15, 
         n_components=5, 
         min_dist=0.0, 
         metric='cosine',
-        random_state=42
+        random_state=42,
+        # Optimisation CPU : utiliser tous les cœurs disponibles
+        n_jobs=-1 if cpu_only else 1
     )
     
     hdbscan_model = HDBSCAN(
         min_cluster_size=min_topic_size,
         metric='euclidean',
         cluster_selection_method='eom',
-        prediction_data=True
+        prediction_data=True,
+        # Optimisation CPU : utiliser tous les cœurs disponibles
+        n_jobs=-1 if cpu_only else 1
     )
     
     vectorizer_model = CountVectorizer(
@@ -140,13 +164,21 @@ def fit_topic_model(texts: List[str], model_save_path: Path, logger: logging.Log
     logger.info("Entraînement du modèle BERTopic...")
     logger.info(f"Nombre de documents: {len(texts)}")
     
-    valid_texts = [text for text in texts if text and text.strip()]
+    # Filtrage des textes valides avec barre de progression
+    logger.info("Filtrage des textes valides...")
+    valid_texts = [text for text in tqdm(texts, desc="Filtrage des textes") if text and text.strip()]
     logger.info(f"Nombre de documents valides: {len(valid_texts)}")
     
     if len(valid_texts) < 50:
         logger.warning("Nombre de documents très faible pour un entraînement robuste.")
     
-    topics, probabilities = topic_model.fit_transform(valid_texts)
+    logger.info("Entraînement en cours (cela peut prendre plusieurs minutes)...")
+    with tqdm(total=100, desc="Entraînement BERTopic") as pbar:
+        # L'entraînement BERTopic n'a pas de callback de progression intégré
+        # donc nous simulons une progression
+        pbar.update(10)  # Début de l'entraînement
+        topics, probabilities = topic_model.fit_transform(valid_texts)
+        pbar.update(90)  # Fin de l'entraînement
     
     topic_info = topic_model.get_topic_info()
     logger.info(f"Nombre de sujets découverts: {len(topic_info) - 1}")
@@ -156,13 +188,19 @@ def fit_topic_model(texts: List[str], model_save_path: Path, logger: logging.Log
             logger.info(f"  Sujet {row['Topic']}: {row['Name']} ({row['Count']} docs)")
     
     logger.info(f"Sauvegarde du modèle entraîné vers: {model_save_path}")
-    topic_model.save(str(model_save_path))
+    with tqdm(total=100, desc="Sauvegarde du modèle") as pbar:
+        pbar.update(20)
+        topic_model.save(str(model_save_path))
+        pbar.update(80)
     
     return topic_model
 
 def load_topic_model(model_path: Path, logger: logging.Logger) -> BERTopic:
     logger.info(f"Chargement du modèle BERTopic depuis: {model_path}")
-    topic_model = BERTopic.load(str(model_path))
+    with tqdm(total=100, desc="Chargement du modèle") as pbar:
+        pbar.update(30)
+        topic_model = BERTopic.load(str(model_path))
+        pbar.update(70)
     
     topic_info = topic_model.get_topic_info()
     logger.info(f"Modèle chargé avec {len(topic_info) - 1} sujets")
@@ -217,12 +255,18 @@ def main():
         description="Ajoute des colonnes de modélisation de sujets à un dataset Hugging Face."
     )
     parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles")
-    parser.add_argument("--embedding-model", default="sentence-transformers/camembert-base", 
-                        help="Modèle d'embedding à utiliser (recommandé: camembert-base pour le français)")
+    parser.add_argument("--embedding-model", default="dangvantuan/sentence-camembert-base", 
+                        help="Modèle d'embedding à utiliser (recommandé: sentence-camembert-base pour le français)")
     parser.add_argument("--min-topic-size", type=int, default=10)
     parser.add_argument("--model-path", default="bertopic_model")
     parser.add_argument("--max-shard-size", default="1GB")
     parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--cpu-only", action="store_true", 
+                        help="Force l'utilisation du CPU uniquement (optimisations pour machines sans GPU)")
+    parser.add_argument("--max-documents", type=int, default=None,
+                        help="Limite le nombre de documents pour les tests (utile pour CPU)")
+    parser.add_argument("--embedding-batch-size", type=int, default=32,
+                        help="Taille des batches pour les embeddings (réduire si mémoire limitée)")
     
     args = parser.parse_args()
 
@@ -236,6 +280,9 @@ def main():
     model_path = Path(args.model_path)
     max_shard_size = args.max_shard_size
     batch_size = args.batch_size
+    cpu_only = args.cpu_only
+    max_documents = args.max_documents
+    embedding_batch_size = args.embedding_batch_size
 
     # Authentification
     token = os.getenv("HF_TOKEN") or HfFolder.get_token()
@@ -291,10 +338,21 @@ def main():
 
     # Préparation du modèle
     if modeling_mode == "fit":
-        topic_model = create_bertopic_model(embedding_model_name, min_topic_size)
+        if cpu_only:
+            logger.info("Mode CPU activé - optimisations pour machines sans GPU")
+            logger.info(f"Taille des batches d'embeddings: {embedding_batch_size}")
         
+        topic_model = create_bertopic_model(embedding_model_name, min_topic_size, cpu_only, embedding_batch_size)
+        
+        logger.info("Extraction et validation des textes...")
         texts = ds[text_column_name]
-        valid_texts = [text for text in texts if text and text.strip()]
+        
+        # Limitation optionnelle du nombre de documents (utile pour tests CPU)
+        if max_documents and len(texts) > max_documents:
+            logger.info(f"Limitation à {max_documents} documents pour optimiser les performances CPU")
+            texts = texts[:max_documents]
+        
+        valid_texts = [text for text in tqdm(texts, desc="Validation des textes") if text and text.strip()]
         
         if len(valid_texts) < min_topic_size:
             logger.error(f"Nombre de textes valides ({len(valid_texts)}) < min_topic_size ({min_topic_size})")
@@ -328,6 +386,7 @@ def main():
     logger.info("Modélisation terminée.")
     
     # Statistiques
+    logger.info("Calcul des statistiques...")
     topic_ids = ds_processed[topic_id_column_name]
     topic_probs = ds_processed[topic_prob_column_name]
     topic_labels = ds_processed[topic_label_column_name]
@@ -335,7 +394,7 @@ def main():
     unique_topics = set(topic_ids)
     logger.info(f"Nombre de sujets uniques: {len(unique_topics)}")
     
-    valid_probs = [p for p in topic_probs if p > 0]
+    valid_probs = [p for p in tqdm(topic_probs, desc="Calcul probabilités") if p > 0]
     if valid_probs:
         logger.info(f"Probabilité moyenne: {np.mean(valid_probs):.3f}")
     else:
