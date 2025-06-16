@@ -12,3 +12,9 @@ transformers
 sentence-transformers
 torch
 google.genai
+# Dépendances pour topic modeling
+bertopic
+umap-learn
+hdbscan
+scikit-learn
+numpy
