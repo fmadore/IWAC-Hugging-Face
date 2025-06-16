@@ -9,4 +9,6 @@ huggingface_hub
 spacy
 textstat
 transformers
+sentence-transformers
+torch
 google.genai
