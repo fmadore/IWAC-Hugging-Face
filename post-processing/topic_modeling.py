@@ -151,7 +151,6 @@ def create_bertopic_model(embedding_model_name: str, min_topic_size: int = 10,
         umap_model=umap_model,
         hdbscan_model=hdbscan_model,
         vectorizer_model=vectorizer_model,
-        top_k_words=10,
         verbose=True,
         calculate_probabilities=True
     )
