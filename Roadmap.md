@@ -1,1 +1,0 @@
-| **Modélisation de sujets**       | `topic_id`, `topic_prob`, `topic_label`          | BERTopic + CamemBERT                                                       | Comparer l’évolution thématique (séculier → sécurité, etc.).                                |
