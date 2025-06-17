@@ -50,6 +50,7 @@ from hdbscan import HDBSCAN
 from collections import Counter
 from tqdm import tqdm
 import torch
+import shutil
 
 def configure_logging() -> None:
     logging.basicConfig(
@@ -187,6 +188,9 @@ def fit_topic_model(texts: List[str], model_save_path: Path, logger: logging.Log
     logger.info(f"Sauvegarde du modèle entraîné vers: {model_save_path}")
     with tqdm(total=100, desc="Sauvegarde du modèle") as pbar:
         pbar.update(20)
+        # Remove existing directory if it exists
+        if model_save_path.exists():
+            shutil.rmtree(model_save_path)
         topic_model.save(
             str(model_save_path),
             serialization="pytorch",  # avoid pickle/joblib issues with Python 3.12
