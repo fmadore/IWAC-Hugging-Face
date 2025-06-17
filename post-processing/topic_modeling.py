@@ -133,9 +133,7 @@ def create_bertopic_model(embedding_model_name: str, min_topic_size: int = 10,
         min_cluster_size=min_topic_size,
         metric='euclidean',
         cluster_selection_method='eom',
-        prediction_data=True,
-        # Optimisation CPU : utiliser tous les cœurs disponibles
-        n_jobs=-1 if cpu_only else 1
+        prediction_data=True
     )
     
     vectorizer_model = CountVectorizer(
@@ -157,7 +155,7 @@ def create_bertopic_model(embedding_model_name: str, min_topic_size: int = 10,
     
     return topic_model
 
-def fit_topic_model(texts: List[str], model_save_path: Path, logger: logging.Logger) -> BERTopic:
+def fit_topic_model(texts: List[str], model_save_path: Path, logger: logging.Logger, embedding_model_name: str) -> BERTopic:
     global topic_model
     
     logger.info("Entraînement du modèle BERTopic...")
@@ -189,7 +187,12 @@ def fit_topic_model(texts: List[str], model_save_path: Path, logger: logging.Log
     logger.info(f"Sauvegarde du modèle entraîné vers: {model_save_path}")
     with tqdm(total=100, desc="Sauvegarde du modèle") as pbar:
         pbar.update(20)
-        topic_model.save(str(model_save_path))
+        topic_model.save(
+            str(model_save_path),
+            serialization="pytorch",  # avoid pickle/joblib issues with Python 3.12
+            save_ctfidf=True,
+            save_embedding_model=embedding_model_name,
+        )
         pbar.update(80)
     
     return topic_model
@@ -357,7 +360,7 @@ def main():
             logger.error(f"Nombre de textes valides ({len(valid_texts)}) < min_topic_size ({min_topic_size})")
             return
         
-        topic_model = fit_topic_model(valid_texts, model_path, logger)
+        topic_model = fit_topic_model(valid_texts, model_path, logger, embedding_model_name)
         
     else:
         if not model_path.exists():
