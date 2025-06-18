@@ -1,6 +1,7 @@
 .env
 .venv
 .cache_omk
+.cache_omk_index
 __pycache__
 bertopic_model
 data/iwac_articles.csv
