@@ -223,6 +223,20 @@ def _get_value(item: Dict[str, Any], field: str) -> str:
     return str(val)
 
 
+def _get_value_only(item: Dict[str, Any], field: str) -> str:
+    """Extrait seulement les valeurs @value d'un champ Omeka (pour dcterms:identifier)"""
+    if field not in item or item[field] is None:
+        return ""
+    val = item[field]
+    if isinstance(val, list):
+        # Ne prendre que les @value, ignorer les autres types
+        parts = [str(v.get("@value", "")) for v in val if isinstance(v, dict) and v.get("@value")]
+        return "|".join(filter(None, parts))
+    if isinstance(val, dict):
+        return val.get("@value", "")
+    return str(val)
+
+
 def _get_value_with_lang(item: Dict[str, Any], field: str, preferred_lang: str = "fr") -> str:
     """Extrait une valeur en privilégiant une langue spécifique"""
     if field not in item or item[field] is None:
@@ -342,10 +356,10 @@ async def map_index_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
 
     return {
         "o:id": item["o:id"],
-        "identifier": _get_value(item, "dcterms:identifier"),
+        "identifier": _get_value_only(item, "dcterms:identifier"),
         "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "thumbnail": thumbnail_url,
-        "Titre": _get_value(item, "dcterms:title"),
+        "Titre": item.get("o:title", ""),
         "Titre alternatif": _get_value(item, "dcterms:alternative"),
         "Type": _get_resource_class_type(item),
         "Description": _get_value_with_lang(item, "dcterms:description", "fr"),
@@ -452,14 +466,14 @@ def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.Dat
                         if not term_stats[spatial]['last_occurrence'] or date_str > term_stats[spatial]['last_occurrence']:
                             term_stats[spatial]['last_occurrence'] = date_str
     
-    # Convertir les sets en listes
+    # Convertir les sets en chaînes séparées par |
     result = {}
     for term, stats in term_stats.items():
         result[term] = {
             'frequency': stats['frequency'],
             'first_occurrence': stats['first_occurrence'] or '',
             'last_occurrence': stats['last_occurrence'] or '',
-            'countries': list(stats['countries'])
+            'countries': "|".join(sorted(stats['countries'])) if stats['countries'] else ''
         }
     
     logger.info(f"Calculated frequency stats for {len(result)} unique terms")
@@ -563,7 +577,7 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
             new_omeka_df.at[idx, 'last_occurrence'] = stats['last_occurrence']
             new_omeka_df.at[idx, 'countries'] = stats['countries']
         else:
-            new_omeka_df.at[idx, 'countries'] = []
+            new_omeka_df.at[idx, 'countries'] = ''
 
     # 5. Load existing dataset from Hugging Face Hub
     existing_df = pd.DataFrame()
@@ -643,7 +657,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Publie l'index IWAC sur le Hub HF")
-    parser.add_argument("--repo", default="fmadore/iwac-index", help="Nom du repo HF (ex. fmadore/iwac-index)")
+    parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles", help="Nom du repo HF (ex. fmadore/iwac-newspaper-articles)")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
     args = parser.parse_args()
 
