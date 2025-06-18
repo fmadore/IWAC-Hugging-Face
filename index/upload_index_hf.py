@@ -10,7 +10,7 @@ sur le Hugging Face Hub.
 Usage
 -----
     python upload_index_hf.py \
-        --repo fmadore/iwac-index \
+        --repo fmadore/iwac-newspaper-articles \
         --max-shard-size 1GB
 
 Variables d'environnement
