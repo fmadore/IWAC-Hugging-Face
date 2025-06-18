@@ -255,8 +255,44 @@ def _get_display_title(item: Dict[str, Any], field: str) -> str:
     return ""
 
 
+def _get_resource_class_type(item: Dict[str, Any]) -> str:
+    """Mappe le resource_class_id vers le type correspondant"""
+    resource_class_mapping = {
+        9: "Lieux",
+        94: "Personnes", 
+        96: "Organisations",
+        54: "Événements",
+        244: "Sujets"  # Par défaut, sera affiné selon l'item_set
+    }
+    
+    resource_class = item.get("o:resource_class")
+    if not resource_class or not isinstance(resource_class, dict):
+        return ""
+    
+    class_id = resource_class.get("o:id")
+    if not class_id:
+        return ""
+    
+    # Cas spécial pour la classe 244 (Sujets/Notices d'autorité)
+    if class_id == 244:
+        # Vérifier l'item_set pour distinguer Sujets vs Notices d'autorité
+        item_sets = item.get("o:item_set", [])
+        if isinstance(item_sets, list):
+            for item_set in item_sets:
+                if isinstance(item_set, dict):
+                    item_set_id = item_set.get("o:id")
+                    if item_set_id == 1:
+                        return "Sujets"
+                    elif item_set_id == 267:
+                        return "Notices d'autorité"
+        # Si pas d'item_set spécifique trouvé, retourner "Sujets" par défaut
+        return "Sujets"
+    
+    return resource_class_mapping.get(class_id, "")
+
+
 def _get_item_set_ids(item: Dict[str, Any]) -> str:
-    """Extrait les IDs des item sets"""
+    """Extrait les IDs des item sets (gardé pour compatibilité si nécessaire ailleurs)"""
     if "o:item_set" not in item or item["o:item_set"] is None:
         return ""
     item_sets = item["o:item_set"]
@@ -311,7 +347,7 @@ async def map_index_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
         "thumbnail": thumbnail_url,
         "Titre": _get_value(item, "dcterms:title"),
         "Titre alternatif": _get_value(item, "dcterms:alternative"),
-        "Type": _get_item_set_ids(item),
+        "Type": _get_resource_class_type(item),
         "Description": _get_value_with_lang(item, "dcterms:description", "fr"),
         "Date création": _get_value(item, "dcterms:created"),
         "date": _get_value(item, "dcterms:date"),
@@ -473,8 +509,20 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
 
     # 3. Fetch current Omeka index items and map them
     logger.info("Fetching index items from Omeka API...")
-    # Vous devrez ajuster le resource_class_id pour les items d'index
-    omeka_items_raw = await api.fetch_items(1)  # Ajustez selon votre configuration
+    
+    # Récupérer tous les types d'items d'index
+    omeka_items_raw = []
+    resource_class_ids = [9, 94, 96, 54, 244]  # Lieux, Personnes, Organisations, Événements, Sujets/Notices
+    
+    for rcid in resource_class_ids:
+        logger.info(f"Fetching items for resource class {rcid}...")
+        try:
+            items = await api.fetch_items(rcid)
+            omeka_items_raw.extend(items)
+            logger.info(f"Fetched {len(items)} items for resource class {rcid}")
+        except Exception as e:
+            logger.error(f"Error fetching items for resource class {rcid}: {e}")
+            continue
 
     if not omeka_items_raw:
         logger.warning("No index items returned from Omeka API. Exiting.")
