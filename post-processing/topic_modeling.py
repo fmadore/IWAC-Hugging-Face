@@ -52,6 +52,8 @@ from tqdm import tqdm
 import torch
 import shutil
 import json
+import unicodedata
+import re
 
 def configure_logging() -> None:
     logging.basicConfig(
@@ -143,7 +145,12 @@ def create_bertopic_model(embedding_model_name: str, min_topic_size: int = 10,
         stop_words=None,
         max_features=5000,
         min_df=2,
-        max_df=0.95
+        max_df=0.95,
+        encoding='utf-8',  # Explicitly set UTF-8 encoding
+        decode_error='replace',  # Replace invalid characters instead of failing
+        strip_accents=None,  # Don't strip accents to preserve French characters
+        lowercase=True,
+        token_pattern=r'(?u)\b\w\w+\b'  # Unicode-aware token pattern
     )
     
     topic_model = BERTopic(
@@ -235,11 +242,21 @@ def predict_topics_batch(batch: Dict[str, List[Any]], text_col: str,
         topic_name_map = {row['Topic']: row['Name'] for _, row in topic_info.iterrows()}
         
         topic_labels = []
-        for topic_id in topics:
+        topic_probs_max = []
+        
+        for i, topic_id in enumerate(topics):
             if topic_id == -1:
                 topic_labels.append("Outlier")
+                topic_probs_max.append(0.0)
             else:
                 topic_labels.append(topic_name_map.get(topic_id, f"Topic_{topic_id}"))
+                # Extraire la probabilité maximale pour ce document
+                if isinstance(probabilities[i], (list, np.ndarray)):
+                    topic_probs_max.append(float(np.max(probabilities[i])))
+                else:
+                    topic_probs_max.append(float(probabilities[i]))
+        
+        probabilities = topic_probs_max
         
     except Exception as e:
         logging.error(f"Erreur lors de la prédiction des sujets: {e}")
