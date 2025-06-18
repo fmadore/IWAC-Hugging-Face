@@ -54,6 +54,21 @@ import shutil
 import json
 import unicodedata
 import re
+import functools
+import builtins
+
+# Force UTF-8 encoding for all file operations to prevent issues on Windows
+# This is a global patch that affects all `open` calls in the script
+original_open = builtins.open
+@functools.wraps(original_open)
+def patched_open(file, mode='r', *args, **kwargs):
+    # Only patch text modes
+    if 'b' not in mode:
+        if 'encoding' not in kwargs:
+            kwargs['encoding'] = 'utf-8'
+            kwargs.setdefault('errors', 'replace')
+    return original_open(file, mode, *args, **kwargs)
+builtins.open = patched_open
 
 def configure_logging() -> None:
     logging.basicConfig(
@@ -199,6 +214,7 @@ def fit_topic_model(texts: List[str], model_save_path: Path, logger: logging.Log
         # Remove existing directory if it exists
         if model_save_path.exists():
             shutil.rmtree(model_save_path)
+        
         topic_model.save(
             str(model_save_path),
             serialization="pytorch",  # avoid pickle/joblib issues with Python 3.12
