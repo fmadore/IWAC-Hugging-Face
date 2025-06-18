@@ -481,7 +481,7 @@ async def load_reference_datasets(token: Optional[str] = None) -> tuple[pd.DataF
     
     try:
         logger.info("Loading publications dataset from Hugging Face Hub...")
-        publications_ds = load_dataset("fmadore/iwac-islamic-publications", name="publications", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
+        publications_ds = load_dataset("fmadore/iwac-newspaper-articles", name="publications", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
         publications_df = publications_ds.to_pandas()
         logger.info(f"Loaded {len(publications_df)} publications")
     except Exception as e:
