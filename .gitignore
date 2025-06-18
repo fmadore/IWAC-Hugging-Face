@@ -5,4 +5,5 @@
 __pycache__
 bertopic_model
 data/iwac_articles.csv
+data/iwac_index.csv
 data/iwac_publications.csv
