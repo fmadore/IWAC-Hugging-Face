@@ -51,6 +51,7 @@ from collections import Counter
 from tqdm import tqdm
 import torch
 import shutil
+import json
 
 def configure_logging() -> None:
     logging.basicConfig(
@@ -251,6 +252,43 @@ def predict_topics_batch(batch: Dict[str, List[Any]], text_col: str,
     batch[topic_label_col] = topic_labels
     
     return batch
+
+# Patch the default JSON encoder so that NumPy types (e.g. np.int64, np.float32, np.ndarray)
+# are automatically converted to their native Python equivalents when dumping to JSON. This
+# prevents errors such as "TypeError: Object of type int64 is not JSON serializable" that
+# can occur when BERTopic attempts to save its configuration files.
+class _NumpyJSONEncoder(json.JSONEncoder):
+    def default(self, obj):  # noqa: D401, N802  (keep signature to respect json API)
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+# Globally patch both the default encoder instance and the class used when
+# `json.dump` needs to instantiate a new encoder (e.g. when a non-default
+# `indent` argument is supplied).
+json.JSONEncoder = _NumpyJSONEncoder
+json._default_encoder = _NumpyJSONEncoder()
+
+# Ensure that non-ASCII characters (e.g. é, à, ñ) are written to JSON files plainly
+# instead of being escaped as \uXXXX sequences. If callers explicitly set the
+# "ensure_ascii" parameter we respect their choice; otherwise we default it to False.
+_original_json_dump = json.dump
+_original_json_dumps = json.dumps
+
+def _patched_dump(obj, fp, *args, **kwargs):
+    kwargs.setdefault("ensure_ascii", False)
+    return _original_json_dump(obj, fp, *args, **kwargs)
+
+def _patched_dumps(obj, *args, **kwargs):
+    kwargs.setdefault("ensure_ascii", False)
+    return _original_json_dumps(obj, *args, **kwargs)
+
+json.dump = _patched_dump
+json.dumps = _patched_dumps
 
 def main():
     global topic_model
