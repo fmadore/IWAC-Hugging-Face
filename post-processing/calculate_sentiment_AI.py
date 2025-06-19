@@ -3,7 +3,7 @@
 calculate_sentiment_AI.py
 ===========================
 
-Ajoute des colonnes avec l'analyse de sentiment détaillée via l'API Gemini
+Ajoute des colonnes avec l'analyse de sentiment détaillée via l'API Gemini ou ChatGPT
 à un dataset Hugging Face existant. Ce script se base sur une colonne texte
 spécifiée (par défaut 'OCR').
 
@@ -11,32 +11,34 @@ Le script :
 1. Charge un dataset Hugging Face.
 2. Pour chaque texte dans la colonne spécifiée :
     a. Vérifie si une analyse existe dans un cache local.
-    b. Si non, appelle l'API Gemini avec un prompt structuré.
+    b. Si non, appelle l'API Gemini ou ChatGPT avec un prompt structuré.
     c. Sauvegarde le résultat de l'API dans le cache.
-3. Ajoute les résultats de l'analyse Gemini dans de nouvelles colonnes
-   (préfixées par "gemini_").
-4. Réorganise les colonnes pour placer les nouvelles colonnes Gemini après
+3. Ajoute les résultats de l'analyse dans de nouvelles colonnes
+   (préfixées par "gemini_" ou "chatgpt_").
+4. Réorganise les colonnes pour placer les nouvelles colonnes après
    la colonne 'sentiment_score' (supposée exister).
 5. Pousse le dataset modifié vers le Hugging Face Hub.
 
-L'utilisateur est invité à choisir la configuration ('articles' ou 'publications')
-et peut spécifier le nom du repo, la colonne texte, etc., via des arguments CLI.
+L'utilisateur est invité à choisir la configuration ('articles' ou 'publications'),
+le modèle d'IA à utiliser ('gemini' ou 'chatgpt'), et peut spécifier le nom du repo,
+la colonne texte, etc., via des arguments CLI.
 
 Usage
 -----
-    python post-processing/calculate_sentiment_AI.py [--repo MON_USER/MON_DATASET] [--config-name CONFIG] [--text-column TEXT_COL]
+    python post-processing/calculate_sentiment_AI.py [--repo MON_USER/MON_DATASET] [--config-name CONFIG] [--text-column TEXT_COL] [--model MODEL]
 
 Exemple:
-    python post-processing/calculate_sentiment_AI.py --repo fmadore/iwac-newspaper-articles --config-name articles
+    python post-processing/calculate_sentiment_AI.py --repo fmadore/iwac-newspaper-articles --config-name articles --model gemini
 
 Variables d'environnement
 -------------------------
 GOOGLE_API_KEY   Clé API pour Google Gemini.
+CHATGPT          Clé API pour OpenAI ChatGPT.
 HF_TOKEN         Jeton d'accès personnel pour le Hugging Face Hub.
 
 Dépendances supplémentaires
 -------------------------
-    pip install datasets huggingface_hub google-api-python-client pydantic python-dotenv tqdm google-ai-generativelanguage
+    pip install datasets huggingface_hub google-api-python-client pydantic python-dotenv tqdm google-ai-generativelanguage openai
     (Note: google.genai is part of google-ai-generativelanguage or a similar package, ensure correct installation for the older SDK)
 """
 import os
@@ -61,7 +63,14 @@ try:
 except ImportError:
     print("Veuillez installer la librairie google-ai-generativelanguage (qui inclut google.genai): pip install google-ai-generativelanguage")
     print("Ou assurez-vous que le SDK google.genai est correctement installé.")
-    exit(1)
+    genai = None
+
+# OpenAI SDK
+try:
+    from openai import OpenAI
+except ImportError:
+    print("Veuillez installer la librairie OpenAI: pip install openai")
+    OpenAI = None
 
 # Configuration du logging
 def configure_logging() -> logging.Logger:
@@ -74,7 +83,7 @@ def configure_logging() -> logging.Logger:
     logger.addHandler(handler)
     return logger
 
-# Modèle Pydantic pour la sortie structurée de Gemini
+# Modèle Pydantic pour la sortie structurée
 class SentimentAnalysisOutput(BaseModel):
     centralite_islam_musulmans: str
     centralite_justification: str
@@ -82,12 +91,18 @@ class SentimentAnalysisOutput(BaseModel):
     subjectivite_justification: str
     polarite: str
     polarite_justification: str
+    
+    class Config:
+        # Allow the model to be pickled for multiprocessing
+        arbitrary_types_allowed = True
 
-# --- Gemini Configuration ---
-GEMINI_MODEL_NAME = "gemini-2.5-flash-preview-05-20" # Model name to be used
+# --- Model Configuration ---
+GEMINI_MODEL_NAME = "gemini-2.5-flash"
+CHATGPT_MODEL_NAME = "o3-mini"
 
 # --- Cache Configuration ---
-CACHE_FILE_DEFAULT_NAME = "gemini_sentiment_cache.json"
+GEMINI_CACHE_FILE_DEFAULT_NAME = "gemini_sentiment_cache.json"
+CHATGPT_CACHE_FILE_DEFAULT_NAME = "chatgpt_sentiment_cache.json"
 
 def load_cache(cache_file_path: Path, logger: logging.Logger) -> Dict[str, Any]:
     """Charge le cache depuis un fichier JSON."""
@@ -110,8 +125,8 @@ def save_cache(cache_file_path: Path, cache_data: Dict[str, Any], logger: loggin
     except IOError as e:
         logger.error(f"Erreur lors de la sauvegarde du cache dans {cache_file_path}: {e}")
 
-# Prompt pour l'analyse de sentiment Gemini (repris de votre script)
-def create_gemini_prompt(article_text: str) -> str:
+# Prompt pour l'analyse de sentiment (utilisé pour les deux modèles)
+def create_sentiment_prompt(article_text: str) -> str:
     prompt = f'''
     Vous êtes un expert en analyse de sentiments, spécialisé dans l'étude des représentations de l'islam et des musulmans dans les médias, notamment en Afrique de l'Ouest francophone. Votre tâche est d'analyser le texte fourni sous cet angle spécifique et de renvoyer une analyse structurée en JSON.
 
@@ -180,7 +195,7 @@ def analyze_text_with_gemini(
 ) -> Dict[str, Any]:
     """
     Analyse le sentiment d'un texte d'article en utilisant l'API Gemini (google.genai SDK).
-    Retourne un dictionnaire avec les champs de SentimentAnalysisOutput et un champ 'gemini_analysis_error'.
+    Retourne un dictionnaire avec les champs de SentimentAnalysisOutput et un champ 'analysis_error'.
     """
     default_error_result = {
         "centralite_islam_musulmans": "ERREUR_ANALYSE",
@@ -189,7 +204,7 @@ def analyze_text_with_gemini(
         "subjectivite_justification": "Erreur lors de l'analyse Gemini.",
         "polarite": "ERREUR_ANALYSE",
         "polarite_justification": "Erreur lors de l'analyse Gemini.",
-        "gemini_analysis_error": "Erreur inconnue"
+        "analysis_error": "Erreur inconnue"
     }
 
     if not article_text or not article_text.strip():
@@ -201,16 +216,16 @@ def analyze_text_with_gemini(
             "subjectivite_justification": "Non applicable car le texte de l'article est vide.",
             "polarite": "Non applicable",
             "polarite_justification": "Non applicable car le texte de l'article est vide.",
-            "gemini_analysis_error": "Texte vide fourni pour analyse"
+            "analysis_error": "Texte vide fourni pour analyse"
         }
 
     try:
         client = genai.Client(api_key=google_api_key)
     except Exception as e:
         logger.error(f"Erreur lors de l'initialisation du client Gemini: {e}")
-        return {**default_error_result, "gemini_analysis_error": f"Erreur client Gemini: {e}"}
+        return {**default_error_result, "analysis_error": f"Erreur client Gemini: {e}"}
 
-    prompt_content = create_gemini_prompt(article_text)
+    prompt_content = create_sentiment_prompt(article_text)
     
     contents = [
         types.Content(
@@ -219,93 +234,201 @@ def analyze_text_with_gemini(
         )
     ]
 
-    # Configuration pour la génération de contenu, demandant un JSON structuré
-    # selon le modèle Pydantic.
     generation_config = types.GenerateContentConfig(
         response_mime_type="application/json",
-        temperature=0.2, # Température basse pour une sortie plus déterministe
+        temperature=0.2,
         response_schema=SentimentAnalysisOutput 
     )
-    
-    # Safety settings (optional, adjust as needed, example from google.generativeai, might differ for google.genai)
-    # For google.genai, safety settings are often part of the model resource or request.
-    # If direct equivalent is not obvious, start without or consult google.genai specific docs.
-    # For now, omitting direct safety_settings in the call, assuming defaults or client-level config.
 
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
-                model=model_name, # Corrected: No "models/" prefix
+                model=model_name,
                 contents=contents,
-                config=generation_config # Corrected: Renamed 'generation_config' to 'config'
+                config=generation_config
             )
 
             if not response.text:
                 logger.warning(f"Réponse vide de Gemini pour le texte (essai {attempt + 1}/{max_retries}).")
                 if attempt == max_retries - 1:
-                    return {**default_error_result, "gemini_analysis_error": "Réponse vide de Gemini après plusieurs essais."}
+                    return {**default_error_result, "analysis_error": "Réponse vide de Gemini après plusieurs essais."}
                 time.sleep(initial_backoff * (2 ** attempt))
                 continue
             
             try:
-                # response.text should be a JSON string if response_mime_type="application/json"
-                # and response_schema is used.
                 json_response = json.loads(response.text)
             except json.JSONDecodeError as e:
                 logger.error(f"Erreur de décodage JSON de la réponse Gemini (essai {attempt + 1}/{max_retries}): {e}. Réponse: {response.text[:500]}")
                 if attempt == max_retries - 1:
-                    return {**default_error_result, "gemini_analysis_error": f"JSONDecodeError: {e}", "raw_response_snippet": response.text[:500]}
+                    return {**default_error_result, "analysis_error": f"JSONDecodeError: {e}", "raw_response_snippet": response.text[:500]}
                 time.sleep(initial_backoff * (2 ** attempt))
                 continue
             
             try:
-                # Pydantic validation (even if response_schema is used, good for robustness)
                 validated_output = SentimentAnalysisOutput(**json_response)
-                return {**validated_output.model_dump(), "gemini_analysis_error": None}
+                return {**validated_output.model_dump(), "analysis_error": None}
             except ValidationError as e:
                 logger.error(f"Erreur de validation Pydantic (essai {attempt + 1}/{max_retries}): {e}. Données reçues: {json_response}")
                 if attempt == max_retries - 1:
-                    return {**default_error_result, "gemini_analysis_error": f"Pydantic ValidationError: {e}", "parsed_data": json_response}
+                    return {**default_error_result, "analysis_error": f"Pydantic ValidationError: {e}", "parsed_data": json_response}
                 time.sleep(initial_backoff * (2 ** attempt))
                 continue
 
-        # Corrected Error Handling based on google-genai SDK v1.16.1 documentation
-        except errors.APIError as e: # Catch specific API errors from google.genai
+        except errors.APIError as e:
             error_code_str = f" (Code: {e.code})" if hasattr(e, 'code') else ""
             error_message_str = f" (Message: {e.message})" if hasattr(e, 'message') else ""
             logger.error(f"Erreur API Gemini (essai {attempt + 1}/{max_retries}): {e}{error_code_str}{error_message_str}. Texte (début): {article_text[:200]}")
             
-            # You might want to inspect e.code or e.message for more specific retry logic
-            # For example, specific codes for rate limits might warrant longer backoff.
-            # For now, using the standard backoff.
             if attempt == max_retries - 1:
-                return {**default_error_result, "gemini_analysis_error": f"APIError: {e}{error_code_str}{error_message_str}"}
-            time.sleep(initial_backoff * (2 ** attempt) * 3) # Slightly longer backoff for general API errors
-        except Exception as e: # Catch-all for other unexpected errors
+                return {**default_error_result, "analysis_error": f"APIError: {e}{error_code_str}{error_message_str}"}
+            time.sleep(initial_backoff * (2 ** attempt) * 3)
+        except Exception as e:
             logger.error(f"Erreur inattendue lors de l'appel à Gemini (essai {attempt + 1}/{max_retries}): {e}")
             if attempt == max_retries - 1:
-                return {**default_error_result, "gemini_analysis_error": f"Exception: {e}"}
+                return {**default_error_result, "analysis_error": f"Exception: {e}"}
             time.sleep(initial_backoff * (2 ** attempt))
             
-    return {**default_error_result, "gemini_analysis_error": "Échec de l'analyse Gemini après plusieurs tentatives."}
+    return {**default_error_result, "analysis_error": "Échec de l'analyse Gemini après plusieurs tentatives."}
 
+def analyze_text_with_chatgpt(
+    article_text: str,
+    chatgpt_api_key: str,
+    model_name: str,
+    logger: logging.Logger,
+    max_retries: int = 3,
+    initial_backoff: int = 5
+) -> Dict[str, Any]:
+    """
+    Analyse le sentiment d'un texte d'article en utilisant l'API ChatGPT (OpenAI o3-mini).
+    Retourne un dictionnaire avec les champs de SentimentAnalysisOutput et un champ 'analysis_error'.
+    """
+    default_error_result = {
+        "centralite_islam_musulmans": "ERREUR_ANALYSE",
+        "centralite_justification": "Erreur lors de l'analyse ChatGPT.",
+        "subjectivite_score": None,
+        "subjectivite_justification": "Erreur lors de l'analyse ChatGPT.",
+        "polarite": "ERREUR_ANALYSE",
+        "polarite_justification": "Erreur lors de l'analyse ChatGPT.",
+        "analysis_error": "Erreur inconnue"
+    }
 
-def process_batch_with_gemini_analysis(
+    if not article_text or not article_text.strip():
+        logger.warning("Texte de l'article vide ou manquant pour l'analyse ChatGPT.")
+        return {
+            **default_error_result,
+            "centralite_islam_musulmans": "Non abordé",
+            "centralite_justification": "Texte de l'article non fourni ou vide.",
+            "subjectivite_justification": "Non applicable car le texte de l'article est vide.",
+            "polarite": "Non applicable",
+            "polarite_justification": "Non applicable car le texte de l'article est vide.",
+            "analysis_error": "Texte vide fourni pour analyse"
+        }
+
+    try:
+        client = OpenAI(api_key=chatgpt_api_key)
+    except Exception as e:
+        logger.error(f"Erreur lors de l'initialisation du client ChatGPT: {e}")
+        return {**default_error_result, "analysis_error": f"Erreur client ChatGPT: {e}"}
+
+    prompt_content = create_sentiment_prompt(article_text)
+
+    for attempt in range(max_retries):
+        try:
+            response = client.responses.create(
+                model=model_name,
+                max_output_tokens=2048,
+                store=False,
+                reasoning={
+                    "effort": "medium",
+                },
+                input=[
+                    {
+                        "role": "developer",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "Vous êtes un expert en analyse de sentiments. Analysez le texte suivant et retournez uniquement un JSON structuré selon le format demandé.",
+                            }
+                        ]
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": prompt_content,
+                            }
+                        ]
+                    }
+                ]
+            )
+
+            # Extract text from response
+            response_text = ""
+            for out_item in response.output:
+                if hasattr(out_item, "content"):
+                    for element in out_item.content:
+                        if hasattr(element, "text"):
+                            response_text += element.text
+
+            if not response_text:
+                logger.warning(f"Réponse vide de ChatGPT pour le texte (essai {attempt + 1}/{max_retries}).")
+                if attempt == max_retries - 1:
+                    return {**default_error_result, "analysis_error": "Réponse vide de ChatGPT après plusieurs essais."}
+                time.sleep(initial_backoff * (2 ** attempt))
+                continue
+            
+            try:
+                # Try to extract JSON from the response
+                json_start = response_text.find('{')
+                json_end = response_text.rfind('}') + 1
+                if json_start != -1 and json_end > json_start:
+                    json_text = response_text[json_start:json_end]
+                    json_response = json.loads(json_text)
+                else:
+                    raise json.JSONDecodeError("No JSON found in response", response_text, 0)
+            except json.JSONDecodeError as e:
+                logger.error(f"Erreur de décodage JSON de la réponse ChatGPT (essai {attempt + 1}/{max_retries}): {e}. Réponse: {response_text[:500]}")
+                if attempt == max_retries - 1:
+                    return {**default_error_result, "analysis_error": f"JSONDecodeError: {e}", "raw_response_snippet": response_text[:500]}
+                time.sleep(initial_backoff * (2 ** attempt))
+                continue
+            
+            try:
+                validated_output = SentimentAnalysisOutput(**json_response)
+                return {**validated_output.model_dump(), "analysis_error": None}
+            except ValidationError as e:
+                logger.error(f"Erreur de validation Pydantic (essai {attempt + 1}/{max_retries}): {e}. Données reçues: {json_response}")
+                if attempt == max_retries - 1:
+                    return {**default_error_result, "analysis_error": f"Pydantic ValidationError: {e}", "parsed_data": json_response}
+                time.sleep(initial_backoff * (2 ** attempt))
+                continue
+
+        except Exception as e:
+            logger.error(f"Erreur lors de l'appel à ChatGPT (essai {attempt + 1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:
+                return {**default_error_result, "analysis_error": f"Exception: {e}"}
+            time.sleep(initial_backoff * (2 ** attempt))
+            
+    return {**default_error_result, "analysis_error": "Échec de l'analyse ChatGPT après plusieurs tentatives."}
+
+def process_batch_with_analysis(
     batch: Dict[str, List[Any]], 
-    google_api_key: str, # Pass API key
-    model_name: str,     # Pass model name
+    model_choice: str,
+    api_key: str,
+    model_name: str,
     cache: Dict[str, Any], 
     cache_file_path: Path, 
     logger: logging.Logger,
     text_column_name: str,
-    id_column_name: str = "o:id" # Added id_column_name argument
+    id_column_name: str = "o:id"
 ) -> Dict[str, List[Any]]:
     """
-    Applique l'analyse de sentiment Gemini à un batch d'exemples, utilisant et mettant à jour un cache.
+    Applique l'analyse de sentiment à un batch d'exemples, utilisant et mettant à jour un cache.
     Utilise la colonne spécifiée par id_column_name comme clé de cache.
     """
     ocr_texts = batch[text_column_name]
-    ids = batch[id_column_name] # Retrieve IDs
+    ids = batch[id_column_name]
     
     # Initialiser les listes pour les nouvelles colonnes
     results_centralite_islam_musulmans = []
@@ -313,11 +436,11 @@ def process_batch_with_gemini_analysis(
     results_subjectivite_score = []
     results_subjectivite_justification = []
     results_polarite = []
-    results_polarite_justification = []    # results_gemini_analysis_error = [] # Supprimé
+    results_polarite_justification = []
 
     processed_in_batch = 0
-    for record_id, text in zip(ids, ocr_texts): # Iterate over IDs and texts
-        cache_key = str(record_id) # Use ID as cache key
+    for record_id, text in zip(ids, ocr_texts):
+        cache_key = str(record_id)
 
         # Vérifier si l'entrée existe dans le cache ET n'a pas d'erreur
         if cache_key in cache:
@@ -325,21 +448,27 @@ def process_batch_with_gemini_analysis(
             # Ignorer le cache si l'entrée contient une erreur d'analyse
             has_error = (cached_result.get("centralite_islam_musulmans") == "ERREUR_ANALYSE" or
                         cached_result.get("polarite") == "ERREUR_ANALYSE" or
-                        cached_result.get("gemini_analysis_error") is not None)
+                        cached_result.get("analysis_error") is not None)
             
             if has_error:
                 logger.info(f"Entrée avec erreur trouvée dans le cache pour l'ID '{cache_key}', ré-analyse en cours...")
-                analysis_result = analyze_text_with_gemini(text, google_api_key, model_name, logger)
+                if model_choice == "gemini":
+                    analysis_result = analyze_text_with_gemini(text, api_key, model_name, logger)
+                else:  # chatgpt
+                    analysis_result = analyze_text_with_chatgpt(text, api_key, model_name, logger)
                 cache[cache_key] = analysis_result
                 processed_in_batch += 1
             else:
                 analysis_result = cached_result
                 logger.debug(f"Résultat trouvé dans le cache pour l'ID '{cache_key}'.")
         else:
-            logger.debug(f"Analyse Gemini pour l'ID '{cache_key}' (texte début): {text[:50]}...")
-            analysis_result = analyze_text_with_gemini(text, google_api_key, model_name, logger) # Pass key and model
-            cache[cache_key] = analysis_result # analysis_result contient 'gemini_analysis_error'
-            processed_in_batch +=1
+            logger.debug(f"Analyse {model_choice.upper()} pour l'ID '{cache_key}' (texte début): {text[:50]}...")
+            if model_choice == "gemini":
+                analysis_result = analyze_text_with_gemini(text, api_key, model_name, logger)
+            else:  # chatgpt
+                analysis_result = analyze_text_with_chatgpt(text, api_key, model_name, logger)
+            cache[cache_key] = analysis_result
+            processed_in_batch += 1
         
         results_centralite_islam_musulmans.append(analysis_result.get("centralite_islam_musulmans"))
         results_centralite_justification.append(analysis_result.get("centralite_justification"))
@@ -347,19 +476,19 @@ def process_batch_with_gemini_analysis(
         results_subjectivite_justification.append(analysis_result.get("subjectivite_justification"))
         results_polarite.append(analysis_result.get("polarite"))
         results_polarite_justification.append(analysis_result.get("polarite_justification"))
-        # results_gemini_analysis_error.append(analysis_result.get("gemini_analysis_error")) # Supprimé
 
-    if processed_in_batch > 0 : # Save cache if new items were processed
+    if processed_in_batch > 0:
         save_cache(cache_file_path, cache, logger)
         logger.info(f"{processed_in_batch} nouveaux éléments traités et ajoutés au cache dans ce batch.")
 
-    batch["gemini_centralite_islam_musulmans"] = results_centralite_islam_musulmans
-    batch["gemini_centralite_justification"] = results_centralite_justification
-    batch["gemini_subjectivite_score"] = results_subjectivite_score
-    batch["gemini_subjectivite_justification"] = results_subjectivite_justification
-    batch["gemini_polarite"] = results_polarite
-    batch["gemini_polarite_justification"] = results_polarite_justification
-    # batch["gemini_analysis_error"] = results_gemini_analysis_error # Supprimé
+    # Ajouter les colonnes avec le préfixe approprié
+    prefix = model_choice
+    batch[f"{prefix}_centralite_islam_musulmans"] = results_centralite_islam_musulmans
+    batch[f"{prefix}_centralite_justification"] = results_centralite_justification
+    batch[f"{prefix}_subjectivite_score"] = results_subjectivite_score
+    batch[f"{prefix}_subjectivite_justification"] = results_subjectivite_justification
+    batch[f"{prefix}_polarite"] = results_polarite
+    batch[f"{prefix}_polarite_justification"] = results_polarite_justification
     
     return batch
 
@@ -376,42 +505,81 @@ def main():
         load_dotenv(dotenv_path=dotenv_path)
         logger.info(f"Variables d'environnement chargées depuis {dotenv_path}")
     else:
-        logger.warning(f"Fichier .env non trouvé à {dotenv_path}. Assurez-vous que GOOGLE_API_KEY et HF_TOKEN sont définis.")
+        logger.warning(f"Fichier .env non trouvé à {dotenv_path}. Assurez-vous que les clés API sont définies.")
 
-    parser = argparse.ArgumentParser(description="Ajoute des colonnes d'analyse de sentiment Gemini à un dataset Hugging Face.")
+    parser = argparse.ArgumentParser(description="Ajoute des colonnes d'analyse de sentiment via Gemini ou ChatGPT à un dataset Hugging Face.")
     parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles", help="ID du repository sur le Hugging Face Hub (ex: utilisateur/nom_dataset).")
     parser.add_argument("--config-name", type=str, default=None, help="Nom de la configuration à traiter (ex: 'articles', 'publications'). Sera demandé si non fourni.")
     parser.add_argument("--text-column", default="OCR", help="Nom de la colonne contenant le texte à analyser.")
-    parser.add_argument("--id-column", default="o:id", help="Nom de la colonne contenant les identifiants uniques pour le cache.") # Added argument for id column
-    parser.add_argument("--cache-file", default=str(script_dir / CACHE_FILE_DEFAULT_NAME), help=f"Chemin vers le fichier cache JSON. Défaut: {CACHE_FILE_DEFAULT_NAME} dans le dossier du script.")
-    parser.add_argument("--batch-size", type=int, default=10, help="Taille des batchs pour le traitement .map(). Attention: un batch size élevé avec des appels API peut être lent ou atteindre des limites.")
+    parser.add_argument("--id-column", default="o:id", help="Nom de la colonne contenant les identifiants uniques pour le cache.")
+    parser.add_argument("--model", type=str, default=None, help="Modèle à utiliser ('gemini' ou 'chatgpt'). Sera demandé si non fourni.")
+    parser.add_argument("--batch-size", type=int, default=10, help="Taille des batchs pour le traitement .map().")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille maximale des shards Parquet lors du push vers le Hub.")
     
     args = parser.parse_args()
 
     repo_id = args.repo
     text_column_name = args.text_column
-    id_column_name = args.id_column # Get id_column_name from args
-    cache_file_path = Path(args.cache_file)
+    id_column_name = args.id_column
     batch_size = args.batch_size
     max_shard_size = args.max_shard_size
 
-    # --- Initialisation de l'API Gemini ---
-    google_api_key = os.getenv("GOOGLE_API_KEY")
-    if not google_api_key:
-        logger.error("La variable d'environnement GOOGLE_API_KEY n'est pas définie. Veuillez la configurer.")
-        return
-    
-    # With google.genai, genai.configure() is not used. API key is passed to client.
-    # Test basic client initialization to catch early configuration issues if desired,
-    # but actual client is created in analyze_text_with_gemini.
-    try:
-        # Quick test if client can be nominally created (optional)
-        _ = genai.Client(api_key=google_api_key) 
-        logger.info(f"Clé API Google chargée. Prêt à utiliser le modèle '{GEMINI_MODEL_NAME}'.")
-    except Exception as e:
-        logger.error(f"Erreur lors de la pré-vérification du client Gemini avec la clé API: {e}")
-        return
+    # --- Choix du modèle par l'utilisateur ---
+    model_choice = args.model
+    if not model_choice:
+        while model_choice not in ["gemini", "chatgpt"]:
+            try:
+                model_choice = input("Entrez le modèle à utiliser ('gemini' ou 'chatgpt'): ").strip().lower()
+            except KeyboardInterrupt:
+                logger.info("\nOpération annulée par l'utilisateur.")
+                return
+            except EOFError:
+                logger.error("\nEntrée non attendue. Arrêt.")
+                return
+    logger.info(f"Modèle sélectionné: {model_choice}")
+
+    # --- Configuration selon le modèle choisi ---
+    if model_choice == "gemini":
+        if genai is None:
+            logger.error("Le SDK Google GenAI n'est pas installé. Veuillez installer: pip install google-ai-generativelanguage")
+            return
+        
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            logger.error("La variable d'environnement GOOGLE_API_KEY n'est pas définie.")
+            return
+        
+        model_name = GEMINI_MODEL_NAME
+        cache_file_path = Path(script_dir / GEMINI_CACHE_FILE_DEFAULT_NAME)
+        
+        # Test du client
+        try:
+            _ = genai.Client(api_key=api_key)
+            logger.info(f"Clé API Google chargée. Prêt à utiliser le modèle '{model_name}'.")
+        except Exception as e:
+            logger.error(f"Erreur lors de la pré-vérification du client Gemini: {e}")
+            return
+            
+    else:  # chatgpt
+        if OpenAI is None:
+            logger.error("Le SDK OpenAI n'est pas installé. Veuillez installer: pip install openai")
+            return
+        
+        api_key = os.getenv("CHATGPT")
+        if not api_key:
+            logger.error("La variable d'environnement CHATGPT n'est pas définie.")
+            return
+        
+        model_name = CHATGPT_MODEL_NAME
+        cache_file_path = Path(script_dir / CHATGPT_CACHE_FILE_DEFAULT_NAME)
+        
+        # Test du client
+        try:
+            _ = OpenAI(api_key=api_key)
+            logger.info(f"Clé API ChatGPT chargée. Prêt à utiliser le modèle '{model_name}'.")
+        except Exception as e:
+            logger.error(f"Erreur lors de la pré-vérification du client ChatGPT: {e}")
+            return
 
     # --- Choix de la configuration par l'utilisateur ---
     config_name_choice = args.config_name
@@ -433,7 +601,7 @@ def main():
         logger.info("Token Hugging Face non trouvé. Tentative de connexion interactive.")
         try:
             login()
-            hf_token = HfFolder.get_token() # Re-check after login
+            hf_token = HfFolder.get_token()
             if not hf_token:
                  logger.error("Connexion interactive échouée ou token non sauvegardé. Veuillez vous connecter manuellement via `huggingface-cli login`.")
                  return
@@ -450,9 +618,6 @@ def main():
     logger.info(f"Chargement du dataset '{repo_id}', configuration '{config_name_choice}'...")
     try:
         ds = load_dataset(repo_id, name=config_name_choice, split="train", token=hf_token, trust_remote_code=True)
-        # Si le dataset est très gros et ne tient pas en RAM, envisager streaming=True
-        # et une approche de traitement différente (pas .map directement sur tout le dataset).
-        # Pour l'instant, on suppose qu'il tient en mémoire.
     except Exception as e:
         logger.error(f"Erreur lors du chargement du dataset: {e}")
         return
@@ -464,52 +629,44 @@ def main():
         logger.error(f"La colonne texte '{text_column_name}' n'existe pas dans le dataset. Colonnes disponibles: {ds.column_names}")
         return
     
-    if id_column_name not in ds.column_names: # Check if id_column_name exists
+    if id_column_name not in ds.column_names:
         logger.error(f"La colonne ID '{id_column_name}' n'existe pas dans le dataset. Colonnes disponibles: {ds.column_names}")
         return
 
-    # --- Application de l'analyse Gemini ---
-    logger.info(f"Début de l'analyse Gemini pour la colonne '{text_column_name}'...")
-    
-    # Utilisation de tqdm pour la barre de progression avec .map()
-    # Note: la progression de tqdm avec .map() peut ne pas être parfaitement granulaire par item,
-    # mais plutôt par batch ou chunk interne à datasets.
+    # --- Application de l'analyse ---
+    logger.info(f"Début de l'analyse {model_choice.upper()} pour la colonne '{text_column_name}'...")
     
     fn_kwargs_for_map = {
-        "google_api_key": google_api_key, # Pass API key
-        "model_name": GEMINI_MODEL_NAME,   # Pass model name
+        "model_choice": model_choice,
+        "api_key": api_key,
+        "model_name": model_name,
         "cache": cache_data,
         "cache_file_path": cache_file_path,
         "logger": logger,
         "text_column_name": text_column_name,
-        "id_column_name": id_column_name # Pass id_column_name to map function
+        "id_column_name": id_column_name
     }
 
     ds_processed = ds.map(
-        process_batch_with_gemini_analysis,
+        process_batch_with_analysis,
         batched=True,
         batch_size=batch_size,
         fn_kwargs=fn_kwargs_for_map,
-        desc=f"Analyse Gemini (col: {text_column_name})"
+        desc=f"Analyse {model_choice.upper()} (col: {text_column_name})"
     )
     
-    logger.info("Analyse Gemini terminée.")
-    save_cache(cache_file_path, cache_data, logger) # Sauvegarde finale du cache
+    logger.info(f"Analyse {model_choice.upper()} terminée.")
+    save_cache(cache_file_path, cache_data, logger)
     logger.info(f"Cache final sauvegardé. Total d'éléments dans le cache: {len(cache_data)}")
 
     # --- Réorganisation des colonnes ---
-    # Les nouvelles colonnes sont:
-    # gemini_centralite_islam_musulmans, gemini_centralite_justification, 
-    # gemini_subjectivite_score, gemini_subjectivite_justification,
-    # gemini_polarite, gemini_polarite_justification
-    
-    new_gemini_cols = [
-        "gemini_centralite_islam_musulmans", "gemini_centralite_justification",
-        "gemini_subjectivite_score", "gemini_subjectivite_justification",
-        "gemini_polarite", "gemini_polarite_justification" # "gemini_analysis_error" supprimé
+    new_cols = [
+        f"{model_choice}_centralite_islam_musulmans", f"{model_choice}_centralite_justification",
+        f"{model_choice}_subjectivite_score", f"{model_choice}_subjectivite_justification",
+        f"{model_choice}_polarite", f"{model_choice}_polarite_justification"
     ]
     
-    insert_after_col = "sentiment_score" # Colonne CamemBERT après laquelle insérer
+    insert_after_col = "sentiment_score"
     
     current_columns = list(ds_processed.column_names)
     logger.info(f"Colonnes actuelles avant réorganisation: {current_columns}")
@@ -517,32 +674,26 @@ def main():
     if insert_after_col in current_columns:
         insert_idx = current_columns.index(insert_after_col) + 1
         
-        # Retirer les colonnes Gemini si elles existent déjà (au cas où le script est relancé sur un dataset déjà traité partiellement)
-        final_columns_set = [col for col in current_columns if col not in new_gemini_cols]
+        # Retirer les colonnes si elles existent déjà
+        final_columns_set = [col for col in current_columns if col not in new_cols]
         
-        # Insérer les nouvelles colonnes Gemini
-        ordered_columns = final_columns_set[:insert_idx] + new_gemini_cols + final_columns_set[insert_idx:]
+        # Insérer les nouvelles colonnes
+        ordered_columns = final_columns_set[:insert_idx] + new_cols + final_columns_set[insert_idx:]
         
-        # Vérifier que toutes les colonnes originales (sauf celles remplacées) et les nouvelles sont présentes
-        if set(ordered_columns) == set(current_columns): # current_columns already includes new_gemini_cols from .map
+        if set(ordered_columns) == set(current_columns):
             ds_processed = ds_processed.select_columns(ordered_columns)
             logger.info(f"Colonnes réorganisées. Nouvel ordre: {ds_processed.column_names}")
         else:
-            logger.warning(f"La réorganisation des colonnes a échoué à maintenir toutes les colonnes. Différence: {set(current_columns).symmetric_difference(set(ordered_columns))}. Ordre inchangé.")
-            logger.warning(f"Colonnes attendues après réorganisation (théorique): {ordered_columns}")
-
-
+            logger.warning(f"La réorganisation des colonnes a échoué à maintenir toutes les colonnes. Ordre inchangé.")
     else:
-        logger.warning(f"La colonne '{insert_after_col}' n'a pas été trouvée. Les nouvelles colonnes Gemini seront ajoutées à la fin.")
-        # Pas besoin de faire select_columns si elles sont déjà à la fin (comportement par défaut de .map)
+        logger.warning(f"La colonne '{insert_after_col}' n'a pas été trouvée. Les nouvelles colonnes seront ajoutées à la fin.")
 
     # Afficher un aperçu des nouvelles colonnes
     num_examples_to_show = min(5, len(ds_processed))
     if num_examples_to_show > 0:
-        for col_name in new_gemini_cols:
+        for col_name in new_cols:
             if col_name in ds_processed.column_names:
                  logger.info(f"Aperçu (premiers {num_examples_to_show}) pour '{col_name}': {ds_processed[col_name][:num_examples_to_show]}")
-
 
     # --- Sauvegarde du dataset traité sur le Hub ---
     logger.info(f"Sauvegarde du dataset traité vers le Hub Hugging Face (repo: '{repo_id}', config: '{config_name_choice}')...")
