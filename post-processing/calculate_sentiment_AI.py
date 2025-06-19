@@ -98,7 +98,7 @@ class SentimentAnalysisOutput(BaseModel):
 
 # --- Model Configuration ---
 GEMINI_MODEL_NAME = "gemini-2.5-flash"
-CHATGPT_MODEL_NAME = "o3-mini"
+CHATGPT_MODEL_NAME = "gpt-4.1-mini"
 
 # --- Cache Configuration ---
 GEMINI_CACHE_FILE_DEFAULT_NAME = "gemini_sentiment_cache.json"
@@ -299,7 +299,7 @@ def analyze_text_with_chatgpt(
     initial_backoff: int = 5
 ) -> Dict[str, Any]:
     """
-    Analyse le sentiment d'un texte d'article en utilisant l'API ChatGPT (OpenAI o3-mini).
+    Analyse le sentiment d'un texte d'article en utilisant l'API ChatGPT (OpenAI gpt-4.1-mini).
     Retourne un dictionnaire avec les champs de SentimentAnalysisOutput et un champ 'analysis_error'.
     """
     default_error_result = {
@@ -334,75 +334,35 @@ def analyze_text_with_chatgpt(
 
     for attempt in range(max_retries):
         try:
-            response = client.responses.create(
+            response = client.beta.chat.completions.parse(
                 model=model_name,
-                max_output_tokens=2048,
-                store=False,
-                reasoning={
-                    "effort": "medium",
-                },
-                input=[
+                max_tokens=2048,
+                temperature=0.2,
+                messages=[
                     {
-                        "role": "developer",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": "Vous êtes un expert en analyse de sentiments. Analysez le texte suivant et retournez uniquement un JSON structuré selon le format demandé.",
-                            }
-                        ]
+                        "role": "system",
+                        "content": "Vous êtes un expert en analyse de sentiments. Analysez le texte suivant et retournez une analyse structurée selon le format demandé."
                     },
                     {
                         "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": prompt_content,
-                            }
-                        ]
+                        "content": prompt_content
                     }
-                ]
+                ],
+                response_format=SentimentAnalysisOutput
             )
 
-            # Extract text from response
-            response_text = ""
-            for out_item in response.output:
-                if hasattr(out_item, "content"):
-                    for element in out_item.content:
-                        if hasattr(element, "text"):
-                            response_text += element.text
+            # Extract parsed response directly
+            parsed_response = response.choices[0].message.parsed
 
-            if not response_text:
+            if not parsed_response:
                 logger.warning(f"Réponse vide de ChatGPT pour le texte (essai {attempt + 1}/{max_retries}).")
                 if attempt == max_retries - 1:
                     return {**default_error_result, "analysis_error": "Réponse vide de ChatGPT après plusieurs essais."}
                 time.sleep(initial_backoff * (2 ** attempt))
                 continue
             
-            try:
-                # Try to extract JSON from the response
-                json_start = response_text.find('{')
-                json_end = response_text.rfind('}') + 1
-                if json_start != -1 and json_end > json_start:
-                    json_text = response_text[json_start:json_end]
-                    json_response = json.loads(json_text)
-                else:
-                    raise json.JSONDecodeError("No JSON found in response", response_text, 0)
-            except json.JSONDecodeError as e:
-                logger.error(f"Erreur de décodage JSON de la réponse ChatGPT (essai {attempt + 1}/{max_retries}): {e}. Réponse: {response_text[:500]}")
-                if attempt == max_retries - 1:
-                    return {**default_error_result, "analysis_error": f"JSONDecodeError: {e}", "raw_response_snippet": response_text[:500]}
-                time.sleep(initial_backoff * (2 ** attempt))
-                continue
-            
-            try:
-                validated_output = SentimentAnalysisOutput(**json_response)
-                return {**validated_output.model_dump(), "analysis_error": None}
-            except ValidationError as e:
-                logger.error(f"Erreur de validation Pydantic (essai {attempt + 1}/{max_retries}): {e}. Données reçues: {json_response}")
-                if attempt == max_retries - 1:
-                    return {**default_error_result, "analysis_error": f"Pydantic ValidationError: {e}", "parsed_data": json_response}
-                time.sleep(initial_backoff * (2 ** attempt))
-                continue
+            # Response is already validated by OpenAI's structured outputs
+            return {**parsed_response.model_dump(), "analysis_error": None}
 
         except Exception as e:
             logger.error(f"Erreur lors de l'appel à ChatGPT (essai {attempt + 1}/{max_retries}): {e}")
