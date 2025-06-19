@@ -1,0 +1,272 @@
+{
+  "2231": {
+    "centralite_islam_musulmans": "Secondaire",
+    "centralite_justification": "L'article mentionne l'organisation par le Centre culturel islamique, incorporant ainsi l'islam de manière présente mais sans en faire le thème principal.",
+    "subjectivite_score": 1,
+    "subjectivite_justification": "Le texte est factuel et se contente d'annoncer un événement sans exprimer d'opinions personnelles ou subjectives sur l'islam ou les musulmans.",
+    "polarite": "Neutre",
+    "polarite_justification": "L'article rapporte des faits liés à l'événement sans véhiculer de jugement positif ou négatif envers l'islam et les musulmans.",
+    "analysis_error": null
+  },
+  "2232": {
+    "centralite_islam_musulmans": "Marginal",
+    "centralite_justification": "L'islam est mentionné brièvement via la réaction du CERFI concernant la prière du vendredi, sans constituer le sujet principal de l'article.",
+    "subjectivite_score": 1,
+    "subjectivite_justification": "La mention de l'islam et des musulmans est rapportée de manière factuelle, sans exprimer de jugement ou d'opinion personnelle sur le sujet.",
+    "polarite": "Neutre",
+    "polarite_justification": "L'article relate la position du CERFI et la réponse gouvernementale de façon neutre, sans valorisation ni dénigrement explicite de l'islam ou des musulmans.",
+    "analysis_error": null
+  },
+  "2233": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article se concentre principalement sur la formation et le rôle des imams et muezzins, constituant ainsi le cœur du sujet.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte présente des faits et des citations factuelles sans exprimer d'opinions personnelles trop marquées, adoptant un ton plutôt informatif.",
+    "polarite": "Positif",
+    "polarite_justification": "Le discours valorise le rôle des leaders islamiques en soulignant leur capacité à promouvoir la paix, l'entente et la cohésion au sein de la communauté musulmane.",
+    "analysis_error": null
+  },
+  "2234": {
+    "centralite_islam_musulmans": "Marginal",
+    "centralite_justification": "L'article mentionne brièvement la visite à la communauté musulmane parmi d'autres institutions religieuses sans en faire le sujet principal.",
+    "subjectivite_score": 1,
+    "subjectivite_justification": "La mention de la communauté musulmane est rapportée de manière très factuelle sans ajout d'opinions ou de jugements personnels.",
+    "polarite": "Neutre",
+    "polarite_justification": "Le passage concernant la communauté musulmane est présenté de façon objective et neutre, sans tonalité émotionnelle marquée ni jugement positif ou négatif.",
+    "analysis_error": null
+  },
+  "2235": {
+    "centralite_islam_musulmans": "Non abordé",
+    "centralite_justification": "L'article ne mentionne ni l'islam ni les musulmans.",
+    "subjectivite_score": null,
+    "subjectivite_justification": "Non applicable car le sujet n'est pas abordé.",
+    "polarite": "Non applicable",
+    "polarite_justification": "Non applicable car le sujet n'est pas abordé.",
+    "analysis_error": null
+  },
+  "2236": {
+    "centralite_islam_musulmans": "Marginal",
+    "centralite_justification": "L'islam et les musulmans sont évoqués brièvement, notamment via une référence conditionnelle à la Communauté musulmane et une invocation religieuse, sans constituer le cœur du discours.",
+    "subjectivite_score": 1,
+    "subjectivite_justification": "Les rares mentions de l'islam sont factuelles et dénuées d'opinions ou de sentiment personnel concernant cette thématique.",
+    "polarite": "Neutre",
+    "polarite_justification": "La représentation de l'islam ne véhicule ni enthousiasme ni critique, se limitant à des références neutres sans jugement émotionnel.",
+    "analysis_error": null
+  },
+  "2237": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article est entièrement consacré à la célébration du Mouloud, mettant en avant l'image de l'islam et de ses valeurs de pardon et de tolérance.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "L'article repose sur des faits et des citations officielles, présentant l'islam de manière valorisante sans recourir à un style excessivement émotionnel.",
+    "polarite": "Très positif",
+    "polarite_justification": "Le texte insiste sur les valeurs de miséricorde, de pardon et de tolérance de l'islam, offrant ainsi une représentation extrêmement favorable des musulmans.",
+    "analysis_error": null
+  },
+  "2238": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article est entièrement centré sur l'exploration historique et l'analyse de l'islam et des musulmans dans le contexte de la colonisation de la Haute Volta.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Le texte combine des faits historiques avec les interprétations et opinions du conférencier, créant un équilibre entre objectivité et subjectivité.",
+    "polarite": "Neutre",
+    "polarite_justification": "L'article présente de manière factuelle l'évolution et les défis de l'islam dans la région, sans exprimer de jugement émotionnel marqué envers l'islam ou ses adeptes.",
+    "analysis_error": null
+  },
+  "2239": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "L'article se concentre sur une cérémonie organisée par des institutions éducatives islamiques, intégrant de nombreuses références directes à l'islam et aux musulmans.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte rapporte des faits et inclut des citations issues du discours religieux sans ajouter d'opinions personnelles marquées, adoptant ainsi un ton principalement factuel.",
+    "polarite": "Positif",
+    "polarite_justification": "L'article valorise l'islam et ses représentants en mettant en avant des valeurs et pratiques religieuses de manière respectueuse et favorable.",
+    "analysis_error": null
+  },
+  "2240": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "L'article se concentre sur un congrès sunnite et utilise le thème de l'islam pour promouvoir un développement économique et social, faisant de l'islam un sujet central.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est principalement factuel et rapporte des événements et déclarations officielles, avec peu d'opinions personnelles sur l'islam.",
+    "polarite": "Positif",
+    "polarite_justification": "L'article présente l'islam et les musulmans de manière favorable, en soulignant leur rôle pour la paix, la tolérance et le développement socio-économique.",
+    "analysis_error": null
+  },
+  "2241": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "L'article se focalise sur l'investiture d'une institution islamique (CERFI) et intègre des déclarations de foi et des engagements religieux, faisant de l'islam un sujet principal.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte rapporte principalement des faits sur l'événement tout en incluant des expressions de foi et d'engagement, mais reste globalement informatif.",
+    "polarite": "Positif",
+    "polarite_justification": "La représentation met en avant une vision valorisante de l'islam, via des engagements religieux et des références positives aux valeurs de la foi, sans excès émotionnel.",
+    "analysis_error": null
+  },
+  "2242": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article est entièrement consacré à un événement et des discours religieux qui mettent en avant l'islam et la célébration du Coran.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte rapporte avant tout des faits et des citations lors de l'évènement, en relayant des discours traditionnels sans imposer un jugement personnel marqué.",
+    "polarite": "Très positif",
+    "polarite_justification": "La représentation de l'islam y est très favorable et élogieuse, mettant en relief la spiritualité, la solidarité et l'importance du rôle du Coran sans aucune tonalité critique.",
+    "analysis_error": null
+  },
+  "2243": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "L'article se concentre essentiellement sur un événement religieux lié à la lecture du Coran, impliquant des institutions islamiques et des pratiques religieuses.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte rapporte principalement des faits et des déclarations officielles, avec quelques nuances d'expression personnelle mais reste globalement factuel.",
+    "polarite": "Positif",
+    "polarite_justification": "Le portrait de l'islam et des musulmans est présenté de manière positive, en valorisant la lecture du Coran et ses bienfaits spirituels.",
+    "analysis_error": null
+  },
+  "2244": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article est principalement axé sur la célébration musulmane et les discours des responsables religieux, mettant en avant les pratiques et traditions de l'islam.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte se contente de rapporter les événements et les propos des responsables religieux de manière factuelle, avec une très légère touche subjective issue des opinions exprimées lors des sermons.",
+    "polarite": "Neutre",
+    "polarite_justification": "Le portrait de l'islam et des musulmans est présenté de façon informative et factuelle, sans opter pour un jugement particulièrement positif ou négatif.",
+    "analysis_error": null
+  },
+  "2245": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "L'article se concentre principalement sur la célébration d'un événement religieux majeur de l'islam, en détaillant le déroulement de la prière et le discours de l'aumônier.",
+    "subjectivite_score": 1,
+    "subjectivite_justification": "Le texte rapporte de manière factuelle et descriptive l'événement et les propos du sermon sans y ajouter d'opinions personnelles.",
+    "polarite": "Neutre",
+    "polarite_justification": "La représentation de l'islam et des musulmans est présentée de façon objective et informative, sans expression d'un sentiment particulièrement positif ou négatif.",
+    "analysis_error": null
+  },
+  "2246": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article est entièrement consacré à un festival spécifiquement dédié à l'islam et à la communauté musulmane.",
+    "subjectivite_score": 1,
+    "subjectivite_justification": "Le texte est purement descriptif et factuel, rapportant les détails de l'événement sans exprimer d'opinion subjective sur l'islam.",
+    "polarite": "Positif",
+    "polarite_justification": "L'article présente l'événement de manière favorable en valorisant la culture et l'unité de la communauté musulmane.",
+    "analysis_error": null
+  },
+  "2247": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "L'article se concentre sur l'organisation du Hadj, une pratique religieuse centrale dans l'islam, et intègre des témoignages de pèlerins exprimant leurs sentiments.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte présente des faits factuels sur l'organisation tout en incluant quelques expressions émotionnelles des pèlerins, sans montrer un biais marqué.",
+    "polarite": "Positif",
+    "polarite_justification": "Les témoignages des pèlerins, qui expriment de la joie et une gratitude envers Dieu, confèrent à la représentation de l'islam une tonalité favorable et optimiste.",
+    "analysis_error": null
+  },
+  "2248": {
+    "centralite_islam_musulmans": "Marginal",
+    "centralite_justification": "L'article mentionne quelques éléments liés à l'islam (tels que 'Inch Allah' et des centres d'écoles islamiques), mais le focus principal reste sur la coopération diplomatique et le développement bilatéral.",
+    "subjectivite_score": 1,
+    "subjectivite_justification": "Les informations relatives à l'islam sont présentées de manière factuelle et objective, sans avis ni jugement subjectif.",
+    "polarite": "Neutre",
+    "polarite_justification": "Le texte ne véhicule ni un sentiment positif ni négatif vis-à-vis de l'islam; les mentions restent purement descriptives et contextuelles.",
+    "analysis_error": null
+  },
+  "2249": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "L'article se concentre sur la participation et les interventions de l'autorité islamique dans le débat sur la laïcité.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte rapporte des faits sur la réunion, incluant quelques opinions exprimées par les intervenants, mais reste essentiellement informatif.",
+    "polarite": "Neutre",
+    "polarite_justification": "L'article présente de manière factuelle les positions et propositions des responsables islamiques sans adopter de tonalité critique ou excessivement enthousiaste.",
+    "analysis_error": null
+  },
+  "2250": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article est entièrement consacré aux événements liés à la prière d'Ide al-Fitr et à la vie communautaire musulmane au Burkina Faso.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "L'article se contente de rapporter des faits et des déclarations des responsables religieux avec une légère coloration positive, sans exprimer de jugements personnels marqués.",
+    "polarite": "Positif",
+    "polarite_justification": "La représentation de l'islam et des musulmans est favorable, mettant en avant des valeurs de paix, de solidarité et de respect mutuel.",
+    "analysis_error": null
+  },
+  "2251": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "L'article met en avant la solidarité musulmane à travers la distribution de vivres durant le Ramadan et cite des hadiths, donnant une place importante à l'islam dans le récit.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Les faits rapportés sur l'action de charité sont étayés par des citations religieuses sans jugement personnel marqué, ce qui traduit un traitement plutôt objectif.",
+    "polarite": "Positif",
+    "polarite_justification": "Le texte présente l'islam sous un jour favorable en valorisant l'engagement solidaire et les valeurs de charité inhérentes au mois de Ramadan.",
+    "analysis_error": null
+  },
+  "2252": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article se concentre exclusivement sur la célébration du Mouloud et l'importance de l'Islam dans la promotion de la paix.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "L'article rapporte des faits et cite des leaders religieux de manière factuelle, avec quelques touches élogieuses mais sans exprimer d'opinions personnelles marquées.",
+    "polarite": "Très positif",
+    "polarite_justification": "Le texte met en avant les valeurs pacifiques et morales de l'Islam en citant des discours qui soulignent la paix et la tolérance, montrant un portrait extrêmement favorable.",
+    "analysis_error": null
+  },
+  "2253": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article est entièrement consacré à la célébration de l'islam et des musulmans, mettant en avant le prophète Mohammad et les valeurs islamiques.",
+    "subjectivite_score": 4,
+    "subjectivite_justification": "Le texte adopte un ton clairement louangeur et normatif en exprimant des jugements valorisants sur l'islam, tout en s'appuyant sur des références et enseignements précis.",
+    "polarite": "Très positif",
+    "polarite_justification": "L'article présente l'islam de manière extrêmement favorable, en soulignant ses enseignements, sa tradition et ses contributions positives, sans nuance négative.",
+    "analysis_error": null
+  },
+  "2254": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article est entièrement consacré à la commémoration de l'Achoûra et aux débats internes sur la manière de représenter l'histoire religieuse, mettant en avant des figures et des événements clés de l'islam chiite.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "L'article présente un mélange de faits historiques et de citations subjectives de différents intervenants qui expriment leurs opinions sur la bonne interprétation de l'Achoûra.",
+    "polarite": "Positif",
+    "polarite_justification": "Le texte offre un portrait valorisant de l'islam authentique en soulignant l'importance de respecter les valeurs et la mémoire sacrée de l'histoire chiite, tout en critiquant les interprétations festives qui dénatureraient cet événement.",
+    "analysis_error": null
+  },
+  "2255": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "L'article se concentre principalement sur la célébration d'une fête musulmane, mettant en avant les pratiques religieuses et les messages du sermon de l'imam.",
+    "subjectivite_score": 1,
+    "subjectivite_justification": "L'article présente des faits vérifiables sur l'événement religieux sans exprimer d'opinions personnelles, adoptant un ton purement informatif.",
+    "polarite": "Positif",
+    "polarite_justification": "Le portrait de l'islam et des musulmans est favorable, soulignant la cohésion sociale, la solidarité et des valeurs positives à travers les messages du sermon.",
+    "analysis_error": null
+  },
+  "2256": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "L'article se concentre principalement sur le hadj et aborde massivement les enjeux tarifaires des pèlerins, avec une présence marquée des associations islamiques et des fidèles musulmans.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "L'article présente un mélange de faits objectifs et d'opinions exprimées par les représentants des agences, notamment dans le choix de termes forts pour dénoncer le monopole, conférant ainsi une subjectivité modérée dans la représentation des musulmans.",
+    "polarite": "Neutre",
+    "polarite_justification": "Le texte expose des critiques ciblées sur le coût et le monopole du transport aérien sans pour autant adopter un jugement général sur l'islam ou les musulmans, ce qui aboutit à une tonalité globalement neutre.",
+    "analysis_error": null
+  },
+  "2257": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article est principalement consacré à la célébration de l'Aïd-el-fitr et met en avant les pratiques et messages des fidèles musulmans.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte rapporte des faits sur la célébration religieuse et inclut des messages positifs, mais il reste essentiellement informatif.",
+    "polarite": "Positif",
+    "polarite_justification": "L'article présente l'islam et les musulmans sous un jour favorable en soulignant la piété, la solidarité et la coexistence pacifique.",
+    "analysis_error": null
+  },
+  "2258": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article est entièrement consacré à une cérémonie religieuse islamique, mettant en avant des rituels, des invocations et des figures religieuses spécifiques à l'islam.",
+    "subjectivite_score": 1,
+    "subjectivite_justification": "Le texte rapporte de manière factuelle le déroulement de la cérémonie sans exprimer d'opinions ou de sentiments personnels sur l'islam.",
+    "polarite": "Positif",
+    "polarite_justification": "La représentation valorise la prière, les bénédictions et la quête de paix, offrant ainsi un portrait favorable de l'islam.",
+    "analysis_error": null
+  },
+  "2259": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article est entièrement consacré aux pratiques et célébrations de l'islam, notamment la fête de l'Aïd El Fitr, et met en avant les messages et normes diffusés par les responsables musulmans.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte présente principalement des faits et des déclarations officielles sur les pratiques islamiques sans ajouter de commentaires personnels ou de jugements, bien que certaines prises de position soient relayées dans les discours.",
+    "polarite": "Positif",
+    "polarite_justification": "La représentation de l'islam y est favorable, mettant en lumière la célébration, les valeurs de paix et la promotion du dialogue interreligieux.",
+    "analysis_error": null
+  },
+  "2260": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "L'article se concentre sur un événement majeur de la Fédération des associations islamiques du Burkina, faisant de l'islam et des musulmans un sujet principal.",
+    "subjectivite_score": 1,
+    "subjectivite_justification": "Le texte présente de manière factuelle l'installation des commissions et l'organisation de la fédération sans exprimer de jugement personnel sur l'islam ou les musulmans.",
+    "polarite": "Neutre",
+    "polarite_justification": "L'article relate les faits et met en avant l'unité et l'organisation des musulmans sans adopter un ton particulièrement élogieux ni critique.",
+    "analysis_error": null
+  }
+}
