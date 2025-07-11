@@ -313,6 +313,17 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
             )
             # nb_pages_int remains None
 
+    # Extract date when item was added to Omeka (YYYY-MM-DD format)
+    added_date = ""
+    if "o:created" in item and isinstance(item["o:created"], dict):
+        created_value = item["o:created"].get("@value", "")
+        if created_value:
+            try:
+                # Extract date part from ISO format (e.g., "2025-07-09T14:02:51+00:00" -> "2025-07-09")
+                added_date = created_value.split("T")[0]
+            except Exception:
+                logger.warning(f"Could not parse added date '{created_value}' for item {item['o:id']}")
+
     # Fetch thumbnail URL
     session = await conn_manager.get()
     thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
@@ -320,6 +331,7 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
     return {
         "o:id": item["o:id"],
         "identifier": _get_value(item, "dcterms:identifier"),
+        "added_date": added_date, # Date when item was added to Omeka
         "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "PDF": primary_url,
         "thumbnail": thumbnail_url, # Added thumbnail field
