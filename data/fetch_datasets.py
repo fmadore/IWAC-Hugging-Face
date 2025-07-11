@@ -2,7 +2,7 @@ from datasets import load_dataset
 import os
 
 # Available configs in the IWAC dataset
-configs = ['articles', 'publications', 'index']
+configs = ['articles', 'publications', 'documents', 'index']
 
 # Process all IWAC configs
 for config_name in configs:
