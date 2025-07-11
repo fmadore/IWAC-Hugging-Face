@@ -221,6 +221,22 @@ class OmekaApiClient:
 # Fonctions d'aide pour mapper les champs Omeka → plat
 # ---------------------------------------------------------------------------
 
+def _get_label(item: Dict[str, Any], field: str) -> str:
+    """Extract o:label from a field that contains an array of objects with o:label."""
+    if field not in item or item[field] is None:
+        return ""
+    val = item[field]
+    if isinstance(val, list):
+        labels = []
+        for v in val:
+            if isinstance(v, dict) and "o:label" in v:
+                labels.append(str(v["o:label"]))
+        return "|".join(filter(None, labels))
+    elif isinstance(val, dict) and "o:label" in val:
+        return str(val["o:label"])
+    return ""
+
+
 def _get_value(item: Dict[str, Any], field: str) -> str:
     if field not in item or item[field] is None:
         return ""
@@ -343,7 +359,6 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
         "author": _join(item, "dcterms:creator"),
         "country": country,
         "pub_date": _get_value(item, "dcterms:date"),
-        "description": _get_value(item, "dcterms:description"),
         "descriptionAI": _get_value(item, "bibo:shortDescription"),
         "subject": _join(item, "dcterms:subject"),
         "spatial": _get_value(item, "dcterms:spatial"),
@@ -351,7 +366,7 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
         "type": _get_value(item, "dcterms:type"),
         "nb_pages": nb_pages_int,
         "source": _get_value(item, "dcterms:source"),
-        "rights": _get_value(item, "dcterms:rights"),
+        "rights": _get_label(item, "dcterms:rights"),
         "OCR": _get_value(item, "bibo:content"),
     }
 
@@ -484,7 +499,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Publie les documents IWAC sur le Hub HF")
-    parser.add_argument("--repo", default="fmadore/iwac-documents", help="Repository Hugging Face où publier")
+    parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles", help="Repository Hugging Face où publier")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
     args = parser.parse_args()
 
