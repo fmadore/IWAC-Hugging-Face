@@ -324,15 +324,21 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
             except Exception:
                 logger.warning(f"Could not parse added date '{created_value}' for item {item['o:id']}")
 
-    # Fetch thumbnail URL
+    # Fetch thumbnail URL and set IIIF manifest URL only if PDF exists
     session = await conn_manager.get()
-    thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
+    thumbnail_url = ""
+    iiif_manifest_url = ""
+    
+    if primary_url:  # Only fetch IIIF data if there's a PDF
+        thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
+        iiif_manifest_url = f"https://islam.zmo.de/iiif/3/{item['o:id']}/manifest"
 
     return {
         "o:id": item["o:id"],
         "identifier": _get_value(item, "dcterms:identifier"),
         "added_date": added_date, # Date when item was added to Omeka
         "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
+        "iiif_manifest": iiif_manifest_url,
         "PDF": primary_url,
         "thumbnail": thumbnail_url, # Added thumbnail field
         "title": _get_value(item, "dcterms:title"),
