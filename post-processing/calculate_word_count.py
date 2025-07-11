@@ -8,7 +8,7 @@ Le script charge un dataset depuis le repository Hugging Face 'fmadore/iwac-news
 compte les mots dans la colonne 'OCR', et ajoute ces comptes dans une nouvelle
 colonne nommée 'nb_mots'. Le dataset mis à jour est ensuite poussé vers le Hub.
 
-L'utilisateur est invité à choisir la configuration ('articles' ou 'publications')
+L'utilisateur est invité à choisir la configuration ('articles', 'publications' ou 'documents')
 à traiter.
 
 Usage
@@ -80,11 +80,11 @@ def main():
 
     # --- Choix de la configuration par l'utilisateur ---
     config_name_choice = ""
-    while config_name_choice not in ["articles", "publications"]:
+    while config_name_choice not in ["articles", "publications", "documents"]:
         try:
-            config_name_choice = input("Quelle configuration traiter? ('articles' ou 'publications'): ").strip().lower()
-            if config_name_choice not in ["articles", "publications"]:
-                logger.warning("Entrée invalide. Veuillez choisir 'articles' ou 'publications'.")
+            config_name_choice = input("Quelle configuration traiter? ('articles', 'publications' ou 'documents'): ").strip().lower()
+            if config_name_choice not in ["articles", "publications", "documents"]:
+                logger.warning("Entrée invalide. Veuillez choisir 'articles', 'publications' ou 'documents'.")
         except KeyboardInterrupt:
             logger.info("\nOpération annulée par l'utilisateur.")
             return
