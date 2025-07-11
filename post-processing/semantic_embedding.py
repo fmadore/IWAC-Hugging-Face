@@ -8,7 +8,7 @@ existant, basées sur la colonne 'descriptionAI' (résumés français générés
 Le script charge un dataset, calcule les embeddings à l'aide d'un modèle de 
 sentence-transformers, et ajoute les résultats dans une nouvelle colonne.
 
-L'utilisateur est invité à choisir la configuration ('articles' ou 'publications').
+L'utilisateur est invité à choisir la configuration ('articles', 'publications' ou 'documents').
 Le nom de la nouvelle colonne est : "embedding_descriptionAI".
 
 Usage
@@ -69,10 +69,10 @@ def get_available_configs(repo_id: str, token: str) -> List[str]:
             return info.config_names
         else:
             # Fallback vers les configs connues
-            return ['articles', 'publications']
+            return ['articles', 'publications', 'documents']
     except Exception:
         # En cas d'erreur, retourner les configs par défaut
-        return ['articles', 'publications']
+        return ['articles', 'publications', 'documents']
 
 def choose_config(available_configs: List[str]) -> str:
     """
