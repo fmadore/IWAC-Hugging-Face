@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+"""
+upload_documents_hf.py
+======================
+
+Extrait les documents (resource_class_id = 49) depuis l'API Omeka S
+d'IWAC, les convertit en dataset Arrow/Parquet et les pousse sur le Hugging Face
+Hub.
+
+Usage
+-----
+    python upload_documents_hf.py \
+        --repo fmadore/iwac-documents \
+        --max-shard-size 1GB
+
+Variables d'environnement
+------------------------
+  OMEKA_BASE_URL        Base URL de l'API, ex. https://islam.zmo.de/api
+  OMEKA_KEY_IDENTITY    Identité de la clé Omeka
+  OMEKA_KEY_CREDENTIAL  Credential de la clé Omeka
+  HF_TOKEN              Jeton d'accès personnel Hugging Face (facultatif si
+                        vous appelez login() de manière interactive)
+"""
+
+import os
+import sys
+import json
+import io
+import gzip
+import hashlib
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+from typing import Dict, Any, List, Optional, Union, Type
+
+# Add parent directory to path to import from root
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import pandas as pd
+import aiohttp
+import aiofiles
+from tqdm import tqdm
+from tqdm.asyncio import tqdm as async_tqdm
+from dotenv import load_dotenv
+from datasets import Dataset, load_dataset
+from huggingface_hub import login, HfFolder, utils as hf_utils
+import huggingface_hub
+from country_mapper import get_country_from_newspaper
+
+# Disable symlinks warning from huggingface_hub
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
+# ---------------------------------------------------------------------------
+# Configuration & journalisation
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+@dataclass
+class Config:
+    """Paramètres globaux chargés depuis .env ou variables d'environnement"""
+
+    API_URL: str = os.getenv("OMEKA_BASE_URL", "https://islam.zmo.de/api")
+    API_KEY_IDENTITY: str = os.getenv("OMEKA_KEY_IDENTITY", "")
+    API_KEY_CREDENTIAL: str = os.getenv("OMEKA_KEY_CREDENTIAL", "")
+    CACHE_DIR: str = ".cache_omk_documents"
+    CACHE_HOURS: int = 24
+
+
+# ---------------------------------------------------------------------------
+# Cache disque (JSON Gzip) pour économiser l'API
+# ---------------------------------------------------------------------------
+
+class Cache:
+    def __init__(self, directory: str, hours: int = 24):
+        self.dir = directory
+        self.duration = timedelta(hours=hours)
+        os.makedirs(directory, exist_ok=True)
+
+    def _path(self, key: str) -> str:
+        name = hashlib.md5(key.encode()).hexdigest() + ".json.gz"
+        return os.path.join(self.dir, name)
+
+    async def get(self, key: str) -> Optional[Any]:
+        path = self._path(key)
+        if not os.path.exists(path):
+            return None
+        mtime = datetime.fromtimestamp(os.path.getmtime(path))
+        if datetime.now() - mtime > self.duration:
+            return None
+        async with aiofiles.open(path, "rb") as f:
+            data = await f.read()
+        with gzip.open(io.BytesIO(data), "rt", encoding="utf-8") as gz:
+            return json.load(gz)
+
+    async def set(self, key: str, value: Any):
+        path = self._path(key)
+        buf = io.BytesIO()
+        with gzip.open(buf, "wt", encoding="utf-8") as gz:
+            json.dump(value, gz)
+        async with aiofiles.open(path, "wb") as f:
+            await f.write(buf.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# Gestion de la connexion HTTP
+# ---------------------------------------------------------------------------
+
+class ConnectionManager:
+    def __init__(self):
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def get(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=20, ssl=False),
+                timeout=aiohttp.ClientTimeout(total=30),
+            )
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+
+conn_manager = ConnectionManager()
+
+
+# ---------------------------------------------------------------------------
+# Decorateur retry asynchrone simple
+# ---------------------------------------------------------------------------
+
+def async_retry(max_tries: int = 5, exceptions: Union[Type[Exception], tuple] = (aiohttp.ClientError, asyncio.TimeoutError)):
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            for attempt in range(max_tries):
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as exc:
+                    logger.warning(f"{func.__name__}: tentative {attempt + 1}/{max_tries} échouée ({exc})")
+                    await asyncio.sleep(2 ** attempt)
+            raise
+
+        return wrapper
+
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# Client API Omeka minimum viable
+# ---------------------------------------------------------------------------
+
+class OmekaApiClient:
+    def __init__(self, cfg: Config, use_cache: bool = True):
+        self.cfg = cfg
+        self.cache = Cache(cfg.CACHE_DIR, cfg.CACHE_HOURS) if use_cache else None
+
+    @async_retry()
+    async def _get(self, endpoint: str, params: Dict[str, Any]) -> Any:
+        params.update(
+            {
+                "key_identity": self.cfg.API_KEY_IDENTITY,
+                "key_credential": self.cfg.API_KEY_CREDENTIAL,
+            }
+        )
+        url = f"{self.cfg.API_URL}/{endpoint}"
+        sess = await conn_manager.get()
+        async with sess.get(url, params=params) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+    async def request(self, endpoint: str, params: Dict[str, Any]):
+        key = f"{endpoint}:{json.dumps(params, sort_keys=True)}"
+        if self.cache:
+            cached = await self.cache.get(key)
+            if cached is not None:
+                return cached
+        data = await self._get(endpoint, params)
+        if self.cache:
+            await self.cache.set(key, data)
+        return data
+
+    async def fetch_items_page(self, rcid: int, page: int, per: int = 100):
+        return await self.request("items", {"resource_class_id": rcid, "page": page, "per_page": per})
+
+    async def fetch_items(self, rcid: int) -> List[Dict[str, Any]]:
+        first = await self.fetch_items_page(rcid, 1)
+        items = list(first)
+        per = 100
+        if len(first) == per:
+            # Estimate total pages if possible, or use an indefinite progress bar
+            # This part requires knowing the total number of items or pages,
+            # which might not be available directly from the first call.
+            # For now, let's assume we don't know the total and use a simple counter.
+            page = 2
+            with tqdm(desc="Fetching item pages", unit="page") as pbar:
+                while True:
+                    batch = await self.fetch_items_page(rcid, page)
+                    if not batch:
+                        break
+                    items.extend(batch)
+                    pbar.update(1)
+                    if len(batch) < per:
+                        break
+                    page += 1
+        logger.info("%d items récupérés pour la classe %d", len(items), rcid)
+        return items
+
+    async def fetch_media_data(self, media_id: str):
+        return await self.request(f"media/{media_id}", {})
+
+
+# ---------------------------------------------------------------------------
+# Fonctions d'aide pour mapper les champs Omeka → plat
+# ---------------------------------------------------------------------------
+
+def _get_value(item: Dict[str, Any], field: str) -> str:
+    if field not in item or item[field] is None:
+        return ""
+    val = item[field]
+    if isinstance(val, list):
+        parts = [str(v.get("display_title") or v.get("@value") or v.get("@id", "")) for v in val]
+        return "|".join(filter(None, parts))
+    if isinstance(val, dict):
+        return val.get("display_title", "") or val.get("@value", "")
+    return str(val)
+
+
+def _join(item: Dict[str, Any], field: str) -> str:
+    return _get_value(item, field)
+
+
+def _get_media_ids(item: Dict[str, Any]) -> str:
+    if "o:media" in item and isinstance(item["o:media"], list):
+        return "|".join(str(m["o:id"]) for m in item["o:media"])
+    return ""
+
+
+@async_retry(max_tries=3, exceptions=(aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError))
+async def fetch_iiif_thumbnail_url(omeka_id: Union[str, int], session: aiohttp.ClientSession) -> str:
+    """Fetches and extracts the thumbnail URL from an IIIF manifest."""
+    manifest_url = f"https://islam.zmo.de/iiif/3/{omeka_id}/manifest"
+    thumbnail_url = ""
+    try:
+        # Use a shorter timeout for this specific, potentially numerous, request type
+        async with session.get(manifest_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                # It's crucial to handle potential JSONDecodeError here if the response is not valid JSON
+                try:
+                    manifest = await resp.json()
+                    thumbnails = manifest.get("thumbnail")
+                    if isinstance(thumbnails, list) and thumbnails:
+                        thumbnail_info = thumbnails[0]
+                        if isinstance(thumbnail_info, dict):
+                            thumbnail_url = thumbnail_info.get("id", "")
+                except json.JSONDecodeError as e_json:
+                    logger.warning(f"JSON decoding error for IIIF manifest {omeka_id}: {e_json}. URL: {manifest_url}")
+            # Log other non-200 responses that are not exceptions handled by async_retry
+            elif resp.status not in [408, 429, 500, 502, 503, 504]: # Avoid redundant logs for retryable http errors
+                logger.warning(f"IIIF manifest request for {omeka_id} returned status {resp.status}. URL: {manifest_url}")
+    except asyncio.TimeoutError: # Specifically catch timeout
+        logger.warning(f"Timeout fetching IIIF manifest for {omeka_id}. URL: {manifest_url}")
+    except aiohttp.ClientError as e_client: # Specifically catch client errors
+        logger.warning(f"Client error fetching IIIF manifest for {omeka_id}: {e_client}. URL: {manifest_url}")
+    # Catching general Exception for unexpected issues, though specific ones are better
+    except Exception as e_general:
+        logger.error(f"Unexpected error fetching IIIF manifest for {omeka_id}: {e_general}. URL: {manifest_url}")
+    return thumbnail_url
+
+
+async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
+    """Transforme un item Omeka en dict plat pour HF datasets."""
+
+    primary_url = ""
+    if item.get("o:primary_media"):
+        mid = item["o:primary_media"]["@id"].split("/")[-1]
+        mdata = await api.fetch_media_data(mid)
+        primary_url = mdata.get("o:original_url", "")
+
+    # Map country based on item set IDs
+    country = ""
+    if "o:item_set" in item and isinstance(item["o:item_set"], list):
+        for item_set in item["o:item_set"]:
+            if isinstance(item_set, dict) and "o:id" in item_set:
+                item_set_id = item_set["o:id"]
+                if item_set_id == 23452:
+                    country = "Bénin"
+                    break
+                elif item_set_id == 23453:
+                    country = "Burkina Faso"
+                    break
+                elif item_set_id == 26327:
+                    country = "Togo"
+                    break
+
+    # Convert nb_pages to int
+    nb_pages_str = _get_value(item, "bibo:numPages")
+    nb_pages_int = None
+    if nb_pages_str:
+        try:
+            nb_pages_int = int(nb_pages_str)
+        except ValueError:
+            logger.warning(
+                f"Could not convert nb_pages '{nb_pages_str}' to int for item {item['o:id']}. Defaulting to null."
+            )
+
+    # Extract date when item was added to Omeka (YYYY-MM-DD format)
+    added_date = ""
+    if "o:created" in item and isinstance(item["o:created"], dict):
+        created_value = item["o:created"].get("@value", "")
+        if created_value:
+            try:
+                # Extract date part from ISO format (e.g., "2025-07-09T14:02:51+00:00" -> "2025-07-09")
+                added_date = created_value.split("T")[0]
+            except Exception:
+                logger.warning(f"Could not parse added date '{created_value}' for item {item['o:id']}")
+
+    # Fetch thumbnail URL and set IIIF manifest URL only if PDF exists
+    session = await conn_manager.get()
+    thumbnail_url = ""
+    iiif_manifest_url = ""
+    
+    if primary_url:  # Only fetch IIIF data if there's a PDF
+        thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
+        iiif_manifest_url = f"https://islam.zmo.de/iiif/3/{item['o:id']}/manifest"
+
+    return {
+        "o:id": item["o:id"],
+        "identifier": _get_value(item, "dcterms:identifier"),
+        "added_date": added_date, # Date when item was added to Omeka
+        "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
+        "iiif_manifest": iiif_manifest_url,
+        "PDF": primary_url,
+        "thumbnail": thumbnail_url,
+        "title": _get_value(item, "dcterms:title"),
+        "author": _join(item, "dcterms:creator"),
+        "country": country,
+        "pub_date": _get_value(item, "dcterms:date"),
+        "description": _get_value(item, "dcterms:description"),
+        "descriptionAI": _get_value(item, "bibo:shortDescription"),
+        "subject": _join(item, "dcterms:subject"),
+        "spatial": _get_value(item, "dcterms:spatial"),
+        "language": _get_value(item, "dcterms:language"),
+        "type": _get_value(item, "dcterms:type"),
+        "nb_pages": nb_pages_int,
+        "source": _get_value(item, "dcterms:source"),
+        "rights": _get_value(item, "dcterms:rights"),
+        "OCR": _get_value(item, "bibo:content"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pipeline principale : fetch → map → dataset → push
+# ---------------------------------------------------------------------------
+
+async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
+    api = OmekaApiClient(cfg, use_cache=True)
+
+    # 1. Fetch current Omeka items and map them
+    logger.info("Fetching items from Omeka API...")
+    omeka_items_raw = await api.fetch_items(49)  # Documents (resource_class_id = 49)
+
+    if not omeka_items_raw:
+        logger.warning("No items returned from Omeka API. Exiting.")
+        return
+
+    logger.info(f"Fetched {len(omeka_items_raw)} items from Omeka.")
+    omeka_records_list = []
+    # Use a standard tqdm here if the inner operations are not heavily async and blocking
+    for it in tqdm(omeka_items_raw, desc="Mapping Omeka documents"):
+        try:
+            record = await map_document(it, api)
+            omeka_records_list.append(record)
+        except Exception as e:
+            logger.error(f"Error mapping item {it.get('o:id', 'Unknown ID')}: {e}", exc_info=True)
+            # Optionally, append a partial record or skip
+    
+    if not omeka_records_list:
+        logger.error("No records were successfully mapped. Exiting.")
+        return
+        
+    new_omeka_df = pd.DataFrame(omeka_records_list)
+    if 'o:id' not in new_omeka_df.columns or new_omeka_df['o:id'].isnull().any():
+        logger.error("Critical: 'o:id' column is missing or contains null values in new Omeka data after mapping. Cannot proceed.")
+        return
+    new_omeka_df['o:id'] = new_omeka_df['o:id'].astype(str) # Ensure consistent type for merging
+
+    # 2. Load existing dataset from Hugging Face Hub
+    existing_df = pd.DataFrame()
+    hf_token_env = os.getenv("HF_TOKEN")
+    hf_token_stored = HfFolder.get_token()
+    token_to_use = hf_token_env if hf_token_env else hf_token_stored
+
+    try:
+        logger.info(f"Attempting to load existing dataset from Hugging Face Hub: {repo}")
+        # Corrected call to load_dataset
+        existing_ds = load_dataset(repo, name="documents", split="train", token=token_to_use, download_mode="force_redownload", verification_mode="no_checks")
+        existing_df = existing_ds.to_pandas()
+        
+        if 'o:id' not in existing_df.columns or existing_df['o:id'].isnull().all():
+            logger.warning("'o:id' column missing or all null in existing Hub dataset. Treating as empty.")
+            existing_df = pd.DataFrame() 
+        else:
+            # Ensure 'o:id' is string type for consistent merging
+            existing_df['o:id'] = existing_df['o:id'].astype(str)
+            logger.info(f"Successfully loaded {len(existing_df)} records from {repo}. Existing columns: {existing_df.columns.tolist()}")
+            
+    except Exception as e:
+        logger.warning(f"Could not load existing dataset from {repo} (may be first run or other issue, error: {e}). Proceeding as if Hub dataset is empty.")
+        existing_df = pd.DataFrame() # Ensure it's an empty DataFrame on error
+
+    # 3. Merge logic
+    if existing_df.empty:
+        logger.info("No existing data on Hub, 'o:id' missing in existing data, or error loading existing data; using new Omeka data directly.")
+        final_df = new_omeka_df
+    else:
+        logger.info(f"Merging new Omeka data ({len(new_omeka_df)} records) with existing Hub data ({len(existing_df)} records).")
+        
+        # Identify columns in existing_df that are NOT in new_omeka_df. These are "extra" columns to preserve.
+        extra_cols_to_preserve = [col for col in existing_df.columns if col not in new_omeka_df.columns]
+        
+        if extra_cols_to_preserve:
+            logger.info(f"Preserving these columns from existing dataset: {extra_cols_to_preserve}")
+            # Select these columns plus 'o:id' from existing_df for the merge
+            cols_from_existing_for_merge = ['o:id'] + extra_cols_to_preserve
+            final_df = pd.merge(new_omeka_df, existing_df[cols_from_existing_for_merge], on='o:id', how='left')
+        else:
+            logger.info("No unique columns to preserve from existing dataset. New Omeka data will form the basis of the updated dataset.")
+            final_df = new_omeka_df
+
+        logger.info(f"Merge complete. Resulting dataset has {len(final_df)} records. Final columns: {final_df.columns.tolist()}")
+        if extra_cols_to_preserve:
+            for col_name in extra_cols_to_preserve:
+                if col_name in final_df.columns:
+                    nan_count = final_df[col_name].isnull().sum()
+                    if nan_count > 0:
+                        logger.info(f"Column '{col_name}' has {nan_count} null values after merge (these are likely new items from Omeka that will need processing).")
+
+    # 4. Conversion to Dataset and Push
+    if not final_df.empty:
+        logger.info(f"Preparing to push {len(final_df)} records to the Hub. Columns: {final_df.columns.tolist()}")
+        
+        # Final check for o:id integrity
+        if 'o:id' not in final_df.columns or final_df['o:id'].isnull().any():
+            logger.error("Critical error: 'o:id' is missing or null in the final DataFrame before push. Aborting push.")
+            await conn_manager.close()
+            return
+
+        ds = Dataset.from_pandas(final_df, preserve_index=False)
+        logger.info("Dataset preview (first 5 rows):")
+        logger.info(ds.to_pandas().head())
+
+        if os.getenv("HF_TOKEN") is None and not hf_utils.is_notebook():
+            login()
+        
+        try:
+            # Before pushing, ensure the local HuggingFace cache for this repo is cleared if needed,
+            # or use a specific commit message. For simplicity, direct push_to_hub is used.
+            logger.info(f"Pushing dataset to {repo} with config 'documents'...")
+            ds.push_to_hub(repo, max_shard_size=shard_size, config_name="documents")
+            logger.info(f"Dataset published/updated on {repo} with config 'documents'")
+        except Exception as e:
+            logger.error(f"Failed to push dataset to Hub: {e}")
+            logger.error("Details of the exception:", exc_info=True)
+
+    else:
+        logger.info("Final dataset is empty. No push operation will be performed (should have been handled by initial empty Omeka data check).")
+
+    await conn_manager.close()
+
+
+# ---------------------------------------------------------------------------
+# Exécution CLI
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Publie les documents IWAC sur le Hub HF")
+    parser.add_argument("--repo", default="fmadore/iwac-documents", help="Repository Hugging Face où publier")
+    parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
+    args = parser.parse_args()
+
+    asyncio.run(build_and_push(Config(), repo=args.repo, shard_size=args.max_shard_size))
