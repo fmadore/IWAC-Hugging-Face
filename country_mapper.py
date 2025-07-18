@@ -57,6 +57,7 @@ COTE_DIVOIRE_NEWSPAPERS = [
     "Le Jour Plus",
     "Le Nouvel Horizon",
     "Le Patriote",
+    "Nord-Sud",
     "Notre Temps",
     "Notre Voie",
     "Plume Libre",
