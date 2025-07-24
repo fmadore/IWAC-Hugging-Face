@@ -4,7 +4,7 @@ calculate_word_count.py
 =======================
 
 Ajoute une colonne avec le nombre de mots à un dataset Hugging Face existant.
-Le script charge un dataset depuis le repository Hugging Face 'fmadore/iwac-newspaper-articles',
+Le script charge un dataset depuis le repository Hugging Face 'fmadore/islam-west-africa-collection',
 compte les mots dans la colonne 'OCR', et ajoute ces comptes dans une nouvelle
 colonne nommée 'nb_mots'. Le dataset mis à jour est ensuite poussé vers le Hub.
 
@@ -72,7 +72,7 @@ def main():
     logger = logging.getLogger(__name__)
 
     # Hardcoded values
-    repo_id = "fmadore/iwac-newspaper-articles"
+    repo_id = "fmadore/islam-west-africa-collection"
     text_column_fixed = "OCR"
     count_column_name = "nb_mots"  # Changed here
     max_shard_size = "1GB"

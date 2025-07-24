@@ -12,7 +12,7 @@ for config_name in configs:
     
     try:
         # Load the dataset with specific config from the unified IWAC dataset
-        dataset = load_dataset("fmadore/iwac-newspaper-articles", config_name)
+        dataset = load_dataset("fmadore/islam-west-africa-collection", config_name)
         
         # Access the data
         print(f"Dataset info for '{config_name}':")

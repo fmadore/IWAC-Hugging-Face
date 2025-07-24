@@ -109,7 +109,7 @@ def main():
     textstat.set_lang('fr') # Configurer la langue pour textstat globalement
 
     parser = argparse.ArgumentParser(description="Ajoute des colonnes de richesse lexicale ('Richesse_Lexicale_OCR') et de lisibilité ('Lisibilite_OCR') à un dataset Hugging Face, basées sur la colonne 'OCR'.")
-    parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles", help="ID du repository sur le Hugging Face Hub (ex: utilisateur/nom_dataset).")
+    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="ID du repository sur le Hugging Face Hub (ex: utilisateur/nom_dataset).")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille maximale des shards Parquet lors du push vers le Hub.")
     parser.add_argument("--batch-size", type=int, default=1000, help="Taille des batchs pour le traitement .map().")
     

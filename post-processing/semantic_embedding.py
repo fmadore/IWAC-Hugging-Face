@@ -16,7 +16,7 @@ Usage
     python post-processing/semantic_embedding.py [--repo MON_USER/MON_DATASET]
 
 Exemple:
-    python post-processing/semantic_embedding.py --repo fmadore/iwac-newspaper-articles
+    python post-processing/semantic_embedding.py --repo fmadore/islam-west-africa-collection
 
 Variables d'environnement
 ---------------------
@@ -231,7 +231,7 @@ def main():
     )
     parser.add_argument(
         "--repo", 
-        default="fmadore/iwac-newspaper-articles", 
+        default="fmadore/islam-west-africa-collection", 
         help="ID du repository sur le Hugging Face Hub (ex: utilisateur/nom_dataset)."
     )
     parser.add_argument(

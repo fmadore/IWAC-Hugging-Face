@@ -331,7 +331,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Ajoute des colonnes de modélisation de sujets à un dataset Hugging Face."
     )
-    parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles")
+    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection")
     parser.add_argument("--embedding-model", default="dangvantuan/sentence-camembert-base", 
                         help="Modèle d'embedding à utiliser (recommandé: sentence-camembert-base pour le français)")
     parser.add_argument("--min-topic-size", type=int, default=10)

@@ -11,7 +11,7 @@ stop‑words removed) and pushes the updated dataset back to the repository.
 Usage
 -----
     python lemmatize_update_hf.py \
-        --repo fmadore/iwac-newspaper-articles \
+        --repo fmadore/islam-west-africa-collection \
         --text-column OCR \
         --lemma-column lemma_text \
         --clean-column lemma_nostop \
@@ -144,7 +144,7 @@ def main():
     configure_logging()
 
     parser = argparse.ArgumentParser(description="Add lemmatised columns to a Hugging Face dataset")
-    parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles", help="Dataset repo on the Hugging Face Hub (e.g. fmadore/iwac-newspaper-articles)")
+    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="Dataset repo on the Hugging Face Hub (e.g. fmadore/islam-west-africa-collection)")
     parser.add_argument("--text-column", default="OCR", help="Name of the column containing the raw French text to process")
     parser.add_argument("--lemma-column", default="lemma_text", help="Column name for the lemmatised text")
     parser.add_argument("--clean-column", default="lemma_nostop", help="Column name for the lemmatised text with stop‑words removed")

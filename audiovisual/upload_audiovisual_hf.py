@@ -475,4 +475,4 @@ if __name__ == "__main__":
     parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
     args = parser.parse_args()
 
-    asyncio.run(build_and_push(Config(), repo="fmadore/iwac-newspaper-articles", shard_size=args.max_shard_size))
+    asyncio.run(build_and_push(Config(), repo="fmadore/islam-west-africa-collection", shard_size=args.max_shard_size))

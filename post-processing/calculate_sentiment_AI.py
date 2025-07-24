@@ -28,7 +28,7 @@ Usage
     python post-processing/calculate_sentiment_AI.py [--repo MON_USER/MON_DATASET] [--config-name CONFIG] [--text-column TEXT_COL] [--model MODEL]
 
 Exemple:
-    python post-processing/calculate_sentiment_AI.py --repo fmadore/iwac-newspaper-articles --config-name articles --model gemini
+    python post-processing/calculate_sentiment_AI.py --repo fmadore/islam-west-africa-collection --config-name articles --model gemini
 
 Variables d'environnement
 -------------------------
@@ -468,7 +468,7 @@ def main():
         logger.warning(f"Fichier .env non trouvé à {dotenv_path}. Assurez-vous que les clés API sont définies.")
 
     parser = argparse.ArgumentParser(description="Ajoute des colonnes d'analyse de sentiment via Gemini ou ChatGPT à un dataset Hugging Face.")
-    parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles", help="ID du repository sur le Hugging Face Hub (ex: utilisateur/nom_dataset).")
+    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="ID du repository sur le Hugging Face Hub (ex: utilisateur/nom_dataset).")
     parser.add_argument("--config-name", type=str, default=None, help="Nom de la configuration à traiter (ex: 'articles', 'publications'). Sera demandé si non fourni.")
     parser.add_argument("--text-column", default="OCR", help="Nom de la colonne contenant le texte à analyser.")
     parser.add_argument("--id-column", default="o:id", help="Nom de la colonne contenant les identifiants uniques pour le cache.")

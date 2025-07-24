@@ -3,14 +3,12 @@
 upload_documents_hf.py
 ======================
 
-Extrait les documents (resource_class_id = 49) depuis l'API Omeka S
-d'IWAC, les convertit en dataset Arrow/Parquet et les pousse sur le Hugging Face
-Hub.
+Extrait les documents (resource_class_id = 49) depuis l'API Omeka S d'IWAC, les convertit en dataset Arrow/Parquet et les pousse sur le Hugging Face Hub comme subset 'documents' du repository fmadore/islam-west-africa-collection.
 
 Usage
 -----
     python upload_documents_hf.py \
-        --repo fmadore/iwac-documents \
+        --repo fmadore/islam-west-africa-collection \
         --max-shard-size 1GB
 
 Variables d'environnement
@@ -18,8 +16,7 @@ Variables d'environnement
   OMEKA_BASE_URL        Base URL de l'API, ex. https://islam.zmo.de/api
   OMEKA_KEY_IDENTITY    Identité de la clé Omeka
   OMEKA_KEY_CREDENTIAL  Credential de la clé Omeka
-  HF_TOKEN              Jeton d'accès personnel Hugging Face (facultatif si
-                        vous appelez login() de manière interactive)
+  HF_TOKEN              Jeton d'accès personnel Hugging Face (facultatif si vous appelez login() de manière interactive)
 """
 
 import os
@@ -499,7 +496,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Publie les documents IWAC sur le Hub HF")
-    parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles", help="Repository Hugging Face où publier")
+    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="Repository Hugging Face où publier")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
     args = parser.parse_args()
 

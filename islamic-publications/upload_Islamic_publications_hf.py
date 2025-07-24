@@ -10,7 +10,7 @@ Hub.
 Usage
 -----
     python upload_Islamic_publications_hf.py \
-        --repo fmadore/iwac-newspaper-articles \
+        --repo fmadore/islam-west-africa-collection \
         --max-shard-size 1GB
 
 Variables d'environnement
@@ -240,70 +240,35 @@ def _get_value(item: Dict[str, Any], field: str) -> str:
 
 @async_retry(max_tries=3, exceptions=(aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError))
 async def fetch_iiif_thumbnail_url(omeka_id: Union[str, int], session: aiohttp.ClientSession) -> str:
-    """Tente de récupérer l'URL de la vignette depuis le manifest IIIF."""
-    # Assuming the IIIF manifest URL structure is consistent
-    manifest_url = f"https://islam.zmo.de/iiif/{omeka_id}/manifest"
+    """Fetches and extracts the thumbnail URL from an IIIF manifest."""
+    # Updated to match newspaper articles structure
+    manifest_url = f"https://islam.zmo.de/iiif/3/{omeka_id}/manifest"
+    thumbnail_url = ""
     try:
-        async with session.get(manifest_url) as resp:
-            resp.raise_for_status()
-            manifest_data = await resp.json()
-            
-            thumbnail_url = ""
-            # IIIF Presentation API 3.0: manifest.thumbnail is an array of objects
-            if isinstance(manifest_data.get("thumbnail"), list):
-                if manifest_data["thumbnail"]:
-                    thumb_obj = manifest_data["thumbnail"][0]
-                    if isinstance(thumb_obj, dict):
-                        thumbnail_url = thumb_obj.get("id", "")
-            # IIIF Presentation API 2.0: manifest.thumbnail is an object
-            elif isinstance(manifest_data.get("thumbnail"), dict):
-                thumbnail_url = manifest_data["thumbnail"].get("@id", "")
-            # Direct URL string
-            elif isinstance(manifest_data.get("thumbnail"), str):
-                 thumbnail_url = manifest_data.get("thumbnail")
-
-            # Fallback: try sequences -> canvases -> thumbnail or images -> resource @id
-            if not thumbnail_url and manifest_data.get("sequences"):
-                if manifest_data["sequences"] and isinstance(manifest_data["sequences"], list):
-                    seq = manifest_data["sequences"][0]
-                    if seq.get("canvases") and isinstance(seq["canvases"], list) and seq["canvases"]:
-                        can = seq["canvases"][0]
-                        # Check if canvas itself has a thumbnail
-                        if can.get("thumbnail"):
-                            if isinstance(can["thumbnail"], list) and can["thumbnail"]:
-                                 thumb_obj = can["thumbnail"][0]
-                                 if isinstance(thumb_obj, dict): thumbnail_url = thumb_obj.get("id", "")
-                            elif isinstance(can["thumbnail"], dict): thumbnail_url = can["thumbnail"].get("@id", "")
-                            elif isinstance(can["thumbnail"], str): thumbnail_url = can["thumbnail"]
-                        # Else, try images on canvas
-                        elif can.get("images") and isinstance(can["images"], list) and can["images"]:
-                            img = can["images"][0]
-                            if img.get("resource") and isinstance(img["resource"], dict) and img["resource"].get("@type") == "dctypes:Image":
-                                base_uri = img["resource"].get("@id", "")
-                                # Attempt to construct a common IIIF image API URL for a thumbnail
-                                if base_uri:
-                                    # Remove existing IIIF parameters if present to avoid duplication
-                                    base_uri = base_uri.split('/full/')[0].split('/square/')[0].split('/!')[0]
-                                    thumbnail_url = f"{base_uri}/full/!200,200/0/default.jpg"
-            
-            if thumbnail_url:
-                logger.debug(f"Found thumbnail for Omeka ID {omeka_id}: {thumbnail_url}")
-                return thumbnail_url
-            else:
-                logger.warning(f"Thumbnail not found in IIIF manifest for Omeka ID {omeka_id} at {manifest_url}")
-                return ""
-    except aiohttp.ClientResponseError as e:
-        if e.status == 404:
-            logger.warning(f"IIIF Manifest not found for Omeka ID {omeka_id} (404 at {manifest_url})")
-        else:
-            logger.error(f"HTTP error fetching IIIF manifest for {omeka_id}: {e.status} {e.message} at {manifest_url}")
-        return ""
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error for IIIF manifest for {omeka_id} at {manifest_url}: {e}")
-        return ""
-    except Exception as e:
-        logger.error(f"Unexpected error fetching thumbnail for {omeka_id} from {manifest_url}: {e}", exc_info=True)
-        return ""
+        # Use a shorter timeout for this specific, potentially numerous, request type
+        async with session.get(manifest_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                # It's crucial to handle potential JSONDecodeError here if the response is not valid JSON
+                try:
+                    manifest = await resp.json()
+                    thumbnails = manifest.get("thumbnail")
+                    if isinstance(thumbnails, list) and thumbnails:
+                        thumbnail_info = thumbnails[0]
+                        if isinstance(thumbnail_info, dict):
+                            thumbnail_url = thumbnail_info.get("id", "")
+                except json.JSONDecodeError as e_json:
+                    logger.warning(f"JSON decoding error for IIIF manifest {omeka_id}: {e_json}. URL: {manifest_url}")
+            # Log other non-200 responses that are not exceptions handled by async_retry
+            elif resp.status not in [408, 429, 500, 502, 503, 504]: # Avoid redundant logs for retryable http errors
+                logger.warning(f"IIIF manifest request for {omeka_id} returned status {resp.status}. URL: {manifest_url}")
+    except asyncio.TimeoutError: # Specifically catch timeout
+        logger.warning(f"Timeout fetching IIIF manifest for {omeka_id}. URL: {manifest_url}")
+    except aiohttp.ClientError as e_client: # Specifically catch client errors
+        logger.warning(f"Client error fetching IIIF manifest for {omeka_id}: {e_client}. URL: {manifest_url}")
+    # Catching general Exception for unexpected issues, though specific ones are better
+    except Exception as e_general:
+        logger.error(f"Unexpected error fetching IIIF manifest for {omeka_id}: {e_general}. URL: {manifest_url}")
+    return thumbnail_url
 
 def _to_int(value: str) -> Optional[int]:
     """Safely convert a string to an integer, returning None if conversion fails."""
@@ -363,21 +328,37 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
         extracted_fabio_url = fabio_has_url_data
     # If none of the above, extracted_fabio_url remains ""
 
-    # Fetch thumbnail URL
-    thumbnail_url = ""
-    if item.get("o:id"):
-        try:
-            session = await conn_manager.get()
-            thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
-        except Exception as e:
-            logger.error(f"Error fetching thumbnail for item {item['o:id']}: {e}")
-            thumbnail_url = ""
+    # Extract date when item was added to Omeka (YYYY-MM-DD format)
+    added_date = ""
+    if "o:created" in item and isinstance(item["o:created"], dict):
+        created_value = item["o:created"].get("@value", "")
+        if created_value:
+            try:
+                # Extract date part from ISO format (e.g., "2025-07-09T14:02:51+00:00" -> "2025-07-09")
+                added_date = created_value.split("T")[0]
+            except Exception:
+                logger.warning(f"Could not parse added date '{created_value}' for item {item['o:id']}")
 
+    # Fetch thumbnail URL and set IIIF manifest URL only if PDF exists
+    session = await conn_manager.get()
+    thumbnail_url = ""
+    iiif_manifest_url = ""
+    
+    if primary_url:  # Only fetch IIIF data if there's a PDF
+        try:
+            thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
+            iiif_manifest_url = f"https://islam.zmo.de/iiif/3/{item['o:id']}/manifest"
+        except Exception as e:
+            logger.error(f"Error fetching IIIF data for item {item['o:id']}: {e}")
+            thumbnail_url = ""
+            iiif_manifest_url = ""
 
     return {
         "o:id": item["o:id"],
         "identifier": _get_value(item, "dcterms:identifier"),
+        "added_date": added_date, # Date when item was added to Omeka
         "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
+        "iiif_manifest": iiif_manifest_url,
         "PDF": primary_url,
         "thumbnail": thumbnail_url, # Added thumbnail field
         "title": _get_value(item, "dcterms:title"),
@@ -424,7 +405,7 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
                 # For now, let's stick to a truly empty one if Omeka returns nothing and Hub is empty.
                 # Or, more robustly, define the expected columns for an empty dataset:
                 expected_cols = [
-                    "o:id", "identifier", "url", "PDF", "thumbnail", "title", "author", 
+                    "o:id", "identifier", "added_date", "url", "iiif_manifest", "PDF", "thumbnail", "title", "author", 
                     "newspaper", "country", "pub_date", "issue", "subject", "spatial", 
                     "language", "nb_pages", "URL", "source", "OCR"
                 ]
@@ -434,7 +415,7 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
             logger.warning(f"Could not load existing dataset from {repo} to determine schema (error: {e_load_meta}). Will push a truly empty dataset if no Omeka items.")
             # Define a minimal or full schema if dataset doesn't exist at all
             expected_cols = [
-                "o:id", "identifier", "url", "PDF", "thumbnail", "title", "author", 
+                "o:id", "identifier", "added_date", "url", "iiif_manifest", "PDF", "thumbnail", "title", "author", 
                 "newspaper", "country", "pub_date", "issue", "subject", "spatial", 
                 "language", "nb_pages", "URL", "source", "OCR"
             ] # Ensure 'o:id' is present for consistency
@@ -588,9 +569,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Publie les publications islamiques IWAC sur le Hub HF") # Updated description
-    parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles", help="Dataset repo on the Hugging Face Hub (e.g. fmadore/iwac-islamic-publications or fmadore/iwac-newspaper-articles)") # Kept default as per user, but updated help text
+    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="Dataset repo on the Hugging Face Hub (e.g. fmadore/islam-west-africa-collection)")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
     args = parser.parse_args()
 
-    # The repo argument from CLI will be used. If user wants fmadore/iwac-islamic-publications, they should pass it.
+    # The repo argument from CLI will be used. If user wants fmadore/islam-west-africa-collection, they should pass it.
     asyncio.run(build_and_push(Config(), repo=args.repo, shard_size=args.max_shard_size))
