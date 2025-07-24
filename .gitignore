@@ -1,6 +1,7 @@
 .env
 .venv
 .cache_omk
+.cache_omk_audiovisual
 .cache_omk_documents
 .cache_omk_index
 __pycache__
