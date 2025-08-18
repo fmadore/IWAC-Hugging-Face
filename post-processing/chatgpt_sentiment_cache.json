@@ -42597,13 +42597,13 @@
     "analysis_error": null
   },
   "9608": {
-    "centralite_islam_musulmans": "Non abordé",
-    "centralite_justification": "Texte de l'article non fourni ou vide.",
-    "subjectivite_score": null,
-    "subjectivite_justification": "Non applicable car le texte de l'article est vide.",
-    "polarite": "Non applicable",
-    "polarite_justification": "Non applicable car le texte de l'article est vide.",
-    "analysis_error": "Texte vide fourni pour analyse"
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte est un message officiel de l'Union Islamique du Bénin adressé aux musulmans à l'occasion de l'Aïd-el-Fitr, centrant entièrement le discours sur l'islam et la communauté musulmane.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le message est principalement factuel et religieux, avec des éléments de prière et d'encouragements, ce qui introduit une légère subjectivité liée à la foi et aux valeurs spirituelles.",
+    "polarite": "Positif",
+    "polarite_justification": "Le texte véhicule un message positif d'unité, de paix, de foi et de célébration, tout en condamnant la violence et en appelant à la paix.",
+    "analysis_error": null
   },
   "9609": {
     "centralite_islam_musulmans": "Très central",
@@ -95748,6 +95748,186 @@
     "subjectivite_justification": "Le texte est principalement factuel et descriptif, rapportant les événements et les paroles du maire et des imams sans exprimer d'opinions personnelles marquées, bien qu'il y ait une légère valorisation positive de l'initiative.",
     "polarite": "Positif",
     "polarite_justification": "L'article présente l'islam et les musulmans de manière favorable, soulignant la cohésion sociale, la piété et les bénédictions, sans critique ni connotation négative.",
+    "analysis_error": null
+  },
+  "73534": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte porte principalement sur une organisation islamique (CNI) et ses représentants, ainsi que sur des événements liés à la communauté musulmane.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est majoritairement factuel avec des citations directes et peu d'opinions personnelles, mais contient quelques jugements modérés comme l'invitation à se défaire de la politique.",
+    "polarite": "Neutre",
+    "polarite_justification": "Le texte relate des faits et des revendications sans ton clairement favorable ou défavorable, présentant une situation administrative et des positions internes sans jugement marqué.",
+    "analysis_error": null
+  },
+  "73535": {
+    "centralite_islam_musulmans": "Secondaire",
+    "centralite_justification": "L'islam est mentionné principalement à travers la cérémonie de prières et la lecture du Coran, mais le texte se concentre surtout sur la politique locale et la reconnaissance envers le président.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est plutôt factuel avec des citations directes et peu d'opinions personnelles, bien que la reconnaissance à Dieu introduise une légère subjectivité.",
+    "polarite": "Neutre",
+    "polarite_justification": "Le traitement de l'islam est respectueux et factuel, sans jugement ni tonalité positive ou négative marquée.",
+    "analysis_error": null
+  },
+  "73536": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte est entièrement consacré à une manifestation religieuse musulmane et aux enseignements liés à l'islam.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte présente principalement des faits et des citations directes du Cheick Malik Konaté, avec une légère présence d'opinions religieuses exprimées comme des enseignements.",
+    "polarite": "Positif",
+    "polarite_justification": "Le texte valorise la célébration religieuse et met en avant l'importance spirituelle de la prière sur le prophète, sans critique ni jugement négatif.",
+    "analysis_error": null
+  },
+  "73537": {
+    "centralite_islam_musulmans": "Marginal",
+    "centralite_justification": "Le texte mentionne l'islam uniquement dans une citation concernant Jean-Marie Le Pen, sans que ce soit le sujet principal.",
+    "subjectivite_score": 4,
+    "subjectivite_justification": "Le texte exprime clairement des jugements et critiques sur les propos de Mamadou Koulibaly, avec un ton engagé et des opinions marquées.",
+    "polarite": "Négatif",
+    "polarite_justification": "Le texte critique fortement les propos de Mamadou Koulibaly et les associe à un risque pour la cohésion sociale, ce qui donne une tonalité négative.",
+    "analysis_error": null
+  },
+  "73538": {
+    "centralite_islam_musulmans": "Marginal",
+    "centralite_justification": "Le texte mentionne brièvement deux lieux de culte pour la communauté musulmane dans le cadre d'un projet immobilier, sans approfondir le sujet de l'islam ou des musulmans.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est principalement factuel avec une légère nuance subjective dans l'expression de confiance du commandant, mais le traitement de la communauté musulmane est neutre et informatif.",
+    "polarite": "Neutre",
+    "polarite_justification": "La mention des lieux de culte pour la communauté musulmane est factuelle et équilibrée, sans jugement positif ou négatif apparent.",
+    "analysis_error": null
+  },
+  "73539": {
+    "centralite_islam_musulmans": "Marginal",
+    "centralite_justification": "L'islam est mentionné brièvement en lien avec la vie communautaire de la personne interviewée, sans être le sujet principal.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est principalement factuel et narratif, avec quelques éléments subjectifs liés aux sentiments et expériences personnelles de l'interviewée.",
+    "polarite": "Neutre",
+    "polarite_justification": "La mention de l'islam est neutre, simplement descriptive de la vie sociale de la personne, sans jugement ni connotation positive ou négative.",
+    "analysis_error": null
+  },
+  "73540": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "Le texte met en avant la communauté musulmane locale et les actions liées au Ramadan, un moment religieux important.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est majoritairement factuel avec des descriptions d'événements et de discours officiels, mais contient quelques expressions valorisantes et de gratitude.",
+    "polarite": "Positif",
+    "polarite_justification": "Le ton est favorable, soulignant la solidarité, le soutien des autorités et la cohésion sociale autour de la communauté musulmane.",
+    "analysis_error": null
+  },
+  "73541": {
+    "centralite_islam_musulmans": "Non abordé",
+    "centralite_justification": "Le texte ne mentionne ni l'islam ni les musulmans dans son contenu.",
+    "subjectivite_score": null,
+    "subjectivite_justification": "Non applicable car le sujet n'est pas abordé.",
+    "polarite": "Non applicable",
+    "polarite_justification": "Non applicable car le sujet n'est pas abordé.",
+    "analysis_error": null
+  },
+  "73542": {
+    "centralite_islam_musulmans": "Secondaire",
+    "centralite_justification": "L'islam et les musulmans sont mentionnés brièvement, notamment lors d'un don à l'occasion du ramadan, mais ne constituent pas le sujet principal de l'entretien.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est majoritairement factuel et descriptif, avec quelques jugements positifs modérés sur le Premier ministre, mais l'évocation de l'islam reste factuelle et limitée.",
+    "polarite": "Neutre",
+    "polarite_justification": "La mention de l'islam est neutre et factuelle, sans jugement positif ou négatif marqué, se limitant à un don et à la participation aux cérémonies communautaires.",
+    "analysis_error": null
+  },
+  "73543": {
+    "centralite_islam_musulmans": "Secondaire",
+    "centralite_justification": "L'islam et les musulmans sont évoqués principalement dans le contexte de la coexistence religieuse et de la tolérance, mais ce n'est pas le sujet principal de l'interview.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Le texte mêle des faits (retour d'exil, situation politique) et des opinions personnelles sur la paix, la réconciliation et la coexistence religieuse, ce qui justifie un score mixte.",
+    "polarite": "Positif",
+    "polarite_justification": "Le discours valorise la tolérance entre musulmans et chrétiens, la paix et la réconciliation, avec un ton favorable à l'harmonie sociale et à l'intégration des différentes confessions religieuses.",
+    "analysis_error": null
+  },
+  "73544": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "Le texte évoque explicitement des violences ciblant des individus de confession musulmane, notamment dans le contexte des tueries de 2000 en Côte d'Ivoire.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Le texte combine des faits historiques précis avec des opinions et jugements sur les événements, notamment sur la nature des violences et l'impunité, ce qui crée un équilibre entre objectivité et subjectivité.",
+    "polarite": "Négatif",
+    "polarite_justification": "La représentation de l'islam et des musulmans est associée à des violences, des massacres et une injustice persistante, ce qui confère une tonalité clairement défavorable et critique au texte.",
+    "analysis_error": null
+  },
+  "73545": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte est entièrement centré sur une figure prétendument musulmane et son rapport à l'islam et à la communauté musulmane.",
+    "subjectivite_score": 5,
+    "subjectivite_justification": "Le texte est très subjectif, utilisant un ton accusateur, des jugements moraux sévères et des attaques personnelles sans neutralité.",
+    "polarite": "Très négatif",
+    "polarite_justification": "Le texte présente une critique très dure et négative envers la personne et, par extension, une vision conflictuelle de l'islam et des musulmans impliqués, avec des accusations graves et un ton alarmiste.",
+    "analysis_error": null
+  },
+  "73546": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte se concentre principalement sur les étudiants musulmans et les violences qu'ils subissent, faisant de l'islam et des musulmans le sujet principal.",
+    "subjectivite_score": 4,
+    "subjectivite_justification": "Le texte présente des jugements clairs et un ton engagé, dénonçant des actes de violence et d'injustice, ce qui indique une subjectivité plutôt marquée.",
+    "polarite": "Négatif",
+    "polarite_justification": "Le texte dénonce des violences et des agressions ciblées contre les étudiants musulmans, ce qui confère une tonalité défavorable et critique au traitement du sujet.",
+    "analysis_error": null
+  },
+  "73547": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte est entièrement centré sur la célébration de la Nuit du Destin, un événement religieux majeur pour les musulmans, et traite largement de la foi islamique et de la communauté musulmane en Côte d'Ivoire.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Le discours mêle des faits religieux et historiques avec des opinions et des jugements sur la situation sociopolitique ivoirienne, montrant un équilibre entre objectivité et subjectivité.",
+    "polarite": "Positif",
+    "polarite_justification": "Le texte valorise la foi islamique, la cohésion et la fraternité au sein de la communauté musulmane, tout en appelant à la paix et à la réconciliation, ce qui donne une tonalité globalement favorable et constructive.",
+    "analysis_error": null
+  },
+  "73548": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte est entièrement consacré à la description des rites du pèlerinage islamique, un pilier fondamental de l'islam, et traite directement des pratiques des musulmans.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est principalement factuel et descriptif, présentant des informations précises sur les rites et conditions du pèlerinage, avec quelques conseils pratiques, ce qui introduit une légère subjectivité.",
+    "polarite": "Positif",
+    "polarite_justification": "Le texte valorise le pèlerinage en insistant sur son importance et en donnant des recommandations pour bien l'accomplir, ce qui reflète une tonalité favorable et respectueuse envers l'islam et les musulmans.",
+    "analysis_error": null
+  },
+  "73549": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte est entièrement centré sur un événement religieux musulman et les propos d'un leader musulman concernant la communauté musulmane.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte rapporte principalement des faits et des citations directes du Cheick Fofana, avec un ton plutôt objectif et peu d'opinions personnelles de l'auteur.",
+    "polarite": "Positif",
+    "polarite_justification": "Le discours met en avant des messages d'union, de respect mutuel et de rassemblement au sein de la communauté musulmane, ce qui est favorable et valorisant.",
+    "analysis_error": null
+  },
+  "73550": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte est entièrement consacré à l'organisation et au déroulement du pèlerinage islamique, un pilier fondamental de l'islam.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est majoritairement factuel avec des informations précises sur les vols et les pèlerins, bien que quelques citations expriment des opinions sur la gestion gouvernementale.",
+    "polarite": "Neutre",
+    "polarite_justification": "Le texte présente les faits et les difficultés rencontrées sans jugement excessif ni tonalité alarmiste ou élogieuse.",
+    "analysis_error": null
+  },
+  "73551": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte traite principalement du pèlerinage musulman (Hadj) et des difficultés rencontrées par les musulmans pour effectuer ce voyage.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est majoritairement factuel avec des informations précises sur la situation, mais inclut quelques éléments émotionnels comme le décès d'une candidate et le stress des pèlerins.",
+    "polarite": "Négatif",
+    "polarite_justification": "Le ton est plutôt défavorable, soulignant les problèmes, les menaces sur le Hadj et les conséquences tragiques liées à la situation.",
+    "analysis_error": null
+  },
+  "73552": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte traite exclusivement du pèlerinage islamique et des musulmans ivoiriens concernés par les difficultés rencontrées.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Le texte mêle des faits précis (dates, montants, décisions officielles) à des expressions de ressentis et jugements (dramatique, déploré, frustration), indiquant un équilibre entre objectivité et subjectivité.",
+    "polarite": "Négatif",
+    "polarite_justification": "Le ton général est critique et met en lumière des difficultés, des échecs organisationnels et des frustrations liées à l'impossibilité pour les pèlerins d'accomplir leur rite religieux.",
+    "analysis_error": null
+  },
+  "73553": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte traite exclusivement des musulmans et de l'organisation du hadj, un événement religieux majeur.",
+    "subjectivite_score": 4,
+    "subjectivite_justification": "Le texte contient des accusations claires, des jugements et des critiques exprimées par la CJICI, ce qui indique une forte subjectivité.",
+    "polarite": "Négatif",
+    "polarite_justification": "Le ton est critique envers l'Etat et les responsables, dénonçant des manquements et des fautes dans l'organisation du hadj.",
     "analysis_error": null
   }
 }
