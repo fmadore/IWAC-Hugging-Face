@@ -96019,5 +96019,95 @@
     "polarite": "Positif",
     "polarite_justification": "Le texte valorise la spiritualité, l'unité et la cohésion des musulmans, sans critique ni jugement négatif.",
     "analysis_error": null
+  },
+  "73567": {
+    "centralite_islam_musulmans": "Secondaire",
+    "centralite_justification": "Le texte n'a pas pour objet principal l'islam mais contient des prières et une citation coranique qui mobilisent une référence religieuse notable.",
+    "subjectivite_score": 4,
+    "subjectivite_justification": "Formulations de soutien moral, invocations et appels religieux exprimant des croyances et des souhaits personnels, donc plutôt subjectif.",
+    "polarite": "Positif",
+    "polarite_justification": "Ton bienveillant et de soutien (souhaits de rétablissement, prières pour miséricorde) exprimant une attitude favorable.",
+    "analysis_error": null
+  },
+  "73568": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte porte exclusivement sur un rassemblement religieux à la grande mosquée et les discours des responsables musulmans concernant l'héritage du Prophète et la communauté musulmane.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Le compte rendu rapporte majoritairement des déclarations laudatives et prescriptives des imams (subjectives) mais reste un reportage factuel des propos tenus, mélangeant faits et opinions.",
+    "polarite": "Positif",
+    "polarite_justification": "Les propos rapportés valorisent l'islam, le Prophète et l'unité communautaire, et appellent à la paix et à la tolérance, sans critique ni attaque.",
+    "analysis_error": null
+  },
+  "73569": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte décrit exclusivement des cérémonies religieuses musulmanes, des prédications et des enseignements sur l'islam à Gagnoa.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Mélange de reportage factuel (lieux, dates, événements) et de déclarations normatives issues de prédicateurs qui expriment des opinions/religieuses positives.",
+    "polarite": "Positif",
+    "polarite_justification": "Les citations et le ton valorisent l'islam (paix, cohésion sociale, bonté, amour) sans critique ni connotation négative.",
+    "analysis_error": null
+  },
+  "73570": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte a pour thème principal « L'islam et les droits de l'homme » et porte directement sur l'image et le comportement des musulmans.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Mélange d'informations factuelles (annonce, conférence) et de déclarations d'acteurs (opinions de l'Amir) présentant un équilibre faits/opinions.",
+    "polarite": "Positif",
+    "polarite_justification": "Le texte défend l'islam en affirmant que ses enseignements respectent les droits de l'homme et explique que les manquements relèvent des musulmans eux-mêmes, adoptant un registre globalement favorable à l'islam.",
+    "analysis_error": null
+  },
+  "73571": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte porte principalement sur l'initiative du Conseil national Islamique et la scolarisation de la jeunesse musulmane, avec plusieurs mentions institutionnelles de la communauté musulmane.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Texte majoritairement factuel décrivant projets, partenariats et financements, avec quelques déclarations positives des responsables rapportées par des citations.",
+    "polarite": "Positif",
+    "polarite_justification": "Présentation favorable des actions de la communauté musulmane (construction d'établissements, financement, partenariat) sans critique ni connotation négative.",
+    "analysis_error": null
+  },
+  "73572": {
+    "centralite_islam_musulmans": "Secondaire",
+    "centralite_justification": "Les musulmans sont mentionnés comme l'une des associations de jeunesse participant à une plate-forme, sans être le sujet principal de l'article.",
+    "subjectivite_score": 1,
+    "subjectivite_justification": "Texte majoritairement factuel et descriptif rapportant événements et déclarations sans ton émotionnel ni jugements.",
+    "polarite": "Neutre",
+    "polarite_justification": "La mention des musulmans est informative et non valorisante ni critique, présentant une coopération interconfessionnelle.",
+    "analysis_error": null
+  },
+  "73573": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article porte essentiellement sur un événement organisé par une association musulmane et une conférence sur l'éducation islamique animée par un imam.",
+    "subjectivite_score": 4,
+    "subjectivite_justification": "Le texte restitue principalement des prises de position normatives de l'imam (jugements sur les « anti valeurs », appel à la conformité aux préceptes divins), donc plutôt subjectif.",
+    "polarite": "Positif",
+    "polarite_justification": "La représentation valorise l'islam et ses guides (conférence, appel moral, rôle des parents et des imams) et présente les intervenants de manière favorable.",
+    "analysis_error": null
+  },
+  "73574": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte porte principalement sur les fidèles musulmans de Bouaké et leurs préparatifs et souhaits pour le pèlerinage à la Mecque.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Récit principalement factuel des événements et déclarations, avec quelques expressions de soutien rapportées sans tonalité argumentative.",
+    "polarite": "Positif",
+    "polarite_justification": "Le contenu met en avant des souhaits de réussite, du soutien aux empêchés et des bénédictions, ce qui véhicule une tonalité favorable.",
+    "analysis_error": null
+  },
+  "73575": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte porte principalement sur l'Association des femmes patriotes musulmanes et ses actions tenues au Centre islamique, plaçant l'islam/la communauté musulmane au centre du récit.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Récit majoritairement factuel (compte rendu d'une conférence) avec quelques déclarations et opinions rapportées de la présidente; tonalité plutôt objective.",
+    "polarite": "Positif",
+    "polarite_justification": "Le contenu met en avant un soutien explicite à l'accord de paix, la promotion de la paix et une motion de soutien au couple présidentiel, présentant la communauté musulmane de manière favorable.",
+    "analysis_error": null
+  },
+  "73576": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "Le texte s'adresse directement aux Imams et aux musulmans et évoque explicitement l'islam comme religion de paix, en les appelant à s'impliquer dans la paix.",
+    "subjectivite_score": 4,
+    "subjectivite_justification": "Tonalité persuasive et normative avec des déclarations valorisantes et des appels à l'engagement religieux pour la paix plutôt que des énoncés purement factuels.",
+    "polarite": "Positif",
+    "polarite_justification": "Présentation favorable de l'islam (qualifié de religion de paix) et appel valorisant aux musulmans pour contribuer à la paix.",
+    "analysis_error": null
   }
 }
