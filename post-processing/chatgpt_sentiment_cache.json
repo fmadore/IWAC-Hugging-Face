@@ -95929,5 +95929,95 @@
     "polarite": "Négatif",
     "polarite_justification": "Le ton est critique envers l'Etat et les responsables, dénonçant des manquements et des fautes dans l'organisation du hadj.",
     "analysis_error": null
+  },
+  "73557": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte traite principalement du Hajj, un événement religieux majeur de l'islam, et des musulmans qui y participent.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est majoritairement factuel avec des descriptions précises des mesures prises et des événements, bien que quelques appréciations positives sur la gestion soient présentes.",
+    "polarite": "Positif",
+    "polarite_justification": "Le texte met en avant les efforts et les innovations pour assurer la sécurité et la qualité du Hajj, soulignant un succès et une amélioration par rapport aux années précédentes.",
+    "analysis_error": null
+  },
+  "73558": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "Le texte traite principalement de l'organisation du Hadj, un événement islamique majeur, et des responsabilités des autorités islamiques et étatiques.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Le texte présente à la fois des faits (dates, documents officiels) et des accusations/opinions exprimées par le vice-président du CNI, ce qui reflète un équilibre entre objectivité et subjectivité.",
+    "polarite": "Négatif",
+    "polarite_justification": "Le ton est critique envers les autorités étatiques et certaines structures impliquées dans l'organisation du Hadj, soulignant des manquements et des dysfonctionnements.",
+    "analysis_error": null
+  },
+  "73559": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte est entièrement consacré à la communauté musulmane, à l'intronisation d'un imam et aux valeurs religieuses liées à l'islam.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte présente principalement des faits et déclarations officielles avec un ton plutôt objectif, bien que quelques jugements positifs sur la cohésion et la discipline soient exprimés.",
+    "polarite": "Positif",
+    "polarite_justification": "Le texte valorise la réconciliation, l'unité et la discipline au sein de la communauté musulmane, avec un ton favorable et respectueux envers l'islam et ses représentants.",
+    "analysis_error": null
+  },
+  "73560": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte est centré sur la visite du guide religieux Check Boikary Fofana et la promotion de l'islam et de la communauté musulmane dans la région.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Le texte mélange des faits (rencontre, discours) et des opinions exprimées par le guide religieux et d'autres acteurs, avec un ton globalement équilibré.",
+    "polarite": "Positif",
+    "polarite_justification": "Le traitement de l'islam et des musulmans est favorable, mettant en avant la cohésion, la paix, la solidarité et le rôle positif de la communauté musulmane.",
+    "analysis_error": null
+  },
+  "73561": {
+    "centralite_islam_musulmans": "Secondaire",
+    "centralite_justification": "L'islam est évoqué principalement dans le cadre des rites funéraires, sans être le sujet principal du texte.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est majoritairement factuel avec des descriptions précises des événements, mais inclut quelques jugements de valeur et émotions exprimées par les proches.",
+    "polarite": "Neutre",
+    "polarite_justification": "La représentation de l'islam est factuelle et respectueuse, centrée sur les rites et les bénédictions, sans jugement positif ou négatif marqué.",
+    "analysis_error": null
+  },
+  "73562": {
+    "centralite_islam_musulmans": "Secondaire",
+    "centralite_justification": "L'islam et les musulmans sont mentionnés principalement dans le cadre des festivités de la radio, mais ce n'est pas le sujet principal du texte.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est majoritairement factuel avec des descriptions précises des activités et projets de la radio, mais inclut quelques expressions subjectives positives sur les réussites et ambitions.",
+    "polarite": "Neutre",
+    "polarite_justification": "Le traitement de l'islam et des musulmans est factuel et respectueux, sans jugement positif ou négatif marqué, se limitant à la description des événements liés à la célébration.",
+    "analysis_error": null
+  },
+  "73563": {
+    "centralite_islam_musulmans": "Secondaire",
+    "centralite_justification": "L'islam est mentionné principalement dans le cadre des rites funéraires, mais le texte se concentre surtout sur la cérémonie et le soutien à la famille.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est majoritairement factuel avec une description des événements et des participants, bien que quelques termes comme 'fortement appréciée' introduisent une légère subjectivité.",
+    "polarite": "Neutre",
+    "polarite_justification": "Le texte présente les faits de manière équilibrée sans jugement positif ou négatif marqué envers l'islam ou les musulmans.",
+    "analysis_error": null
+  },
+  "73564": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte est entièrement consacré à une radio confessionnelle musulmane et à son rôle dans la communauté musulmane en Côte d'Ivoire.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte présente principalement des faits et des déclarations officielles avec un ton plutôt objectif, bien que quelques appréciations positives soient exprimées.",
+    "polarite": "Positif",
+    "polarite_justification": "Le texte valorise la radio Al Bayane et son impact positif sur la communauté musulmane, soulignant son importance et les ambitions futures sans critique ni jugement négatif.",
+    "analysis_error": null
+  },
+  "73565": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte porte principalement sur le rôle du COSIM et des imams dans l'organisation spirituelle du Hadj, un pilier fondamental de l'islam.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est majoritairement factuel avec des déclarations officielles du COSIM, bien que certaines opinions sur les responsabilités soient exprimées.",
+    "polarite": "Neutre",
+    "polarite_justification": "Le texte expose des faits et critiques sur l'organisation du Hadj sans ton alarmiste ni élogieux, adoptant un registre informatif et équilibré.",
+    "analysis_error": null
+  },
+  "73566": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte est entièrement consacré à une journée islamique et aux enseignements liés à la Tidjania, une confrérie musulmane.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte présente principalement des faits et des citations officielles avec un ton plutôt objectif, bien que quelques expressions valorisantes soient présentes.",
+    "polarite": "Positif",
+    "polarite_justification": "Le texte valorise la spiritualité, l'unité et la cohésion des musulmans, sans critique ni jugement négatif.",
+    "analysis_error": null
   }
 }
