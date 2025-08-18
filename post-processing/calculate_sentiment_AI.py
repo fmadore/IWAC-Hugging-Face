@@ -126,64 +126,23 @@ def save_cache(cache_file_path: Path, cache_data: Dict[str, Any], logger: loggin
         logger.error(f"Erreur lors de la sauvegarde du cache dans {cache_file_path}: {e}")
 
 # Prompt pour l'analyse de sentiment (utilisé pour les deux modèles)
+PROMPT_MD_RELATIVE_PATH = os.path.join("prompts", "sentiment_prompt.md")
+
+def _load_base_prompt() -> str:
+    """Load the reusable base prompt instructions from the markdown file once."""
+    try:
+        base_dir = Path(__file__).resolve().parent
+        prompt_path = base_dir / PROMPT_MD_RELATIVE_PATH
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        return f"[ERREUR: impossible de charger le fichier de prompt: {e}]"
+
+_BASE_PROMPT_MD = _load_base_prompt()
+
 def create_sentiment_prompt(article_text: str) -> str:
-    prompt = f'''
-    Vous êtes un expert en analyse de sentiments, spécialisé dans l'étude des représentations de l'islam et des musulmans dans les médias, notamment en Afrique de l'Ouest francophone. Votre tâche est d'analyser le texte fourni sous cet angle spécifique et de renvoyer une analyse structurée en JSON.
-
-    Votre analyse doit spécifiquement évaluer comment l'islam et/ou les musulmans sont dépeints ou représentés dans l'article. La subjectivité et la polarité doivent être jugées par rapport à cette représentation. Si l'islam et les musulmans ne sont qu'un sujet marginal ou non pertinent dans l'article, indiquez-le clairement.
-
-    Pour le texte de l'article suivant :
-    ---
-    {article_text}
-    ---
-
-    Veuillez fournir les informations suivantes au format JSON respectant le schéma Pydantic SentimentAnalysisOutput:
-    {{
-      "centralite_islam_musulmans": "<Très central | Central | Secondaire | Marginal | Non abordé>",
-      "centralite_justification": "<Courte justification (1 phrase) expliquant le niveau de centralité de l'islam/des musulmans dans l'article>",
-      "subjectivite_score": <score_de_1_a_5_ou_null_si_non_aborde>,
-      "subjectivite_justification": "<justification_en_1_2_phrases expliquant pourquoi ce score de subjectivité a été attribué concernant la manière dont l'article traite de l'islam et/ou des musulmans, ou 'Non applicable si le sujet n'est pas abordé'>",
-      "polarite": "<Très positif | Positif | Neutre | Négatif | Très négatif | Non applicable>",
-      "polarite_justification": "<justification_en_1_2_phrases expliquant pourquoi cette polarité a été attribuée en ce qui concerne le portrait de l'islam et/ou des musulmans dans l'article, ou 'Non applicable si le sujet n'est pas abordé'>"
-    }}
-
-    Voici les barèmes à utiliser :
-
-    Centralité de l'islam et des musulmans dans l'article :
-    - Très central : L'article est principalement ou entièrement consacré à l'islam et/ou aux musulmans.
-    - Central : L'islam et/ou les musulmans sont un des sujets principaux de l'article.
-    - Secondaire : L'islam et/ou les musulmans sont mentionnés ou discutés, mais ne constituent pas le focus principal de l'article.
-    - Marginal : L'islam et/ou les musulmans sont brièvement mentionnés de manière anecdotique ou périphérique.
-    - Non abordé : L'article ne traite pas du tout de l'islam ou des musulmans.
-
-    Subjectivité (note de 1 à 5) – Évaluez le degré d'objectivité/subjectivité de l'article DANS SA MANIÈRE DE REPRÉSENTER l'islam et/ou les musulmans (Attribuez 'null' si 'Non abordé' pour la centralité) :
-    1 : Très objectif (rapporte des faits vérifiables sur l'islam/les musulmans sans exprimer d'opinions ou de sentiments personnels à leur sujet, style purement informatif sur ce thème).
-    2 : Plutôt objectif (principalement factuel concernant l'islam/les musulmans, mais peut contenir des traces subtiles d'opinions ou des choix de mots suggérant une perspective limitée sur ce thème).
-    3 : Mixte (contient un mélange équilibré de faits et d'opinions/sentiments personnels concernant l'islam/les musulmans, ou présente plusieurs points de vue sur ce thème).
-    4 : Plutôt subjectif (exprime clairement des opinions, des sentiments ou des jugements sur l'islam/les musulmans, même s'il s'appuie sur certains faits pour les étayer).
-    5 : Très subjectif (fortement biaisé dans sa représentation de l'islam/des musulmans, exprime des opinions et des émotions intenses à leur sujet, avec peu ou pas de présentation objective des faits, style éditorial ou billet d'humeur sur ce thème).
-
-    Polarité – Évaluez le sentiment général exprimé DANS L'ARTICLE ENVERS l'islam et/ou les musulmans, ou concernant leur représentation (Attribuez 'Non applicable' si 'Non abordé' pour la centralité) :
-    - Très positif : Le portrait de l'islam/des musulmans est extrêmement favorable, enthousiaste, élogieux.
-    - Positif : Le portrait de l'islam/des musulmans est favorable, optimiste.
-    - Neutre : Pas de sentiment clair envers l'islam/des musulmans ou équilibre entre aspects positifs et négatifs dans leur représentation ; ton factuel sans charge émotionnelle marquée à leur égard.
-    - Négatif : Le portrait de l'islam/des musulmans est défavorable, critique, pessimiste.
-    - Très négatif : Le portrait de l'islam/des musulmans est extrêmement défavorable, alarmiste, très critique.
-
-    Si la centralité est "Non abordé", le "subjectivite_score" doit être null, et "polarite", "subjectivite_justification", et "polarite_justification" doivent être "Non applicable". Le JSON doit toujours être valide.
-    Par exemple, si "centralite_islam_musulmans" est "Non abordé":
-    {{
-      "centralite_islam_musulmans": "Non abordé",
-      "centralite_justification": "L'article ne mentionne ni l'islam ni les musulmans.",
-      "subjectivite_score": null,
-      "subjectivite_justification": "Non applicable car le sujet n'est pas abordé.",
-      "polarite": "Non applicable",
-      "polarite_justification": "Non applicable car le sujet n'est pas abordé."
-    }}
-
-    Assurez-vous que votre réponse est uniquement le JSON structuré demandé, sans texte ou formatage supplémentaire avant ou après le JSON.
-    '''
-    return prompt
+    """Compose the final prompt by embedding the article text after the base instructions."""
+    return f"{_BASE_PROMPT_MD}\n\nTexte à analyser:\n---\n{article_text}\n---\n\nRetournez uniquement le JSON demandé."
 
 def analyze_text_with_gemini(
     article_text: str,
