@@ -98,7 +98,8 @@ class SentimentAnalysisOutput(BaseModel):
 
 # --- Model Configuration ---
 GEMINI_MODEL_NAME = "gemini-2.5-flash"
-CHATGPT_MODEL_NAME = "gpt-4.1-mini"
+# Updated to use the newer ChatGPT 5 mini model
+CHATGPT_MODEL_NAME = "gpt-5-mini"
 
 # --- Cache Configuration ---
 GEMINI_CACHE_FILE_DEFAULT_NAME = "gemini_sentiment_cache.json"
@@ -258,7 +259,7 @@ def analyze_text_with_chatgpt(
     initial_backoff: int = 5
 ) -> Dict[str, Any]:
     """
-    Analyse le sentiment d'un texte d'article en utilisant l'API ChatGPT (OpenAI gpt-4.1-mini).
+    Analyse le sentiment d'un texte d'article en utilisant l'API ChatGPT (OpenAI gpt-5-mini).
     Retourne un dictionnaire avec les champs de SentimentAnalysisOutput et un champ 'analysis_error'.
     """
     default_error_result = {
@@ -291,44 +292,99 @@ def analyze_text_with_chatgpt(
 
     prompt_content = create_sentiment_prompt(article_text)
 
+    # Nous utilisons maintenant l'API Responses (client.responses.create) avec la configuration demandée.
+    system_preamble = (
+        "Vous êtes un expert en analyse de sentiments. "
+        "Analysez le texte fourni et retournez UNIQUEMENT un objet JSON respectant strictement le schéma : "
+        "{centralite_islam_musulmans:str, centralite_justification:str, subjectivite_score:int|nul, "
+        "subjectivite_justification:str, polarite:str, polarite_justification:str}. "
+        "Aucun texte hors JSON."
+    )
+
+    def _extract_json(text: str) -> Dict[str, Any]:
+        """Tente de parser directement, sinon isole la première/dernière accolade."""
+        if not text:
+            raise ValueError("Réponse vide")
+        try:
+            return json.loads(text)
+        except Exception:
+            start = text.find('{')
+            end = text.rfind('}')
+            if start != -1 and end != -1 and end > start:
+                candidate = text[start:end+1]
+                return json.loads(candidate)
+            raise
+
     for attempt in range(max_retries):
         try:
-            response = client.beta.chat.completions.parse(
+            response = client.responses.create(
                 model=model_name,
-                max_tokens=2048,
-                temperature=0.2,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Vous êtes un expert en analyse de sentiments. Analysez le texte suivant et retournez une analyse structurée selon le format demandé."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt_content
-                    }
+                input=[
+                    {"role": "system", "content": system_preamble},
+                    {"role": "user", "content": prompt_content}
                 ],
-                response_format=SentimentAnalysisOutput
+                text={
+                    "format": {"type": "text"},  # Conserver la config fournie
+                    "verbosity": "low"
+                },
+                reasoning={"effort": "low"},
+                tools=[],
+                store=True
             )
 
-            # Extract parsed response directly
-            parsed_response = response.choices[0].message.parsed
+            # Tentative d'accès au texte de sortie (selon le SDK openai >= 1.0 responses)
+            raw_text = None
+            if hasattr(response, 'output_text') and response.output_text:
+                raw_text = response.output_text
+            else:
+                # Fallback : concaténer les segments
+                try:
+                    parts = []
+                    for item in getattr(response, 'output', []) or []:
+                        content = getattr(item, 'content', None)
+                        if content:
+                            for c in content:
+                                t = getattr(c, 'text', None)
+                                if t and getattr(t, 'value', None):
+                                    parts.append(t.value)
+                    if parts:
+                        raw_text = "\n".join(parts)
+                except Exception:
+                    pass
 
-            if not parsed_response:
+            if not raw_text:
                 logger.warning(f"Réponse vide de ChatGPT pour le texte (essai {attempt + 1}/{max_retries}).")
                 if attempt == max_retries - 1:
                     return {**default_error_result, "analysis_error": "Réponse vide de ChatGPT après plusieurs essais."}
                 time.sleep(initial_backoff * (2 ** attempt))
                 continue
-            
-            # Response is already validated by OpenAI's structured outputs
-            return {**parsed_response.model_dump(), "analysis_error": None}
+
+            try:
+                json_payload = _extract_json(raw_text)
+            except Exception as je:
+                logger.error(f"Échec parsing JSON (essai {attempt + 1}/{max_retries}): {je}. Extrait: {raw_text[:200]}")
+                if attempt == max_retries - 1:
+                    return {**default_error_result, "analysis_error": f"JSON parse error: {je}", "raw_response_snippet": raw_text[:500]}
+                time.sleep(initial_backoff * (2 ** attempt))
+                continue
+
+            try:
+                validated_output = SentimentAnalysisOutput(**json_payload)
+            except ValidationError as ve:
+                logger.error(f"Validation Pydantic échouée (essai {attempt + 1}/{max_retries}): {ve}")
+                if attempt == max_retries - 1:
+                    return {**default_error_result, "analysis_error": f"ValidationError: {ve}", "parsed_data": json_payload}
+                time.sleep(initial_backoff * (2 ** attempt))
+                continue
+
+            return {**validated_output.model_dump(), "analysis_error": None}
 
         except Exception as e:
             logger.error(f"Erreur lors de l'appel à ChatGPT (essai {attempt + 1}/{max_retries}): {e}")
             if attempt == max_retries - 1:
                 return {**default_error_result, "analysis_error": f"Exception: {e}"}
             time.sleep(initial_backoff * (2 ** attempt))
-            
+
     return {**default_error_result, "analysis_error": "Échec de l'analyse ChatGPT après plusieurs tentatives."}
 
 def process_batch_with_analysis(
