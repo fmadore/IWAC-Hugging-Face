@@ -1,7 +1,7 @@
 # country_mapper.py
 
 BENIN_NEWSPAPERS = [
-    "24h au Bénin",
+    "24 Heures au Bénin",
     "Agence Bénin Presse",
     "ASSALAM",
     "Banouto",
@@ -63,6 +63,7 @@ COTE_DIVOIRE_NEWSPAPERS = [
     "Ivoire Dimanche",
     "L'Alternative",
     "L'Intelligent d'Abidjan",
+    "L'Inter",
     "La Voie",
     "Le Jour",
     "Le Jour Plus",
