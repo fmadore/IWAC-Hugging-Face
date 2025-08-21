@@ -10,7 +10,7 @@ sur le Hugging Face Hub.
 Usage
 -----
     python upload_index_hf.py \
-        --repo fmadore/iwac-newspaper-articles \
+        --repo fmadore/islam-west-africa-collection \
         --max-shard-size 1GB
 
 Variables d'environnement
@@ -499,7 +499,7 @@ async def load_reference_datasets(token: Optional[str] = None) -> tuple[pd.DataF
     
     try:
         logger.info("Loading articles dataset from Hugging Face Hub...")
-        articles_ds = load_dataset("fmadore/iwac-newspaper-articles", name="articles", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
+        articles_ds = load_dataset("fmadore/islam-west-africa-collection", name="articles", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
         articles_df = articles_ds.to_pandas()
         logger.info(f"Loaded {len(articles_df)} articles")
     except Exception as e:
@@ -507,7 +507,7 @@ async def load_reference_datasets(token: Optional[str] = None) -> tuple[pd.DataF
     
     try:
         logger.info("Loading publications dataset from Hugging Face Hub...")
-        publications_ds = load_dataset("fmadore/iwac-newspaper-articles", name="publications", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
+        publications_ds = load_dataset("fmadore/islam-west-africa-collection", name="publications", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
         publications_df = publications_ds.to_pandas()
         logger.info(f"Loaded {len(publications_df)} publications")
     except Exception as e:
@@ -669,7 +669,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Publie l'index IWAC sur le Hub HF")
-    parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles", help="Nom du repo HF (ex. fmadore/iwac-newspaper-articles)")
+    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="Nom du repo HF (ex. fmadore/islam-west-africa-collection)")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
     args = parser.parse_args()
 
