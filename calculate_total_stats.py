@@ -26,6 +26,7 @@ import argparse
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Dict, Any, Optional
 from datasets import load_dataset
@@ -139,7 +140,7 @@ def calculate_dataset_stats(df: pd.DataFrame, dataset_name: str) -> Dict[str, An
     
     if df is None or df.empty:
         logger.warning(f"Dataset '{dataset_name}' vide ou non disponible")
-        return {
+        base = {
             "total_records": 0,
             "total_words": 0,
             "total_pages": 0,
@@ -149,6 +150,14 @@ def calculate_dataset_stats(df: pd.DataFrame, dataset_name: str) -> Dict[str, An
             "unique_newspapers": 0,
             "columns_available": []
         }
+        # Champs spécifiques audiovisuels
+        if dataset_name == "audiovisual":
+            base.update({
+                "total_duration_minutes": 0,
+                "records_with_duration": 0,
+                "average_duration_minutes": 0
+            })
+        return base
     
     # Déterminer les noms de colonnes à utiliser selon le dataset
     word_count_col = "nb_mots"
@@ -194,14 +203,52 @@ def calculate_dataset_stats(df: pd.DataFrame, dataset_name: str) -> Dict[str, An
         "word_count_column_used": word_count_col,
         "page_count_column_used": page_count_col
     }
+
+    # Statistiques spécifiques au dataset audiovisuel
+    if dataset_name == "audiovisual":
+        def parse_iso8601_duration_to_minutes(val: str) -> int:
+            """Convertit une durée ISO8601 simplifiée (ex: PT208M, PT2H30M, PT3600S) en minutes entières.
+            Gestion basique des jours (D), heures (H), minutes (M) et secondes (S)."""
+            if not isinstance(val, str) or not val or not val.startswith('P'):
+                return 0
+            # Extraire composantes avec regex tolérante
+            # Forme attendue P[nD][T[nH][nM][nS]] ; on ne traite ici que la partie temps.
+            pattern = re.compile(r"P(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?")
+            m = pattern.fullmatch(val.strip())
+            if not m:
+                # Cas simple type PT208M sans P? (par sécurité)
+                simple = re.match(r"PT(\d+)M", val.strip())
+                if simple:
+                    return int(simple.group(1))
+                return 0
+            days = int(m.group('days') or 0)
+            hours = int(m.group('hours') or 0)
+            minutes = int(m.group('minutes') or 0)
+            seconds = int(m.group('seconds') or 0)
+            total_minutes = days * 24 * 60 + hours * 60 + minutes + seconds / 60.0
+            return int(round(total_minutes))
+
+        duration_minutes_series = df.get('extent', pd.Series(dtype=str)).fillna('').astype(str).map(parse_iso8601_duration_to_minutes)
+        total_duration_minutes = int(duration_minutes_series.sum())
+        records_with_duration = int((df.get('extent', pd.Series(dtype=str)).fillna('') != '').sum())
+        average_duration_minutes = int(round(total_duration_minutes / records_with_duration)) if records_with_duration > 0 else 0
+        stats.update({
+            "total_duration_minutes": total_duration_minutes,
+            "records_with_duration": records_with_duration,
+            "average_duration_minutes": average_duration_minutes
+        })
+        logger.info(f"  - Durée totale (minutes): {total_duration_minutes:,}")
+        logger.info(f"  - Durée moyenne (minutes): {average_duration_minutes:,}")
+        logger.info(f"  - Enregistrements avec durée: {records_with_duration:,}")
     
     logger.info(f"Statistiques pour '{dataset_name}':")
     logger.info(f"  - Enregistrements totaux: {total_records:,}")
-    logger.info(f"  - Mots totaux: {total_words:,} (colonne: {word_count_col})")
-    logger.info(f"  - Pages totales: {total_pages:,} (colonne: {page_count_col})")
-    logger.info(f"  - Avec comptage de mots: {records_with_word_count:,}")
-    logger.info(f"  - Avec comptage de pages: {records_with_page_count:,}")
-    logger.info(f"  - Avec contenu OCR: {records_with_ocr:,}")
+    if dataset_name != "audiovisual":
+        logger.info(f"  - Mots totaux: {total_words:,} (colonne: {word_count_col})")
+        logger.info(f"  - Pages totales: {total_pages:,} (colonne: {page_count_col})")
+        logger.info(f"  - Avec comptage de mots: {records_with_word_count:,}")
+        logger.info(f"  - Avec comptage de pages: {records_with_page_count:,}")
+        logger.info(f"  - Avec contenu OCR: {records_with_ocr:,}")
     if dataset_name in ["articles", "publications"]:
         logger.info(f"  - Journaux uniques: {unique_newspapers:,}")
     
@@ -242,7 +289,7 @@ def main():
             return
 
     # Configurations à traiter
-    configs = ["articles", "publications", "documents"]
+    configs = ["articles", "publications", "documents", "audiovisual"]
     
     # Structure pour stocker tous les résultats
     all_stats = {
@@ -259,7 +306,9 @@ def main():
             "total_records_with_word_count": 0,
             "total_records_with_page_count": 0,
             "total_records_with_ocr": 0,
-            "unique_newspapers_total": 0
+            "unique_newspapers_total": 0,
+            "total_duration_minutes": 0,
+            "total_records_with_duration": 0
         }
     }
 
@@ -277,13 +326,18 @@ def main():
         # Stocker les statistiques
         all_stats["datasets"][config] = stats
         
-        # Ajouter aux totaux globaux
+        # Ajouter aux totaux globaux (communs)
         all_stats["totals"]["total_records"] += stats["total_records"]
         all_stats["totals"]["total_words"] += stats["total_words"]
         all_stats["totals"]["total_pages"] += stats["total_pages"]
         all_stats["totals"]["total_records_with_word_count"] += stats["records_with_word_count"]
         all_stats["totals"]["total_records_with_page_count"] += stats["records_with_page_count"]
         all_stats["totals"]["total_records_with_ocr"] += stats["records_with_ocr"]
+
+        # Totaux spécifiques audiovisuels
+        if config == "audiovisual":
+            all_stats["totals"]["total_duration_minutes"] += stats.get("total_duration_minutes", 0)
+            all_stats["totals"]["total_records_with_duration"] += stats.get("records_with_duration", 0)
         
         # Collecter les journaux uniques pour le total global
         if config in ["articles", "publications"] and df is not None and "newspaper" in df.columns:
@@ -303,6 +357,9 @@ def main():
     logger.info(f"Mots totaux: {totals['total_words']:,}")
     logger.info(f"Pages totales: {totals['total_pages']:,}")
     logger.info(f"Journaux uniques (total): {totals['unique_newspapers_total']:,}")
+    if totals.get('total_duration_minutes', 0) > 0:
+        hours = totals['total_duration_minutes'] / 60.0
+        logger.info(f"Durée totale audiovisuelle: {totals['total_duration_minutes']:,} minutes (~{hours:,.1f} heures)")
     logger.info(f"Enregistrements avec comptage de mots: {totals['total_records_with_word_count']:,}")
     logger.info(f"Enregistrements avec comptage de pages: {totals['total_records_with_page_count']:,}")
     logger.info(f"Enregistrements avec contenu OCR: {totals['total_records_with_ocr']:,}")
@@ -351,11 +408,19 @@ def main():
             for config, stats in all_stats["datasets"].items():
                 f.write(f"\n{config.upper()}\n")
                 f.write(f"  Enregistrements: {stats['total_records']:,}\n")
-                f.write(f"  Mots: {stats['total_words']:,}\n")
-                f.write(f"  Pages: {stats['total_pages']:,}\n")
-                f.write(f"  Avec OCR: {stats['records_with_ocr']:,}\n")
+                if config == "audiovisual":
+                    f.write(f"  Durée totale (minutes): {stats.get('total_duration_minutes', 0):,}\n")
+                    f.write(f"  Durée moyenne (minutes): {stats.get('average_duration_minutes', 0):,}\n")
+                else:
+                    f.write(f"  Mots: {stats.get('total_words', 0):,}\n")
+                    f.write(f"  Pages: {stats.get('total_pages', 0):,}\n")
+                    f.write(f"  Avec OCR: {stats.get('records_with_ocr', 0):,}\n")
                 if config in ["articles", "publications"]:
                     f.write(f"  Journaux uniques: {stats['unique_newspapers']:,}\n")
+            if totals.get('total_duration_minutes', 0) > 0:
+                f.write(f"\nAUDIOVISUEL\n")
+                f.write(f"  Durée totale (minutes): {totals['total_duration_minutes']:,} (~{totals['total_duration_minutes']/60.0:,.1f} heures)\n")
+                f.write(f"  Enregistrements avec durée: {totals['total_records_with_duration']:,}\n")
             
             if totals['total_records'] > 0:
                 f.write(f"\nCOUVERTURE DES DONNÉES\n")
