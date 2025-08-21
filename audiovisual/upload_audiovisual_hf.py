@@ -5,7 +5,7 @@ upload_audiovisual_hf.py
 
 Extrait les documents audiovisuels (resource_class_id = 38) depuis l'API Omeka S
 d'IWAC, les convertit en dataset Arrow/Parquet et les pousse sur le Hugging Face
-Hub comme subset 'audiovisual' du repository fmadore/iwac-newspaper-articles.
+Hub comme subset 'audiovisual' du repository fmadore/islam-west-africa-collection.
 
 Usage
 -----
