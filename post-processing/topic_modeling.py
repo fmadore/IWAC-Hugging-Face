@@ -242,13 +242,20 @@ def predict_topics_batch(batch: Dict[str, List[Any]], text_col: str,
     global topic_model
     
     texts = batch[text_col]
+    languages = batch.get('language', [None] * len(texts))  # Get language info if available
     
     processed_texts = []
-    for text in texts:
-        if text is None or text.strip() == "":
-            processed_texts.append(" ")
+    for i, text in enumerate(texts):
+        # Check if this entry should be processed (French or empty language)
+        lang = languages[i] if i < len(languages) else None
+        if lang == 'Français' or not lang or (isinstance(lang, str) and lang.strip() == ''):
+            if text is None or text.strip() == "":
+                processed_texts.append(" ")
+            else:
+                processed_texts.append(str(text))
         else:
-            processed_texts.append(str(text))
+            # For non-French entries, use a special placeholder
+            processed_texts.append(" ")
     
     try:
         topics, probabilities = topic_model.transform(processed_texts)
@@ -261,7 +268,14 @@ def predict_topics_batch(batch: Dict[str, List[Any]], text_col: str,
         topic_probs_max = []
         
         for i, topic_id in enumerate(topics):
-            if topic_id == -1:
+            lang = languages[i] if i < len(languages) else None
+            
+            # For non-French entries, assign special values
+            if lang and lang != 'Français' and lang.strip() != '':
+                topic_labels.append("Non-French")
+                topic_probs_max.append(0.0)
+                topics[i] = -2  # Special topic ID for non-French
+            elif topic_id == -1:
                 topic_labels.append("Outlier")
                 topic_probs_max.append(0.0)
             else:
@@ -276,9 +290,21 @@ def predict_topics_batch(batch: Dict[str, List[Any]], text_col: str,
         
     except Exception as e:
         logging.error(f"Erreur lors de la prédiction des sujets: {e}")
-        topics = [-1] * len(texts)
-        probabilities = [0.0] * len(texts)
-        topic_labels = ["Error"] * len(texts)
+        topics = []
+        probabilities = []
+        topic_labels = []
+        
+        # Assign values based on language
+        for i, text in enumerate(texts):
+            lang = languages[i] if i < len(languages) else None
+            if lang and lang != 'Français' and lang.strip() != '':
+                topics.append(-2)  # Non-French
+                probabilities.append(0.0)
+                topic_labels.append("Non-French")
+            else:
+                topics.append(-1)  # Error
+                probabilities.append(0.0)
+                topic_labels.append("Error")
     
     batch[topic_id_col] = topics
     batch[topic_prob_col] = probabilities
@@ -394,6 +420,21 @@ def main():
 
     logger.info(f"Dataset chargé. Nombre de lignes: {len(ds)}")
 
+    # Vérifier la distribution des langues
+    if 'language' in ds.column_names:
+        languages = ds['language']
+        french_count = sum(1 for lang in languages if lang == 'Français')
+        other_count = sum(1 for lang in languages if lang and lang != 'Français')
+        empty_count = sum(1 for lang in languages if not lang or lang.strip() == '')
+        
+        logger.info(f"Statistiques des langues:")
+        logger.info(f"  - Français: {french_count} (seront traités pour la modélisation)")
+        logger.info(f"  - Autres langues: {other_count} (conservés mais non traités)")
+        logger.info(f"  - Vides: {empty_count} (conservés mais non traités)")
+        logger.info(f"  - Total: {len(ds)}")
+    else:
+        logger.warning("Colonne 'language' non trouvée. Tous les textes seront traités.")
+
     if text_column_name not in ds.column_names:
         logger.error(f"Colonne '{text_column_name}' non trouvée. Colonnes disponibles: {ds.column_names}")
         return
@@ -421,8 +462,19 @@ def main():
         
         topic_model = create_bertopic_model(embedding_model_name, min_topic_size, cpu_only, embedding_batch_size)
         
-        logger.info("Extraction et validation des textes...")
-        texts = ds[text_column_name]
+        logger.info("Extraction et validation des textes français pour l'entraînement...")
+        
+        # Extraire seulement les textes français pour l'entraînement du modèle
+        if 'language' in ds.column_names:
+            french_texts = []
+            for i, (text, lang) in enumerate(zip(ds[text_column_name], ds['language'])):
+                if lang == 'Français' and text and text.strip():
+                    french_texts.append(text)
+            texts = french_texts
+            logger.info(f"Textes français valides extraits: {len(texts)}")
+        else:
+            texts = ds[text_column_name]
+            logger.info("Colonne langue non disponible, utilisation de tous les textes")
         
         # Limitation optionnelle du nombre de documents (utile pour tests CPU)
         if max_documents and len(texts) > max_documents:
