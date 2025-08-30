@@ -105064,5 +105064,131 @@
     "polarite": "Négatif",
     "polarite_justification": "Le ton critique met en garde contre l'exploitation de l'islam à des fins politiques, qualifie la déclaration d'excessive et souligne des conséquences dangereuses et imprévisibles.",
     "analysis_error": null
+  },
+  "76371": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte porte exclusivement sur le début du mois de jeûne musulman et les décisions des imams à la mosquée d'Adjamé.",
+    "subjectivite_score": 1,
+    "subjectivite_justification": "Texte factuel et descriptif rapportant dates, déclarations et procédures sans jugements ni opinions.",
+    "polarite": "Neutre",
+    "polarite_justification": "Présentation informative et dépourvue d'évaluation positive ou négative du sujet.",
+    "analysis_error": null
+  },
+  "76372": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article porte exclusivement sur le premier congrès du Conseil national islamique et les discours, actions et valeurs liés à l'islam et aux musulmans.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Le texte est un compte rendu journalistique factuel mais contient des passages laudateurs et des citations valorisantes qui introduisent des éléments d'opinion, d'où un équilibre faits/opinions.",
+    "polarite": "Positif",
+    "polarite_justification": "La représentation de l'islam et des musulmans est globalement valorisante, insistant sur l'unité, la dignité, les vertus et les succès du CNI.",
+    "analysis_error": null
+  },
+  "76373": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article porte entièrement sur la communauté musulmane du Lycée technique, sa mosquée, son nouveau bureau et des figures religieuses locales.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Récit majoritairement factuel (installation du bureau, projets, dons) avec quelques citations et appréciations positives, donc plutôt objectif.",
+    "polarite": "Positif",
+    "polarite_justification": "Ton global favorable mettant en avant réalisations, dons et éloges des acteurs religieux et de la femme dans la communauté.",
+    "analysis_error": null
+  },
+  "76374": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte porte entièrement sur la nuit du destin et les pratiques des musulmans, faisant de l'islam le sujet principal.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Principalement descriptif et informatif avec quelques formulations valorisantes issues de sources religieuses, mais peu d'opinions personnelles de l'auteur.",
+    "polarite": "Positif",
+    "polarite_justification": "Ton célébratoire et valorisant de la pratique religieuse (réconciliation, pardon, salut) présentant l'événement de manière favorable aux musulmans.",
+    "analysis_error": null
+  },
+  "76375": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "L'article porte principalement sur le Ramadan et la préparation des musulmans, faisant de l'islam et des pratiques musulmanes le sujet central.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Texte mixte combinant informations factuelles sur le Ramadan et des citations/opinions personnelles d'interlocuteurs décrivant l'importance spirituelle et les difficultés économiques.",
+    "polarite": "Neutre",
+    "polarite_justification": "Ton global informatif et respectueux soulignant la valeur spirituelle du Ramadan mais évoquant aussi des critiques/objectifs sur la hausse des prix, aboutissant à une tonalité équilibrée.",
+    "analysis_error": null
+  },
+  "76376": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte porte principalement sur la célébration de la Nuit du destin par les musulmans et les positions du Conseil national islamique.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Majoritairement factuel sur l'événement et les discours, mais contenant des déclarations critiques du CNI envers la RTI qui introduisent une légère subjectivité.",
+    "polarite": "Négatif",
+    "polarite_justification": "La représentation générale de la pratique religieuse est positive, mais le traitement médiatique est critiqué explicitement (accusations de non-considération et de partialité de la RTI), donnant une tonalité défavorable quant à la couverture médiatique des musulmans.",
+    "analysis_error": null
+  },
+  "76377": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte porte essentiellement sur la célébration de l'Aïd-el-Fitr et les pratiques religieuses des musulmans en Côte d'Ivoire.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Le texte combine descriptions factuelles des rites et événements avec des commentaires et jugements (sur la télévision, la laïcité et la paix sociale), d'où un mélange faits/opinions.",
+    "polarite": "Positif",
+    "polarite_justification": "Le ton valorise la célébration religieuse, la générosité des fidèles et salue favorablement la retransmission télévisée et ses effets positifs sur la paix sociale.",
+    "analysis_error": null
+  },
+  "76378": {
+    "centralite_islam_musulmans": "Secondaire",
+    "centralite_justification": "La communauté musulmane est mentionnée brièvement en lien avec le jeûne du Ramadan mais n'est pas le sujet principal de l'article.",
+    "subjectivite_score": 2,
+    "subjectivite_justification": "Le texte est majoritairement factuel et rapporté (prix, témoignages), avec quelques formulations d'opinion limitées (souhaits envers le gouvernement).",
+    "polarite": "Neutre",
+    "polarite_justification": "Le ton décrit des difficultés économiques affectant la communauté observant le jeûne sans jugement accusateur ni éloge, restant essentiellement informatif.",
+    "analysis_error": null
+  },
+  "76379": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte est un message religieux émanant du COSIM et du CNI centré entièrement sur le Ramadan, l'Eïd et les fidèles musulmans.",
+    "subjectivite_score": 4,
+    "subjectivite_justification": "Texte prescriptif et laudatif contenant des prières, des exhortations morales et des jugements de valeur religieux plutôt que de simples faits.",
+    "polarite": "Positif",
+    "polarite_justification": "Ton globalement élogieux et bienveillant envers l'islam et les musulmans, insistant sur la gratitude, la solidarité, la tolérance et la paix.",
+    "analysis_error": null
+  },
+  "76380": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte porte principalement sur la non-retransmission de la nuit du destin et ses conséquences pour les fidèles musulmans en Côte d'Ivoire.",
+    "subjectivite_score": 4,
+    "subjectivite_justification": "L'article adopte un ton d'opinion critique et émet des interprétations politiques et émotionnelles (inquiétude, frustration, soupçons) au-delà de faits stricts.",
+    "polarite": "Négatif",
+    "polarite_justification": "Le propos est défavorable à la décision de non-retransmission et critique le gouvernement, évoquant des conséquences négatives pour la communauté musulmane.",
+    "analysis_error": null
+  },
+  "76415": {
+    "centralite_islam_musulmans": "Secondaire",
+    "centralite_justification": "La présence de l'islam/des musulmans est mentionnée via le titre du locuteur et quelques références ethno-religieuses mais n'est pas le sujet principal du texte.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Le texte est globalement opinionné et polémique sur le plan politique, mais les mentions des musulmans/communautés restent factuelles et intégrées à un discours plus large, mêlant faits et jugements.",
+    "polarite": "Positif",
+    "polarite_justification": "La référence aux musulmans est utilisée de manière valorisante (présentation du locuteur comme président des musulmans orthodoxes et défense des Dioulas contre des accusations), sans ton négatif dirigé contre l'islam ou les musulmans.",
+    "analysis_error": null
+  },
+  "76416": {
+    "centralite_islam_musulmans": "Très central",
+    "centralite_justification": "Le texte porte essentiellement sur le monde musulman en Côte d'Ivoire, son histoire, son organisation et son rapport à la politique, thème central du séminaire décrit.",
+    "subjectivite_score": 3,
+    "subjectivite_justification": "Le texte mélange descriptions factuelles et récits historiques avec interprétations et jugements (sur la marginalisation, les attitudes politiques et les propositions de mobilisation), donc un équilibre faits/opinions.",
+    "polarite": "Positif",
+    "polarite_justification": "Le ton valorise la communauté musulmane (richesse, solidarité, valeurs) tout en critiquant les acteurs politiques et historiques responsables de marginalisation, ce qui présente globalement une image favorable aux musulmans.",
+    "analysis_error": null
+  },
+  "76417": {
+    "centralite_islam_musulmans": "Secondaire",
+    "centralite_justification": "La communauté musulmane et un conseiller aux affaires islamiques sont mentionnés comme cibles de clientélisme mais ce n'est pas le sujet principal de l'article.",
+    "subjectivite_score": 4,
+    "subjectivite_justification": "Texte fortement critique et argumentatif sur la gabegie et le favoritisme, présentant des jugements et accusations plus que des faits neutres.",
+    "polarite": "Négatif",
+    "polarite_justification": "La mention de la communauté musulmane apparaît dans un contexte de clientélisme et de favoritisme dénoncé, ce qui donne une tonalité défavorable au traitement associé aux musulmans.",
+    "analysis_error": null
+  },
+  "76419": {
+    "centralite_islam_musulmans": "Central",
+    "centralite_justification": "La mobilisation et la « pêche aux musulmans » sont présentées comme une phase clé de la stratégie politique d'Alassane Ouattara, donc le thème religieux/communautaire est un élément majeur du texte.",
+    "subjectivite_score": 4,
+    "subjectivite_justification": "Le texte adopte un ton interprétatif et accusateur en imputant des stratégies cyniques à Ouattara et en utilisant des jugements de valeur, montrant une forte subjectivité.",
+    "polarite": "Négatif",
+    "polarite_justification": "La représentation de la relation à l'islam/aux musulmans est décrite comme une manœuvre manipulatrice et instrumentalisée, ce qui confère une tonalité clairement défavorable.",
+    "analysis_error": null
   }
 }
