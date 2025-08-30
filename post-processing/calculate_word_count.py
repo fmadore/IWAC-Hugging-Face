@@ -108,7 +108,7 @@ def main():
     # --- Chargement du dataset ---
     logger.info(f"Chargement du dataset '{repo_id}', configuration '{config_name_choice}'...")
     try:
-        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token, trust_remote_code=True)
+        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token)
     except Exception as e:
         logger.error(f"Erreur lors du chargement du dataset: {e}")
         return
@@ -121,7 +121,18 @@ def main():
         return
 
     if count_column_name in ds.column_names:
-        logger.warning(f"La colonne de comptage '{count_column_name}' existe déjà. Elle sera écrasée.")
+        # Ask user if they want to recalculate existing word counts
+        logger.info(f"La colonne de comptage '{count_column_name}' existe déjà.")
+        try:
+            user_choice = input("Voulez-vous recalculer les comptes de mots existants? (o/n): ").strip().lower()
+            if user_choice not in ['o', 'oui', 'y', 'yes']:
+                logger.info("Opération annulée. Les comptes de mots existants sont conservés.")
+                return
+            else:
+                logger.info("Recalcul des comptes de mots confirmé. Procédure en cours...")
+        except (KeyboardInterrupt, EOFError):
+            logger.info("\nOpération annulée par l'utilisateur.")
+            return
 
     # --- Application du comptage de mots ---
     logger.info(f"Calcul du nombre de mots pour la colonne '{text_column_fixed}' et stockage dans '{count_column_name}'...")
@@ -137,6 +148,14 @@ def main():
         desc=f"Comptage des mots dans '{text_column_fixed}'"
     )
     logger.info(f"Comptage des mots terminé. Aperçu de la nouvelle colonne (premiers 5) pour '{count_column_name}': {ds_processed[count_column_name][:5]}")
+
+    # Convert to pandas to ensure proper integer typing, then back to Dataset
+    logger.info("Converting to pandas to ensure integer typing for nb_mots column...")
+    df = ds_processed.to_pandas()
+    if count_column_name in df.columns:
+        df[count_column_name] = df[count_column_name].astype('Int64')  # Nullable integer type
+        logger.info(f"Converted {count_column_name} column to nullable integer type (Int64)")
+    ds_processed = Dataset.from_pandas(df, preserve_index=False)
 
     # --- Réorganisation des colonnes ---
     logger.info(f"Réorganisation des colonnes pour placer '{count_column_name}' après '{text_column_fixed}'.")
