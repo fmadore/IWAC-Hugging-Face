@@ -115,8 +115,7 @@ def load_dataset_safe(repo_id: str, config_name: str, token: Optional[str] = Non
             repo_id, 
             name=config_name, 
             split="train", 
-            token=token, 
-            trust_remote_code=True
+            token=token
         )
         df = ds.to_pandas()
         logger.info(f"Dataset '{config_name}' chargé avec succès: {len(df)} lignes, {len(df.columns)} colonnes")

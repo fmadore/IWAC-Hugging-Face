@@ -301,7 +301,7 @@ def main():
     # --- Chargement du dataset ---
     logger.info(f"Chargement du dataset '{repo_id}', configuration '{config_name_choice}'...")
     try:
-        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token, trust_remote_code=True)
+        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token)
     except Exception as e:
         logger.error(f"Erreur lors du chargement du dataset: {e}")
         return

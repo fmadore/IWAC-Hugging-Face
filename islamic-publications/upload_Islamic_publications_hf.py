@@ -472,7 +472,7 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
 
     try:
         logger.info(f"Attempting to load existing dataset from Hugging Face Hub: {repo} (config 'publications')")
-        existing_ds = Dataset.load_dataset(repo, name="publications", split="train", token=token_to_use, trust_remote_code=True, download_mode="force_redownload", ignore_verifications=True) # Use name="publications"
+        existing_ds = Dataset.load_dataset(repo, name="publications", split="train", token=token_to_use, download_mode="force_redownload", ignore_verifications=True) # Use name="publications"
         existing_df = existing_ds.to_pandas()
         if 'o:id' not in existing_df.columns:
             logger.warning("'o:id' column not found in existing Hub dataset (config 'publications'). Treating as empty.")
