@@ -454,6 +454,11 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
             await conn_manager.close()
             return
 
+        # Convert nb_pages to nullable integer type to preserve integer dtype with null values
+        if 'nb_pages' in final_df.columns:
+            final_df['nb_pages'] = final_df['nb_pages'].astype('Int64')  # Nullable integer type
+            logger.info(f"Converted nb_pages column to nullable integer type (Int64)")
+
         ds = Dataset.from_pandas(final_df, preserve_index=False)
         logger.info("Dataset preview (first 5 rows):")
         logger.info(ds.to_pandas().head())
