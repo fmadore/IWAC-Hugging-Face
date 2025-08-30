@@ -38,7 +38,7 @@ HF_TOKEN         Jeton d'accès personnel pour le Hugging Face Hub.
 
 Dépendances supplémentaires
 -------------------------
-    pip install datasets huggingface_hub google-api-python-client pydantic python-dotenv tqdm google-ai-generativelanguage openai
+    pip install datasets huggingface_hub google-api-python-client python-dotenv tqdm google-ai-generativelanguage openai
     (Note: google.genai is part of google-ai-generativelanguage or a similar package, ensure correct installation for the older SDK)
 """
 import os
@@ -51,7 +51,6 @@ from typing import Optional, List, Dict, Any
 
 from datasets import load_dataset, Dataset
 from huggingface_hub import HfFolder, login
-from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 from tqdm import tqdm
 
@@ -83,18 +82,29 @@ def configure_logging() -> logging.Logger:
     logger.addHandler(handler)
     return logger
 
-# Modèle Pydantic pour la sortie structurée
-class SentimentAnalysisOutput(BaseModel):
-    centralite_islam_musulmans: str
-    centralite_justification: str
-    subjectivite_score: Optional[int] = Field(default=None)
-    subjectivite_justification: str
-    polarite: str
-    polarite_justification: str
-    
-    class Config:
-        # Allow the model to be pickled for multiprocessing
-        arbitrary_types_allowed = True
+# Schema pour la validation des données (sans Pydantic pour éviter les problèmes de pickling)
+EXPECTED_FIELDS = {
+    "centralite_islam_musulmans": str,
+    "centralite_justification": str,
+    "subjectivite_score": (int, type(None)),
+    "subjectivite_justification": str,
+    "polarite": str,
+    "polarite_justification": str
+}
+
+def validate_sentiment_output(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Valide la sortie de l'analyse de sentiment sans utiliser Pydantic."""
+    validated = {}
+    for field, expected_type in EXPECTED_FIELDS.items():
+        value = data.get(field)
+        if isinstance(expected_type, tuple):  # pour Optional[int]
+            if value is not None and not isinstance(value, expected_type[0]):
+                raise ValueError(f"Field {field} must be {expected_type[0]} or None, got {type(value)}")
+        else:
+            if not isinstance(value, expected_type):
+                raise ValueError(f"Field {field} must be {expected_type}, got {type(value)}")
+        validated[field] = value
+    return validated
 
 # --- Model Configuration ---
 GEMINI_MODEL_NAME = "gemini-2.5-flash"
@@ -196,8 +206,7 @@ def analyze_text_with_gemini(
 
     generation_config = types.GenerateContentConfig(
         response_mime_type="application/json",
-        temperature=0.2,
-        response_schema=SentimentAnalysisOutput 
+        temperature=0.2
     )
 
     for attempt in range(max_retries):
@@ -225,12 +234,12 @@ def analyze_text_with_gemini(
                 continue
             
             try:
-                validated_output = SentimentAnalysisOutput(**json_response)
-                return {**validated_output.model_dump(), "analysis_error": None}
-            except ValidationError as e:
-                logger.error(f"Erreur de validation Pydantic (essai {attempt + 1}/{max_retries}): {e}. Données reçues: {json_response}")
+                validated_output = validate_sentiment_output(json_response)
+                return {**validated_output, "analysis_error": None}
+            except (ValueError, KeyError) as e:
+                logger.error(f"Erreur de validation (essai {attempt + 1}/{max_retries}): {e}. Données reçues: {json_response}")
                 if attempt == max_retries - 1:
-                    return {**default_error_result, "analysis_error": f"Pydantic ValidationError: {e}", "parsed_data": json_response}
+                    return {**default_error_result, "analysis_error": f"ValidationError: {e}", "parsed_data": json_response}
                 time.sleep(initial_backoff * (2 ** attempt))
                 continue
 
@@ -369,15 +378,15 @@ def analyze_text_with_chatgpt(
                 continue
 
             try:
-                validated_output = SentimentAnalysisOutput(**json_payload)
-            except ValidationError as ve:
-                logger.error(f"Validation Pydantic échouée (essai {attempt + 1}/{max_retries}): {ve}")
+                validated_output = validate_sentiment_output(json_payload)
+            except (ValueError, KeyError) as ve:
+                logger.error(f"Validation échouée (essai {attempt + 1}/{max_retries}): {ve}")
                 if attempt == max_retries - 1:
                     return {**default_error_result, "analysis_error": f"ValidationError: {ve}", "parsed_data": json_payload}
                 time.sleep(initial_backoff * (2 ** attempt))
                 continue
 
-            return {**validated_output.model_dump(), "analysis_error": None}
+            return {**validated_output, "analysis_error": None}
 
         except Exception as e:
             logger.error(f"Erreur lors de l'appel à ChatGPT (essai {attempt + 1}/{max_retries}): {e}")
@@ -592,7 +601,7 @@ def main():
     # --- Chargement du dataset ---
     logger.info(f"Chargement du dataset '{repo_id}', configuration '{config_name_choice}'...")
     try:
-        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=hf_token, trust_remote_code=True)
+        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=hf_token)
     except Exception as e:
         logger.error(f"Erreur lors du chargement du dataset: {e}")
         return
