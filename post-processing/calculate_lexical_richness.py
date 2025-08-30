@@ -155,7 +155,7 @@ def main():
     # --- Chargement du dataset ---
     logger.info(f"Chargement du dataset '{repo_id}', configuration '{config_name_choice}'...")
     try:
-        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token, trust_remote_code=True)
+        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token)
     except Exception as e:
         logger.error(f"Erreur lors du chargement du dataset: {e}")
         return
@@ -167,10 +167,24 @@ def main():
         logger.error(f"La colonne de texte source (hardcodée) '{text_column_name}' n'existe pas dans le dataset. Colonnes disponibles: {ds.column_names}")
         return
 
-    if richness_column_name in ds.column_names:
-        logger.warning(f"La colonne de richesse lexicale '{richness_column_name}' existe déjà. Elle sera écrasée.")
-    if readability_column_name in ds.column_names:
-        logger.warning(f"La colonne de lisibilité '{readability_column_name}' existe déjà. Elle sera écrasée.")
+    if richness_column_name in ds.column_names or readability_column_name in ds.column_names:
+        existing_cols = []
+        if richness_column_name in ds.column_names:
+            existing_cols.append(f"richesse lexicale '{richness_column_name}'")
+        if readability_column_name in ds.column_names:
+            existing_cols.append(f"lisibilité '{readability_column_name}'")
+        
+        logger.info(f"Les colonnes suivantes existent déjà: {', '.join(existing_cols)}")
+        try:
+            user_choice = input("Voulez-vous recalculer les métriques existantes? (o/n): ").strip().lower()
+            if user_choice not in ['o', 'oui', 'y', 'yes']:
+                logger.info("Opération annulée. Les métriques existantes sont conservées.")
+                return
+            else:
+                logger.info("Recalcul des métriques confirmé. Procédure en cours...")
+        except (KeyboardInterrupt, EOFError):
+            logger.info("\nOpération annulée par l'utilisateur.")
+            return
 
     # --- Application du calcul des métriques ---
     logger.info(f"Calcul du TTR (col: '{richness_column_name}') et de la lisibilité (col: '{readability_column_name}') pour la colonne '{text_column_name}'...")
