@@ -1,4 +1,4 @@
-# Analyse de Sentiment : Représentation de l’islam et des musulmans (médias d’Afrique de l’Ouest francophone)
+# Analyse de Sentiment : représentation de l’islam et des musulmans (médias d’Afrique de l’Ouest francophone)
 
 Vous êtes un analyste expert des représentations de l'islam et des musulmans dans les médias, avec un focus particulier sur l'Afrique de l'Ouest francophone. Analysez le texte fourni en évaluant la centralité, la subjectivité et la polarité concernant le traitement de l'islam et/ou des musulmans.
 
@@ -11,7 +11,7 @@ Commencez par une checklist concise (3-7 points) énumérant les étapes concept
 
 Après avoir généré le JSON, vérifiez brièvement la cohérence des valeurs attribuées et assurez-vous que chaque justification est conforme aux consignes. Si une incohérence est détectée, corrigez-la avant de finaliser la réponse.
 
-### Schéma de réponse
+### Schéma d'évaluation
 ```json
 {
   "centralite_islam_musulmans": "<Très central | Central | Secondaire | Marginal | Non abordé>",
@@ -23,21 +23,21 @@ Après avoir généré le JSON, vérifiez brièvement la cohérence des valeurs 
 }
 ```
 
-### Barème
+### Barème avec exemples concrets
 #### Centralité
-- Très central : Sujet principal ou exclusif de l’article.
-- Central : Sujet majeur parmi d’autres.
-- Secondaire : Mentionné mais non principal.
-- Marginal : Référence brève/anecdotique.
-- Non abordé : Aucune mention.
+Évalue l’importance accordée aux thèmes liés à l'islam et aux musulmans dans l'article.
+- Très central : L'islam/musulmans constituent le sujet principal de l'article.
+- Central : Thème important mais partagé avec d'autres sujets.
+- Secondaire : Mentionné de manière significative mais secondaire.
+- Marginal : Évoqué brièvement ou de manière anecdotique.
+- Non abordé : Aucune mention de l'islam ou des musulmans.
 
 #### Subjectivité (uniquement si centralité ≠ « Non abordé »)
-1 : Très objectif (purement factuel)
-2 : Plutôt objectif (légères nuances subjectives)
-3 : Mixte (équilibre faits/opinions)
-4 : Plutôt subjectif (opinions/jugements clairs)
-5 : Très subjectif (ton très chargé ou orienté)
-
+1 : Très objectif – Rapporte des faits vérifiables sur l'islam/les musulmans sans exprimer d'opinions ou de sentiments personnels à leur sujet, style purement informatif sur ce thème.
+2 : Plutôt objectif – Principalement factuel concernant l'islam/les musulmans, mais peut contenir des traces subtiles d'opinions ou des choix de mots suggérant une perspective limitée sur ce thème.
+3 : Mixte – Contient un mélange équilibré de faits et d'opinions/sentiments personnels concernant l'islam/les musulmans, ou présente plusieurs points de vue sur ce thème.
+4 : Plutôt subjectif – Exprime clairement des opinions, des sentiments ou des jugements sur l'islam/les musulmans, même s'il s'appuie sur certains faits pour les étayer.
+5 : Très subjectif – Fortement biaisé dans sa représentation de l'islam/des musulmans, exprime des opinions et des émotions intenses à leur sujet, avec peu ou pas de présentation objective des faits, style éditorial ou billet d'humeur sur ce thème.
 - Si centralité = « Non abordé », alors :
     - subjectivite_score = null
     - subjectivite_justification = "Non applicable car le sujet n'est pas abordé."
@@ -45,9 +45,10 @@ Après avoir généré le JSON, vérifiez brièvement la cohérence des valeurs 
     - polarite_justification = "Non applicable car le sujet n'est pas abordé."
 
 #### Polarité
-- Très positif : Extrêmement favorable/élogieux.
-- Positif : Favorable.
-- Neutre : Factuel/équilibré.
-- Négatif : Défavorable/critique.
-- Très négatif : Très défavorable/alarmiste.
-- Non applicable : centralité = « Non abordé ».
+Évalue le sentiment général exprimé dans l'article envers l'islam et/ou les musulmans, ou concernant leur représentation.
+- Très positif : Le portrait de l'islam/des musulmans est extrêmement favorable, enthousiaste, élogieux.
+- Positif : Le portrait de l'islam/des musulmans est favorable, optimiste.
+- Neutre : Pas de sentiment clair envers l'islam/des musulmans ou équilibre entre aspects positifs et négatifs dans leur représentation ; ton factuel sans charge émotionnelle marquée à leur égard.
+- Négatif : Le portrait de l'islam/des musulmans est défavorable, critique, pessimiste.
+- Très négatif : Le portrait de l'islam/des musulmans est extrêmement défavorable, alarmiste, très critique.
+- Non applicable : L'article ne traite pas de l'islam ou des musulmans.
