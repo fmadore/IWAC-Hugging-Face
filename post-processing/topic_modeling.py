@@ -8,6 +8,10 @@ existant, basées sur la colonne 'lemma_nostop' (texte lemmatisé sans mots vide
 Le script utilise BERTopic avec CamemBERT pour identifier les sujets principaux
 et ajoute les résultats dans de nouvelles colonnes.
 
+IMPORTANT: Seuls les documents avec language='Français' sont traités par le modèle.
+Les documents d'autres langues ou sans indication de langue conservent des valeurs
+vides (None) dans les colonnes de sujets (topic_id, topic_prob, topic_label).
+
 Usage
 -----
     python post-processing/topic_modeling.py [--repo MON_USER/MON_DATASET]
@@ -244,67 +248,60 @@ def predict_topics_batch(batch: Dict[str, List[Any]], text_col: str,
     texts = batch[text_col]
     languages = batch.get('language', [None] * len(texts))  # Get language info if available
     
-    processed_texts = []
-    for i, text in enumerate(texts):
-        # Check if this entry should be processed (French or empty language)
-        lang = languages[i] if i < len(languages) else None
-        if lang == 'Français' or not lang or (isinstance(lang, str) and lang.strip() == ''):
-            if text is None or text.strip() == "":
-                processed_texts.append(" ")
-            else:
-                processed_texts.append(str(text))
-        else:
-            # For non-French entries, use a special placeholder
-            processed_texts.append(" ")
+    # Identify French entries and prepare texts for processing
+    french_indices = []
+    french_texts = []
     
-    try:
-        topics, probabilities = topic_model.transform(processed_texts)
-        
-        # Obtenir les informations des sujets une seule fois pour optimiser
-        topic_info = topic_model.get_topic_info()
-        topic_name_map = {row['Topic']: row['Name'] for _, row in topic_info.iterrows()}
-        
-        topic_labels = []
-        topic_probs_max = []
-        
-        for i, topic_id in enumerate(topics):
-            lang = languages[i] if i < len(languages) else None
+    for i, text in enumerate(texts):
+        lang = languages[i] if i < len(languages) else None
+        # Only process entries with French language
+        if lang == 'Français':
+            french_indices.append(i)
+            if text is None or text.strip() == "":
+                french_texts.append(" ")  # Empty placeholder for empty French text
+            else:
+                french_texts.append(str(text))
+    
+    # Initialize result arrays with None values
+    topics = [None] * len(texts)
+    probabilities = [None] * len(texts)
+    topic_labels = [None] * len(texts)
+    
+    # Only process French texts if there are any
+    if french_texts:
+        try:
+            # Transform only French texts
+            french_topics, french_probabilities = topic_model.transform(french_texts)
             
-            # For non-French entries, assign special values
-            if lang and lang != 'Français' and lang.strip() != '':
-                topic_labels.append("Non-French")
-                topic_probs_max.append(0.0)
-                topics[i] = -2  # Special topic ID for non-French
-            elif topic_id == -1:
-                topic_labels.append("Outlier")
-                topic_probs_max.append(0.0)
-            else:
-                topic_labels.append(topic_name_map.get(topic_id, f"Topic_{topic_id}"))
-                # Extraire la probabilité maximale pour ce document
-                if isinstance(probabilities[i], (list, np.ndarray)):
-                    topic_probs_max.append(float(np.max(probabilities[i])))
+            # Get topic information for label mapping
+            topic_info = topic_model.get_topic_info()
+            topic_name_map = {row['Topic']: row['Name'] for _, row in topic_info.iterrows()}
+            
+            # Assign results back to the corresponding positions
+            for idx, french_idx in enumerate(french_indices):
+                topic_id = french_topics[idx]
+                
+                if topic_id == -1:
+                    topics[french_idx] = topic_id
+                    probabilities[french_idx] = 0.0
+                    topic_labels[french_idx] = "Outlier"
                 else:
-                    topic_probs_max.append(float(probabilities[i]))
-        
-        probabilities = topic_probs_max
-        
-    except Exception as e:
-        logging.error(f"Erreur lors de la prédiction des sujets: {e}")
-        topics = []
-        probabilities = []
-        topic_labels = []
-        
-        # Assign values based on language
-        for i, text in enumerate(texts):
-            lang = languages[i] if i < len(languages) else None
-            if lang and lang != 'Français' and lang.strip() != '':
-                topics.append(-2)  # Non-French
-                probabilities.append(0.0)
-                topic_labels.append("Non-French")
-            else:
-                topics.append(-1)  # Error
-                probabilities.append(0.0)
-                topic_labels.append("Error")
+                    topics[french_idx] = topic_id
+                    # Extract max probability for this document
+                    if isinstance(french_probabilities[idx], (list, np.ndarray)):
+                        probabilities[french_idx] = float(np.max(french_probabilities[idx]))
+                    else:
+                        probabilities[french_idx] = float(french_probabilities[idx])
+                    topic_labels[french_idx] = topic_name_map.get(topic_id, f"Topic_{topic_id}")
+            
+        except Exception as e:
+            logging.error(f"Erreur lors de la prédiction des sujets: {e}")
+            # In case of error, set French entries to error values, keep non-French as None
+            for french_idx in french_indices:
+                topics[french_idx] = -1
+                probabilities[french_idx] = 0.0
+                topic_labels[french_idx] = "Error"
+    # If no French texts in this batch, all values remain None (which is what we want)
     
     batch[topic_id_col] = topics
     batch[topic_prob_col] = probabilities
@@ -413,7 +410,7 @@ def main():
     # Chargement du dataset
     logger.info(f"Chargement du dataset '{repo_id}', configuration '{config_name_choice}'...")
     try:
-        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token, trust_remote_code=True)
+        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token)
     except Exception as e:
         logger.error(f"Erreur lors du chargement du dataset: {e}")
         return
@@ -429,9 +426,13 @@ def main():
         
         logger.info(f"Statistiques des langues:")
         logger.info(f"  - Français: {french_count} (seront traités pour la modélisation)")
-        logger.info(f"  - Autres langues: {other_count} (conservés mais non traités)")
-        logger.info(f"  - Vides: {empty_count} (conservés mais non traités)")
+        logger.info(f"  - Autres langues: {other_count} (conservés avec colonnes vides)")
+        logger.info(f"  - Vides/manquants: {empty_count} (conservés avec colonnes vides)")
         logger.info(f"  - Total: {len(ds)}")
+        
+        if french_count == 0:
+            logger.error("Aucun document français trouvé. La modélisation ne peut pas continuer.")
+            return
     else:
         logger.warning("Colonne 'language' non trouvée. Tous les textes seront traités.")
 
@@ -520,21 +521,38 @@ def main():
     topic_probs = ds_processed[topic_prob_column_name]
     topic_labels = ds_processed[topic_label_column_name]
     
-    unique_topics = set(topic_ids)
-    logger.info(f"Nombre de sujets uniques: {len(unique_topics)}")
+    # Count processed vs skipped rows
+    processed_count = sum(1 for tid in topic_ids if tid is not None)
+    skipped_count = sum(1 for tid in topic_ids if tid is None)
     
-    valid_probs = [p for p in tqdm(topic_probs, desc="Calcul probabilités") if p > 0]
-    if valid_probs:
-        logger.info(f"Probabilité moyenne: {np.mean(valid_probs):.3f}")
+    logger.info(f"Lignes traitées (français): {processed_count}")
+    logger.info(f"Lignes ignorées (non-français/vides): {skipped_count}")
+    logger.info(f"Total des lignes: {len(topic_ids)}")
+    
+    # Filter out None values for statistics
+    valid_topic_ids = [tid for tid in topic_ids if tid is not None]
+    valid_topic_probs = [prob for prob in topic_probs if prob is not None]
+    valid_topic_labels = [label for label in topic_labels if label is not None]
+    
+    if valid_topic_ids:
+        unique_topics = set(valid_topic_ids)
+        logger.info(f"Nombre de sujets uniques: {len(unique_topics)}")
+        
+        valid_probs = [p for p in valid_topic_probs if p > 0]
+        if valid_probs:
+            logger.info(f"Probabilité moyenne: {np.mean(valid_probs):.3f}")
+        else:
+            logger.info("Aucune probabilité valide trouvée")
+        
+        topic_counts = Counter(valid_topic_ids)
+        logger.info("Top 10 des sujets les plus fréquents:")
+        for topic_id, count in topic_counts.most_common(10):
+            # Trouver le label correspondant
+            label = next((label for tid, label in zip(valid_topic_ids, valid_topic_labels) if tid == topic_id), f"Topic_{topic_id}")
+            logger.info(f"  Sujet {topic_id}: {label} ({count} documents)")
     else:
-        logger.info("Aucune probabilité valide trouvée")
-    
-    topic_counts = Counter(topic_ids)
-    logger.info("Top 10 des sujets les plus fréquents:")
-    for topic_id, count in topic_counts.most_common(10):
-        # Trouver le label correspondant
-        label = next((label for tid, label in zip(topic_ids, topic_labels) if tid == topic_id), f"Topic_{topic_id}")
-        logger.info(f"  Sujet {topic_id}: {label} ({count} documents)")
+        logger.warning("Aucun document français n'a été traité pour la modélisation.")
+        unique_topics = set()
 
     # Réorganisation des colonnes
     insert_after_col = "lemma_nostop"
@@ -574,11 +592,14 @@ def main():
 
     logger.info(f"Processus terminé. Colonnes {new_columns} ajoutées avec succès.")
     logger.info(f"Modèle d'embedding utilisé: {embedding_model_name}")
-    logger.info(f"Nombre de sujets découverts: {len(unique_topics)}")
+    if valid_topic_ids:
+        logger.info(f"Nombre de sujets découverts: {len(unique_topics)}")
     logger.info(f"Modèle BERTopic sauvegardé à: {model_path}")
     if modeling_mode == "fit":
         logger.info(f"Taille minimale des sujets: {min_topic_size}")
-        logger.info(f"Nombre de documents traités: {len(ds)}")
+        logger.info(f"Documents français traités: {processed_count}")
+        logger.info(f"Documents non-français ignorés: {skipped_count}")
+        logger.info(f"Total des documents: {len(ds)}")
 
 if __name__ == "__main__":
     main()
