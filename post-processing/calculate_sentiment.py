@@ -47,10 +47,21 @@ def configure_logging() -> None:
 # Initialisation du pipeline de sentiment (sera fait dans main pour gérer les ressources)
 sentiment_pipeline = None
 
+def get_sentiment_value(label: str) -> int | None:
+    """Convertit un label de sentiment textuel en valeur numérique."""
+    if label == 'POSITIVE':
+        return 1
+    elif label == 'NEGATIVE':
+        return -1
+    elif label == 'NEUTRAL':
+        return 0
+    else:  # N/A, ERROR, or other unexpected labels
+        return None
+
 def calculate_sentiment_batch(texts: list[str]) -> list[dict]:
     """
     Calcule le sentiment pour une liste de textes.
-    Retourne une liste de dictionnaires avec 'label' and 'score'.
+    Retourne une liste de dictionnaires avec 'label', 'score', et 'value'.
     """
     global sentiment_pipeline
     if not sentiment_pipeline:
@@ -77,24 +88,22 @@ def calculate_sentiment_batch(texts: list[str]) -> list[dict]:
         final_results = []
         for i, res in enumerate(results):
             if not isinstance(res, dict) or 'label' not in res or 'score' not in res:
-                # Si le résultat n'est pas conforme, mettre des valeurs par défaut
-                # Cela peut arriver si le texte original était None ou vide.
                 original_text_is_empty = not (isinstance(texts[i], str) and texts[i].strip())
                 if original_text_is_empty:
-                    final_results.append({'label': 'N/A', 'score': 0.0})
+                    final_results.append({'label': 'N/A', 'score': 0.0, 'value': get_sentiment_value('N/A')})
                 else: # Cas d'erreur inattendu du pipeline
-                    final_results.append({'label': 'ERROR', 'score': 0.0})
+                    final_results.append({'label': 'ERROR', 'score': 0.0, 'value': get_sentiment_value('ERROR')})
             else:
-                final_results.append(res)
+                final_results.append({'label': res['label'], 'score': res['score'], 'value': get_sentiment_value(res['label'])})
         return final_results
 
     except Exception as e:
         logging.getLogger(__name__).error(f"Erreur lors de l'analyse de sentiment par batch: {e}")
         # Retourner des valeurs par défaut pour tout le batch en cas d'erreur majeure
-        return [{'label': 'ERROR', 'score': 0.0} for _ in texts]
+        return [{'label': 'ERROR', 'score': 0.0, 'value': get_sentiment_value('ERROR')} for _ in texts]
 
 
-def add_sentiment_metrics_batch(batch: dict, text_col: str, label_col: str, score_col: str) -> dict:
+def add_sentiment_metrics_batch(batch: dict, text_col: str, label_col: str, score_col: str, value_col: str) -> dict:
     """
     Applique le calcul du sentiment à un batch d'exemples.
     """
@@ -105,6 +114,8 @@ def add_sentiment_metrics_batch(batch: dict, text_col: str, label_col: str, scor
              batch[label_col] = ['N/A'] * num_rows
         if score_col not in batch:
              batch[score_col] = [0.0] * num_rows
+        if value_col not in batch:
+             batch[value_col] = [None] * num_rows # Utiliser None pour les valeurs entières potentiellement nulles
         return batch
 
     texts_in_batch: list = batch[text_col]
@@ -113,6 +124,7 @@ def add_sentiment_metrics_batch(batch: dict, text_col: str, label_col: str, scor
     
     batch[label_col] = [res['label'] for res in sentiment_results]
     batch[score_col] = [res['score'] for res in sentiment_results]
+    batch[value_col] = [res['value'] for res in sentiment_results]
     return batch
 
 def main():
@@ -120,8 +132,8 @@ def main():
     configure_logging()
     logger = logging.getLogger(__name__)
 
-    parser = argparse.ArgumentParser(description="Ajoute des colonnes d'analyse de sentiment ('sentiment_label', 'sentiment_score') à un dataset Hugging Face, basées sur la colonne 'OCR'.")
-    parser.add_argument("--repo", default="fmadore/iwac-newspaper-articles", help="ID du repository sur le Hugging Face Hub (ex: utilisateur/nom_dataset).")
+    parser = argparse.ArgumentParser(description="Ajoute des colonnes d'analyse de sentiment ('sentiment_label', 'sentiment_score', 'sentiment_value') à un dataset Hugging Face, basées sur la colonne 'OCR'.")
+    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="ID du repository sur le Hugging Face Hub (ex: utilisateur/nom_dataset).")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille maximale des shards Parquet lors du push vers le Hub.")
     parser.add_argument("--batch-size", type=int, default=100, help="Taille des batchs pour le traitement .map(). Attention: un batch size élevé avec des modèles transformers peut consommer beaucoup de RAM/VRAM.")
     
@@ -131,6 +143,7 @@ def main():
     text_column_name = "OCR"  # Hardcoded
     sentiment_label_col_name = "sentiment_label"  # Hardcoded
     sentiment_score_col_name = "sentiment_score"  # Hardcoded
+    sentiment_value_col_name = "sentiment_value" # Nouvelle colonne
     max_shard_size = args.max_shard_size
     batch_size = args.batch_size # Peut nécessiter d'être plus petit pour les transformers
 
@@ -179,7 +192,7 @@ def main():
     # --- Chargement du dataset ---
     logger.info(f"Chargement du dataset '{repo_id}', configuration '{config_name_choice}'...")
     try:
-        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token, trust_remote_code=True)
+        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token)
     except Exception as e:
         logger.error(f"Erreur lors du chargement du dataset: {e}")
         return
@@ -195,13 +208,15 @@ def main():
         logger.warning(f"La colonne de label de sentiment '{sentiment_label_col_name}' existe déjà. Elle sera écrasée.")
     if sentiment_score_col_name in ds.column_names:
         logger.warning(f"La colonne de score de sentiment '{sentiment_score_col_name}' existe déjà. Elle sera écrasée.")
+    if sentiment_value_col_name in ds.column_names:
+        logger.warning(f"La colonne de valeur de sentiment '{sentiment_value_col_name}' existe déjà. Elle sera écrasée.")
 
     # --- Application du calcul des métriques de sentiment ---
-    logger.info(f"Calcul du sentiment (cols: '{sentiment_label_col_name}', '{sentiment_score_col_name}') pour la colonne '{text_column_name}'...")
+    logger.info(f"Calcul du sentiment (cols: '{sentiment_label_col_name}', '{sentiment_score_col_name}', '{sentiment_value_col_name}') pour la colonne '{text_column_name}'...")
     
     ds_processed = ds.map(
         add_sentiment_metrics_batch,
-        fn_kwargs={"text_col": text_column_name, "label_col": sentiment_label_col_name, "score_col": sentiment_score_col_name},
+        fn_kwargs={"text_col": text_column_name, "label_col": sentiment_label_col_name, "score_col": sentiment_score_col_name, "value_col": sentiment_value_col_name},
         batched=True,
         batch_size=batch_size, # Un batch size plus petit est souvent nécessaire pour les transformers
         desc="Calcul du sentiment",
@@ -210,45 +225,55 @@ def main():
     logger.info(f"Calcul du sentiment terminé.")
     logger.info(f"Aperçu (premiers 5) pour '{sentiment_label_col_name}': {ds_processed[sentiment_label_col_name][:5]}")
     logger.info(f"Aperçu (premiers 5) pour '{sentiment_score_col_name}': {ds_processed[sentiment_score_col_name][:5]}")
+    logger.info(f"Aperçu (premiers 5) pour '{sentiment_value_col_name}': {ds_processed[sentiment_value_col_name][:5]}")
     
     # --- Réorganisation des colonnes ---
-    insert_after_col = "lemma_nostop"  # MODIFIÉ: Colonne après laquelle insérer les nouvelles métriques
-    logger.info(f"Réorganisation des colonnes pour placer '{sentiment_label_col_name}' et '{sentiment_score_col_name}' après '{insert_after_col}'.")
+    insert_after_col = "lemma_nostop"
+    new_sentiment_cols = [sentiment_label_col_name, sentiment_score_col_name, sentiment_value_col_name]
+    logger.info(f"Réorganisation des colonnes pour placer {new_sentiment_cols} après '{insert_after_col}'.")
     
     existing_columns = list(ds_processed.column_names)
     
+    # S'assurer que les nouvelles colonnes sont bien dans existing_columns (elles devraient l'être après .map)
+    for col_name in new_sentiment_cols:
+        if col_name not in existing_columns:
+            logger.warning(f"La colonne '{col_name}' attendue après le .map() n'a pas été trouvée dans le dataset. Elle ne sera pas incluse dans la réorganisation.")
+            # Retirer de la liste si elle n'existe pas pour éviter les erreurs
+            new_sentiment_cols.remove(col_name)
+
     if insert_after_col not in existing_columns:
-        logger.warning(f"La colonne '{insert_after_col}' n'a pas été trouvée. Les nouvelles colonnes seront ajoutées à la fin.")
-        ordered_columns = [col for col in existing_columns if col not in [sentiment_label_col_name, sentiment_score_col_name]]
-        if sentiment_label_col_name in existing_columns: # Devrait toujours y être après .map()
-            ordered_columns.append(sentiment_label_col_name)
-        if sentiment_score_col_name in existing_columns: # Devrait toujours y être
-            ordered_columns.append(sentiment_score_col_name)
+        logger.warning(f"La colonne '{insert_after_col}' n'a pas été trouvée. Les nouvelles colonnes de sentiment seront ajoutées à la fin.")
+        ordered_columns = [col for col in existing_columns if col not in new_sentiment_cols]
+        ordered_columns.extend(new_sentiment_cols) # Ajoute celles qui existent
     else:
         ordered_columns = []
+        # Créer une liste des nouvelles colonnes qui existent réellement pour les ajouter
+        cols_to_add_at_insert_point = [col for col in new_sentiment_cols if col in existing_columns]
+
         for col in existing_columns:
-            # Exclure les nouvelles colonnes pour les ajouter au bon endroit
-            if col == sentiment_label_col_name or col == sentiment_score_col_name:
+            if col in cols_to_add_at_insert_point: # Ne pas ajouter les nouvelles colonnes ici, elles seront ajoutées après insert_after_col
                 continue
             ordered_columns.append(col)
             if col == insert_after_col:
-                if sentiment_label_col_name in existing_columns:
-                    ordered_columns.append(sentiment_label_col_name)
-                if sentiment_score_col_name in existing_columns:
-                    ordered_columns.append(sentiment_score_col_name)
+                ordered_columns.extend(cols_to_add_at_insert_point) # Ajouter les nouvelles colonnes ici
     
-    if len(ordered_columns) == len(existing_columns) and set(ordered_columns) == set(existing_columns):
+    # Vérification finale pour s'assurer que toutes les colonnes sont présentes
+    if set(ordered_columns) == set(existing_columns) and len(ordered_columns) == len(existing_columns):
         ds_processed = ds_processed.select_columns(ordered_columns)
         logger.info(f"Nouvel ordre des colonnes: {ds_processed.column_names}")
     else:
-        logger.warning("La réorganisation des colonnes a été sautée car une incohérence a été détectée. "
-                         f"Colonnes attendues: {existing_columns}, Colonnes réorganisées proposées: {ordered_columns}. "
-                         "Vérifiez les noms des colonnes et la logique de réorganisation.")
+        logger.warning("La réorganisation des colonnes a été sautée ou est incomplète car une incohérence a été détectée. "
+                         f"Colonnes existantes: {existing_columns}, "
+                         f"Colonnes réorganisées proposées: {ordered_columns}. "
+                         "Les colonnes de sentiment pourraient ne pas être à la position désirée.")
+        # Si la réorganisation a échoué mais qu'on veut quand même un ordre, on peut forcer un fallback
+        # ou laisser l'ordre tel quel (ce qui est le cas si on ne fait rien ici).
+        # Pour l'instant, on logue l'avertissement.
 
     # --- Sauvegarde du dataset traité --- 
     logger.info(f"Sauvegarde du dataset traité vers le Hub Hugging Face (repo: '{repo_id}', config: '{config_name_choice}')...")
     try:
-        commit_message = f"Ajout colonnes '{sentiment_label_col_name}' et '{sentiment_score_col_name}' basées sur '{text_column_name}' (config: {config_name_choice})"
+        commit_message = f"Ajout colonnes '{sentiment_label_col_name}', '{sentiment_score_col_name}', '{sentiment_value_col_name}' basées sur '{text_column_name}' (config: {config_name_choice})"
         ds_processed.push_to_hub(
             repo_id=repo_id,
             config_name=config_name_choice,

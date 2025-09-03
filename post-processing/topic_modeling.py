@@ -3,10 +3,14 @@
 topic_modeling.py
 =================
 
-Ajoute des colonnes avec la modélisation de sujets à un dataset Hugging Face 
-existant, basées sur la colonne 'lemma_nostop' (texte lemmatisé sans mots vides).
-Le script utilise BERTopic avec CamemBERT pour identifier les sujets principaux
-et ajoute les résultats dans de nouvelles colonnes.
+Ajoute des colonnes avec la modélisation de sujets à un dataset Hugging Face.
+
+Changement clé: on utilise désormais deux vues du texte pour de meilleures
+représentations de sujets en français:
+- Embeddings: colonne "OCR" (phrases naturelles complètes) pour construire l'espace
+    sémantique et réduire les outliers.
+- Vectorisation/labels (c-TF-IDF): colonne "lemma_nostop" pour générer des labels
+    plus propres et informatifs.
 
 IMPORTANT: Seuls les documents avec language='Français' sont traités par le modèle.
 Les documents d'autres langues ou sans indication de langue conservent des valeurs
@@ -14,7 +18,7 @@ vides (None) dans les colonnes de sujets (topic_id, topic_prob, topic_label).
 
 Usage
 -----
-    python post-processing/topic_modeling.py [--repo MON_USER/MON_DATASET]
+        python post-processing/topic_modeling.py [--repo MON_USER/MON_DATASET]
 
 Variables d'environnement
 ---------------------
@@ -22,21 +26,21 @@ HF_TOKEN   Jeton d'accès personnel pour le Hugging Face Hub
 
 Dépendances
 -----------
-    pip install bertopic sentence-transformers umap-learn hdbscan scikit-learn tqdm torch
+        pip install bertopic sentence-transformers umap-learn hdbscan scikit-learn tqdm torch
 
 Modèles d'embedding français recommandés
 ---------------------------------------
-    --embedding-model dangvantuan/sentence-camembert-base     # Modèle base (110M params)
-    --embedding-model dangvantuan/sentence-camembert-large    # Modèle large (336M params, meilleur)
-    --embedding-model Lajavaness/sentence-camembert-large     # Alternative optimisée
+        --embedding-model dangvantuan/sentence-camembert-base     # Modèle base (110M params)
+        --embedding-model dangvantuan/sentence-camembert-large    # Modèle large (336M params, meilleur)
+        --embedding-model Lajavaness/sentence-camembert-large     # Alternative optimisée
 
 Optimisations CPU
 -----------------
-    Pour machines sans GPU, utilisez les options :
-    --cpu-only                    # Force l'utilisation du CPU
-    --max-documents 10000         # Limite le nombre de documents pour tests
-    --embedding-batch-size 16     # Réduit la taille des batches si mémoire limitée
-    --min-topic-size 20           # Augmente la taille min des sujets pour réduire le bruit
+        Pour machines sans GPU, utilisez les options :
+        --cpu-only                    # Force l'utilisation du CPU
+        --max-documents 10000         # Limite le nombre de documents pour tests
+        --embedding-batch-size 16     # Réduit la taille des batches si mémoire limitée
+        --min-topic-size 20           # Augmente la taille min des sujets pour réduire le bruit
 """
 import argparse
 import logging
@@ -78,6 +82,20 @@ def patched_open(file, mode='r', *args, **kwargs):
             kwargs.setdefault('errors', 'replace')
     return original_open(file, mode, *args, **kwargs)
 builtins.open = patched_open
+
+# Domain-specific stopwords to de-emphasize boilerplate in labels (c-TF-IDF)
+DOMAIN_STOPWORDS = {
+    # lower-case; CountVectorizer lowercases by default
+    "el",
+    "cfa",
+    "monsieur",
+    "madame",
+    "excellence",
+    "président",
+    "ministre",
+    # phrase kept for clarity; unigram components above will remove it effectively
+    "excellence monsieur",
+}
 
 def configure_logging() -> None:
     logging.basicConfig(
@@ -202,10 +220,11 @@ def create_bertopic_model(
     hdbscan_selection_method: str = 'leaf',
     hdbscan_epsilon: float = 0.0,
     # Vectorizer params
-    vectorizer_min_df: int = 5,
-    vectorizer_max_features: int = 10000,
+    vectorizer_min_df: int = 10,
+    vectorizer_max_df: float = 0.9,
+    vectorizer_max_features: int = 25000,
     vectorizer_ngram_min: int = 1,
-    vectorizer_ngram_max: int = 2,
+    vectorizer_ngram_max: int = 3,
 ) -> BERTopic:
     # Configuration pour CPU si demandé
     device = "cpu" if cpu_only else "cuda" if torch.cuda.is_available() else "cpu"
@@ -234,10 +253,10 @@ def create_bertopic_model(
     
     vectorizer_model = CountVectorizer(
         ngram_range=(vectorizer_ngram_min, vectorizer_ngram_max),
-        stop_words=None,
-        max_features=vectorizer_max_features,
-        min_df=vectorizer_min_df,
-        max_df=0.95,
+    stop_words=sorted(DOMAIN_STOPWORDS) if DOMAIN_STOPWORDS else None,
+    max_features=vectorizer_max_features,
+    min_df=vectorizer_min_df,
+    max_df=vectorizer_max_df,
         encoding='utf-8',  # Explicitly set UTF-8 encoding
         decode_error='replace',  # Replace invalid characters instead of failing
         strip_accents=None,  # Don't strip accents to preserve French characters
@@ -260,24 +279,31 @@ def create_bertopic_model(
     return topic_model
 
 def fit_topic_model(
-    texts: List[str],
+    docs_clean: List[str],
+    embed_texts: List[str],
     model_save_path: Path,
     logger: logging.Logger,
     embedding_model_name: str,
+    embedding_batch_size: int,
     reduce_outliers_threshold: float | None = None,
     topic_label_max_words: int = 8,
 ) -> BERTopic:
     global topic_model
     
-    logger.info("Entraînement du modèle BERTopic...")
-    logger.info(f"Nombre de documents: {len(texts)}")
+    logger.info("Entraînement du modèle BERTopic (embeddings=OCR, c-TF-IDF=lemma_nostop)...")
+    logger.info(f"Nombre de paires docs (clean+OCR): {len(docs_clean)}")
     
-    # Filtrage des textes valides avec barre de progression
-    logger.info("Filtrage des textes valides...")
-    valid_texts = [text for text in tqdm(texts, desc="Filtrage des textes") if text and text.strip()]
-    logger.info(f"Nombre de documents valides: {len(valid_texts)}")
+    # Filtrer les paires valides (les deux côtés doivent être non vides)
+    logger.info("Filtrage des paires valides...")
+    valid_docs_clean = []
+    valid_embed_texts = []
+    for dc, et in tqdm(list(zip(docs_clean, embed_texts)), desc="Filtrage des textes"):
+        if dc and str(dc).strip() and et and str(et).strip():
+            valid_docs_clean.append(str(dc))
+            valid_embed_texts.append(str(et))
+    logger.info(f"Nombre de paires valides: {len(valid_docs_clean)}")
     
-    if len(valid_texts) < 50:
+    if len(valid_docs_clean) < 50:
         logger.warning("Nombre de documents très faible pour un entraînement robuste.")
     
     logger.info("Entraînement en cours (cela peut prendre plusieurs minutes)...")
@@ -285,7 +311,16 @@ def fit_topic_model(
         # L'entraînement BERTopic n'a pas de callback de progression intégré
         # donc nous simulons une progression
         pbar.update(10)  # Début de l'entraînement
-        topics, probabilities = topic_model.fit_transform(valid_texts)
+        # Calculer les embeddings sur le texte OCR complet
+        logger.info("Calcul des embeddings (OCR)...")
+        embeddings = topic_model.embedding_model.encode(
+            valid_embed_texts,
+            batch_size=embedding_batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+        )
+        # Entraîner avec docs_clean pour la vectorisation/labels, mais embeddings venant de OCR
+        topics, probabilities = topic_model.fit_transform(valid_docs_clean, embeddings=embeddings)
         pbar.update(90)  # Fin de l'entraînement
 
     # Optionally reduce outliers on the training set and update topic representations
@@ -293,10 +328,10 @@ def fit_topic_model(
         if reduce_outliers_threshold is not None and reduce_outliers_threshold > 0:
             logger.info(f"Réduction des outliers d'entraînement (seuil={reduce_outliers_threshold})…")
             new_topics = topic_model.reduce_outliers(
-                valid_texts, topics, probabilities, strategy="c-tf-idf", threshold=reduce_outliers_threshold
+                valid_docs_clean, topics, probabilities, strategy="c-tf-idf", threshold=reduce_outliers_threshold
             )
             # Mettre à jour les représentations avec les nouveaux topics
-            topic_model.update_topics(valid_texts, topics=new_topics)
+            topic_model.update_topics(valid_docs_clean, topics=new_topics)
             logger.info("Outliers d'entraînement réaffectés et représentations mises à jour.")
     except Exception as e:
         logger.warning(f"Réduction des outliers impossible/ignorée: {e}")
@@ -347,15 +382,16 @@ def load_topic_model(model_path: Path, logger: logging.Logger) -> BERTopic:
 
 def predict_topics_batch(
     batch: Dict[str, List[Any]],
-    text_col: str,
+    embed_text_col: str,
     topic_id_col: str,
     topic_prob_col: str,
     topic_label_col: str,
     outlier_reassign_threshold: float | None = None,
+    embedding_batch_size: int = 16,
 ) -> Dict[str, List[Any]]:
     global topic_model
     
-    texts = batch[text_col]
+    texts = batch[embed_text_col]
     languages = batch.get('language', [None] * len(texts))  # Get language info if available
     
     # Identify French entries and prepare texts for processing
@@ -380,8 +416,14 @@ def predict_topics_batch(
     # Only process French texts if there are any
     if french_texts:
         try:
-            # Transform only French texts
-            french_topics, french_probabilities = topic_model.transform(french_texts)
+            # Encode embeddings on OCR texts and transform
+            embeddings = topic_model.embedding_model.encode(
+                french_texts,
+                batch_size=embedding_batch_size,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
+            french_topics, french_probabilities = topic_model.transform(french_texts, embeddings=embeddings)
             
             # Get topic information for label mapping
             topic_info = topic_model.get_topic_info()
@@ -504,9 +546,10 @@ def main():
     parser.add_argument("--hdbscan-selection-method", type=str, choices=["eom", "leaf"], default="leaf",
                         help="HDBSCAN cluster_selection_method")
     parser.add_argument("--hdbscan-epsilon", type=float, default=0.0, help="HDBSCAN cluster_selection_epsilon")
-    parser.add_argument("--vectorizer-min-df", type=int, default=5, help="CountVectorizer min_df")
-    parser.add_argument("--vectorizer-max-features", type=int, default=8000, help="CountVectorizer max_features")
-    parser.add_argument("--vectorizer-ngrams", type=str, default="1,2", help="CountVectorizer ngram range 'a,b'")
+    parser.add_argument("--vectorizer-min-df", type=int, default=10, help="CountVectorizer min_df")
+    parser.add_argument("--vectorizer-max-df", type=float, default=0.9, help="CountVectorizer max_df")
+    parser.add_argument("--vectorizer-max-features", type=int, default=25000, help="CountVectorizer max_features")
+    parser.add_argument("--vectorizer-ngrams", type=str, default="1,3", help="CountVectorizer ngram range 'a,b'")
     # Outlier reduction options
     parser.add_argument("--reduce-outliers-train", type=float, default=0.35,
                         help="Seuil (0-1) pour réduire/réassigner les outliers à l'entraînement via c-TF-IDF. 0=désactivé")
@@ -519,7 +562,8 @@ def main():
 
     repo_id = args.repo
     embedding_model_name = args.embedding_model
-    text_column_name = "lemma_nostop"
+    text_column_name = "lemma_nostop"  # used for vectorization/labels (docs_clean)
+    embed_text_column_name = "OCR"      # used for embeddings (full French sentences)
     topic_id_column_name = "topic_id"
     topic_prob_column_name = "topic_prob"
     topic_label_column_name = "topic_label"
@@ -586,6 +630,10 @@ def main():
     if text_column_name not in ds.column_names:
         logger.error(f"Colonne '{text_column_name}' non trouvée. Colonnes disponibles: {ds.column_names}")
         return
+    if embed_text_column_name not in ds.column_names:
+        logger.error(f"Colonne d'embeddings '{embed_text_column_name}' non trouvée. Colonnes disponibles: {ds.column_names}")
+        logger.error("Le script attend 'OCR' pour calculer les embeddings.")
+        return
 
     # Vérifier si les colonnes de sujets existent déjà
     new_columns = [topic_id_column_name, topic_prob_column_name, topic_label_column_name]
@@ -626,42 +674,53 @@ def main():
             hdbscan_selection_method=args.hdbscan_selection_method,
             hdbscan_epsilon=args.hdbscan_epsilon,
             vectorizer_min_df=args.vectorizer_min_df,
+            vectorizer_max_df=args.vectorizer_max_df,
             vectorizer_max_features=args.vectorizer_max_features,
             vectorizer_ngram_min=ngram_min,
             vectorizer_ngram_max=ngram_max,
         )
         
-        logger.info("Extraction et validation des textes français pour l'entraînement...")
+        logger.info("Extraction des textes français pour l'entraînement (OCR pour embeddings, lemma_nostop pour labels)...")
         
-        # Extraire seulement les textes français pour l'entraînement du modèle
+        # Extraire seulement les textes français; créer deux listes alignées
         if 'language' in ds.column_names:
-            french_texts = []
-            for i, (text, lang) in enumerate(zip(ds[text_column_name], ds['language'])):
-                if lang == 'Français' and text and text.strip():
-                    if len(str(text).split()) >= args.min_train_tokens:
-                        french_texts.append(text)
-            texts = french_texts
-            logger.info(f"Textes français valides extraits: {len(texts)}")
+            docs_clean = []
+            embed_texts = []
+            for lemma_text, ocr_text, lang in zip(ds[text_column_name], ds[embed_text_column_name], ds['language']):
+                if lang == 'Français' and lemma_text and str(lemma_text).strip() and ocr_text and str(ocr_text).strip():
+                    if len(str(lemma_text).split()) >= args.min_train_tokens:
+                        docs_clean.append(str(lemma_text))
+                        embed_texts.append(str(ocr_text))
+            logger.info(f"Paires (lemma_nostop + OCR) extraites: {len(docs_clean)}")
         else:
-            texts = ds[text_column_name]
-            logger.info("Colonne langue non disponible, utilisation de tous les textes")
+            docs_clean = [str(t) for t in ds[text_column_name]]
+            embed_texts = [str(t) for t in ds[embed_text_column_name]]
+            logger.info("Colonne langue non disponible, utilisation de tous les textes (OCR/lemma)")
         
         # Limitation optionnelle du nombre de documents (utile pour tests CPU)
-        if max_documents and len(texts) > max_documents:
+        if max_documents and len(docs_clean) > max_documents:
             logger.info(f"Limitation à {max_documents} documents pour optimiser les performances CPU")
-            texts = texts[:max_documents]
+            docs_clean = docs_clean[:max_documents]
+            embed_texts = embed_texts[:max_documents]
         
-        valid_texts = [text for text in tqdm(texts, desc="Validation des textes") if text and text.strip()]
-        
-        if len(valid_texts) < min_topic_size:
-            logger.error(f"Nombre de textes valides ({len(valid_texts)}) < min_topic_size ({min_topic_size})")
+        # Petite validation locale
+        valid_pairs = [
+            (dc, et) for dc, et in tqdm(list(zip(docs_clean, embed_texts)), desc="Validation des paires")
+            if dc and str(dc).strip() and et and str(et).strip()
+        ]
+        if len(valid_pairs) < min_topic_size:
+            logger.error(f"Nombre de textes valides ({len(valid_pairs)}) < min_topic_size ({min_topic_size})")
             return
-        
+        docs_clean_valid = [p[0] for p in valid_pairs]
+        embed_texts_valid = [p[1] for p in valid_pairs]
+
         topic_model = fit_topic_model(
-            valid_texts,
+            docs_clean_valid,
+            embed_texts_valid,
             model_path,
             logger,
             embedding_model_name,
+            embedding_batch_size,
             reduce_outliers_threshold=(args.reduce_outliers_train if args.reduce_outliers_train > 0 else None),
             topic_label_max_words=args.topic_label_max_words,
         )
@@ -679,11 +738,12 @@ def main():
     ds_processed = ds.map(
         predict_topics_batch,
         fn_kwargs={
-            "text_col": text_column_name,
+            "embed_text_col": embed_text_column_name,
             "topic_id_col": topic_id_column_name,
             "topic_prob_col": topic_prob_column_name,
             "topic_label_col": topic_label_column_name,
             "outlier_reassign_threshold": (args.outlier_reassign_threshold if args.outlier_reassign_threshold and args.outlier_reassign_threshold > 0 else None),
+            "embedding_batch_size": embedding_batch_size,
         },
         batched=True,
         batch_size=batch_size,
