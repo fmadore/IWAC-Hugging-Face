@@ -6,6 +6,7 @@
 .cache_omk_index
 __pycache__
 bertopic_model
+bertopic_model_merge_full
 data/iwac_articles.csv
 data/iwac_audiovisual.csv
 data/iwac_documents.csv
