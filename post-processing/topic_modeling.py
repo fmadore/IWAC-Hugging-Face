@@ -47,6 +47,11 @@ import numpy as np
 from datasets import load_dataset
 from huggingface_hub import HfFolder, login
 from bertopic import BERTopic
+try:
+    from bertopic.representation import KeyBERTInspired
+    KEYBERT_AVAILABLE = True
+except ImportError:
+    KEYBERT_AVAILABLE = False
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import CountVectorizer
 from umap import UMAP
@@ -82,6 +87,53 @@ def configure_logging() -> None:
     )
 
 topic_model = None
+
+def create_custom_topic_representation():
+    """Create a custom topic representation that removes duplicates and creates cleaner labels."""
+    if KEYBERT_AVAILABLE:
+        # Use KeyBERTInspired to get diverse keywords
+        keybert_model = KeyBERTInspired()
+        return keybert_model
+    else:
+        # Fallback to default representation
+        return None
+
+def clean_topic_labels(topic_model, max_words=8):
+    """Clean topic labels by removing duplicates and limiting word count."""
+    topic_info = topic_model.get_topic_info()
+    
+    for idx, row in topic_info.iterrows():
+        topic_id = row['Topic']
+        if topic_id == -1:  # Skip outlier topic
+            continue
+            
+        # Get the original topic words
+        topic_words = topic_model.get_topic(topic_id)
+        if not topic_words:
+            continue
+            
+        # Extract unique words (case-insensitive deduplication)
+        seen_words = set()
+        unique_words = []
+        
+        for word, score in topic_words:
+            word_lower = word.lower()
+            if word_lower not in seen_words:
+                seen_words.add(word_lower)
+                unique_words.append(word)
+                if len(unique_words) >= max_words:
+                    break
+        
+        # Create new label
+        if unique_words:
+            new_label = f"{topic_id}_" + "_".join(unique_words)
+            # Update the topic info
+            topic_info.loc[topic_info['Topic'] == topic_id, 'Name'] = new_label
+    
+    # Update the topic model's topic info
+    topic_model.topic_labels_ = {row['Topic']: row['Name'] for _, row in topic_info.iterrows()}
+    
+    return topic_model
 
 def get_available_configs(repo_id: str, token: str) -> List[str]:
     try:
@@ -135,35 +187,56 @@ def choose_modeling_mode() -> str:
             print("\nOpération annulée.")
             exit(0)
 
-def create_bertopic_model(embedding_model_name: str, min_topic_size: int = 10, 
-                         cpu_only: bool = False, embedding_batch_size: int = 32) -> BERTopic:
+def create_bertopic_model(
+    embedding_model_name: str,
+    min_topic_size: int = 10,
+    cpu_only: bool = False,
+    embedding_batch_size: int = 32,
+    # UMAP params
+    umap_n_neighbors: int = 50,
+    umap_min_dist: float = 0.1,
+    umap_n_components: int = 10,
+    umap_metric: str = 'cosine',
+    # HDBSCAN params
+    hdbscan_min_samples: int = 5,
+    hdbscan_selection_method: str = 'leaf',
+    hdbscan_epsilon: float = 0.0,
+    # Vectorizer params
+    vectorizer_min_df: int = 5,
+    vectorizer_max_features: int = 10000,
+    vectorizer_ngram_min: int = 1,
+    vectorizer_ngram_max: int = 2,
+) -> BERTopic:
     # Configuration pour CPU si demandé
     device = "cpu" if cpu_only else "cuda" if torch.cuda.is_available() else "cpu"
     
     embedding_model = SentenceTransformer(embedding_model_name, device=device)
     
     umap_model = UMAP(
-        n_neighbors=15, 
-        n_components=5, 
-        min_dist=0.0, 
-        metric='cosine',
+        n_neighbors=umap_n_neighbors,
+        n_components=umap_n_components,
+        min_dist=umap_min_dist,
+        metric=umap_metric,
         random_state=42,
         # Optimisation CPU : utiliser tous les cœurs disponibles
-        n_jobs=-1 if cpu_only else 1
+        n_jobs=-1 if device == "cpu" else 1,
     )
     
     hdbscan_model = HDBSCAN(
         min_cluster_size=min_topic_size,
+        min_samples=hdbscan_min_samples,
         metric='euclidean',
-        cluster_selection_method='eom',
-        prediction_data=True
+        cluster_selection_method=hdbscan_selection_method,
+        cluster_selection_epsilon=hdbscan_epsilon,
+        prediction_data=True,
+        approx_min_span_tree=False,
     )
     
     vectorizer_model = CountVectorizer(
-        ngram_range=(1, 2),
+        ngram_range=(vectorizer_ngram_min, vectorizer_ngram_max),
         stop_words=None,
-        max_features=5000,
-        min_df=2,
+        max_features=vectorizer_max_features,
+        min_df=vectorizer_min_df,
         max_df=0.95,
         encoding='utf-8',  # Explicitly set UTF-8 encoding
         decode_error='replace',  # Replace invalid characters instead of failing
@@ -172,18 +245,28 @@ def create_bertopic_model(embedding_model_name: str, min_topic_size: int = 10,
         token_pattern=r'(?u)\b\w\w+\b'  # Unicode-aware token pattern
     )
     
+    representation_model = create_custom_topic_representation()
+    
     topic_model = BERTopic(
         embedding_model=embedding_model,
         umap_model=umap_model,
         hdbscan_model=hdbscan_model,
         vectorizer_model=vectorizer_model,
+        representation_model=representation_model,
         verbose=True,
         calculate_probabilities=True
     )
     
     return topic_model
 
-def fit_topic_model(texts: List[str], model_save_path: Path, logger: logging.Logger, embedding_model_name: str) -> BERTopic:
+def fit_topic_model(
+    texts: List[str],
+    model_save_path: Path,
+    logger: logging.Logger,
+    embedding_model_name: str,
+    reduce_outliers_threshold: float | None = None,
+    topic_label_max_words: int = 8,
+) -> BERTopic:
     global topic_model
     
     logger.info("Entraînement du modèle BERTopic...")
@@ -204,6 +287,27 @@ def fit_topic_model(texts: List[str], model_save_path: Path, logger: logging.Log
         pbar.update(10)  # Début de l'entraînement
         topics, probabilities = topic_model.fit_transform(valid_texts)
         pbar.update(90)  # Fin de l'entraînement
+
+    # Optionally reduce outliers on the training set and update topic representations
+    try:
+        if reduce_outliers_threshold is not None and reduce_outliers_threshold > 0:
+            logger.info(f"Réduction des outliers d'entraînement (seuil={reduce_outliers_threshold})…")
+            new_topics = topic_model.reduce_outliers(
+                valid_texts, topics, probabilities, strategy="c-tf-idf", threshold=reduce_outliers_threshold
+            )
+            # Mettre à jour les représentations avec les nouveaux topics
+            topic_model.update_topics(valid_texts, topics=new_topics)
+            logger.info("Outliers d'entraînement réaffectés et représentations mises à jour.")
+    except Exception as e:
+        logger.warning(f"Réduction des outliers impossible/ignorée: {e}")
+    
+    # Clean topic labels to remove duplicates
+    try:
+        logger.info("Nettoyage des labels de topics (suppression des doublons)...")
+        topic_model = clean_topic_labels(topic_model, max_words=topic_label_max_words)
+        logger.info(f"Labels de topics nettoyés (max {topic_label_max_words} mots uniques).")
+    except Exception as e:
+        logger.warning(f"Nettoyage des labels impossible/ignoré: {e}")
     
     topic_info = topic_model.get_topic_info()
     logger.info(f"Nombre de sujets découverts: {len(topic_info) - 1}")
@@ -241,8 +345,14 @@ def load_topic_model(model_path: Path, logger: logging.Logger) -> BERTopic:
     
     return topic_model
 
-def predict_topics_batch(batch: Dict[str, List[Any]], text_col: str, 
-                        topic_id_col: str, topic_prob_col: str, topic_label_col: str) -> Dict[str, List[Any]]:
+def predict_topics_batch(
+    batch: Dict[str, List[Any]],
+    text_col: str,
+    topic_id_col: str,
+    topic_prob_col: str,
+    topic_label_col: str,
+    outlier_reassign_threshold: float | None = None,
+) -> Dict[str, List[Any]]:
     global topic_model
     
     texts = batch[text_col]
@@ -276,15 +386,31 @@ def predict_topics_batch(batch: Dict[str, List[Any]], text_col: str,
             # Get topic information for label mapping
             topic_info = topic_model.get_topic_info()
             topic_name_map = {row['Topic']: row['Name'] for _, row in topic_info.iterrows()}
+            # Mapping for probability columns (non-outlier topics only)
+            non_outlier_topic_ids = [int(t) for t in topic_info['Topic'].tolist() if int(t) != -1]
             
             # Assign results back to the corresponding positions
             for idx, french_idx in enumerate(french_indices):
                 topic_id = french_topics[idx]
                 
                 if topic_id == -1:
-                    topics[french_idx] = topic_id
-                    probabilities[french_idx] = 0.0
-                    topic_labels[french_idx] = "Outlier"
+                    # Try to reassign outliers to the most probable non-outlier topic when confident
+                    reassigned = False
+                    if outlier_reassign_threshold is not None and french_probabilities is not None:
+                        probs_vec = french_probabilities[idx]
+                        if isinstance(probs_vec, (list, np.ndarray)) and len(probs_vec) == len(non_outlier_topic_ids):
+                            j = int(np.argmax(probs_vec))
+                            best_prob = float(probs_vec[j])
+                            if best_prob >= outlier_reassign_threshold:
+                                topic_id = int(non_outlier_topic_ids[j])
+                                topics[french_idx] = topic_id
+                                probabilities[french_idx] = best_prob
+                                topic_labels[french_idx] = topic_name_map.get(topic_id, f"Topic_{topic_id}")
+                                reassigned = True
+                    if not reassigned:
+                        topics[french_idx] = -1
+                        probabilities[french_idx] = 0.0
+                        topic_labels[french_idx] = "Outlier"
                 else:
                     topics[french_idx] = topic_id
                     # Extract max probability for this document
@@ -357,7 +483,7 @@ def main():
     parser.add_argument("--repo", default="fmadore/islam-west-africa-collection")
     parser.add_argument("--embedding-model", default="dangvantuan/sentence-camembert-base", 
                         help="Modèle d'embedding à utiliser (recommandé: sentence-camembert-base pour le français)")
-    parser.add_argument("--min-topic-size", type=int, default=10)
+    parser.add_argument("--min-topic-size", type=int, default=5)
     parser.add_argument("--model-path", default="bertopic_model")
     parser.add_argument("--max-shard-size", default="1GB")
     parser.add_argument("--batch-size", type=int, default=100)
@@ -365,8 +491,29 @@ def main():
                         help="Force l'utilisation du CPU uniquement (optimisations pour machines sans GPU)")
     parser.add_argument("--max-documents", type=int, default=None,
                         help="Limite le nombre de documents pour les tests (utile pour CPU)")
-    parser.add_argument("--embedding-batch-size", type=int, default=32,
+    parser.add_argument("--embedding-batch-size", type=int, default=16,
                         help="Taille des batches pour les embeddings (réduire si mémoire limitée)")
+    parser.add_argument("--min-train-tokens", type=int, default=5,
+                        help="Longueur minimale (en tokens) pour inclure un texte dans l'entraînement")
+    # UMAP/HDBSCAN/Vectorizer advanced tuning
+    parser.add_argument("--umap-n-neighbors", type=int, default=60, help="UMAP n_neighbors (plus grand = moins d'outliers)")
+    parser.add_argument("--umap-min-dist", type=float, default=0.1, help="UMAP min_dist")
+    parser.add_argument("--umap-n-components", type=int, default=10, help="UMAP n_components")
+    parser.add_argument("--umap-metric", type=str, default="cosine", help="UMAP metric")
+    parser.add_argument("--hdbscan-min-samples", type=int, default=3, help="HDBSCAN min_samples (plus petit = moins d'outliers)")
+    parser.add_argument("--hdbscan-selection-method", type=str, choices=["eom", "leaf"], default="leaf",
+                        help="HDBSCAN cluster_selection_method")
+    parser.add_argument("--hdbscan-epsilon", type=float, default=0.0, help="HDBSCAN cluster_selection_epsilon")
+    parser.add_argument("--vectorizer-min-df", type=int, default=5, help="CountVectorizer min_df")
+    parser.add_argument("--vectorizer-max-features", type=int, default=8000, help="CountVectorizer max_features")
+    parser.add_argument("--vectorizer-ngrams", type=str, default="1,2", help="CountVectorizer ngram range 'a,b'")
+    # Outlier reduction options
+    parser.add_argument("--reduce-outliers-train", type=float, default=0.35,
+                        help="Seuil (0-1) pour réduire/réassigner les outliers à l'entraînement via c-TF-IDF. 0=désactivé")
+    parser.add_argument("--outlier-reassign-threshold", type=float, default=0.35,
+                        help="Réassigne un outlier à la prédiction si la meilleure proba >= seuil (0-1). 0=jamais")
+    parser.add_argument("--topic-label-max-words", type=int, default=8,
+                        help="Nombre maximum de mots uniques dans les labels de topics (défaut: 8)")
     
     args = parser.parse_args()
 
@@ -461,7 +608,28 @@ def main():
             logger.info("Mode CPU activé - optimisations pour machines sans GPU")
             logger.info(f"Taille des batches d'embeddings: {embedding_batch_size}")
         
-        topic_model = create_bertopic_model(embedding_model_name, min_topic_size, cpu_only, embedding_batch_size)
+        # Parse ngram range
+        try:
+            ngram_min, ngram_max = [int(x.strip()) for x in args.vectorizer_ngrams.split(",")]
+        except Exception:
+            ngram_min, ngram_max = 1, 2
+        topic_model = create_bertopic_model(
+            embedding_model_name,
+            min_topic_size,
+            cpu_only,
+            embedding_batch_size,
+            umap_n_neighbors=args.umap_n_neighbors,
+            umap_min_dist=args.umap_min_dist,
+            umap_n_components=args.umap_n_components,
+            umap_metric=args.umap_metric,
+            hdbscan_min_samples=args.hdbscan_min_samples,
+            hdbscan_selection_method=args.hdbscan_selection_method,
+            hdbscan_epsilon=args.hdbscan_epsilon,
+            vectorizer_min_df=args.vectorizer_min_df,
+            vectorizer_max_features=args.vectorizer_max_features,
+            vectorizer_ngram_min=ngram_min,
+            vectorizer_ngram_max=ngram_max,
+        )
         
         logger.info("Extraction et validation des textes français pour l'entraînement...")
         
@@ -470,7 +638,8 @@ def main():
             french_texts = []
             for i, (text, lang) in enumerate(zip(ds[text_column_name], ds['language'])):
                 if lang == 'Français' and text and text.strip():
-                    french_texts.append(text)
+                    if len(str(text).split()) >= args.min_train_tokens:
+                        french_texts.append(text)
             texts = french_texts
             logger.info(f"Textes français valides extraits: {len(texts)}")
         else:
@@ -488,7 +657,14 @@ def main():
             logger.error(f"Nombre de textes valides ({len(valid_texts)}) < min_topic_size ({min_topic_size})")
             return
         
-        topic_model = fit_topic_model(valid_texts, model_path, logger, embedding_model_name)
+        topic_model = fit_topic_model(
+            valid_texts,
+            model_path,
+            logger,
+            embedding_model_name,
+            reduce_outliers_threshold=(args.reduce_outliers_train if args.reduce_outliers_train > 0 else None),
+            topic_label_max_words=args.topic_label_max_words,
+        )
         
     else:
         if not model_path.exists():
@@ -506,7 +682,8 @@ def main():
             "text_col": text_column_name,
             "topic_id_col": topic_id_column_name,
             "topic_prob_col": topic_prob_column_name,
-            "topic_label_col": topic_label_column_name
+            "topic_label_col": topic_label_column_name,
+            "outlier_reassign_threshold": (args.outlier_reassign_threshold if args.outlier_reassign_threshold and args.outlier_reassign_threshold > 0 else None),
         },
         batched=True,
         batch_size=batch_size,
