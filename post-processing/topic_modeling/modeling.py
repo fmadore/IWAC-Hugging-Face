@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import inspect
 from typing import Any, Dict, List
 
 import numpy as np
@@ -62,8 +63,80 @@ def clean_topic_labels(topic_model: BERTopic, max_words: int = 8) -> BERTopic:
             new_label = f"{topic_id}_" + "_".join(unique_words)
             topic_info.loc[topic_info['Topic'] == topic_id, 'Name'] = new_label
 
-    topic_model.topic_labels_ = {row['Topic']: row['Name'] for _, row in topic_info.iterrows()}
+    # Apply labels through the public API when available (BERTopic >= 0.16)
+    labels_map = {row['Topic']: row['Name'] for _, row in topic_info.iterrows()}
+    if hasattr(topic_model, "set_topic_labels"):
+        topic_model.set_topic_labels(labels_map)
+    else:  # fallback for older versions
+        try:
+            topic_model.topic_labels_ = labels_map  # type: ignore[attr-defined]
+        except Exception:
+            pass
     return topic_model
+
+
+def _embed_texts(embedding_model: Any, texts: List[str], batch_size: int, show_progress: bool) -> np.ndarray:
+    """Embed texts across BERTopic/SBERT versions.
+
+    Supports:
+    - SentenceTransformer.encode (older direct model)
+    - EmbeddingModel.embed / embed_documents (BERTopic backends)
+    """
+    def _call_with_supported(method, texts_arg):
+        """Call method(texts, **kwargs) using only supported kwargs.
+
+        Handles variants like show_progress_bar|verbose and optional batch_size.
+        Falls back to calling without kwargs if needed.
+        """
+        try:
+            sig = inspect.signature(method)
+            params = set(sig.parameters.keys())
+        except (TypeError, ValueError):  # builtins or C-accelerated functions
+            params = set()
+
+        kwargs = {}
+        if 'batch_size' in params:
+            kwargs['batch_size'] = batch_size
+        # Some apis use show_progress_bar, some use verbose, some none
+        if 'show_progress_bar' in params:
+            kwargs['show_progress_bar'] = show_progress
+        elif 'show_progress' in params:
+            kwargs['show_progress'] = show_progress
+        elif 'verbose' in params:
+            kwargs['verbose'] = show_progress
+
+        try:
+            return np.asarray(method(texts_arg, **kwargs))
+        except TypeError:
+            # Retry with no kwargs at all
+            return np.asarray(method(texts_arg))
+
+    # SentenceTransformer from sentence-transformers
+    if hasattr(embedding_model, "encode"):
+        method = getattr(embedding_model, "encode")
+        try:
+            sig = inspect.signature(method)
+            params = set(sig.parameters.keys())
+        except (TypeError, ValueError):
+            params = set()
+
+        kwargs = {"convert_to_numpy": True}
+        if 'batch_size' in params:
+            kwargs['batch_size'] = batch_size
+        if 'show_progress_bar' in params:
+            kwargs['show_progress_bar'] = show_progress
+        try:
+            return method(texts, **kwargs)
+        except TypeError:
+            # Minimal fallback
+            return np.asarray(method(texts))
+
+    # BERTopic EmbeddingModel interface
+    if hasattr(embedding_model, "embed"):
+        return _call_with_supported(embedding_model.embed, texts)
+    if hasattr(embedding_model, "embed_documents"):
+        return _call_with_supported(embedding_model.embed_documents, texts)
+    raise AttributeError("Unsupported embedding model: no encode/embed/embed_documents method found")
 
 
 def create_bertopic_model(
@@ -169,11 +242,11 @@ def fit_topic_model(
     with tqdm(total=100, desc="Entraînement BERTopic") as pbar:
         pbar.update(10)
         logger.info("Calcul des embeddings (OCR)...")
-        embeddings = topic_model.embedding_model.encode(
+        embeddings = _embed_texts(
+            topic_model.embedding_model,
             valid_embed_texts,
-            batch_size=embedding_batch_size,
-            show_progress_bar=True,
-            convert_to_numpy=True,
+            embedding_batch_size,
+            show_progress=True,
         )
         topics, probabilities = topic_model.fit_transform(valid_docs_clean, embeddings=embeddings)
         pbar.update(90)
@@ -229,12 +302,56 @@ def load_topic_model(model_path: Path, logger: logging.Logger) -> BERTopic:
     logger.info(f"Chargement du modèle BERTopic depuis: {model_path}")
     with tqdm(total=100, desc="Chargement du modèle") as pbar:
         pbar.update(30)
-        topic_model = BERTopic.load(str(model_path))
+        try:
+            topic_model = BERTopic.load(str(model_path))
+        except UnicodeDecodeError as e:
+            logger.warning(
+                f"Erreur d'encodage UTF-8 lors du chargement ({e}). Tentative de réparation des fichiers JSON..."
+            )
+            _repair_model_dir_encoding(model_path, logger)
+            topic_model = BERTopic.load(str(model_path))
         pbar.update(70)
 
     topic_info = topic_model.get_topic_info()
     logger.info(f"Modèle chargé avec {len(topic_info) - 1} sujets")
     return topic_model
+
+
+def _repair_model_dir_encoding(model_dir: Path, logger: logging.Logger) -> None:
+    """Repair JSON files in a saved BERTopic directory by re-encoding to UTF-8.
+
+    Some environments may save JSON using a local ANSI codepage (e.g., cp1252) on Windows.
+    This function scans .json files and if they are not valid UTF-8, decodes with a few
+    common fallbacks, then writes back as UTF-8.
+    """
+    if not model_dir.exists():
+        return
+    for json_path in model_dir.glob("**/*.json"):
+        try:
+            data = json_path.read_bytes()
+            try:
+                # Fast-path: already UTF-8
+                data.decode("utf-8")
+                continue
+            except UnicodeDecodeError:
+                pass
+
+            text = None
+            for enc in ("cp1252", "latin-1"):
+                try:
+                    text = data.decode(enc)
+                    logger.info(f"Ré-encodage de '{json_path.name}' depuis {enc} vers UTF-8")
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if text is None:
+                # As a last resort, replace errors with placeholders
+                text = data.decode("utf-8", errors="replace")
+                logger.info(f"Ré-encodage de '{json_path.name}' avec remplacement d'erreurs vers UTF-8")
+
+            json_path.write_text(text, encoding="utf-8", errors="strict")
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"Impossible de réparer '{json_path}': {e}")
 
 
 def predict_topics_batch(
@@ -264,11 +381,11 @@ def predict_topics_batch(
 
     if french_texts:
         try:
-            embeddings = topic_model.embedding_model.encode(
+            embeddings = _embed_texts(
+                topic_model.embedding_model,
                 french_texts,
-                batch_size=embedding_batch_size,
-                show_progress_bar=False,
-                convert_to_numpy=True,
+                embedding_batch_size,
+                show_progress=False,
             )
             french_topics, french_probabilities = topic_model.transform(french_texts, embeddings=embeddings)
 
