@@ -25,20 +25,21 @@ from tqdm import tqdm
 
 import sys
 
-# Allow importing sibling modules when running this file directly
+# Ensure package imports work when running this file directly
 CURRENT_DIR = Path(__file__).resolve().parent
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
+PARENT_DIR = CURRENT_DIR.parent
+if str(PARENT_DIR) not in sys.path:
+    sys.path.insert(0, str(PARENT_DIR))
 
-from patches import apply_all_patches  # type: ignore
-from utils import (
+from topic_modeling.patches import apply_all_patches  # type: ignore
+from topic_modeling.utils import (
     configure_logging,
     get_available_configs,
     choose_config,
     choose_modeling_mode,
     build_arg_parser,
 )  # type: ignore
-from modeling import (  # type: ignore
+from topic_modeling.modeling import (  # type: ignore
     create_bertopic_model,
     fit_topic_model,
     load_topic_model,
