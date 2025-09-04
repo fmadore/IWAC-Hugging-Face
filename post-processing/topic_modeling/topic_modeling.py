@@ -153,31 +153,7 @@ def main() -> None:
         if cpu_only:
             logger.info("Mode CPU activé - optimisations pour machines sans GPU")
             logger.info(f"Taille des batches d'embeddings: {embedding_batch_size}")
-        
-        # Parse ngram range
-        try:
-            ngram_min, ngram_max = [int(x.strip()) for x in args.vectorizer_ngrams.split(",")]
-        except Exception:
-            ngram_min, ngram_max = 1, 2
-        topic_model = create_bertopic_model(
-            embedding_model_name,
-            min_topic_size,
-            cpu_only,
-            embedding_batch_size,
-            umap_n_neighbors=args.umap_n_neighbors,
-            umap_min_dist=args.umap_min_dist,
-            umap_n_components=args.umap_n_components,
-            umap_metric=args.umap_metric,
-            hdbscan_min_samples=args.hdbscan_min_samples,
-            hdbscan_selection_method=args.hdbscan_selection_method,
-            hdbscan_epsilon=args.hdbscan_epsilon,
-            vectorizer_min_df=args.vectorizer_min_df,
-            vectorizer_max_df=args.vectorizer_max_df,
-            vectorizer_max_features=args.vectorizer_max_features,
-            vectorizer_ngram_min=ngram_min,
-            vectorizer_ngram_max=ngram_max,
-        )
-        
+
         logger.info("Extraction des textes français pour l'entraînement (OCR pour embeddings, lemma_nostop pour labels)...")
         
         # Extraire seulement les textes français; créer deux listes alignées
@@ -195,7 +171,7 @@ def main() -> None:
             embed_texts = [str(t) for t in ds[embed_text_column_name]]
             logger.info("Colonne langue non disponible, utilisation de tous les textes (OCR/lemma)")
         
-        # Limitation optionnelle du nombre de documents (utile pour tests CPU)
+    # Limitation optionnelle du nombre de documents (utile pour tests CPU)
         if max_documents and len(docs_clean) > max_documents:
             logger.info(f"Limitation à {max_documents} documents pour optimiser les performances CPU")
             docs_clean = docs_clean[:max_documents]
@@ -211,6 +187,59 @@ def main() -> None:
             return
         docs_clean_valid = [p[0] for p in valid_pairs]
         embed_texts_valid = [p[1] for p in valid_pairs]
+
+        # Load extra domain stopwords if provided
+        extra_stopwords: list[str] | None = None
+        if args.domain_stopwords_file:
+            try:
+                from pathlib import Path as _P
+                path_sw = _P(args.domain_stopwords_file)
+                if path_sw.exists():
+                    with path_sw.open("r", encoding="utf-8", errors="replace") as f:
+                        extra_stopwords = [line.strip().lower() for line in f if line.strip()]
+                    logger.info(f"Stopwords additionnels chargés: {len(extra_stopwords)} mots")
+                else:
+                    logger.warning(f"Fichier de stopwords introuvable: {path_sw}")
+            except Exception as e:
+                logger.warning(f"Impossible de charger les stopwords additionnels: {e}")
+
+        # Determine dynamic min_cluster_size if desired_topics is provided
+        dynamic_min_cluster_size = min_topic_size
+        if args.desired_topics and args.desired_topics > 0:
+            try:
+                dynamic_min_cluster_size = max(20, int(len(docs_clean_valid) / int(args.desired_topics)))
+                logger.info(
+                    f"min_cluster_size dynamique: {dynamic_min_cluster_size} (docs={len(docs_clean_valid)}, sujets visés={args.desired_topics})"
+                )
+            except Exception:
+                pass
+
+        # Parse ngram range
+        try:
+            ngram_min, ngram_max = [int(x.strip()) for x in args.vectorizer_ngrams.split(",")]
+        except Exception:
+            ngram_min, ngram_max = 1, 3
+
+        topic_model = create_bertopic_model(
+            embedding_model_name,
+            dynamic_min_cluster_size,
+            cpu_only,
+            embedding_batch_size,
+            umap_n_neighbors=args.umap_n_neighbors,
+            umap_min_dist=args.umap_min_dist,
+            umap_n_components=args.umap_n_components,
+            umap_metric=args.umap_metric,
+            hdbscan_min_samples=args.hdbscan_min_samples,
+            hdbscan_selection_method=args.hdbscan_selection_method,
+            hdbscan_epsilon=args.hdbscan_epsilon,
+            vectorizer_min_df=args.vectorizer_min_df,
+            vectorizer_max_df=args.vectorizer_max_df,
+            vectorizer_max_features=args.vectorizer_max_features,
+            vectorizer_ngram_min=ngram_min,
+            vectorizer_ngram_max=ngram_max,
+            domain_stopwords=extra_stopwords,
+            desired_topics=args.desired_topics,
+        )
 
         topic_model = fit_topic_model(
             topic_model,

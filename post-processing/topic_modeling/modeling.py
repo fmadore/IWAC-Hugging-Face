@@ -19,21 +19,59 @@ from sklearn.feature_extraction.text import CountVectorizer
 from tqdm import tqdm
 from umap import UMAP
 
-from .constants import DOMAIN_STOPWORDS
+from .constants import DOMAIN_STOPWORDS, LABEL_ONLY_STOPWORDS
+import unicodedata
 
 try:
-    from bertopic.representation import KeyBERTInspired
-
+    from bertopic.representation import KeyBERTInspired, PartOfSpeech, Merge
     KEYBERT_AVAILABLE = True
 except ImportError:  # pragma: no cover - optional dependency
     KEYBERT_AVAILABLE = False
 
+# Optional: c-TF-IDF with reduction of frequent words to improve labels
+try:  # pragma: no cover - optional dependency across versions
+    from bertopic._ctfidf import ClassTfidfTransformer  # type: ignore
+    CTFIDF_AVAILABLE = True
+except Exception:  # older/newer versions may move this symbol
+    ClassTfidfTransformer = None  # type: ignore
+    CTFIDF_AVAILABLE = False
+
 
 def create_custom_topic_representation():
-    """Create a custom topic representation that removes duplicates and creates cleaner labels."""
-    if KEYBERT_AVAILABLE:
-        return KeyBERTInspired()
-    return None
+    """Create a custom topic representation that prioritizes NOUN/ADJ and adds diversity.
+
+    Uses PartOfSpeech (French) + KeyBERTInspired via Merge when available.
+    Falls back to KeyBERTInspired alone, then to None.
+    """
+    if not KEYBERT_AVAILABLE:
+        return None
+    try:  # Try POS + KeyBERT with Merge
+        pos = PartOfSpeech(model="fr_core_news_md", allowed_pos={"NOUN", "ADJ"}, top_n=10)
+        keybert = KeyBERTInspired(mm_r=True, diversity=0.3)
+        return Merge([pos, keybert])
+    except Exception:  # spaCy model missing or representation unavailable
+        try:
+            return KeyBERTInspired()
+        except Exception:
+            return None
+
+
+def _normalize_token(token: str) -> str:
+    """Lowercase and strip accents/punct for robust matching.
+
+    Keeps alphanumerics; removes combining marks and punctuation.
+    """
+    if not token:
+        return ""
+    t = token.lower()
+    t = unicodedata.normalize("NFKD", t)
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    # keep letters/digits and space/hyphen separators
+    cleaned = []
+    for ch in t:
+        if ch.isalnum() or ch in {" ", "-", "_"}:
+            cleaned.append(ch)
+    return "".join(cleaned).strip()
 
 
 def clean_topic_labels(topic_model: BERTopic, max_words: int = 8) -> BERTopic:
@@ -52,15 +90,22 @@ def clean_topic_labels(topic_model: BERTopic, max_words: int = 8) -> BERTopic:
         seen_words = set()
         unique_words: List[str] = []
         for word, _ in topic_words:
-            w = word.lower()
-            if w not in seen_words:
-                seen_words.add(w)
-                unique_words.append(word)
-                if len(unique_words) >= max_words:
-                    break
+            w_norm = _normalize_token(word)
+            if not w_norm:
+                continue
+            # skip if token or its normalized form is in label-only or vectorizer stopwords
+            if (w_norm in LABEL_ONLY_STOPWORDS) or (w_norm in DOMAIN_STOPWORDS):
+                continue
+            if w_norm in seen_words:
+                continue
+            seen_words.add(w_norm)
+            unique_words.append(word)
+            if len(unique_words) >= max_words:
+                break
 
         if unique_words:
-            new_label = f"{topic_id}_" + "_".join(unique_words)
+            # shorter, cleaner label: join with " - " and no id prefix (BERTopic UI shows id)
+            new_label = " - ".join(unique_words)
             topic_info.loc[topic_info['Topic'] == topic_id, 'Name'] = new_label
 
     # Apply labels through the public API when available (BERTopic >= 0.16)
@@ -159,6 +204,8 @@ def create_bertopic_model(
     vectorizer_max_features: int = 25000,
     vectorizer_ngram_min: int = 1,
     vectorizer_ngram_max: int = 3,
+    domain_stopwords: List[str] | None = None,
+    desired_topics: int | None = None,
 ) -> BERTopic:
     device = "cpu" if cpu_only else "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -173,6 +220,15 @@ def create_bertopic_model(
         n_jobs=-1 if device == "cpu" else 1,
     )
 
+    # Optionally adjust cluster size based on desired number of topics
+    if desired_topics and desired_topics > 0:
+        try:
+            # heuristic: cluster size around N/desired_topics will be set by caller using len(docs)
+            # Here we ensure min_topic_size is at least 20 to avoid tiny clusters
+            min_topic_size = max(20, int(min_topic_size))
+        except Exception:
+            pass
+
     hdbscan_model = HDBSCAN(
         min_cluster_size=min_topic_size,
         min_samples=hdbscan_min_samples,
@@ -183,27 +239,42 @@ def create_bertopic_model(
         approx_min_span_tree=False,
     )
 
+    # Build combined stopwords
+    stopwords = set(DOMAIN_STOPWORDS)
+    if domain_stopwords:
+        stopwords.update({s.lower() for s in domain_stopwords if s})
+
     vectorizer_model = CountVectorizer(
         ngram_range=(vectorizer_ngram_min, vectorizer_ngram_max),
-        stop_words=sorted(DOMAIN_STOPWORDS) if DOMAIN_STOPWORDS else None,
+        stop_words=sorted(stopwords) if stopwords else None,
         max_features=vectorizer_max_features,
         min_df=vectorizer_min_df,
         max_df=vectorizer_max_df,
         encoding='utf-8',
-        decode_error='replace',
-        strip_accents=None,
+    decode_error='replace',
+    # Normalize accents to merge e.g., "août" and "aout"
+    strip_accents='unicode',
         lowercase=True,
         token_pattern=r'(?u)\b\w\w+\b',
     )
 
     representation_model = create_custom_topic_representation()
 
+    # Use BERTopic defaults with tuned components; optionally enable c-TF-IDF reduction of frequent words
+    ctfidf_model = None
+    if CTFIDF_AVAILABLE:
+        try:
+            ctfidf_model = ClassTfidfTransformer(reduce_frequent_words=True)
+        except Exception:
+            ctfidf_model = None
     topic_model = BERTopic(
         embedding_model=embedding_model,
         umap_model=umap_model,
         hdbscan_model=hdbscan_model,
         vectorizer_model=vectorizer_model,
         representation_model=representation_model,
+        # Reduce frequent words helps mitigate boilerplate domination in labels
+        ctfidf_model=ctfidf_model,  # keep default if unavailable; rely on stopwords/df thresholds
         verbose=True,
         calculate_probabilities=True,
     )
@@ -391,6 +462,7 @@ def predict_topics_batch(
 
             topic_info = topic_model.get_topic_info()
             topic_name_map = {row['Topic']: row['Name'] for _, row in topic_info.iterrows()}
+            # Keep the order as provided by topic_info to better match probabilities ordering across versions
             non_outlier_topic_ids = [int(t) for t in topic_info['Topic'].tolist() if int(t) != -1]
 
             for idx, french_idx in enumerate(french_indices):

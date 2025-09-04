@@ -99,13 +99,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-train-tokens", type=int, default=5, help="Longueur minimale (en tokens) pour inclure un texte dans l'entraînement"
     )
+    parser.add_argument(
+        "--domain-stopwords-file",
+        type=str,
+        default=None,
+        help="Fichier texte (UTF-8) de stopwords supplémentaires spécifiques au domaine (1 mot par ligne)",
+    )
+    parser.add_argument(
+        "--desired-topics",
+        type=int,
+        default=None,
+        help="Nombre de sujets visé; ajuste dynamiquement min_cluster_size = max(20, N_docs/desired_topics)",
+    )
     # UMAP/HDBSCAN/Vectorizer advanced tuning
-    parser.add_argument("--umap-n-neighbors", type=int, default=60, help="UMAP n_neighbors (plus grand = moins d'outliers)")
-    parser.add_argument("--umap-min-dist", type=float, default=0.1, help="UMAP min_dist")
-    parser.add_argument("--umap-n-components", type=int, default=10, help="UMAP n_components")
+    parser.add_argument("--umap-n-neighbors", type=int, default=150, help="UMAP n_neighbors (plus grand = moins d'outliers)")
+    parser.add_argument("--umap-min-dist", type=float, default=0.0, help="UMAP min_dist")
+    parser.add_argument("--umap-n-components", type=int, default=5, help="UMAP n_components")
     parser.add_argument("--umap-metric", type=str, default="cosine", help="UMAP metric")
     parser.add_argument(
-        "--hdbscan-min-samples", type=int, default=3, help="HDBSCAN min_samples (plus petit = moins d'outliers)"
+        "--hdbscan-min-samples", type=int, default=2, help="HDBSCAN min_samples (plus petit = moins d'outliers)"
     )
     parser.add_argument(
         "--hdbscan-selection-method", type=str, choices=["eom", "leaf"], default="leaf", help="HDBSCAN cluster_selection_method"
@@ -119,16 +131,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reduce-outliers-train",
         type=float,
-        default=0.35,
+        default=0.1,
         help="Seuil (0-1) pour réduire/réassigner les outliers à l'entraînement via c-TF-IDF. 0=désactivé",
     )
     parser.add_argument(
         "--outlier-reassign-threshold",
         type=float,
-        default=0.35,
+        default=0.1,
         help="Réassigne un outlier à la prédiction si la meilleure proba >= seuil (0-1). 0=jamais",
     )
     parser.add_argument(
-        "--topic-label-max-words", type=int, default=8, help="Nombre maximum de mots uniques dans les labels de topics (défaut: 8)"
+        "--topic-label-max-words", type=int, default=6, help="Nombre maximum de mots uniques dans les labels de topics (défaut: 6)"
     )
     return parser
