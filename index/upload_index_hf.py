@@ -402,7 +402,7 @@ def extract_terms_from_field(field_value: str) -> List[str]:
 
 
 def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
-    """Calcule les statistiques de fréquence pour tous les termes des colonnes subject et spatial"""
+    """Calcule les statistiques de fréquence pour tous les termes des colonnes subject, spatial et author"""
     term_stats = defaultdict(lambda: {
         'frequency': 0,
         'first_occurrence': None,
@@ -443,6 +443,19 @@ def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.Dat
                             term_stats[spatial]['first_occurrence'] = date_str
                         if not term_stats[spatial]['last_occurrence'] or date_str > term_stats[spatial]['last_occurrence']:
                             term_stats[spatial]['last_occurrence'] = date_str
+            
+            # Traiter les auteurs
+            authors = extract_terms_from_field(row.get('author', ''))
+            for author in authors:
+                if author:
+                    term_stats[author]['frequency'] += 1
+                    if country:
+                        term_stats[author]['countries'].add(country)
+                    if date_str:
+                        if not term_stats[author]['first_occurrence'] or date_str < term_stats[author]['first_occurrence']:
+                            term_stats[author]['first_occurrence'] = date_str
+                        if not term_stats[author]['last_occurrence'] or date_str > term_stats[author]['last_occurrence']:
+                            term_stats[author]['last_occurrence'] = date_str
     
     # Traiter les publications
     logger.info("Calculating frequency stats from publications dataset...")
@@ -477,6 +490,19 @@ def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.Dat
                             term_stats[spatial]['first_occurrence'] = date_str
                         if not term_stats[spatial]['last_occurrence'] or date_str > term_stats[spatial]['last_occurrence']:
                             term_stats[spatial]['last_occurrence'] = date_str
+            
+            # Traiter les auteurs
+            authors = extract_terms_from_field(row.get('author', ''))
+            for author in authors:
+                if author:
+                    term_stats[author]['frequency'] += 1
+                    if country:
+                        term_stats[author]['countries'].add(country)
+                    if date_str:
+                        if not term_stats[author]['first_occurrence'] or date_str < term_stats[author]['first_occurrence']:
+                            term_stats[author]['first_occurrence'] = date_str
+                        if not term_stats[author]['last_occurrence'] or date_str > term_stats[author]['last_occurrence']:
+                            term_stats[author]['last_occurrence'] = date_str
     
     # Convertir les sets en chaînes séparées par |
     result = {}
