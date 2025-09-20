@@ -4,6 +4,7 @@
 .cache_omk_audiovisual
 .cache_omk_documents
 .cache_omk_index
+.cache_omk_references
 __pycache__
 bertopic_model
 bertopic_model_merge_full
