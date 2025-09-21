@@ -547,7 +547,7 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
             # Use outer merge to keep all records and preserve extra columns
             final_df = pd.merge(new_omeka_df, existing_df[['o:id'] + extra_cols_to_preserve], on='o:id', how='outer', suffixes=('', '_old'))
             # Fill NaN values in new columns with data from existing columns where available
-            final_df = final_df.fillna(method='ffill', axis=1).fillna(method='bfill', axis=1)
+            final_df = final_df.ffill(axis=1).bfill(axis=1)
         else:
             logger.info("No extra columns to preserve from existing data.")
             final_df = new_omeka_df
@@ -570,7 +570,8 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
         int_columns = ['nb_pages', 'page_start', 'page_end']
         for col in int_columns:
             if col in final_df.columns:
-                final_df[col] = final_df[col].astype('Int64')
+                # Convert to numeric first, coercing errors to NaN, then to nullable integer
+                final_df[col] = pd.to_numeric(final_df[col], errors='coerce').astype('Int64')
 
         ds = Dataset.from_pandas(final_df, preserve_index=False)
         logger.info("Dataset preview (first 5 rows):")
