@@ -76,6 +76,19 @@ class Config:
 # Reference resource classes
 RESOURCE_CLASSES = [35, 43, 88, 40, 82, 178, 52, 77, 305]
 
+# Resource class mapping
+RESOURCE_CLASS_MAPPING = {
+    35: 'Article de revue',
+    43: 'Chapitre',
+    88: 'Thèse',
+    40: 'Livre',
+    82: 'Rapport',
+    178: 'Compte rendu',
+    52: 'Ouvrage collectif',
+    77: 'Communication',
+    305: 'Article de blog'
+}
+
 # Country mapping based on item sets
 COUNTRY_ITEM_SETS = {
     2193: 'Bénin',
@@ -275,6 +288,27 @@ def _get_value(item: Dict[str, Any], field: str) -> str:
     return str(val)
 
 
+def _get_iwac_identifier(item: Dict[str, Any], field: str) -> str:
+    """Extract identifier values that start with 'iwac-reference'"""
+    if field not in item or item[field] is None:
+        return ""
+    val = item[field]
+    if isinstance(val, list):
+        for v in val:
+            identifier = str(v.get("display_title") or v.get("@value") or v.get("@id", ""))
+            if identifier.startswith("iwac-reference"):
+                return identifier
+    elif isinstance(val, dict):
+        identifier = val.get("display_title", "") or val.get("@value", "")
+        if identifier.startswith("iwac-reference"):
+            return identifier
+    else:
+        identifier = str(val)
+        if identifier.startswith("iwac-reference"):
+            return identifier
+    return ""
+
+
 def _join(item: Dict[str, Any], field: str) -> str:
     return _get_value(item, field)
 
@@ -286,9 +320,13 @@ def _get_media_ids(item: Dict[str, Any]) -> str:
 
 
 def _get_resource_class(item: Dict[str, Any]) -> str:
-    """Extract resource class information"""
+    """Extract resource class information and map to human-readable name"""
     if "o:resource_class" in item and isinstance(item["o:resource_class"], dict):
-        return str(item["o:resource_class"].get("o:id", ""))
+        class_id = item["o:resource_class"].get("o:id")
+        if class_id and class_id in RESOURCE_CLASS_MAPPING:
+            return RESOURCE_CLASS_MAPPING[class_id]
+        elif class_id:
+            return str(class_id)  # Return ID as string if not in mapping
     return ""
 
 
@@ -335,12 +373,6 @@ async def fetch_iiif_thumbnail_url(omeka_id: Union[str, int], session: aiohttp.C
 
 async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item Omeka de référence en dict plat pour HF datasets."""
-
-    primary_url = ""
-    if item.get("o:primary_media"):
-        mid = item["o:primary_media"]["@id"].split("/")[-1]
-        mdata = await api.fetch_media_data(mid)
-        primary_url = mdata.get("o:original_url", "")
 
     # Map country based on item set IDs
     country = _get_countries_from_item_sets(item)
@@ -407,22 +439,11 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
             except Exception:
                 logger.warning(f"Could not parse added date '{created_value}' for item {item['o:id']}")
 
-    # Fetch thumbnail URL and set IIIF manifest URL only if primary media exists
-    session = await conn_manager.get()
-    thumbnail_url = ""
-    iiif_manifest_url = ""
-    
-    if primary_url:  # Only fetch IIIF data if there's a primary media
-        thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
-        iiif_manifest_url = f"https://islam.zmo.de/iiif/3/{item['o:id']}/manifest"
-
     return {
         "o:id": item["o:id"],
         "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
-        "identifier": _get_value(item, "dcterms:identifier"),
+        "identifier": _get_iwac_identifier(item, "dcterms:identifier"),
         "o:resource_class": _get_resource_class(item),
-        "o:item_set": _get_item_set_ids(item),
-        "o:media/file": primary_url,
         "title": _get_value(item, "dcterms:title"),
         "bibo:authorList": _join(item, "bibo:authorList"),
         "bibo:editorList": _join(item, "bibo:editorList"),
@@ -449,8 +470,6 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
         "fabio_has_url": extracted_fabio_url,
         "country": country,
         "added_date": added_date,
-        "iiif_manifest": iiif_manifest_url,
-        "thumbnail": thumbnail_url,
     }
 
 
