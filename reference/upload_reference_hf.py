@@ -399,67 +399,78 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
 
     # Convert volume to int
     volume_str = _get_value(item, "bibo:volume")
-    volume_int = None
+    volume_int = ""
     if volume_str:
         try:
             volume_int = int(volume_str)
         except ValueError:
             logger.warning(
-                f"Could not convert volume '{volume_str}' to int for item {item['o:id']}. Defaulting to null."
+                f"Could not convert volume '{volume_str}' to int for item {item['o:id']}. Defaulting to empty."
             )
 
     # Convert issue to int
     issue_str = _get_value(item, "bibo:issue")
-    issue_int = None
+    issue_int = ""
     if issue_str:
         try:
             issue_int = int(issue_str)
         except ValueError:
             logger.warning(
-                f"Could not convert issue '{issue_str}' to int for item {item['o:id']}. Defaulting to null."
+                f"Could not convert issue '{issue_str}' to int for item {item['o:id']}. Defaulting to empty."
             )
 
     # Convert edition to int
     edition_str = _get_value(item, "bibo:edition")
-    edition_int = None
+    edition_int = ""
     if edition_str:
         try:
             edition_int = int(edition_str)
         except ValueError:
             logger.warning(
-                f"Could not convert edition '{edition_str}' to int for item {item['o:id']}. Defaulting to null."
+                f"Could not convert edition '{edition_str}' to int for item {item['o:id']}. Defaulting to empty."
+            )
+
+    # Convert chapter to int
+    chapter_str = _get_value(item, "bibo:chapter")
+    chapter_int = ""
+    if chapter_str:
+        try:
+            chapter_int = int(chapter_str)
+        except ValueError:
+            logger.warning(
+                f"Could not convert chapter '{chapter_str}' to int for item {item['o:id']}. Defaulting to empty."
             )
 
     # Convert nb_pages to int
     nb_pages_str = _get_value(item, "bibo:numPages")
-    nb_pages_int = None
+    nb_pages_int = ""
     if nb_pages_str:
         try:
             nb_pages_int = int(nb_pages_str)
         except ValueError:
             logger.warning(
-                f"Could not convert nb_pages '{nb_pages_str}' to int for item {item['o:id']}. Defaulting to null."
+                f"Could not convert nb_pages '{nb_pages_str}' to int for item {item['o:id']}. Defaulting to empty."
             )
 
     # Convert page start/end to int
     page_start_str = _get_value(item, "bibo:pageStart")
-    page_start_int = None
+    page_start_int = ""
     if page_start_str:
         try:
             page_start_int = int(page_start_str)
         except ValueError:
             logger.warning(
-                f"Could not convert pageStart '{page_start_str}' to int for item {item['o:id']}. Defaulting to null."
+                f"Could not convert pageStart '{page_start_str}' to int for item {item['o:id']}. Defaulting to empty."
             )
 
     page_end_str = _get_value(item, "bibo:pageEnd")
-    page_end_int = None
+    page_end_int = ""
     if page_end_str:
         try:
             page_end_int = int(page_end_str)
         except ValueError:
             logger.warning(
-                f"Could not convert pageEnd '{page_end_str}' to int for item {item['o:id']}. Defaulting to null."
+                f"Could not convert pageEnd '{page_end_str}' to int for item {item['o:id']}. Defaulting to empty."
             )
 
     # Extract date when item was added to Omeka (YYYY-MM-DD format)
@@ -486,7 +497,7 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
         "pub_date": _get_value(item, "dcterms:date"),
         "type": _get_value(item, "dcterms:type"),
         "book_title": _get_value(item, "dcterms:alternative"),
-        "chapter": _get_value(item, "bibo:chapter"),
+        "chapter": chapter_int,
         "volume": volume_int,
         "issue": issue_int,
         "abstract": _get_value(item, "dcterms:abstract"),
@@ -604,13 +615,6 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
             logger.error("Critical error: 'o:id' is missing or null in the final DataFrame before push. Aborting push.")
             await conn_manager.close()
             return
-
-        # Convert integer columns to nullable integer type to preserve integer dtype with null values
-        int_columns = ['volume', 'issue', 'edition', 'nb_pages', 'page_start', 'page_end']
-        for col in int_columns:
-            if col in final_df.columns:
-                # Convert to numeric first, coercing errors to NaN, then to nullable integer
-                final_df[col] = pd.to_numeric(final_df[col], errors='coerce').astype('Int64')
 
         ds = Dataset.from_pandas(final_df, preserve_index=False)
         logger.info("Dataset preview (first 5 rows):")
