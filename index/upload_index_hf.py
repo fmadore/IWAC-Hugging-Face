@@ -401,8 +401,9 @@ def extract_terms_from_field(field_value: str) -> List[str]:
     return [term.strip() for term in str(field_value).split("|") if term.strip()]
 
 
-def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
-    """Calcule les statistiques de fréquence pour tous les termes des colonnes subject, spatial et author"""
+def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.DataFrame, references_df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    """Calcule les statistiques de fréquence pour tous les termes des colonnes subject, spatial et author des datasets articles et publications,
+    ainsi que les colonnes author, editor et publisher du dataset references"""
     term_stats = defaultdict(lambda: {
         'frequency': 0,
         'first_occurrence': None,
@@ -504,6 +505,53 @@ def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.Dat
                         if not term_stats[author]['last_occurrence'] or date_str > term_stats[author]['last_occurrence']:
                             term_stats[author]['last_occurrence'] = date_str
     
+    # Traiter les références
+    logger.info("Calculating frequency stats from references dataset...")
+    if not references_df.empty:
+        for _, row in tqdm(references_df.iterrows(), total=len(references_df), desc="Processing references"):
+            # Extraire la date
+            date_str = row.get('pub_date', '') or row.get('date', '')
+            country = row.get('country', '')
+            
+            # Traiter les auteurs
+            authors = extract_terms_from_field(row.get('author', ''))
+            for author in authors:
+                if author:
+                    term_stats[author]['frequency'] += 1
+                    if country:
+                        term_stats[author]['countries'].add(country)
+                    if date_str:
+                        if not term_stats[author]['first_occurrence'] or date_str < term_stats[author]['first_occurrence']:
+                            term_stats[author]['first_occurrence'] = date_str
+                        if not term_stats[author]['last_occurrence'] or date_str > term_stats[author]['last_occurrence']:
+                            term_stats[author]['last_occurrence'] = date_str
+            
+            # Traiter les éditeurs
+            editors = extract_terms_from_field(row.get('editor', ''))
+            for editor in editors:
+                if editor:
+                    term_stats[editor]['frequency'] += 1
+                    if country:
+                        term_stats[editor]['countries'].add(country)
+                    if date_str:
+                        if not term_stats[editor]['first_occurrence'] or date_str < term_stats[editor]['first_occurrence']:
+                            term_stats[editor]['first_occurrence'] = date_str
+                        if not term_stats[editor]['last_occurrence'] or date_str > term_stats[editor]['last_occurrence']:
+                            term_stats[editor]['last_occurrence'] = date_str
+            
+            # Traiter les éditeurs/maisons d'édition
+            publishers = extract_terms_from_field(row.get('publisher', ''))
+            for publisher in publishers:
+                if publisher:
+                    term_stats[publisher]['frequency'] += 1
+                    if country:
+                        term_stats[publisher]['countries'].add(country)
+                    if date_str:
+                        if not term_stats[publisher]['first_occurrence'] or date_str < term_stats[publisher]['first_occurrence']:
+                            term_stats[publisher]['first_occurrence'] = date_str
+                        if not term_stats[publisher]['last_occurrence'] or date_str > term_stats[publisher]['last_occurrence']:
+                            term_stats[publisher]['last_occurrence'] = date_str
+    
     # Convertir les sets en chaînes séparées par |
     result = {}
     for term, stats in term_stats.items():
@@ -518,10 +566,11 @@ def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.Dat
     return result
 
 
-async def load_reference_datasets(token: Optional[str] = None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Charge les datasets articles et publications depuis Hugging Face Hub"""
+async def load_reference_datasets(token: Optional[str] = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Charge les datasets articles, publications et references depuis Hugging Face Hub"""
     articles_df = pd.DataFrame()
     publications_df = pd.DataFrame()
+    references_df = pd.DataFrame()
     
     try:
         logger.info("Loading articles dataset from Hugging Face Hub...")
@@ -539,7 +588,15 @@ async def load_reference_datasets(token: Optional[str] = None) -> tuple[pd.DataF
     except Exception as e:
         logger.warning(f"Could not load publications dataset: {e}")
     
-    return articles_df, publications_df
+    try:
+        logger.info("Loading references dataset from Hugging Face Hub...")
+        references_ds = load_dataset("fmadore/islam-west-africa-collection", name="references", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
+        references_df = references_ds.to_pandas()
+        logger.info(f"Loaded {len(references_df)} references")
+    except Exception as e:
+        logger.warning(f"Could not load references dataset: {e}")
+    
+    return articles_df, publications_df, references_df
 
 
 # ---------------------------------------------------------------------------
@@ -554,10 +611,10 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
     hf_token_stored = HfFolder.get_token()
     token_to_use = hf_token_env if hf_token_env else hf_token_stored
     
-    articles_df, publications_df = await load_reference_datasets(token_to_use)
+    articles_df, publications_df, references_df = await load_reference_datasets(token_to_use)
     
     # 2. Calculer les statistiques de fréquence
-    frequency_stats = calculate_frequency_stats(articles_df, publications_df)
+    frequency_stats = calculate_frequency_stats(articles_df, publications_df, references_df)
 
     # 3. Fetch current Omeka index items and map them
     logger.info("Fetching index items from Omeka API...")
