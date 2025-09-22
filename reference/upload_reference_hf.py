@@ -397,6 +397,39 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
         extracted_fabio_url = fabio_has_url_data
     # If none of the above, extracted_fabio_url remains ""
 
+    # Convert volume to int
+    volume_str = _get_value(item, "bibo:volume")
+    volume_int = None
+    if volume_str:
+        try:
+            volume_int = int(volume_str)
+        except ValueError:
+            logger.warning(
+                f"Could not convert volume '{volume_str}' to int for item {item['o:id']}. Defaulting to null."
+            )
+
+    # Convert issue to int
+    issue_str = _get_value(item, "bibo:issue")
+    issue_int = None
+    if issue_str:
+        try:
+            issue_int = int(issue_str)
+        except ValueError:
+            logger.warning(
+                f"Could not convert issue '{issue_str}' to int for item {item['o:id']}. Defaulting to null."
+            )
+
+    # Convert edition to int
+    edition_str = _get_value(item, "bibo:edition")
+    edition_int = None
+    if edition_str:
+        try:
+            edition_int = int(edition_str)
+        except ValueError:
+            logger.warning(
+                f"Could not convert edition '{edition_str}' to int for item {item['o:id']}. Defaulting to null."
+            )
+
     # Convert nb_pages to int
     nb_pages_str = _get_value(item, "bibo:numPages")
     nb_pages_int = None
@@ -443,20 +476,21 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
         "o:id": item["o:id"],
         "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "identifier": _get_iwac_identifier(item, "dcterms:identifier"),
+        "added_date": added_date,
         "o:resource_class": _get_resource_class(item),
         "title": _get_value(item, "dcterms:title"),
-        "bibo:authorList": _join(item, "bibo:authorList"),
-        "bibo:editorList": _join(item, "bibo:editorList"),
-        "bibo:reviewOf": _get_value(item, "bibo:reviewOf"),
+        "author": _join(item, "bibo:authorList"),
+        "editor": _join(item, "bibo:editorList"),
+        "review_of": _get_value(item, "bibo:reviewOf"),
         "publisher": _get_value(item, "dcterms:publisher"),
         "pub_date": _get_value(item, "dcterms:date"),
         "type": _get_value(item, "dcterms:type"),
-        "alternative": _get_value(item, "dcterms:alternative"),
+        "book_title": _get_value(item, "dcterms:alternative"),
         "chapter": _get_value(item, "bibo:chapter"),
-        "volume": _get_value(item, "bibo:volume"),
-        "issue": _get_value(item, "bibo:issue"),
+        "volume": volume_int,
+        "issue": issue_int,
         "abstract": _get_value(item, "dcterms:abstract"),
-        "edition": _get_value(item, "bibo:edition"),
+        "edition": edition_int,
         "nb_pages": nb_pages_int,
         "page_start": page_start_int,
         "page_end": page_end_int,
@@ -467,9 +501,8 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
         "spatial": _get_value(item, "dcterms:spatial"),
         "language": _get_value(item, "dcterms:language"),
         "doi": _get_value(item, "bibo:doi"),
-        "fabio_has_url": extracted_fabio_url,
+        "URL": extracted_fabio_url,
         "country": country,
-        "added_date": added_date,
     }
 
 
@@ -539,18 +572,24 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
     else:
         logger.info(f"Merging new Omeka data ({len(new_omeka_df)} records) with existing Hub data ({len(existing_df)} records).")
         
-        # Identify columns in existing_df that are NOT in new_omeka_df. These are "extra" columns to preserve.
-        extra_cols_to_preserve = [col for col in existing_df.columns if col not in new_omeka_df.columns]
+        # Define columns to exclude from existing data (old columns we want to remove)
+        columns_to_exclude = ['o:item_set', 'o:media/file', 'iiif_manifest', 'thumbnail']
+        
+        # Identify columns in existing_df that are NOT in new_omeka_df and NOT in the exclusion list
+        extra_cols_to_preserve = [col for col in existing_df.columns 
+                                 if col not in new_omeka_df.columns and col not in columns_to_exclude]
         
         if extra_cols_to_preserve:
             logger.info(f"Extra columns to preserve from existing data: {extra_cols_to_preserve}")
-            # Use outer merge to keep all records and preserve extra columns
+            # Use outer merge to keep all records and preserve extra columns (excluding unwanted ones)
             final_df = pd.merge(new_omeka_df, existing_df[['o:id'] + extra_cols_to_preserve], on='o:id', how='outer', suffixes=('', '_old'))
             # Fill NaN values in new columns with data from existing columns where available
             final_df = final_df.ffill(axis=1).bfill(axis=1)
         else:
-            logger.info("No extra columns to preserve from existing data.")
+            logger.info("No extra columns to preserve from existing data (excluding unwanted columns).")
             final_df = new_omeka_df
+            
+        logger.info(f"Excluded columns from merge: {columns_to_exclude}")
 
         logger.info(f"Merge complete. Resulting dataset has {len(final_df)} records. Final columns: {final_df.columns.tolist()}")
         if extra_cols_to_preserve:
@@ -567,7 +606,7 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
             return
 
         # Convert integer columns to nullable integer type to preserve integer dtype with null values
-        int_columns = ['nb_pages', 'page_start', 'page_end']
+        int_columns = ['volume', 'issue', 'edition', 'nb_pages', 'page_start', 'page_end']
         for col in int_columns:
             if col in final_df.columns:
                 # Convert to numeric first, coercing errors to NaN, then to nullable integer
