@@ -397,27 +397,11 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
         extracted_fabio_url = fabio_has_url_data
     # If none of the above, extracted_fabio_url remains ""
 
-    # Convert volume to int
+    # Keep volume as string (can contain multiple values like "1|2")
     volume_str = _get_value(item, "bibo:volume")
-    volume_int = ""
-    if volume_str:
-        try:
-            volume_int = int(volume_str)
-        except ValueError:
-            logger.warning(
-                f"Could not convert volume '{volume_str}' to int for item {item['o:id']}. Defaulting to empty."
-            )
 
-    # Convert issue to int
+    # Keep issue as string (can contain multiple values like "3|4")
     issue_str = _get_value(item, "bibo:issue")
-    issue_int = ""
-    if issue_str:
-        try:
-            issue_int = int(issue_str)
-        except ValueError:
-            logger.warning(
-                f"Could not convert issue '{issue_str}' to int for item {item['o:id']}. Defaulting to empty."
-            )
 
     # Convert edition to int
     edition_str = _get_value(item, "bibo:edition")
@@ -498,8 +482,8 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
         "type": _get_value(item, "dcterms:type"),
         "book_title": _get_value(item, "dcterms:alternative"),
         "chapter": chapter_int,
-        "volume": volume_int,
-        "issue": issue_int,
+        "volume": volume_str,
+        "issue": issue_str,
         "abstract": _get_value(item, "dcterms:abstract"),
         "edition": edition_int,
         "nb_pages": nb_pages_int,
@@ -615,6 +599,14 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
             logger.error("Critical error: 'o:id' is missing or null in the final DataFrame before push. Aborting push.")
             await conn_manager.close()
             return
+
+        # Ensure consistent data types for mixed columns
+        # Convert numeric columns that might have mixed types to strings to avoid Arrow conversion issues
+        mixed_type_columns = ['chapter', 'edition', 'nb_pages', 'page_start', 'page_end']
+        for col in mixed_type_columns:
+            if col in final_df.columns:
+                # Convert all values to strings, replacing empty strings with empty strings (not 'nan')
+                final_df[col] = final_df[col].astype(str).replace('nan', '')
 
         ds = Dataset.from_pandas(final_df, preserve_index=False)
         logger.info("Dataset preview (first 5 rows):")
