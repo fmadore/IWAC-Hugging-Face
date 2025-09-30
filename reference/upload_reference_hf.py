@@ -92,7 +92,7 @@ RESOURCE_CLASS_MAPPING = {
 
 # Country mapping based on item sets
 COUNTRY_ITEM_SETS = {
-    2193: 'Bénin',
+    2193: 'Benin',
     2212: 'Burkina Faso',
     2217: 'Côte d\'Ivoire',
     2222: 'Niger',
