@@ -31,6 +31,7 @@ import hashlib
 import asyncio
 import logging
 import argparse
+import re
 import pandas as pd
 import aiohttp
 import aiofiles
@@ -260,6 +261,20 @@ class OmekaApiClient:
 # Fonctions d'aide pour mapper les champs Omeka → plat
 # ---------------------------------------------------------------------------
 
+def count_words(text: str) -> int:
+    """
+    Compte le nombre de mots dans une chaîne de caractères.
+    Les mots sont simplement séparés par des espaces.
+    Retourne 0 si le texte est None ou vide.
+    """
+    if not text:
+        return 0
+    # Utilise une expression régulière pour mieux gérer les séparateurs multiples
+    # et la ponctuation simple attachée aux mots.
+    words = re.findall(r"\b\w+\b", str(text).lower())
+    return len(words)
+
+
 def _get_label(item: Dict[str, Any], field: str) -> str:
     """Extract o:label from a field that contains an array of objects with o:label."""
     if field not in item or item[field] is None:
@@ -467,6 +482,10 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
             except Exception:
                 logger.warning(f"Could not parse added date '{created_value}' for item {item['o:id']}")
 
+    # Calculate word count from bibo:content (but don't include content in output)
+    content_text = _get_value(item, "bibo:content")
+    nb_mots = count_words(content_text)
+
     return {
         "o:id": item["o:id"],
         "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
@@ -497,6 +516,7 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
         "language": _get_value(item, "dcterms:language"),
         "doi": _get_value(item, "bibo:doi"),
         "URL": extracted_fabio_url,
+        "nb_mots": nb_mots,
         "country": country,
     }
 
