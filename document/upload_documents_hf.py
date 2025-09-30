@@ -304,7 +304,7 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
             if isinstance(item_set, dict) and "o:id" in item_set:
                 item_set_id = item_set["o:id"]
                 if item_set_id == 23452:
-                    country = "Bénin"
+                    country = "Benin"
                     break
                 elif item_set_id == 23453:
                     country = "Burkina Faso"
