@@ -41,7 +41,7 @@ from tqdm import tqdm
 from tqdm.asyncio import tqdm as async_tqdm
 from dotenv import load_dotenv
 from datasets import Dataset, load_dataset
-from huggingface_hub import login, HfFolder, utils as hf_utils
+from huggingface_hub import login, get_token, utils as hf_utils
 import huggingface_hub
 
 # Disable symlinks warning from huggingface_hub
@@ -608,7 +608,7 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
 
     # 1. Charger les datasets de référence pour calculer les statistiques
     hf_token_env = os.getenv("HF_TOKEN")
-    hf_token_stored = HfFolder.get_token()
+    hf_token_stored = get_token()
     token_to_use = hf_token_env if hf_token_env else hf_token_stored
     
     articles_df, publications_df, references_df = await load_reference_datasets(token_to_use)
