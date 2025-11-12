@@ -68,6 +68,7 @@ COTE_DIVOIRE_NEWSPAPERS = [
     "Le Débat Ivoirien",
     "Le Jour",
     "Le Jour Plus",
+    "Le Nouveau Réveil",
     "Le Nouvel Horizon",
     "Le Patriote",
     "Nord-Sud",
