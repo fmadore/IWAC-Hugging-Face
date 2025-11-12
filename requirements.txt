@@ -5,7 +5,7 @@ tqdm
 pandas
 pyarrow
 datasets
-huggingface_hub
+huggingface_hub[hf_xet]
 spacy
 textstat
 transformers
