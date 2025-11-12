@@ -65,6 +65,7 @@ COTE_DIVOIRE_NEWSPAPERS = [
     "L'Intelligent d'Abidjan",
     "L'Inter",
     "La Voie",
+    "Le Débat Ivoirien",
     "Le Jour",
     "Le Jour Plus",
     "Le Nouvel Horizon",
