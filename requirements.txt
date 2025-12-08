@@ -1,6 +1,7 @@
 aiohttp
 aiofiles
 python-dotenv
+rich
 tqdm
 pandas
 pyarrow
@@ -11,7 +12,7 @@ textstat
 transformers
 sentence-transformers
 torch
-google.genai
+google-genai
 openai
 # Dépendances pour topic modeling
 bertopic
