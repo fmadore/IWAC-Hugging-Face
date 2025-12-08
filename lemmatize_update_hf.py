@@ -15,8 +15,11 @@ Usage
         --text-column OCR \
         --lemma-column lemma_text \
         --clean-column lemma_nostop \
-        --spacy-model fr_core_news_sm \
+        --spacy-model fr_core_news_lg \
         --max-shard-size 1GB
+
+Note: The default model (fr_core_news_lg) is optimized for CPU. For GPU users,
+consider using fr_dep_news_trf for better accuracy (but much slower on CPU).
 
 Environment variables
 ---------------------
@@ -25,8 +28,8 @@ HF_TOKEN   Personal access token for the Hugging Face Hub (alternatively you
 
 Dependencies
 ------------
-    pip install datasets huggingface_hub spacy tqdm python-dotenv
-    python -m spacy download fr_core_news_sm
+    pip install datasets huggingface_hub spacy rich python-dotenv
+    python -m spacy download fr_core_news_lg
 
 """
 
@@ -34,33 +37,54 @@ import os
 import argparse
 import logging
 from typing import List
-import re # Added import
-import unicodedata # Added import
+import re
+import unicodedata
 
 import datasets
 from datasets import Dataset
-from huggingface_hub import login, HfFolder
+from huggingface_hub import login, get_token
 import spacy
-from tqdm import tqdm
+
+# Rich console imports for beautiful output
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
+from rich.logging import RichHandler
+from rich.prompt import Prompt
+from rich import box
+
+# Initialize Rich console
+console = Console()
 
 
 def configure_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)]
     )
 
 
 # Preprocessing constants and function
 RE_DASH  = re.compile(r"[–—−]")
-RE_SPACE = re.compile(r"\\s{2,}")
-MAP_QUOTES = str.maketrans("‘’‚‛“”„‟«»",  "''''\"\"\"\"\"\"")
-MAP_LIG   = str.maketrans({"œ":"oe","Œ":"OE","æ":"ae","Æ":"AE"})
+RE_SPACE = re.compile(r"\s{2,}")  # Fixed: was incorrectly escaped
+# Fancy quotes to normalize (using Unicode codepoints for reliability)
+QUOTE_REPLACEMENTS = [
+    ("\u2018", "'"), ("\u2019", "'"), ("\u201a", "'"), ("\u201b", "'"),  # single quotes
+    ("\u201c", '"'), ("\u201d", '"'), ("\u201e", '"'), ("\u201f", '"'),  # double quotes
+    ("\u00ab", '"'), ("\u00bb", '"'),  # guillemets « »
+]
+MAP_LIG = str.maketrans({"œ": "oe", "Œ": "OE", "æ": "ae", "Æ": "AE"})
+
 
 def normalize(text: str) -> str:
     text = unicodedata.normalize("NFC", text)
-    text = text.translate(MAP_QUOTES).translate(MAP_LIG)
-    text = RE_DASH.sub("-", text).replace("\\u00A0", " ")
+    for old, new in QUOTE_REPLACEMENTS:
+        text = text.replace(old, new)
+    text = text.translate(MAP_LIG)
+    text = RE_DASH.sub("-", text).replace("\u00a0", " ")
     return RE_SPACE.sub(" ", text).strip()
 
 
@@ -69,7 +93,7 @@ def load_spacy_model(name: str):
     try:
         return spacy.load(name, disable=["parser", "ner", "textcat"])
     except OSError:
-        logging.info("SpaCy model '%s' not found – downloading…", name)
+        console.print(f"[yellow]⚠[/yellow] SpaCy model '{name}' not found – downloading…")
         from spacy.cli import download as spacy_download
 
         spacy_download(name)
@@ -148,67 +172,73 @@ def main():
     parser.add_argument("--text-column", default="OCR", help="Name of the column containing the raw French text to process")
     parser.add_argument("--lemma-column", default="lemma_text", help="Column name for the lemmatised text")
     parser.add_argument("--clean-column", default="lemma_nostop", help="Column name for the lemmatised text with stop‑words removed")
-    parser.add_argument("--spacy-model", default="fr_dep_news_trf", help="spaCy model to use for French lemmatisation")
+    parser.add_argument("--spacy-model", default="fr_core_news_lg", help="spaCy model to use for French lemmatisation (use fr_core_news_lg for CPU)")
     parser.add_argument("--max-shard-size", default="1GB", help="Maximum Parquet shard size when pushing to the Hub")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
     # Authenticate with the Hub
     # ------------------------------------------------------------------
-    if os.getenv("HF_TOKEN") is None and HfFolder.get_token() is None:
+    if os.getenv("HF_TOKEN") is None and get_token() is None:
         login()
 
-    token = os.getenv("HF_TOKEN") or HfFolder.get_token()
+    token = os.getenv("HF_TOKEN") or get_token()
 
     # ------------------------------------------------------------------
     # Load dataset from the Hub
     # ------------------------------------------------------------------
-    logging.info("Loading dataset '%s' (config 'articles')…", args.repo)
-    ds: Dataset = datasets.load_dataset(args.repo, name="articles", split="train", token=token) # Added name="articles"
+    console.print(Panel(
+        f"[bold]Repository:[/bold] {args.repo}\n"
+        f"[bold]Text column:[/bold] {args.text_column}\n"
+        f"[bold]spaCy model:[/bold] {args.spacy_model}",
+        title="[bold blue]Lemmatization Configuration[/bold blue]",
+        border_style="blue"
+    ))
+    
+    with console.status("[bold green]Loading dataset from Hugging Face Hub...", spinner="dots"):
+        ds: Dataset = datasets.load_dataset(args.repo, name="articles", split="train", token=token)
+    console.print(f"[green]✓[/green] Loaded {len(ds):,} articles from '{args.repo}'")
 
     if args.text_column not in ds.column_names:
-        raise ValueError(
-            f"Column '{args.text_column}' not found in the dataset. Available columns: {ds.column_names}"
-        )
+        console.print(f"[red]✗[/red] Column '{args.text_column}' not found in the dataset.")
+        console.print(f"[yellow]ℹ[/yellow] Available columns: {', '.join(ds.column_names)}")
+        raise ValueError(f"Column '{args.text_column}' not found in the dataset.")
 
     # ------------------------------------------------------------------
     # Ask user for processing preference
     # ------------------------------------------------------------------
-    while True:
-        process_choice = input(
-            f"Process all articles or only those with empty '{args.lemma_column}'? (all/empty): "
-        ).lower()
-        if process_choice in ["all", "empty"]:
-            break
-        logging.warning("Invalid choice. Please enter 'all' or 'empty'.")
+    process_choice = Prompt.ask(
+        f"Process all articles or only those with empty '[cyan]{args.lemma_column}[/cyan]'?",
+        choices=["all", "empty"],
+        default="empty"
+    )
 
     if process_choice == "empty":
         if args.lemma_column not in ds.column_names:
-            logging.warning(
-                f"Lemma column '{args.lemma_column}' not found. Processing all articles instead."
+            console.print(
+                f"[yellow]⚠[/yellow] Lemma column '{args.lemma_column}' not found. Processing all articles instead."
             )
         else:
-            logging.info(f"Filtering dataset to process only articles with empty '{args.lemma_column}' column…")
-            # Filter out rows where the lemma column is not empty (i.e., already processed)
-            # An empty string or None would indicate an empty lemma field.
-            original_row_count = len(ds)
-            ds = ds.filter(lambda example: not example[args.lemma_column] or example[args.lemma_column].strip() == "")
-            filtered_row_count = len(ds)
-            logging.info(f"Selected {filtered_row_count} articles out of {original_row_count} for processing.")
+            with console.status("[bold green]Filtering dataset...", spinner="dots"):
+                original_row_count = len(ds)
+                ds = ds.filter(lambda example: not example[args.lemma_column] or example[args.lemma_column].strip() == "")
+                filtered_row_count = len(ds)
+            console.print(f"[blue]→[/blue] Selected [bold]{filtered_row_count:,}[/bold] articles out of {original_row_count:,} for processing.")
             if filtered_row_count == 0:
-                logging.info(f"No articles found with an empty '{args.lemma_column}'. Exiting.")
+                console.print(f"[green]✓[/green] No articles found with an empty '{args.lemma_column}'. Nothing to do.")
                 return
 
     # ------------------------------------------------------------------
     # Load the spaCy model once
     # ------------------------------------------------------------------
-    logging.info("Loading spaCy model '%s'…", args.spacy_model)
-    nlp = load_spacy_model(args.spacy_model)
+    with console.status(f"[bold green]Loading spaCy model '{args.spacy_model}'...", spinner="dots"):
+        nlp = load_spacy_model(args.spacy_model)
+    console.print(f"[green]✓[/green] Loaded spaCy model '{args.spacy_model}'")
 
     # ------------------------------------------------------------------
     # Map lemmatisation over the dataset
     # ------------------------------------------------------------------
-    logging.info("Applying lemmatisation – this can take a while…")
+    console.print(f"[blue]→[/blue] Applying lemmatisation – this can take a while…")
     ds = ds.map(
         lemmatise_batch,
         batched=True,
@@ -226,17 +256,28 @@ def main():
     # ------------------------------------------------------------------
     # Push updated dataset to the Hub
     # ------------------------------------------------------------------
-    logging.info("Pushing updated dataset back to %s (config 'articles')…", args.repo)
-    ds.push_to_hub(
-        args.repo,
-        config_name="articles", # Added config_name
-        token=token,
-        max_shard_size=args.max_shard_size,
-        commit_message=f"Add/update columns '{args.lemma_column}' and '{args.clean_column}' (French lemmatisation, mode: {process_choice})",
-    )
+    console.print(f"[blue]→[/blue] Pushing updated dataset back to {args.repo}…")
+    with console.status("[bold green]Uploading to Hugging Face Hub...", spinner="dots"):
+        ds.push_to_hub(
+            args.repo,
+            config_name="articles",
+            token=token,
+            max_shard_size=args.max_shard_size,
+            commit_message=f"Add/update columns '{args.lemma_column}' and '{args.clean_column}' (French lemmatisation, mode: {process_choice})",
+        )
 
-    logging.info("Done. New columns: %s, %s", args.lemma_column, args.clean_column)
+    # Summary table
+    table = Table(title="Lemmatization Complete", box=box.ROUNDED)
+    table.add_column("Property", style="cyan")
+    table.add_column("Value", style="green")
+    table.add_row("Repository", args.repo)
+    table.add_row("Articles processed", f"{len(ds):,}")
+    table.add_row("Lemma column", args.lemma_column)
+    table.add_row("Clean column", args.clean_column)
+    table.add_row("Mode", process_choice)
+    console.print(table)
+    console.print("[green]✓[/green] Done!")
 
-
+    
 if __name__ == "__main__":
     main()
