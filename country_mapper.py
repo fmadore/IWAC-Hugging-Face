@@ -31,12 +31,15 @@ BENIN_NEWSPAPERS = [
 ]
 
 BURKINA_FASO_NEWSPAPERS = [
+    "Agence d'Information du Burkina",
     "Al Mawadda",
     "An-Nasr Trimestriel",
     "An-Nasr Vendredi",
     "Burkina 24",
     "Carrefour africain",
+    "Faso Actu",
     "FasoZine",
+    "Infowakat",
     "L'Appel",
     "L'Autre Regard",
     "L'Evénement",
@@ -50,6 +53,7 @@ BURKINA_FASO_NEWSPAPERS = [
     "Mutations",
     "San Finna",
     "Sidwaya",
+    "Wakat Séra",
 ]
 
 COTE_DIVOIRE_NEWSPAPERS = [
@@ -58,10 +62,12 @@ COTE_DIVOIRE_NEWSPAPERS = [
     "Al Muwassat Info",
     "Alif",
     "Agence Ivoirienne de Presse",
+    "APA News",
     "Fraternité Hebdo",
     "Fraternité Matin",
     "Ivoire Dimanche",
     "L'Alternative",
+    "L'Expression",
     "L'Intelligent d'Abidjan",
     "L'Inter",
     "La Voie",
@@ -71,6 +77,7 @@ COTE_DIVOIRE_NEWSPAPERS = [
     "Le Nouveau Réveil",
     "Le Nouvel Horizon",
     "Le Patriote",
+    "Le Temps",
     "Nord-Sud",
     "Notre Temps",
     "Notre Voie",
@@ -90,13 +97,16 @@ NIGER_NEWSPAPERS = [
 ]
 
 TOGO_NEWSPAPERS = [
+    "AfreePress",
     "Agence Togolaise de Presse",
     "Atopani Express",
     "Courrier du Golfe",
     "Forum Hebdo",
     "L'éveil du Peuple",
+    "La Dépêche",
     "La Lettre de Tchaoudjo",
     "La Nouvelle Marche",
+    "La Voix de la Nation",
     "Le Démocrate",
     "Le Pacific",
     "Le Rendez-Vous",
