@@ -45,6 +45,15 @@ Scripts that enrich the dataset with computed columns:
 - `country_mapper.py` - Maps newspaper names to countries (Benin, Burkina Faso, Côte d'Ivoire, Niger, Togo)
 - `data/fetch_datasets.py` - Download datasets locally
 
+## Hardware Constraints
+
+- Development is done on **CPU only** (no GPU available)
+- Prefer CPU-optimized models and libraries:
+  - spaCy: Use `fr_core_news_lg` instead of transformer models (`fr_dep_news_trf`)
+  - Processing: Consider batch sizes and model complexity for CPU performance
+  - Embeddings: Use lightweight models optimized for CPU
+- Mention CPU limitations when suggesting computationally intensive operations
+
 ## Code Style & Conventions
 
 ### Console Output - Use Rich Library
