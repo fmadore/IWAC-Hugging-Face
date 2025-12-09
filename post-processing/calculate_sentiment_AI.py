@@ -38,8 +38,7 @@ HF_TOKEN         Jeton d'accès personnel pour le Hugging Face Hub.
 
 Dépendances supplémentaires
 -------------------------
-    pip install datasets huggingface_hub google-api-python-client python-dotenv tqdm google-ai-generativelanguage openai
-    (Note: google.genai is part of google-ai-generativelanguage or a similar package, ensure correct installation for the older SDK)
+    pip install datasets huggingface_hub google-genai python-dotenv openai pydantic rich
 """
 import os
 import json
@@ -47,21 +46,29 @@ import time
 import argparse
 import logging
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 
 from datasets import load_dataset, Dataset
-from huggingface_hub import HfFolder, login
+from huggingface_hub import get_token, login
 from dotenv import load_dotenv
-from tqdm import tqdm
+from pydantic import BaseModel, Field
 
-# Gemini (Google GenAI SDK - older version)
+# Rich for beautiful console output
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
+from rich.logging import RichHandler
+from rich.prompt import Prompt, Confirm
+from rich import box
+
+# Google GenAI SDK
 try:
     from google import genai
     from google.genai import types
     from google.genai import errors
 except ImportError:
-    print("Veuillez installer la librairie google-ai-generativelanguage (qui inclut google.genai): pip install google-ai-generativelanguage")
-    print("Ou assurez-vous que le SDK google.genai est correctement installé.")
+    print("Veuillez installer le SDK Google GenAI: pip install google-genai")
     genai = None
 
 # OpenAI SDK
@@ -71,45 +78,51 @@ except ImportError:
     print("Veuillez installer la librairie OpenAI: pip install openai")
     OpenAI = None
 
-# Configuration du logging
-def configure_logging() -> logging.Logger:
-    """Configure le logging de base."""
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    return logger
+# Global Rich console
+console = Console()
 
-# Schema pour la validation des données (sans Pydantic pour éviter les problèmes de pickling)
-EXPECTED_FIELDS = {
-    "centralite_islam_musulmans": str,
-    "centralite_justification": str,
-    "subjectivite_score": (int, type(None)),
-    "subjectivite_justification": str,
-    "polarite": str,
-    "polarite_justification": str
-}
+# Configuration du logging avec Rich
+def configure_logging() -> logging.Logger:
+    """Configure le logging avec Rich pour un affichage élégant."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)]
+    )
+    return logging.getLogger(__name__)
+
+# Pydantic model for structured outputs (used by both Gemini and ChatGPT)
+class SentimentAnalysisOutput(BaseModel):
+    """Schema for sentiment analysis output - used for structured outputs with AI APIs."""
+    centralite_islam_musulmans: Literal[
+        "Très central", "Central", "Secondaire", "Marginal", "Non abordé"
+    ] = Field(description="Importance accordée aux thèmes liés à l'islam et aux musulmans dans l'article")
+    centralite_justification: str = Field(description="Courte justification en 1 phrase sur la centralité de l'islam/des musulmans")
+    subjectivite_score: Optional[int] = Field(
+        default=None,
+        description="Score de subjectivité de 1 à 5, ou null si le sujet n'est pas abordé",
+        ge=1, le=5
+    )
+    subjectivite_justification: str = Field(description="Justification en 1-2 phrases pour le score de subjectivité")
+    polarite: Literal[
+        "Très positif", "Positif", "Neutre", "Négatif", "Très négatif", "Non applicable"
+    ] = Field(description="Sentiment général exprimé dans l'article envers l'islam et/ou les musulmans")
+    polarite_justification: str = Field(description="Justification en 1-2 phrases pour la polarité")
+
 
 def validate_sentiment_output(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Valide la sortie de l'analyse de sentiment sans utiliser Pydantic."""
-    validated = {}
-    for field, expected_type in EXPECTED_FIELDS.items():
-        value = data.get(field)
-        if isinstance(expected_type, tuple):  # pour Optional[int]
-            if value is not None and not isinstance(value, expected_type[0]):
-                raise ValueError(f"Field {field} must be {expected_type[0]} or None, got {type(value)}")
-        else:
-            if not isinstance(value, expected_type):
-                raise ValueError(f"Field {field} must be {expected_type}, got {type(value)}")
-        validated[field] = value
-    return validated
+    """Valide la sortie de l'analyse de sentiment en utilisant le modèle Pydantic."""
+    try:
+        validated = SentimentAnalysisOutput(**data)
+        return validated.model_dump()
+    except Exception as e:
+        raise ValueError(f"Validation failed: {e}")
 
 # --- Model Configuration ---
 GEMINI_MODEL_NAME = "gemini-2.5-flash"
-# Updated to use the newer ChatGPT 5 mini model
-CHATGPT_MODEL_NAME = "gpt-5-mini"
+# Use gpt-4o-mini which supports structured outputs
+CHATGPT_MODEL_NAME = "gpt-4o-mini"
 
 # --- Cache Configuration ---
 GEMINI_CACHE_FILE_DEFAULT_NAME = "gemini_sentiment_cache.json"
@@ -136,7 +149,7 @@ def save_cache(cache_file_path: Path, cache_data: Dict[str, Any], logger: loggin
     except IOError as e:
         logger.error(f"Erreur lors de la sauvegarde du cache dans {cache_file_path}: {e}")
 
-# Prompt pour l'analyse de sentiment (utilisé pour les deux modèles)
+# Prompt pour l'analyse de sentiment - loaded from markdown file
 PROMPT_MD_RELATIVE_PATH = os.path.join("prompts", "sentiment_prompt.md")
 
 def _load_base_prompt() -> str:
@@ -149,11 +162,13 @@ def _load_base_prompt() -> str:
     except Exception as e:
         return f"[ERREUR: impossible de charger le fichier de prompt: {e}]"
 
-_BASE_PROMPT_MD = _load_base_prompt()
+# Load once at module level - used as system instruction for both APIs
+SYSTEM_INSTRUCTION = _load_base_prompt()
 
-def create_sentiment_prompt(article_text: str) -> str:
-    """Compose the final prompt by embedding the article text after the base instructions."""
-    return f"{_BASE_PROMPT_MD}\n\nTexte à analyser:\n---\n{article_text}\n---\n\nRetournez uniquement le JSON demandé."
+
+def create_user_prompt_for_structured(article_text: str) -> str:
+    """Create the user prompt with the article text to analyze."""
+    return f"Texte à analyser:\n---\n{article_text}\n---"
 
 def analyze_text_with_gemini(
     article_text: str,
@@ -165,6 +180,7 @@ def analyze_text_with_gemini(
 ) -> Dict[str, Any]:
     """
     Analyse le sentiment d'un texte d'article en utilisant l'API Gemini (google.genai SDK).
+    Utilise les structured outputs avec un schema Pydantic et system_instruction.
     Retourne un dictionnaire avec les champs de SentimentAnalysisOutput et un champ 'analysis_error'.
     """
     default_error_result = {
@@ -195,17 +211,13 @@ def analyze_text_with_gemini(
         logger.error(f"Erreur lors de l'initialisation du client Gemini: {e}")
         return {**default_error_result, "analysis_error": f"Erreur client Gemini: {e}"}
 
-    prompt_content = create_sentiment_prompt(article_text)
+    # Use structured output with Pydantic schema and system instruction
+    user_prompt = create_user_prompt_for_structured(article_text)
     
-    contents = [
-        types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=prompt_content)]
-        )
-    ]
-
     generation_config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
         response_mime_type="application/json",
+        response_schema=SentimentAnalysisOutput,
         temperature=0.2
     )
 
@@ -213,10 +225,16 @@ def analyze_text_with_gemini(
         try:
             response = client.models.generate_content(
                 model=model_name,
-                contents=contents,
+                contents=user_prompt,
                 config=generation_config
             )
 
+            # With structured outputs, response.parsed contains the Pydantic model instance
+            if response.parsed:
+                validated_output = response.parsed.model_dump()
+                return {**validated_output, "analysis_error": None}
+            
+            # Fallback to text parsing if parsed is not available
             if not response.text:
                 logger.warning(f"Réponse vide de Gemini pour le texte (essai {attempt + 1}/{max_retries}).")
                 if attempt == max_retries - 1:
@@ -226,16 +244,14 @@ def analyze_text_with_gemini(
             
             try:
                 json_response = json.loads(response.text)
+                validated_output = validate_sentiment_output(json_response)
+                return {**validated_output, "analysis_error": None}
             except json.JSONDecodeError as e:
                 logger.error(f"Erreur de décodage JSON de la réponse Gemini (essai {attempt + 1}/{max_retries}): {e}. Réponse: {response.text[:500]}")
                 if attempt == max_retries - 1:
                     return {**default_error_result, "analysis_error": f"JSONDecodeError: {e}", "raw_response_snippet": response.text[:500]}
                 time.sleep(initial_backoff * (2 ** attempt))
                 continue
-            
-            try:
-                validated_output = validate_sentiment_output(json_response)
-                return {**validated_output, "analysis_error": None}
             except (ValueError, KeyError) as e:
                 logger.error(f"Erreur de validation (essai {attempt + 1}/{max_retries}): {e}. Données reçues: {json_response}")
                 if attempt == max_retries - 1:
@@ -268,7 +284,8 @@ def analyze_text_with_chatgpt(
     initial_backoff: int = 5
 ) -> Dict[str, Any]:
     """
-    Analyse le sentiment d'un texte d'article en utilisant l'API ChatGPT (OpenAI gpt-5-mini).
+    Analyse le sentiment d'un texte d'article en utilisant l'API ChatGPT avec structured outputs.
+    Utilise client.chat.completions.parse() avec un modèle Pydantic pour la validation automatique.
     Retourne un dictionnaire avec les champs de SentimentAnalysisOutput et un champ 'analysis_error'.
     """
     default_error_result = {
@@ -299,94 +316,61 @@ def analyze_text_with_chatgpt(
         logger.error(f"Erreur lors de l'initialisation du client ChatGPT: {e}")
         return {**default_error_result, "analysis_error": f"Erreur client ChatGPT: {e}"}
 
-    prompt_content = create_sentiment_prompt(article_text)
-
-    # Nous utilisons maintenant l'API Responses (client.responses.create) avec la configuration demandée.
-    system_preamble = (
-        "Vous êtes un expert en analyse de sentiments. "
-        "Analysez le texte fourni et retournez UNIQUEMENT un objet JSON respectant strictement le schéma : "
-        "{centralite_islam_musulmans:str, centralite_justification:str, subjectivite_score:int|nul, "
-        "subjectivite_justification:str, polarite:str, polarite_justification:str}. "
-        "Aucun texte hors JSON."
-    )
-
-    def _extract_json(text: str) -> Dict[str, Any]:
-        """Tente de parser directement, sinon isole la première/dernière accolade."""
-        if not text:
-            raise ValueError("Réponse vide")
-        try:
-            return json.loads(text)
-        except Exception:
-            start = text.find('{')
-            end = text.rfind('}')
-            if start != -1 and end != -1 and end > start:
-                candidate = text[start:end+1]
-                return json.loads(candidate)
-            raise
+    # Use structured outputs with chat.completions.parse()
+    user_prompt = create_user_prompt_for_structured(article_text)
 
     for attempt in range(max_retries):
         try:
-            response = client.responses.create(
+            # Use chat.completions.parse() for structured outputs with Pydantic
+            completion = client.chat.completions.parse(
                 model=model_name,
-                input=[
-                    {"role": "system", "content": system_preamble},
-                    {"role": "user", "content": prompt_content}
+                messages=[
+                    {"role": "system", "content": SYSTEM_INSTRUCTION},
+                    {"role": "user", "content": user_prompt}
                 ],
-                text={
-                    "format": {"type": "text"},  # Conserver la config fournie
-                    "verbosity": "low"
-                },
-                reasoning={"effort": "low"},
-                tools=[],
-                store=True
+                response_format=SentimentAnalysisOutput,
+                temperature=0.2
             )
 
-            # Tentative d'accès au texte de sortie (selon le SDK openai >= 1.0 responses)
-            raw_text = None
-            if hasattr(response, 'output_text') and response.output_text:
-                raw_text = response.output_text
-            else:
-                # Fallback : concaténer les segments
-                try:
-                    parts = []
-                    for item in getattr(response, 'output', []) or []:
-                        content = getattr(item, 'content', None)
-                        if content:
-                            for c in content:
-                                t = getattr(c, 'text', None)
-                                if t and getattr(t, 'value', None):
-                                    parts.append(t.value)
-                    if parts:
-                        raw_text = "\n".join(parts)
-                except Exception:
-                    pass
-
-            if not raw_text:
+            message = completion.choices[0].message
+            
+            # Check for refusal
+            if message.refusal:
+                logger.warning(f"ChatGPT a refusé la requête (essai {attempt + 1}/{max_retries}): {message.refusal}")
+                if attempt == max_retries - 1:
+                    return {**default_error_result, "analysis_error": f"Refusal: {message.refusal}"}
+                time.sleep(initial_backoff * (2 ** attempt))
+                continue
+            
+            # With structured outputs, message.parsed contains the Pydantic model instance
+            if message.parsed:
+                validated_output = message.parsed.model_dump()
+                return {**validated_output, "analysis_error": None}
+            
+            # Fallback to content parsing if parsed is not available
+            if not message.content:
                 logger.warning(f"Réponse vide de ChatGPT pour le texte (essai {attempt + 1}/{max_retries}).")
                 if attempt == max_retries - 1:
                     return {**default_error_result, "analysis_error": "Réponse vide de ChatGPT après plusieurs essais."}
                 time.sleep(initial_backoff * (2 ** attempt))
                 continue
-
+            
             try:
-                json_payload = _extract_json(raw_text)
-            except Exception as je:
-                logger.error(f"Échec parsing JSON (essai {attempt + 1}/{max_retries}): {je}. Extrait: {raw_text[:200]}")
+                json_payload = json.loads(message.content)
+                validated_output = validate_sentiment_output(json_payload)
+                return {**validated_output, "analysis_error": None}
+            except json.JSONDecodeError as je:
+                logger.error(f"Échec parsing JSON (essai {attempt + 1}/{max_retries}): {je}. Extrait: {message.content[:200]}")
                 if attempt == max_retries - 1:
-                    return {**default_error_result, "analysis_error": f"JSON parse error: {je}", "raw_response_snippet": raw_text[:500]}
+                    return {**default_error_result, "analysis_error": f"JSON parse error: {je}", "raw_response_snippet": message.content[:500]}
                 time.sleep(initial_backoff * (2 ** attempt))
                 continue
-
-            try:
-                validated_output = validate_sentiment_output(json_payload)
             except (ValueError, KeyError) as ve:
                 logger.error(f"Validation échouée (essai {attempt + 1}/{max_retries}): {ve}")
                 if attempt == max_retries - 1:
                     return {**default_error_result, "analysis_error": f"ValidationError: {ve}", "parsed_data": json_payload}
                 time.sleep(initial_backoff * (2 ** attempt))
                 continue
-
-            return {**validated_output, "analysis_error": None}
 
         except Exception as e:
             logger.error(f"Erreur lors de l'appel à ChatGPT (essai {attempt + 1}/{max_retries}): {e}")
@@ -479,6 +463,13 @@ def process_batch_with_analysis(
 def main():
     logger = configure_logging()
     
+    # Afficher le titre
+    console.print(Panel.fit(
+        "[bold cyan]Analyse de Sentiment AI[/bold cyan]\n"
+        "[dim]Gemini / ChatGPT pour les représentations de l'islam[/dim]",
+        border_style="cyan"
+    ))
+    
     # Déterminer le répertoire du script et la racine du projet
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parent
@@ -487,9 +478,9 @@ def main():
     dotenv_path = project_root / ".env"
     if dotenv_path.exists():
         load_dotenv(dotenv_path=dotenv_path)
-        logger.info(f"Variables d'environnement chargées depuis {dotenv_path}")
+        console.print(f"[green]✓[/green] Variables d'environnement chargées depuis {dotenv_path}")
     else:
-        logger.warning(f"Fichier .env non trouvé à {dotenv_path}. Assurez-vous que les clés API sont définies.")
+        console.print(f"[yellow]⚠[/yellow] Fichier .env non trouvé à {dotenv_path}")
 
     parser = argparse.ArgumentParser(description="Ajoute des colonnes d'analyse de sentiment via Gemini ou ChatGPT à un dataset Hugging Face.")
     parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="ID du repository sur le Hugging Face Hub (ex: utilisateur/nom_dataset).")
@@ -511,114 +502,120 @@ def main():
     # --- Choix du modèle par l'utilisateur ---
     model_choice = args.model
     if not model_choice:
-        while model_choice not in ["gemini", "chatgpt"]:
-            try:
-                model_choice = input("Entrez le modèle à utiliser ('gemini' ou 'chatgpt'): ").strip().lower()
-            except KeyboardInterrupt:
-                logger.info("\nOpération annulée par l'utilisateur.")
-                return
-            except EOFError:
-                logger.error("\nEntrée non attendue. Arrêt.")
-                return
-    logger.info(f"Modèle sélectionné: {model_choice}")
+        model_choice = Prompt.ask(
+            "[cyan]Modèle à utiliser[/cyan]",
+            choices=["gemini", "chatgpt"],
+            default="gemini"
+        )
+    console.print(f"[blue]→[/blue] Modèle sélectionné: [bold]{model_choice.upper()}[/bold]")
 
     # --- Configuration selon le modèle choisi ---
     if model_choice == "gemini":
         if genai is None:
-            logger.error("Le SDK Google GenAI n'est pas installé. Veuillez installer: pip install google-ai-generativelanguage")
+            console.print("[red]✗[/red] Le SDK Google GenAI n'est pas installé.")
+            console.print("  [dim]pip install google-genai[/dim]")
             return
         
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
-            logger.error("La variable d'environnement GOOGLE_API_KEY n'est pas définie.")
+            console.print("[red]✗[/red] Variable d'environnement [bold]GOOGLE_API_KEY[/bold] non définie.")
             return
         
         model_name = GEMINI_MODEL_NAME
         cache_file_path = Path(script_dir / GEMINI_CACHE_FILE_DEFAULT_NAME)
         
         # Test du client
-        try:
-            _ = genai.Client(api_key=api_key)
-            logger.info(f"Clé API Google chargée. Prêt à utiliser le modèle '{model_name}'.")
-        except Exception as e:
-            logger.error(f"Erreur lors de la pré-vérification du client Gemini: {e}")
-            return
+        with console.status("[bold green]Vérification de la clé API Google...", spinner="dots"):
+            try:
+                _ = genai.Client(api_key=api_key)
+            except Exception as e:
+                console.print(f"[red]✗[/red] Erreur client Gemini: {e}")
+                return
+        console.print(f"[green]✓[/green] Clé API Google valide. Modèle: [bold]{model_name}[/bold]")
             
     else:  # chatgpt
         if OpenAI is None:
-            logger.error("Le SDK OpenAI n'est pas installé. Veuillez installer: pip install openai")
+            console.print("[red]✗[/red] Le SDK OpenAI n'est pas installé.")
+            console.print("  [dim]pip install openai[/dim]")
             return
         
         api_key = os.getenv("CHATGPT")
         if not api_key:
-            logger.error("La variable d'environnement CHATGPT n'est pas définie.")
+            console.print("[red]✗[/red] Variable d'environnement [bold]CHATGPT[/bold] non définie.")
             return
         
         model_name = CHATGPT_MODEL_NAME
         cache_file_path = Path(script_dir / CHATGPT_CACHE_FILE_DEFAULT_NAME)
         
         # Test du client
-        try:
-            _ = OpenAI(api_key=api_key)
-            logger.info(f"Clé API ChatGPT chargée. Prêt à utiliser le modèle '{model_name}'.")
-        except Exception as e:
-            logger.error(f"Erreur lors de la pré-vérification du client ChatGPT: {e}")
-            return
+        with console.status("[bold green]Vérification de la clé API OpenAI...", spinner="dots"):
+            try:
+                _ = OpenAI(api_key=api_key)
+            except Exception as e:
+                console.print(f"[red]✗[/red] Erreur client ChatGPT: {e}")
+                return
+        console.print(f"[green]✓[/green] Clé API OpenAI valide. Modèle: [bold]{model_name}[/bold]")
 
     # --- Choix de la configuration par l'utilisateur ---
     config_name_choice = args.config_name
     if not config_name_choice:
-        while config_name_choice not in ["articles", "publications"]:
-            try:
-                config_name_choice = input("Entrez la configuration à traiter ('articles' ou 'publications'): ").strip().lower()
-            except KeyboardInterrupt:
-                logger.info("\nOpération annulée par l'utilisateur.")
-                return
-            except EOFError:
-                logger.error("\nEntrée non attendue. Arrêt.")
-                return
-    logger.info(f"Configuration sélectionnée: {config_name_choice}")
+        config_name_choice = Prompt.ask(
+            "[cyan]Configuration à traiter[/cyan]",
+            choices=["articles", "publications"],
+            default="articles"
+        )
+    console.print(f"[blue]→[/blue] Configuration: [bold]{config_name_choice}[/bold]")
 
     # --- Authentification avec le Hub Hugging Face ---
-    hf_token = os.getenv("HF_TOKEN") or HfFolder.get_token()
+    hf_token = os.getenv("HF_TOKEN") or get_token()
     if not hf_token:
-        logger.info("Token Hugging Face non trouvé. Tentative de connexion interactive.")
+        console.print("[yellow]ℹ[/yellow] Token Hugging Face non trouvé. Connexion interactive...")
         try:
             login()
-            hf_token = HfFolder.get_token()
+            hf_token = get_token()
             if not hf_token:
-                 logger.error("Connexion interactive échouée ou token non sauvegardé. Veuillez vous connecter manuellement via `huggingface-cli login`.")
-                 return
+                console.print("[red]✗[/red] Connexion échouée. Utilisez: [dim]huggingface-cli login[/dim]")
+                return
         except Exception as e:
-            logger.error(f"Erreur lors de la connexion interactive à Hugging Face: {e}")
+            console.print(f"[red]✗[/red] Erreur de connexion HF: {e}")
             return
-    logger.info("Authentification Hugging Face réussie.")
+    console.print("[green]✓[/green] Authentification Hugging Face réussie")
 
     # --- Chargement du cache ---
     cache_data = load_cache(cache_file_path, logger)
-    logger.info(f"{len(cache_data)} éléments chargés depuis le cache.")
+    console.print(f"[green]✓[/green] Cache chargé: [bold]{len(cache_data)}[/bold] éléments")
 
     # --- Chargement du dataset ---
-    logger.info(f"Chargement du dataset '{repo_id}', configuration '{config_name_choice}'...")
-    try:
-        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=hf_token)
-    except Exception as e:
-        logger.error(f"Erreur lors du chargement du dataset: {e}")
-        return
+    with console.status(f"[bold green]Chargement du dataset '{config_name_choice}'...", spinner="dots"):
+        try:
+            ds = load_dataset(repo_id, name=config_name_choice, split="train", token=hf_token)
+        except Exception as e:
+            console.print(f"[red]✗[/red] Erreur de chargement: {e}")
+            return
 
-    logger.info(f"Dataset chargé. Nombre de lignes: {len(ds)}")
-    logger.info(f"Colonnes disponibles: {ds.column_names}")
+    # Afficher les infos du dataset dans un tableau
+    info_table = Table(title="Dataset Info", box=box.ROUNDED)
+    info_table.add_column("Propriété", style="cyan")
+    info_table.add_column("Valeur", style="green")
+    info_table.add_row("Repository", repo_id)
+    info_table.add_row("Configuration", config_name_choice)
+    info_table.add_row("Nombre de lignes", str(len(ds)))
+    info_table.add_row("Colonne texte", text_column_name)
+    info_table.add_row("Colonne ID", id_column_name)
+    console.print(info_table)
 
     if text_column_name not in ds.column_names:
-        logger.error(f"La colonne texte '{text_column_name}' n'existe pas dans le dataset. Colonnes disponibles: {ds.column_names}")
+        console.print(f"[red]✗[/red] Colonne texte '{text_column_name}' introuvable")
+        console.print(f"  [dim]Disponibles: {ds.column_names}[/dim]")
         return
     
     if id_column_name not in ds.column_names:
-        logger.error(f"La colonne ID '{id_column_name}' n'existe pas dans le dataset. Colonnes disponibles: {ds.column_names}")
+        console.print(f"[red]✗[/red] Colonne ID '{id_column_name}' introuvable")
+        console.print(f"  [dim]Disponibles: {ds.column_names}[/dim]")
         return
 
     # --- Application de l'analyse ---
-    logger.info(f"Début de l'analyse {model_choice.upper()} pour la colonne '{text_column_name}'...")
+    console.print(f"\n[bold cyan]Début de l'analyse {model_choice.upper()}[/bold cyan]")
     
     fn_kwargs_for_map = {
         "model_choice": model_choice,
@@ -636,12 +633,12 @@ def main():
         batched=True,
         batch_size=batch_size,
         fn_kwargs=fn_kwargs_for_map,
-        desc=f"Analyse {model_choice.upper()} (col: {text_column_name})"
+        desc=f"Analyse {model_choice.upper()}"
     )
     
-    logger.info(f"Analyse {model_choice.upper()} terminée.")
+    console.print(f"[green]✓[/green] Analyse {model_choice.upper()} terminée")
     save_cache(cache_file_path, cache_data, logger)
-    logger.info(f"Cache final sauvegardé. Total d'éléments dans le cache: {len(cache_data)}")
+    console.print(f"[green]✓[/green] Cache sauvegardé: [bold]{len(cache_data)}[/bold] éléments")
 
     # --- Réorganisation des colonnes ---
     new_cols = [
@@ -653,7 +650,6 @@ def main():
     insert_after_col = "sentiment_score"
     
     current_columns = list(ds_processed.column_names)
-    logger.info(f"Colonnes actuelles avant réorganisation: {current_columns}")
 
     if insert_after_col in current_columns:
         insert_idx = current_columns.index(insert_after_col) + 1
@@ -666,27 +662,50 @@ def main():
         
         if set(ordered_columns) == set(current_columns):
             ds_processed = ds_processed.select_columns(ordered_columns)
-            logger.info(f"Colonnes réorganisées. Nouvel ordre: {ds_processed.column_names}")
+            console.print("[green]✓[/green] Colonnes réorganisées")
         else:
-            logger.warning(f"La réorganisation des colonnes a échoué à maintenir toutes les colonnes. Ordre inchangé.")
+            console.print("[yellow]⚠[/yellow] Réorganisation des colonnes échouée, ordre inchangé")
     else:
-        logger.warning(f"La colonne '{insert_after_col}' n'a pas été trouvée. Les nouvelles colonnes seront ajoutées à la fin.")
+        console.print(f"[yellow]⚠[/yellow] Colonne '{insert_after_col}' non trouvée, nouvelles colonnes ajoutées à la fin")
 
-    # Afficher un aperçu des nouvelles colonnes
-    num_examples_to_show = min(5, len(ds_processed))
-    if num_examples_to_show > 0:
-        for col_name in new_cols:
-            if col_name in ds_processed.column_names:
-                 logger.info(f"Aperçu (premiers {num_examples_to_show}) pour '{col_name}': {ds_processed[col_name][:num_examples_to_show]}")
+    # Afficher un aperçu des résultats dans un tableau
+    num_examples = min(3, len(ds_processed))
+    if num_examples > 0:
+        preview_table = Table(title=f"Aperçu des résultats ({num_examples} premiers)", box=box.ROUNDED)
+        preview_table.add_column("ID", style="dim")
+        preview_table.add_column("Centralité", style="cyan")
+        preview_table.add_column("Subj.", style="yellow", justify="center")
+        preview_table.add_column("Polarité", style="green")
+        
+        for i in range(num_examples):
+            preview_table.add_row(
+                str(ds_processed[id_column_name][i]),
+                str(ds_processed[f"{model_choice}_centralite_islam_musulmans"][i] or "-")[:20],
+                str(ds_processed[f"{model_choice}_subjectivite_score"][i] or "-"),
+                str(ds_processed[f"{model_choice}_polarite"][i] or "-")[:15]
+            )
+        console.print(preview_table)
 
     # --- Sauvegarde du dataset traité sur le Hub ---
-    logger.info(f"Sauvegarde du dataset traité vers le Hub Hugging Face (repo: '{repo_id}', config: '{config_name_choice}')...")
-    try:
-        ds_processed.push_to_hub(repo_id, config_name=config_name_choice, token=hf_token, max_shard_size=max_shard_size)
-        logger.info("Dataset traité et sauvegardé avec succès sur le Hub.")
-    except Exception as e:
-        logger.error(f"Erreur lors de la sauvegarde du dataset sur le Hub: {e}")
-        logger.error("Le dataset traité est disponible localement mais n'a pas été poussé.")
+    console.print(f"\n[bold cyan]Sauvegarde vers Hugging Face Hub[/bold cyan]")
+    with console.status("[bold green]Push en cours...", spinner="dots"):
+        try:
+            ds_processed.push_to_hub(repo_id, config_name=config_name_choice, token=hf_token, max_shard_size=max_shard_size)
+        except Exception as e:
+            console.print(f"[red]✗[/red] Erreur lors du push: {e}")
+            console.print("[yellow]ℹ[/yellow] Le dataset traité est disponible localement.")
+            return
+    
+    # Résumé final
+    console.print(Panel.fit(
+        f"[bold green]✓ Traitement terminé avec succès![/bold green]\n\n"
+        f"[cyan]Repository:[/cyan] {repo_id}\n"
+        f"[cyan]Configuration:[/cyan] {config_name_choice}\n"
+        f"[cyan]Lignes traitées:[/cyan] {len(ds_processed)}\n"
+        f"[cyan]Modèle:[/cyan] {model_name}",
+        title="Résumé",
+        border_style="green"
+    ))
 
 if __name__ == "__main__":
     main()
