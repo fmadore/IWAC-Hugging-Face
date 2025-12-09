@@ -25,30 +25,56 @@ HF_TOKEN   Jeton d'accès personnel pour le Hugging Face Hub (sinon, une
 
 Dépendances supplémentaires
 -------------------------
-    pip install sentence-transformers torch datasets huggingface_hub tqdm
+    pip install sentence-transformers torch datasets huggingface_hub rich
 """
 import argparse
 import logging
 import os
-import numpy as np
-from typing import List, Dict, Any
-from datasets import load_dataset, Dataset
-from huggingface_hub import HfFolder, login
+from typing import List, Dict, Any, Optional
+from datasets import load_dataset
+from huggingface_hub import get_token, login, dataset_info
 from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
 import torch
+import random
+import numpy as np
+import uuid
 
-# Configuration du logging
-def configure_logging() -> None:
-    """Configure le logging de base."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+# Disable symlinks warning from huggingface_hub
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
+# Rich console imports for beautiful output
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
+from rich.logging import RichHandler
+from rich.prompt import Prompt, IntPrompt
+from rich import box
+
+# Initialize Rich console
+console = Console()
+
+# Configure logging with Rich handler
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)]
+)
+logger = logging.getLogger(__name__)
 
 # Modèle d'embedding global (sera initialisé dans main())
-embedding_model = None
+embedding_model: Optional[SentenceTransformer] = None
+
+
+def set_seed(seed: int = 42):
+    """Set random seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 
 def get_available_configs(repo_id: str, token: str) -> List[str]:
     """
@@ -62,17 +88,14 @@ def get_available_configs(repo_id: str, token: str) -> List[str]:
         List[str]: Liste des noms de configurations disponibles.
     """
     try:
-        # Essayer de charger les métadonnées du dataset pour obtenir les configs
-        from huggingface_hub import dataset_info
         info = dataset_info(repo_id, token=token)
         if hasattr(info, 'config_names') and info.config_names:
             return info.config_names
         else:
-            # Fallback vers les configs connues
             return ['articles', 'publications', 'documents']
     except Exception:
-        # En cas d'erreur, retourner les configs par défaut
         return ['articles', 'publications', 'documents']
+
 
 def choose_config(available_configs: List[str]) -> str:
     """
@@ -85,26 +108,31 @@ def choose_config(available_configs: List[str]) -> str:
         str: Nom de la configuration choisie.
     """
     if len(available_configs) == 1:
-        print(f"Une seule configuration disponible: '{available_configs[0]}'")
+        console.print(f"[yellow]ℹ[/yellow] Single configuration available: [cyan]{available_configs[0]}[/cyan]")
         return available_configs[0]
     
-    print("Configurations disponibles:")
+    # Display available configurations in a table
+    table = Table(title="Available Configurations", box=box.ROUNDED)
+    table.add_column("#", style="cyan", justify="center")
+    table.add_column("Configuration", style="green")
+    
     for i, config in enumerate(available_configs, 1):
-        print(f"  {i}. {config}")
+        table.add_row(str(i), config)
+    
+    console.print(table)
     
     while True:
         try:
-            choice = input(f"Choisissez une configuration (1-{len(available_configs)}): ").strip()
-            choice_idx = int(choice) - 1
-            if 0 <= choice_idx < len(available_configs):
-                return available_configs[choice_idx]
-            else:
-                print(f"Veuillez entrer un nombre entre 1 et {len(available_configs)}.")
-        except ValueError:
-            print("Veuillez entrer un nombre valide.")
+            choice = IntPrompt.ask(
+                f"Choose a configuration",
+                choices=[str(i) for i in range(1, len(available_configs) + 1)],
+                show_choices=False
+            )
+            return available_configs[choice - 1]
         except KeyboardInterrupt:
-            print("\nOpération annulée.")
-            exit(0)
+            console.print("\n[yellow]Operation cancelled.[/yellow]")
+            raise SystemExit(0)
+
 
 def choose_update_mode() -> str:
     """
@@ -113,24 +141,31 @@ def choose_update_mode() -> str:
     Returns:
         str: Mode choisi ('all' pour tout recalculer, 'missing' pour seulement les valeurs manquantes)
     """
-    print("\nMode de mise à jour des embeddings:")
-    print("  1. Mettre à jour seulement les lignes sans embeddings (recommandé)")
-    print("  2. Recalculer tous les embeddings (peut être long)")
+    console.print("\n[bold]Update Mode:[/bold]")
+    table = Table(box=box.SIMPLE)
+    table.add_column("#", style="cyan", justify="center")
+    table.add_column("Mode", style="green")
+    table.add_column("Description", style="white")
+    
+    table.add_row("1", "missing", "Update only rows without embeddings (recommended)")
+    table.add_row("2", "all", "Recalculate all embeddings (may take longer)")
+    
+    console.print(table)
     
     while True:
         try:
-            choice = input("Choisissez un mode (1-2): ").strip()
-            if choice == "1":
-                return "missing"
-            elif choice == "2":
-                return "all"
-            else:
-                print("Veuillez entrer 1 ou 2.")
+            choice = Prompt.ask("Choose update mode", choices=["1", "2"], default="1")
+            return "missing" if choice == "1" else "all"
         except KeyboardInterrupt:
-            print("\nOpération annulée.")
-            exit(0)
+            console.print("\n[yellow]Operation cancelled.[/yellow]")
+            raise SystemExit(0)
 
-def compute_embeddings_batch(batch: Dict[str, List[Any]], text_col: str, embedding_col: str, update_mode: str = "all") -> Dict[str, List[Any]]:
+def compute_embeddings_batch(
+    batch: Dict[str, List[Any]], 
+    text_col: str, 
+    embedding_col: str, 
+    update_mode: str = "all"
+) -> Dict[str, List[Any]]:
     """
     Calcule les embeddings pour un batch de textes.
     
@@ -145,16 +180,17 @@ def compute_embeddings_batch(batch: Dict[str, List[Any]], text_col: str, embeddi
     """
     global embedding_model
     
+    if embedding_model is None:
+        raise RuntimeError("Embedding model not initialized")
+    
     texts = batch[text_col]
     existing_embeddings = batch.get(embedding_col, [None] * len(texts))
     
     # Déterminer quels textes ont besoin d'embeddings
-    texts_to_process = []
-    indices_to_update = []
-    processed_texts = []
+    indices_to_update: List[int] = []
+    processed_texts: List[str] = []
     
     for i, (text, existing_emb) in enumerate(zip(texts, existing_embeddings)):
-        # Vérifier si on doit traiter ce texte
         should_process = False
         
         if update_mode == "all":
@@ -163,271 +199,351 @@ def compute_embeddings_batch(batch: Dict[str, List[Any]], text_col: str, embeddi
             # Traiter seulement si l'embedding n'existe pas ou est vide/invalide
             if (existing_emb is None or 
                 existing_emb == [] or 
-                (isinstance(existing_emb, list) and all(x == 0.0 for x in existing_emb))):
+                (isinstance(existing_emb, list) and len(existing_emb) > 0 and all(x == 0.0 for x in existing_emb))):
                 should_process = True
         
         if should_process:
-            if text is None or text == "":
-                processed_texts.append("")  # Texte vide pour les valeurs manquantes
-            else:
-                processed_texts.append(str(text))
-            texts_to_process.append(text)
+            processed_texts.append(str(text) if text else "")
             indices_to_update.append(i)
+    
+    embedding_dim = embedding_model.get_sentence_embedding_dimension()
     
     # Si aucun texte à traiter, retourner le batch tel quel
     if not processed_texts:
         if embedding_col not in batch:
-            # Créer la colonne avec les embeddings existants ou vides
-            embedding_dim = embedding_model.get_sentence_embedding_dimension()
-            batch[embedding_col] = [existing_emb if existing_emb is not None else [0.0] * embedding_dim 
-                                  for existing_emb in existing_embeddings]
+            batch[embedding_col] = [
+                existing_emb if existing_emb is not None else [0.0] * embedding_dim 
+                for existing_emb in existing_embeddings
+            ]
         return batch
     
     # Calculer les embeddings pour les textes sélectionnés
     try:
-        # Utiliser show_progress_bar=False pour éviter les conflits avec tqdm externe
         embeddings = embedding_model.encode(
             processed_texts, 
-            batch_size=32,  # Batch size interne pour le modèle
+            batch_size=32,
             show_progress_bar=False,
             convert_to_numpy=True
         )
-        
-        # Convertir en listes pour la compatibilité avec datasets
         new_embeddings_list = [emb.tolist() for emb in embeddings]
         
     except Exception as e:
-        logging.error(f"Erreur lors du calcul des embeddings: {e}")
-        # En cas d'erreur, créer des embeddings vides
-        embedding_dim = embedding_model.get_sentence_embedding_dimension()
+        logger.error(f"Error computing embeddings: {e}")
         new_embeddings_list = [[0.0] * embedding_dim for _ in processed_texts]
     
     # Construire la liste finale des embeddings
     if embedding_col not in batch:
-        # Initialiser avec les embeddings existants ou des embeddings vides
-        embedding_dim = embedding_model.get_sentence_embedding_dimension()
-        final_embeddings = [existing_emb if existing_emb is not None else [0.0] * embedding_dim 
-                          for existing_emb in existing_embeddings]
+        final_embeddings = [
+            existing_emb if existing_emb is not None else [0.0] * embedding_dim 
+            for existing_emb in existing_embeddings
+        ]
     else:
-        final_embeddings = batch[embedding_col].copy()
+        final_embeddings = list(batch[embedding_col])
     
     # Mettre à jour seulement les indices sélectionnés
     for idx, new_emb in zip(indices_to_update, new_embeddings_list):
         final_embeddings[idx] = new_emb
     
-    # Ajouter les embeddings au batch
     batch[embedding_col] = final_embeddings
-    
     return batch
+
+
+def display_config_panel(repo_id: str, config_name: str, model_name: str, update_mode: str, batch_size: int):
+    """Display configuration in a beautiful Rich panel."""
+    table = Table(show_header=False, box=box.SIMPLE)
+    table.add_column("Setting", style="cyan")
+    table.add_column("Value", style="green")
+    
+    table.add_row("Repository", repo_id)
+    table.add_row("Configuration", config_name)
+    table.add_row("Model", model_name)
+    table.add_row("Update Mode", update_mode)
+    table.add_row("Batch Size", str(batch_size))
+    table.add_row("Device", "CUDA" if torch.cuda.is_available() else "CPU")
+    
+    console.print(Panel(table, title="[bold blue]🔢 Semantic Embedding Configuration", border_style="blue"))
+
+
+def display_text_stats(texts: List[Any], column_name: str) -> int:
+    """Display statistics about the text column and return count of non-empty texts."""
+    non_empty_texts = [t for t in texts if t is not None and str(t).strip() != ""]
+    empty_count = len(texts) - len(non_empty_texts)
+    
+    table = Table(title=f"Source Column Statistics: '{column_name}'", box=box.ROUNDED)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+    
+    table.add_row("Total entries", str(len(texts)))
+    table.add_row("Non-empty entries", str(len(non_empty_texts)))
+    table.add_row("Empty/None entries", str(empty_count))
+    
+    if non_empty_texts:
+        avg_length = sum(len(str(t)) for t in non_empty_texts) / len(non_empty_texts)
+        table.add_row("Avg. text length", f"{avg_length:.1f} characters")
+    
+    console.print(table)
+    return len(non_empty_texts)
+
+
+def display_embedding_stats(existing_embeddings: List[Any]) -> tuple[int, int]:
+    """Display statistics about existing embeddings and return (valid, missing) counts."""
+    valid_embeddings = 0
+    empty_embeddings = 0
+    
+    for emb in existing_embeddings:
+        if emb is None or emb == [] or (isinstance(emb, list) and len(emb) > 0 and all(x == 0.0 for x in emb)):
+            empty_embeddings += 1
+        else:
+            valid_embeddings += 1
+    
+    table = Table(title="Existing Embeddings Statistics", box=box.ROUNDED)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+    
+    table.add_row("Valid embeddings", str(valid_embeddings))
+    table.add_row("Missing/empty embeddings", str(empty_embeddings))
+    percentage = (empty_embeddings / len(existing_embeddings) * 100) if existing_embeddings else 0
+    table.add_row("To be processed", f"{percentage:.1f}%")
+    
+    console.print(table)
+    return valid_embeddings, empty_embeddings
 
 def main():
     global embedding_model
-    configure_logging()
-    logger = logging.getLogger(__name__)
 
     parser = argparse.ArgumentParser(
-        description="Ajoute une colonne d'embeddings sémantiques ('embedding_descriptionAI') "
-                   "à un dataset Hugging Face, basée sur la colonne 'descriptionAI'."
+        description="Add semantic embedding column ('embedding_descriptionAI') "
+                   "to a Hugging Face dataset, based on the 'descriptionAI' column."
     )
     parser.add_argument(
         "--repo", 
         default="fmadore/islam-west-africa-collection", 
-        help="ID du repository sur le Hugging Face Hub (ex: utilisateur/nom_dataset)."
+        help="Repository ID on Hugging Face Hub (e.g., user/dataset_name)."
     )
     parser.add_argument(
         "--model", 
-        default="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
-        help="Modèle sentence-transformers à utiliser pour les embeddings."
+        default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        help="Sentence-transformers model (default: MiniLM-L12-v2, optimized for CPU)."
     )
     parser.add_argument(
         "--max-shard-size", 
         default="1GB", 
-        help="Taille maximale des shards Parquet lors du push vers le Hub."
+        help="Maximum Parquet shard size when pushing to Hub."
     )
     parser.add_argument(
         "--batch-size", 
         type=int, 
         default=50, 
-        help="Taille des batchs pour le traitement .map()."
+        help="Batch size for the .map() processing."
     )
     
     args = parser.parse_args()
 
     repo_id = args.repo
     model_name = args.model
-    text_column_name = "descriptionAI"  # Colonne source (résumés Gemini)
-    embedding_column_name = "embedding_descriptionAI"  # Nouvelle colonne
+    text_column_name = "descriptionAI"
+    embedding_column_name = "embedding_descriptionAI"
     max_shard_size = args.max_shard_size
     batch_size = args.batch_size
 
+    # --- Configuration de la reproductibilité ---
+    set_seed(42)
+
     # --- Authentification avec le Hub ---
-    token = os.getenv("HF_TOKEN") or HfFolder.get_token()
+    console.print("\n[bold cyan]Step 1:[/bold cyan] Authenticating with Hugging Face Hub...")
+    token = os.getenv("HF_TOKEN") or get_token()
     if not token:
-        logger.info("Token Hugging Face non trouvé. Tentative de connexion interactive.")
+        console.print("[yellow]ℹ[/yellow] HF token not found. Attempting interactive login...")
         try:
             login()
-            token = HfFolder.get_token()
+            token = get_token()
             if not token:
-                logger.error("Connexion interactive échouée ou token non obtenu. Veuillez définir HF_TOKEN ou vous connecter manuellement.")
+                console.print("[red]✗[/red] Interactive login failed. Please set HF_TOKEN or login manually.")
                 return
         except Exception as e:
-            logger.error(f"Erreur lors de la connexion interactive: {e}")
+            console.print(f"[red]✗[/red] Login error: {e}")
             return
+    console.print("[green]✓[/green] Authenticated successfully.")
 
     # --- Choix de la configuration ---
-    available_configs = get_available_configs(repo_id, token)
+    console.print("\n[bold cyan]Step 2:[/bold cyan] Selecting configuration...")
+    with console.status("[bold green]Fetching available configurations...", spinner="dots"):
+        available_configs = get_available_configs(repo_id, token)
+    
     config_name_choice = choose_config(available_configs)
-    logger.info(f"Configuration choisie: '{config_name_choice}'")
+    console.print(f"[green]✓[/green] Selected configuration: [cyan]{config_name_choice}[/cyan]")
     
     # --- Choix du mode de mise à jour ---
     update_mode = choose_update_mode()
-    logger.info(f"Mode de mise à jour choisi: '{update_mode}'")
+    console.print(f"[green]✓[/green] Update mode: [cyan]{update_mode}[/cyan]")
 
     # --- Initialisation du modèle d'embedding ---
-    logger.info(f"Chargement du modèle d'embedding: {model_name}")
+    console.print(f"\n[bold cyan]Step 3:[/bold cyan] Loading embedding model...")
     try:
-        # Vérifier si CUDA est disponible
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Utilisation du device: {device}")
+        console.print(f"[blue]→[/blue] Using device: [cyan]{device}[/cyan]")
         
-        embedding_model = SentenceTransformer(model_name, device=device)
+        with console.status(f"[bold green]Loading model: {model_name}...", spinner="dots"):
+            embedding_model = SentenceTransformer(model_name, device=device)
+        
         embedding_dim = embedding_model.get_sentence_embedding_dimension()
-        logger.info(f"Modèle chargé avec succès. Dimension des embeddings: {embedding_dim}")
+        console.print(f"[green]✓[/green] Model loaded. Embedding dimension: [cyan]{embedding_dim}[/cyan]")
         
     except Exception as e:
-        logger.error(f"Erreur lors du chargement du modèle d'embedding: {e}")
+        console.print(f"[red]✗[/red] Failed to load embedding model: {e}")
         return
+
+    # --- Display configuration panel ---
+    console.print()
+    display_config_panel(repo_id, config_name_choice, model_name, update_mode, batch_size)
 
     # --- Chargement du dataset ---
-    logger.info(f"Chargement du dataset '{repo_id}', configuration '{config_name_choice}'...")
+    console.print(f"\n[bold cyan]Step 4:[/bold cyan] Loading dataset...")
     try:
-        ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token)
+        with console.status(f"[bold green]Loading '{repo_id}' (config: {config_name_choice})...", spinner="dots"):
+            ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token)
     except Exception as e:
-        logger.error(f"Erreur lors du chargement du dataset: {e}")
+        console.print(f"[red]✗[/red] Failed to load dataset: {e}")
         return
 
-    logger.info(f"Dataset chargé. Nombre de lignes: {len(ds)}")
-    logger.info(f"Colonnes disponibles: {ds.column_names}")
+    console.print(f"[green]✓[/green] Dataset loaded: [cyan]{len(ds)}[/cyan] rows")
+    logger.debug(f"Available columns: {ds.column_names}")
 
     # --- Vérifications des colonnes ---
     if text_column_name not in ds.column_names:
-        logger.error(f"La colonne de texte source '{text_column_name}' n'existe pas dans le dataset. Colonnes disponibles: {ds.column_names}")
+        console.print(f"[red]✗[/red] Source column '{text_column_name}' not found in dataset.")
+        console.print(f"[yellow]ℹ[/yellow] Available columns: {', '.join(ds.column_names)}")
         return
 
     if embedding_column_name in ds.column_names:
         if update_mode == "all":
-            logger.warning(f"La colonne d'embedding '{embedding_column_name}' existe déjà. Elle sera écrasée.")
+            console.print(f"[yellow]⚠[/yellow] Embedding column '{embedding_column_name}' exists and will be overwritten.")
         else:
-            logger.info(f"La colonne d'embedding '{embedding_column_name}' existe déjà. Seules les valeurs manquantes seront calculées.")
+            console.print(f"[yellow]ℹ[/yellow] Embedding column '{embedding_column_name}' exists. Only missing values will be computed.")
     else:
-        logger.info(f"La colonne d'embedding '{embedding_column_name}' sera créée.")
+        console.print(f"[blue]→[/blue] Embedding column '{embedding_column_name}' will be created.")
 
     # --- Statistiques sur la colonne source ---
+    console.print(f"\n[bold cyan]Step 5:[/bold cyan] Analyzing source data...")
     texts = ds[text_column_name]
-    non_empty_texts = [t for t in texts if t is not None and t.strip() != ""]
-    logger.info(f"Statistiques de la colonne '{text_column_name}':")
-    logger.info(f"  - Total d'entrées: {len(texts)}")
-    logger.info(f"  - Entrées non vides: {len(non_empty_texts)}")
-    logger.info(f"  - Entrées vides/None: {len(texts) - len(non_empty_texts)}")
-    
-    if non_empty_texts:
-        avg_length = sum(len(t) for t in non_empty_texts) / len(non_empty_texts)
-        logger.info(f"  - Longueur moyenne des textes non vides: {avg_length:.1f} caractères")
+    display_text_stats(texts, text_column_name)
     
     # --- Statistiques sur les embeddings existants (si mode 'missing') ---
     if update_mode == "missing" and embedding_column_name in ds.column_names:
         existing_embeddings = ds[embedding_column_name]
-        valid_embeddings = 0
-        empty_embeddings = 0
+        valid_count, missing_count = display_embedding_stats(existing_embeddings)
         
-        for emb in existing_embeddings:
-            if emb is None or emb == [] or (isinstance(emb, list) and all(x == 0.0 for x in emb)):
-                empty_embeddings += 1
-            else:
-                valid_embeddings += 1
-        
-        logger.info(f"Statistiques des embeddings existants:")
-        logger.info(f"  - Embeddings valides: {valid_embeddings}")
-        logger.info(f"  - Embeddings manquants/vides: {empty_embeddings}")
-        logger.info(f"  - Pourcentage à traiter: {(empty_embeddings/len(existing_embeddings)*100):.1f}%")
+        if missing_count == 0:
+            console.print(Panel(
+                "[green]All embeddings are already computed![/green]\n\n"
+                "No processing needed.",
+                title="ℹ Nothing to do",
+                border_style="green"
+            ))
+            return
 
     # --- Application du calcul des embeddings ---
-    logger.info(f"Calcul des embeddings (colonne: '{embedding_column_name}') pour la colonne '{text_column_name}'...")
+    console.print(f"\n[bold cyan]Step 6:[/bold cyan] Computing embeddings...")
     
-    ds_processed = ds.map(
-        compute_embeddings_batch,
-        fn_kwargs={
-            "text_col": text_column_name, 
-            "embedding_col": embedding_column_name,
-            "update_mode": update_mode
-        },
-        batched=True,
-        batch_size=batch_size,
-        desc=f"Calcul des embeddings ({'tous' if update_mode == 'all' else 'manquants seulement'})",
-    )
+    mode_desc = "all rows" if update_mode == "all" else "missing rows only"
+    console.print(f"[blue]→[/blue] Processing {mode_desc}...")
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task(f"[cyan]Computing embeddings", total=len(ds))
+        
+        def compute_with_progress(batch):
+            result = compute_embeddings_batch(
+                batch, 
+                text_column_name, 
+                embedding_column_name,
+                update_mode
+            )
+            progress.update(task, advance=len(batch[text_column_name]))
+            return result
+        
+        ds_processed = ds.map(
+            compute_with_progress,
+            batched=True,
+            batch_size=batch_size,
+            desc=None,  # Disable tqdm since we use Rich
+            load_from_cache_file=False,  # Disable caching
+            new_fingerprint=str(uuid.uuid4()),  # Bypass hashing to avoid warnings
+        )
 
-    logger.info("Calcul des embeddings terminé.")
+    console.print("[green]✓[/green] Embedding computation complete.")
     
     # --- Vérification des résultats ---
+    console.print("\n[bold]Sample embeddings (first 3):[/bold]")
     embeddings_sample = ds_processed[embedding_column_name][:3]
-    logger.info(f"Aperçu des embeddings (3 premiers):")
     for i, emb in enumerate(embeddings_sample):
-        if emb:
-            logger.info(f"  Embedding {i+1}: dimension {len(emb)}, premiers éléments: {emb[:5]}")
+        if emb and len(emb) > 0 and not all(x == 0.0 for x in emb):
+            console.print(f"  [cyan]#{i+1}[/cyan]: dim={len(emb)}, values=[{emb[0]:.4f}, {emb[1]:.4f}, ...]")
         else:
-            logger.info(f"  Embedding {i+1}: vide")
+            console.print(f"  [cyan]#{i+1}[/cyan]: [dim]empty/zero[/dim]")
 
     # --- Réorganisation des colonnes ---
-    # Placer la nouvelle colonne après 'descriptionAI'
     insert_after_col = "descriptionAI"
-    new_embedding_cols = [embedding_column_name]
-    logger.info(f"Réorganisation des colonnes pour placer {new_embedding_cols} après '{insert_after_col}'.")
-    
-    existing_columns = list(ds_processed.column_names)
-    
-    if insert_after_col in existing_columns:
-        # Trouver l'index de la colonne après laquelle insérer
+    if insert_after_col in ds_processed.column_names:
+        existing_columns = list(ds_processed.column_names)
         insert_index = existing_columns.index(insert_after_col) + 1
         
-        # Créer la nouvelle liste de colonnes
         new_columns = existing_columns[:insert_index]
-        
-        # Ajouter les nouvelles colonnes d'embedding
-        for col in new_embedding_cols:
-            if col in existing_columns and col not in new_columns:
-                new_columns.append(col)
-        
-        # Ajouter le reste des colonnes
+        if embedding_column_name in existing_columns and embedding_column_name not in new_columns:
+            new_columns.append(embedding_column_name)
         for col in existing_columns[insert_index:]:
             if col not in new_columns:
                 new_columns.append(col)
         
-        # Réorganiser le dataset
         ds_processed = ds_processed.select_columns(new_columns)
-        logger.info(f"Colonnes réorganisées. Nouvel ordre: {ds_processed.column_names}")
-    else:
-        logger.warning(f"Colonne de référence '{insert_after_col}' non trouvée. Les nouvelles colonnes seront ajoutées à la fin.")
+        console.print(f"[blue]→[/blue] Columns reordered ('{embedding_column_name}' after '{insert_after_col}')")
 
     # --- Sauvegarde du dataset traité ---
-    logger.info(f"Sauvegarde du dataset traité vers le Hub Hugging Face (repo: '{repo_id}', config: '{config_name_choice}')...")
+    console.print(f"\n[bold cyan]Step 7:[/bold cyan] Pushing to Hugging Face Hub...")
+    
     try:
-        commit_message = f"Ajout colonne '{embedding_column_name}' (embeddings sémantiques) basée sur '{text_column_name}' avec {model_name} (config: {config_name_choice})"
-        ds_processed.push_to_hub(
-            repo_id=repo_id,
-            config_name=config_name_choice,
-            commit_message=commit_message,
-            token=token,
-            max_shard_size=max_shard_size,
+        commit_message = (
+            f"Add/update '{embedding_column_name}' embeddings using {model_name} "
+            f"(config: {config_name_choice}, mode: {update_mode})"
         )
-        logger.info("Dataset traité et sauvegardé avec succès.")
+        
+        with console.status("[bold green]Pushing dataset to Hub...", spinner="dots"):
+            ds_processed.push_to_hub(
+                repo_id=repo_id,
+                config_name=config_name_choice,
+                commit_message=commit_message,
+                token=token,
+                max_shard_size=max_shard_size,
+            )
+        
+        # Success panel
+        action = "updated" if embedding_column_name in ds.column_names else "created"
+        console.print(Panel(
+            f"[bold green]✓ Dataset successfully published![/bold green]\n\n"
+            f"Repository: [cyan]{repo_id}[/cyan]\n"
+            f"Configuration: [cyan]{config_name_choice}[/cyan]\n"
+            f"Column: [cyan]{embedding_column_name}[/cyan] ({action})\n"
+            f"Model: [cyan]{model_name}[/cyan]\n"
+            f"Embedding dimension: [cyan]{embedding_dim}[/cyan]\n"
+            f"Records: [cyan]{len(ds_processed)}[/cyan]",
+            title="🎉 Upload Complete",
+            border_style="green"
+        ))
+        
     except Exception as e:
-        logger.error(f"Erreur lors de la sauvegarde du dataset sur le Hub: {e}")
-        return
+        console.print(Panel(
+            f"[bold red]✗ Failed to push dataset[/bold red]\n\n{e}",
+            title="Error",
+            border_style="red"
+        ))
+        logger.error("Push error details:", exc_info=True)
 
-    logger.info(f"Processus terminé. Colonne '{embedding_column_name}' {'mise à jour' if embedding_column_name in ds.column_names else 'ajoutée'} avec succès.")
-    logger.info(f"Mode de traitement: {update_mode}")
-    logger.info(f"Modèle utilisé: {model_name}")
-    logger.info(f"Dimension des embeddings: {embedding_dim}")
 
 if __name__ == "__main__":
     main()
