@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 from datasets import load_dataset
-from huggingface_hub import HfFolder, login
+from huggingface_hub import get_token, login
 from tqdm import tqdm
 
 import sys
@@ -38,12 +38,18 @@ from topic_modeling.utils import (
     choose_config,
     choose_modeling_mode,
     build_arg_parser,
+    console,
+    display_coherence_summary,
 )  # type: ignore
 from topic_modeling.modeling import (  # type: ignore
     create_bertopic_model,
     fit_topic_model,
     load_topic_model,
     predict_topics_batch as predict_topics_batch_impl,
+    compute_coherence_metrics,
+    save_model_parameters,
+    extract_year_from_date,
+    compute_topics_over_time,
 )
 
 
@@ -73,12 +79,12 @@ def main() -> None:
     embedding_batch_size = args.embedding_batch_size
 
     # Authentification
-    token = os.getenv("HF_TOKEN") or HfFolder.get_token()
+    token = os.getenv("HF_TOKEN") or get_token()
     if not token:
         logger.info("Token Hugging Face non trouvé. Tentative de connexion interactive.")
         try:
             login()
-            token = HfFolder.get_token()
+            token = get_token()
             if not token:
                 logger.error("Connexion interactive échouée.")
                 return
@@ -204,10 +210,15 @@ def main() -> None:
                 logger.warning(f"Impossible de charger les stopwords additionnels: {e}")
 
         # Determine dynamic min_cluster_size if desired_topics is provided
+        # For ~12000 docs targeting 80 topics, we want min_cluster_size around 30-50
+        # Too high = too few topics, too low = too many fragmented topics
         dynamic_min_cluster_size = min_topic_size
         if args.desired_topics and args.desired_topics > 0:
             try:
-                dynamic_min_cluster_size = max(20, int(len(docs_clean_valid) / int(args.desired_topics)))
+                # Use a smaller divisor to allow more topics to form
+                # With 12000 docs and desired_topics=80, this gives ~50 (not 150)
+                calculated_size = int(len(docs_clean_valid) / (int(args.desired_topics) * 3))
+                dynamic_min_cluster_size = max(15, min(calculated_size, 100))  # Clamp between 15-100
                 logger.info(
                     f"min_cluster_size dynamique: {dynamic_min_cluster_size} (docs={len(docs_clean_valid)}, sujets visés={args.desired_topics})"
                 )
@@ -232,8 +243,6 @@ def main() -> None:
             hdbscan_min_samples=args.hdbscan_min_samples,
             hdbscan_selection_method=args.hdbscan_selection_method,
             hdbscan_epsilon=args.hdbscan_epsilon,
-            vectorizer_min_df=args.vectorizer_min_df,
-            vectorizer_max_df=args.vectorizer_max_df,
             vectorizer_max_features=args.vectorizer_max_features,
             vectorizer_ngram_min=ngram_min,
             vectorizer_ngram_max=ngram_max,
@@ -251,6 +260,61 @@ def main() -> None:
             embedding_batch_size,
             reduce_outliers_threshold=(args.reduce_outliers_train if args.reduce_outliers_train > 0 else None),
             topic_label_max_words=args.topic_label_max_words,
+            nr_topics=args.nr_topics,
+        )
+        
+        # Compute and save coherence metrics for DH quality assessment (enabled by default)
+        coherence_metrics = None
+        if not args.skip_coherence:
+            logger.info("Calcul des métriques de cohérence (important pour l'analyse DH)...")
+            coherence_metrics = compute_coherence_metrics(topic_model, docs_clean_valid, logger)
+            if coherence_metrics and "error" not in coherence_metrics:
+                display_coherence_summary(coherence_metrics)
+        else:
+            logger.info("Calcul de cohérence désactivé (--skip-coherence)")
+        
+        # Save all parameters for reproducibility (critical for academic work)
+        logger.info("Sauvegarde des paramètres pour reproductibilité...")
+        umap_params = {
+            "n_neighbors": args.umap_n_neighbors,
+            "min_dist": args.umap_min_dist,
+            "n_components": args.umap_n_components,
+            "metric": args.umap_metric,
+            "random_state": 42,
+        }
+        hdbscan_params = {
+            "min_cluster_size": dynamic_min_cluster_size,
+            "min_samples": args.hdbscan_min_samples,
+            "cluster_selection_method": args.hdbscan_selection_method,
+            "cluster_selection_epsilon": args.hdbscan_epsilon,
+        }
+        vectorizer_params = {
+            "ngram_range": [ngram_min, ngram_max],
+            "min_df": 2,  # Hardcoded for BERTopic c-TF-IDF compatibility
+            "max_df": 1.0,  # Hardcoded for BERTopic c-TF-IDF compatibility
+            "max_features": args.vectorizer_max_features,
+        }
+        from topic_modeling.constants import DOMAIN_STOPWORDS
+        all_stopwords = list(DOMAIN_STOPWORDS)
+        if extra_stopwords:
+            all_stopwords.extend(extra_stopwords)
+        
+        save_model_parameters(
+            model_path,
+            embedding_model_name,
+            dynamic_min_cluster_size,
+            umap_params,
+            hdbscan_params,
+            vectorizer_params,
+            all_stopwords,
+            coherence_metrics=coherence_metrics,
+            extra_info={
+                "config_name": config_name_choice,
+                "num_training_docs": len(docs_clean_valid),
+                "reduce_outliers_threshold": args.reduce_outliers_train,
+                "desired_topics": args.desired_topics,
+            },
+            logger=logger,
         )
         
     else:
@@ -286,6 +350,54 @@ def main() -> None:
 
     logger.info("Modélisation terminée.")
     
+    # Topics over time analysis (enabled by default if pub_date exists)
+    if not args.skip_topics_over_time and "pub_date" in ds.column_names:
+        logger.info("Calcul de l'évolution temporelle des topics...")
+        
+        # Get French documents for temporal analysis
+        french_docs_for_time = []
+        french_dates_for_time = []
+        
+        if 'language' in ds_processed.column_names:
+            for i, (doc, lang, date) in enumerate(zip(
+                ds_processed[embed_text_column_name],
+                ds_processed['language'],
+                ds_processed['pub_date']
+            )):
+                if lang == 'Français' and doc and str(doc).strip():
+                    french_docs_for_time.append(str(doc))
+                    french_dates_for_time.append(date)
+        else:
+            french_docs_for_time = [str(d) for d in ds_processed[embed_text_column_name] if d]
+            french_dates_for_time = list(ds_processed['pub_date'])
+        
+        if french_docs_for_time:
+            topics_over_time_df, _ = compute_topics_over_time(
+                topic_model,
+                french_docs_for_time,
+                french_dates_for_time,
+                logger,
+                nr_bins=args.time_bins,
+            )
+            
+            # Save topics_over_time to CSV if requested
+            if topics_over_time_df is not None and args.save_topics_over_time:
+                try:
+                    save_path = Path(args.save_topics_over_time)
+                    topics_over_time_df.to_csv(save_path, index=False, encoding='utf-8')
+                    logger.info(f"Topics over time sauvegardé: {save_path}")
+                except Exception as e:
+                    logger.warning(f"Impossible de sauvegarder topics_over_time: {e}")
+            
+            # Also save alongside model
+            if topics_over_time_df is not None:
+                try:
+                    tot_path = model_path / "topics_over_time.csv"
+                    topics_over_time_df.to_csv(tot_path, index=False, encoding='utf-8')
+                    logger.info(f"Topics over time aussi sauvegardé dans le modèle: {tot_path}")
+                except Exception as e:
+                    logger.warning(f"Impossible de sauvegarder topics_over_time dans le modèle: {e}")
+    
     # Statistiques
     logger.info("Calcul des statistiques...")
     topic_ids = ds_processed[topic_id_column_name]
@@ -308,6 +420,19 @@ def main() -> None:
     if valid_topic_ids:
         unique_topics = set(valid_topic_ids)
         logger.info(f"Nombre de sujets uniques: {len(unique_topics)}")
+        
+        # Outlier analysis (Topic -1)
+        outlier_count = valid_topic_ids.count(-1)
+        total_valid = len(valid_topic_ids)
+        if total_valid > 0:
+            outlier_percentage = (outlier_count / total_valid) * 100
+            logger.info(f"Outliers (Topic -1): {outlier_count} documents ({outlier_percentage:.2f}%)")
+            
+            if outlier_percentage > 35:
+                logger.warning("⚠️  Pourcentage d'outliers élevé (>35%).")
+                logger.warning("   Suggestion: Augmentez --umap-n-neighbors (ex: 250) ou réduisez --hdbscan-min-samples.")
+            else:
+                logger.info("✅ Pourcentage d'outliers acceptable.")
         
         valid_probs = [p for p in valid_topic_probs if p > 0]
         if valid_probs:
@@ -361,16 +486,37 @@ def main() -> None:
         logger.error(f"Erreur lors de la sauvegarde: {e}")
         return
 
-    logger.info(f"Processus terminé. Colonnes {new_columns} ajoutées avec succès.")
-    logger.info(f"Modèle d'embedding utilisé: {embedding_model_name}")
-    if valid_topic_ids:
-        logger.info(f"Nombre de sujets découverts: {len(unique_topics)}")
-    logger.info(f"Modèle BERTopic sauvegardé à: {model_path}")
+    # Final summary using Rich
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich import box
+    
+    summary_table = Table(title="Résumé de la modélisation", box=box.ROUNDED)
+    summary_table.add_column("Paramètre", style="cyan")
+    summary_table.add_column("Valeur", style="green")
+    
+    summary_table.add_row("Colonnes ajoutées", ", ".join(new_columns))
+    summary_table.add_row("Modèle d'embedding", embedding_model_name)
+    summary_table.add_row("Topics découverts", str(len(unique_topics)) if valid_topic_ids else "0")
+    summary_table.add_row("Documents français traités", str(processed_count))
+    summary_table.add_row("Documents ignorés", str(skipped_count))
+    summary_table.add_row("Total documents", str(len(ds)))
+    summary_table.add_row("Modèle sauvegardé", str(model_path))
+    
     if modeling_mode == "fit":
-        logger.info(f"Taille minimale des sujets: {min_topic_size}")
-        logger.info(f"Documents français traités: {processed_count}")
-        logger.info(f"Documents non-français ignorés: {skipped_count}")
-        logger.info(f"Total des documents: {len(ds)}")
+        summary_table.add_row("Taille min. clusters", str(min_topic_size))
+        params_file = model_path / "training_parameters.json"
+        if params_file.exists():
+            summary_table.add_row("Paramètres", str(params_file))
+    
+    console.print()
+    console.print(summary_table)
+    console.print()
+    console.print("[green]✓[/green] Processus terminé avec succès!")
+    
+    if modeling_mode == "fit":
+        console.print(f"[blue]→[/blue] Pour reproduire: consultez [cyan]{model_path / 'training_parameters.json'}[/cyan]")
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,56 @@
+# Domain-specific stopwords for IWAC topic modeling
+# Only truly non-informative terms that add noise
+# Add one word/phrase per line (case-insensitive)
+
+# OCR artifacts and abbreviations (garbage tokens)
+lp
+bf
+wa
+adj
+octet
+ii
+iii
+iv
+vi
+vii
+viii
+ix
+xi
+xii
+
+# Generic location words (not specific places)
+place
+rond
+point
+
+# Generic administrative boilerplate
+presence prefet
+exhorter
+
+# Generic news boilerplate (not domain-specific)
+carton
+sac
+bidon
+bidon huile
+
+# English stopwords (from non-French docs leaking through)
+the
+of
+to
+and
+in
+for
+is
+on
+that
+by
+this
+with
+are
+from
+or
+an
+be
+as
+at
+was

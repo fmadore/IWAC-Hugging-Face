@@ -5,10 +5,12 @@ BERTopic model creation, training, loading, and inference utilities.
 """
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime
 from pathlib import Path
 import inspect
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -36,6 +38,290 @@ except Exception:  # older/newer versions may move this symbol
     ClassTfidfTransformer = None  # type: ignore
     CTFIDF_AVAILABLE = False
 
+# Optional: gensim for coherence metrics
+try:
+    from gensim.corpora import Dictionary
+    from gensim.models.coherencemodel import CoherenceModel
+    GENSIM_AVAILABLE = True
+except ImportError:
+    GENSIM_AVAILABLE = False
+
+
+def compute_coherence_metrics(
+    topic_model: BERTopic,
+    docs: List[str],
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    """Compute topic coherence metrics (C_v, NPMI, U_Mass) for quality assessment.
+    
+    These metrics are standard in Digital Humanities for evaluating topic interpretability.
+    C_v (0-1): Higher is better, measures semantic similarity of top words
+    NPMI (-1 to 1): Higher is better, normalized pointwise mutual information
+    U_Mass (negative): Less negative is better, based on document co-occurrence
+    
+    Returns dict with coherence scores and per-topic breakdown.
+    """
+    if not GENSIM_AVAILABLE:
+        logger.warning("gensim non disponible - impossible de calculer les métriques de cohérence. "
+                      "Installez avec: pip install gensim")
+        return {"error": "gensim not available"}
+    
+    try:
+        # Get topic words from BERTopic
+        topic_info = topic_model.get_topic_info()
+        topics_words: List[List[str]] = []
+        topic_ids: List[int] = []
+        
+        for _, row in topic_info.iterrows():
+            topic_id = row['Topic']
+            if topic_id == -1:  # Skip outlier topic
+                continue
+            topic_words = topic_model.get_topic(topic_id)
+            if topic_words:
+                words = [word for word, _ in topic_words[:10]]  # Top 10 words
+                topics_words.append(words)
+                topic_ids.append(topic_id)
+        
+        if not topics_words:
+            logger.warning("Aucun topic valide pour calculer la cohérence")
+            return {"error": "no valid topics"}
+        
+        # Tokenize documents for gensim
+        tokenized_docs = [doc.lower().split() for doc in docs if doc and doc.strip()]
+        
+        if len(tokenized_docs) < 10:
+            logger.warning("Pas assez de documents pour calculer la cohérence")
+            return {"error": "insufficient documents"}
+        
+        # Create gensim dictionary
+        dictionary = Dictionary(tokenized_docs)
+        
+        # Compute multiple coherence metrics
+        metrics: Dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(),
+            "num_topics": len(topics_words),
+            "num_documents": len(tokenized_docs),
+        }
+        
+        # C_v coherence (most commonly used in DH)
+        try:
+            cm_cv = CoherenceModel(
+                topics=topics_words,
+                texts=tokenized_docs,
+                dictionary=dictionary,
+                coherence='c_v'
+            )
+            cv_score = cm_cv.get_coherence()
+            cv_per_topic = cm_cv.get_coherence_per_topic()
+            metrics["c_v"] = {
+                "score": float(cv_score),
+                "per_topic": {tid: float(score) for tid, score in zip(topic_ids, cv_per_topic)},
+                "interpretation": "0-1, higher is better"
+            }
+            logger.info(f"Cohérence C_v: {cv_score:.4f}")
+        except Exception as e:
+            logger.warning(f"Impossible de calculer C_v: {e}")
+            metrics["c_v"] = {"error": str(e)}
+        
+        # NPMI coherence
+        try:
+            cm_npmi = CoherenceModel(
+                topics=topics_words,
+                texts=tokenized_docs,
+                dictionary=dictionary,
+                coherence='c_npmi'
+            )
+            npmi_score = cm_npmi.get_coherence()
+            npmi_per_topic = cm_npmi.get_coherence_per_topic()
+            metrics["npmi"] = {
+                "score": float(npmi_score),
+                "per_topic": {tid: float(score) for tid, score in zip(topic_ids, npmi_per_topic)},
+                "interpretation": "-1 to 1, higher is better"
+            }
+            logger.info(f"Cohérence NPMI: {npmi_score:.4f}")
+        except Exception as e:
+            logger.warning(f"Impossible de calculer NPMI: {e}")
+            metrics["npmi"] = {"error": str(e)}
+        
+        # U_Mass coherence (faster, based on document co-occurrence)
+        try:
+            corpus = [dictionary.doc2bow(doc) for doc in tokenized_docs]
+            cm_umass = CoherenceModel(
+                topics=topics_words,
+                corpus=corpus,
+                dictionary=dictionary,
+                coherence='u_mass'
+            )
+            umass_score = cm_umass.get_coherence()
+            umass_per_topic = cm_umass.get_coherence_per_topic()
+            metrics["u_mass"] = {
+                "score": float(umass_score),
+                "per_topic": {tid: float(score) for tid, score in zip(topic_ids, umass_per_topic)},
+                "interpretation": "negative, less negative is better"
+            }
+            logger.info(f"Cohérence U_Mass: {umass_score:.4f}")
+        except Exception as e:
+            logger.warning(f"Impossible de calculer U_Mass: {e}")
+            metrics["u_mass"] = {"error": str(e)}
+        
+        # Topic diversity: proportion of unique words across all topics
+        all_words = [word for topic in topics_words for word in topic]
+        unique_words = set(all_words)
+        diversity = len(unique_words) / len(all_words) if all_words else 0
+        metrics["topic_diversity"] = {
+            "score": float(diversity),
+            "interpretation": "0-1, higher means more diverse topics"
+        }
+        logger.info(f"Diversité des topics: {diversity:.4f}")
+        
+        return metrics
+        
+    except Exception as e:
+        logger.error(f"Erreur lors du calcul des métriques de cohérence: {e}")
+        return {"error": str(e)}
+
+
+def save_model_parameters(
+    model_save_path: Path,
+    embedding_model_name: str,
+    min_topic_size: int,
+    umap_params: Dict[str, Any],
+    hdbscan_params: Dict[str, Any],
+    vectorizer_params: Dict[str, Any],
+    stopwords_used: List[str],
+    coherence_metrics: Dict[str, Any] | None = None,
+    extra_info: Dict[str, Any] | None = None,
+    logger: logging.Logger | None = None,
+) -> Path:
+    """Save all model parameters to a JSON file for reproducibility.
+    
+    This is critical for academic DH work where reproducibility is essential.
+    """
+    params = {
+        "metadata": {
+            "created_at": datetime.now().isoformat(),
+            "bertopic_version": None,
+            "pipeline_version": "1.0.0",
+        },
+        "embedding_model": {
+            "name": embedding_model_name,
+        },
+        "clustering": {
+            "min_topic_size": min_topic_size,
+            "umap": umap_params,
+            "hdbscan": hdbscan_params,
+        },
+        "vectorizer": vectorizer_params,
+        "stopwords": {
+            "count": len(stopwords_used),
+            "words": sorted(stopwords_used),
+        },
+    }
+    
+    # Add BERTopic version if available
+    try:
+        import bertopic
+        params["metadata"]["bertopic_version"] = bertopic.__version__
+    except Exception:
+        pass
+    
+    if coherence_metrics:
+        params["coherence_metrics"] = coherence_metrics
+    
+    if extra_info:
+        params["extra"] = extra_info
+    
+    params_path = model_save_path / "training_parameters.json"
+    try:
+        with open(params_path, "w", encoding="utf-8") as f:
+            json.dump(params, f, ensure_ascii=False, indent=2)
+        if logger:
+            logger.info(f"Paramètres sauvegardés: {params_path}")
+    except Exception as e:
+        if logger:
+            logger.warning(f"Impossible de sauvegarder les paramètres: {e}")
+    
+    return params_path
+
+
+def extract_year_from_date(date_str: str | None) -> int | None:
+    """Extract year from a date string (supports YYYY-MM-DD, YYYY, etc.)."""
+    if not date_str or not isinstance(date_str, str):
+        return None
+    date_str = date_str.strip()
+    if not date_str:
+        return None
+    
+    # Try YYYY-MM-DD or YYYY/MM/DD format
+    try:
+        if len(date_str) >= 4:
+            year = int(date_str[:4])
+            if 1800 <= year <= 2100:  # Reasonable year range
+                return year
+    except (ValueError, IndexError):
+        pass
+    
+    return None
+
+
+def compute_topics_over_time(
+    topic_model: BERTopic,
+    docs: List[str],
+    timestamps: List[str | int | None],
+    logger: logging.Logger,
+    nr_bins: int | None = None,
+) -> Tuple[Any | None, Dict[int, int]]:
+    """Compute topics over time using BERTopic's built-in method.
+    
+    Returns:
+        - topics_over_time DataFrame (or None if failed)
+        - year_mapping: dict mapping doc index to extracted year
+    """
+    # Extract years from timestamps
+    years: List[int | None] = []
+    year_mapping: Dict[int, int] = {}
+    
+    for i, ts in enumerate(timestamps):
+        if isinstance(ts, int):
+            year = ts if 1800 <= ts <= 2100 else None
+        else:
+            year = extract_year_from_date(str(ts) if ts else None)
+        years.append(year)
+        if year is not None:
+            year_mapping[i] = year
+    
+    # Filter to docs with valid years
+    valid_indices = [i for i, y in enumerate(years) if y is not None]
+    if len(valid_indices) < 10:
+        logger.warning(f"Pas assez de documents avec dates valides ({len(valid_indices)}) pour l'analyse temporelle")
+        return None, year_mapping
+    
+    valid_docs = [docs[i] for i in valid_indices]
+    valid_years = [years[i] for i in valid_indices]
+    
+    # Convert years to timestamps for BERTopic
+    # BERTopic expects datetime-like objects or strings
+    timestamps_str = [f"{y}-01-01" for y in valid_years]
+    
+    try:
+        topics_over_time = topic_model.topics_over_time(
+            valid_docs,
+            timestamps_str,
+            nr_bins=nr_bins,
+            datetime_format="%Y-%m-%d",
+        )
+        
+        # Log summary
+        if topics_over_time is not None and len(topics_over_time) > 0:
+            year_range = f"{min(valid_years)}-{max(valid_years)}"
+            logger.info(f"Analyse temporelle: {len(topics_over_time)} entrées, période {year_range}")
+        
+        return topics_over_time, year_mapping
+        
+    except Exception as e:
+        logger.error(f"Erreur lors du calcul topics_over_time: {e}")
+        return None, year_mapping
+
 
 def create_custom_topic_representation():
     """Create a custom topic representation that prioritizes NOUN/ADJ and adds diversity.
@@ -46,7 +332,8 @@ def create_custom_topic_representation():
     if not KEYBERT_AVAILABLE:
         return None
     try:  # Try POS + KeyBERT with Merge
-        pos = PartOfSpeech(model="fr_core_news_md", allowed_pos={"NOUN", "ADJ"}, top_n=10)
+        # Use 'lg' model for better accuracy as requested in instructions
+        pos = PartOfSpeech(model="fr_core_news_lg", allowed_pos={"NOUN", "ADJ"}, top_n=10)
         keybert = KeyBERTInspired(mm_r=True, diversity=0.3)
         return Merge([pos, keybert])
     except Exception:  # spaCy model missing or representation unavailable
@@ -189,18 +476,16 @@ def create_bertopic_model(
     min_topic_size: int = 10,
     cpu_only: bool = False,
     embedding_batch_size: int = 32,  # kept for API parity
-    # UMAP params
-    umap_n_neighbors: int = 50,
-    umap_min_dist: float = 0.1,
-    umap_n_components: int = 10,
+    # UMAP params (BERTopic best practice defaults)
+    umap_n_neighbors: int = 15,
+    umap_min_dist: float = 0.0,
+    umap_n_components: int = 5,
     umap_metric: str = 'cosine',
-    # HDBSCAN params
-    hdbscan_min_samples: int = 5,
+    # HDBSCAN params (BERTopic best practice defaults)
+    hdbscan_min_samples: int = 10,
     hdbscan_selection_method: str = 'leaf',
     hdbscan_epsilon: float = 0.0,
-    # Vectorizer params
-    vectorizer_min_df: int = 10,
-    vectorizer_max_df: float = 0.9,
+    # Vectorizer params (min_df=2, max_df=1.0 are hardcoded for BERTopic c-TF-IDF compatibility)
     vectorizer_max_features: int = 25000,
     vectorizer_ngram_min: int = 1,
     vectorizer_ngram_max: int = 3,
@@ -217,7 +502,8 @@ def create_bertopic_model(
         min_dist=umap_min_dist,
         metric=umap_metric,
         random_state=42,
-        n_jobs=-1 if device == "cpu" else 1,
+        # Force single-thread for strict reproducibility across machines (DH requirement)
+        n_jobs=1,
     )
 
     # Optionally adjust cluster size based on desired number of topics
@@ -244,16 +530,28 @@ def create_bertopic_model(
     if domain_stopwords:
         stopwords.update({s.lower() for s in domain_stopwords if s})
 
+    # IMPORTANT: BERTopic's c-TF-IDF works on "documents per topic" where each topic's
+    # documents are concatenated into a single mega-document. This means the vectorizer
+    # operates on N_topics documents (e.g., ~50-100), not N_docs (~12000).
+    # 
+    # With few topics, min_df/max_df constraints can conflict:
+    # - min_df=10 requires term to appear in 10+ topic-documents
+    # - max_df=0.9 with 50 topics = term can appear in max 45 topic-documents
+    # - This leaves a very narrow valid range, causing sklearn errors
+    #
+    # Solution: Use min_df=2 (BERTopic best practice) and max_df=1.0 (no upper limit)
+    # Frequency filtering is handled by max_features and stopwords instead.
+    
     vectorizer_model = CountVectorizer(
         ngram_range=(vectorizer_ngram_min, vectorizer_ngram_max),
         stop_words=sorted(stopwords) if stopwords else None,
         max_features=vectorizer_max_features,
-        min_df=vectorizer_min_df,
-        max_df=vectorizer_max_df,
+        min_df=2,  # BERTopic best practice - term must appear in at least 2 topics
+        max_df=1.0,  # No upper limit - avoid conflict with min_df on few topics
         encoding='utf-8',
-    decode_error='replace',
-    # Normalize accents to merge e.g., "août" and "aout"
-    strip_accents='unicode',
+        decode_error='replace',
+        # Normalize accents to merge e.g., "août" and "aout"
+        strip_accents='unicode',
         lowercase=True,
         token_pattern=r'(?u)\b\w\w+\b',
     )
@@ -292,6 +590,7 @@ def fit_topic_model(
     embedding_batch_size: int,
     reduce_outliers_threshold: float | None = None,
     topic_label_max_words: int = 8,
+    nr_topics: int | None = None,
 ) -> BERTopic:
     logger.info("Entraînement du modèle BERTopic (embeddings=OCR, c-TF-IDF=lemma_nostop)...")
     logger.info(f"Nombre de paires docs (clean+OCR): {len(docs_clean)}")
@@ -335,6 +634,20 @@ def fit_topic_model(
             logger.info("Outliers d'entraînement réaffectés et représentations mises à jour.")
     except Exception as e:  # pragma: no cover - defensive
         logger.warning(f"Réduction des outliers impossible/ignorée: {e}")
+
+    # Optionally reduce number of topics by merging similar ones
+    try:
+        if nr_topics is not None and nr_topics > 0:
+            current_topics = len(topic_model.get_topic_info()) - 1  # -1 for outlier topic
+            if current_topics > nr_topics:
+                logger.info(f"Réduction du nombre de topics: {current_topics} → {nr_topics} (fusion des topics similaires)...")
+                topic_model.reduce_topics(valid_docs_clean, nr_topics=nr_topics)
+                new_count = len(topic_model.get_topic_info()) - 1
+                logger.info(f"Topics réduits: {current_topics} → {new_count}")
+            else:
+                logger.info(f"Nombre de topics ({current_topics}) déjà ≤ nr_topics ({nr_topics}), pas de réduction.")
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"Réduction des topics impossible/ignorée: {e}")
 
     # Clean topic labels
     try:
