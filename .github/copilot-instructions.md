@@ -186,6 +186,37 @@ Before pushing to HF Hub:
 3. Check that `o:id` is present and non-null
 4. Review the dataset summary table output
 
+## Digital Humanities Best Practices
+
+This is a **research dataset for Digital Humanities** studying Islam in West Africa. Code suggestions should follow DH principles:
+
+### Domain Relevance
+- **Never filter out domain-specific terms** as stopwords (Islamic organizations like COSIM, FAIB, UIB; religious events like Ramadan, Tabaski, Maouloud; religious figures and titles)
+- These terms are **core to the research** - they should appear in topic labels, analyses, and visualizations
+- Only remove truly non-informative noise: OCR artifacts, English stopwords (from non-French docs), generic boilerplate
+
+### Topic Modeling Guidelines
+When working with `post-processing/topic_modeling/`:
+- **Target 60-100 meaningful topics** for ~12K documents (not 500+ fragmented clusters)
+- Prioritize **topic coherence** over topic count - use coherence metrics (C_v ≥ 0.4)
+- Reduce outliers aggressively (35%+ outliers indicates poor clustering)
+- Keep Islamic/religious terminology in topic labels - they're semantically meaningful
+- Use `--nr-topics` to merge similar topics if too fragmented
+
+### Reproducibility
+- Always save parameters in `training_parameters.json`
+- Document coherence metrics for academic accountability
+- Use fixed random seeds (42) for reproducible results
+
+### Stopwords Philosophy
+```python
+# BAD - removes domain-relevant terms:
+stopwords = {"ramadan", "tabaski", "cosim", "imam", "mosquée"}
+
+# GOOD - only removes noise:
+stopwords = {"the", "of", "and", "lp", "bf", "monsieur", "fcfa"}
+```
+
 ## Language
 
 - Code comments: English or French (existing codebase uses both)
