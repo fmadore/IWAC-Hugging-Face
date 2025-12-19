@@ -5,6 +5,7 @@
 .cache_omk_documents
 .cache_omk_index
 .cache_omk_references
+.cache_word_count
 __pycache__
 bertopic_model
 bertopic_model_merge_full
