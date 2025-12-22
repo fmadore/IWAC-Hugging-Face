@@ -3,7 +3,7 @@
 calculate_sentiment_AI.py
 ===========================
 
-Ajoute des colonnes avec l'analyse de sentiment détaillée via l'API Gemini ou ChatGPT
+Ajoute des colonnes avec l'analyse de sentiment détaillée via l'API Gemini, ChatGPT ou Mistral
 à un dataset Hugging Face existant. Ce script se base sur une colonne texte
 spécifiée (par défaut 'OCR').
 
@@ -11,16 +11,16 @@ Le script :
 1. Charge un dataset Hugging Face.
 2. Pour chaque texte dans la colonne spécifiée :
     a. Vérifie si une analyse existe dans un cache local.
-    b. Si non, appelle l'API Gemini ou ChatGPT avec un prompt structuré.
+    b. Si non, appelle l'API Gemini, ChatGPT ou Mistral avec un prompt structuré.
     c. Sauvegarde le résultat de l'API dans le cache.
 3. Ajoute les résultats de l'analyse dans de nouvelles colonnes
-   (préfixées par "gemini_" ou "chatgpt_").
+   (préfixées par "gemini_", "chatgpt_" ou "mistral_").
 4. Réorganise les colonnes pour placer les nouvelles colonnes après
    la colonne 'sentiment_score' (supposée exister).
 5. Pousse le dataset modifié vers le Hugging Face Hub.
 
 L'utilisateur est invité à choisir la configuration ('articles' ou 'publications'),
-le modèle d'IA à utiliser ('gemini' ou 'chatgpt'), et peut spécifier le nom du repo,
+le modèle d'IA à utiliser ('gemini', 'chatgpt' ou 'mistral'), et peut spécifier le nom du repo,
 la colonne texte, etc., via des arguments CLI.
 
 Usage
@@ -34,11 +34,12 @@ Variables d'environnement
 -------------------------
 GOOGLE_API_KEY   Clé API pour Google Gemini.
 CHATGPT          Clé API pour OpenAI ChatGPT.
+MISTRAL_API_KEY  Clé API pour Mistral AI.
 HF_TOKEN         Jeton d'accès personnel pour le Hugging Face Hub.
 
 Dépendances supplémentaires
 -------------------------
-    pip install datasets huggingface_hub google-genai python-dotenv openai pydantic rich
+    pip install datasets huggingface_hub google-genai python-dotenv openai mistralai pydantic rich
 """
 import os
 import json
@@ -77,6 +78,13 @@ try:
 except ImportError:
     print("Veuillez installer la librairie OpenAI: pip install openai")
     OpenAI = None
+
+# Mistral AI SDK
+try:
+    from mistralai import Mistral
+except ImportError:
+    print("Veuillez installer la librairie Mistral AI: pip install mistralai")
+    Mistral = None
 
 # Global Rich console
 console = Console()
@@ -120,13 +128,17 @@ def validate_sentiment_output(data: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(f"Validation failed: {e}")
 
 # --- Model Configuration ---
-GEMINI_MODEL_NAME = "gemini-2.5-flash"
-# Use gpt-4o-mini which supports structured outputs
-CHATGPT_MODEL_NAME = "gpt-4o-mini"
+# Gemini 3 Flash Preview with thinking_level support (use "low" for minimal latency)
+GEMINI_MODEL_NAME = "gemini-3-flash-preview"
+# GPT-5 Mini - latest efficient model with structured output support
+CHATGPT_MODEL_NAME = "gpt-5-mini"
+# Ministral 3 14B (2025-12) - efficient 14B parameter model with structured output support
+MISTRAL_MODEL_NAME = "ministral-3-14b-latest"
 
 # --- Cache Configuration ---
 GEMINI_CACHE_FILE_DEFAULT_NAME = "gemini_sentiment_cache.json"
 CHATGPT_CACHE_FILE_DEFAULT_NAME = "chatgpt_sentiment_cache.json"
+MISTRAL_CACHE_FILE_DEFAULT_NAME = "mistral_sentiment_cache.json"
 
 def load_cache(cache_file_path: Path, logger: logging.Logger) -> Dict[str, Any]:
     """Charge le cache depuis un fichier JSON."""
@@ -214,11 +226,14 @@ def analyze_text_with_gemini(
     # Use structured output with Pydantic schema and system instruction
     user_prompt = create_user_prompt_for_structured(article_text)
     
+    # Configure with thinking_level="low" for minimal reasoning overhead (Gemini 3 models)
+    # System instruction contains the full analysis prompt
     generation_config = types.GenerateContentConfig(
         system_instruction=SYSTEM_INSTRUCTION,
         response_mime_type="application/json",
         response_schema=SentimentAnalysisOutput,
-        temperature=0.2
+        temperature=0.2,
+        thinking_config=types.ThinkingConfig(thinking_level="low")
     )
 
     for attempt in range(max_retries):
@@ -380,6 +395,107 @@ def analyze_text_with_chatgpt(
 
     return {**default_error_result, "analysis_error": "Échec de l'analyse ChatGPT après plusieurs tentatives."}
 
+
+def analyze_text_with_mistral(
+    article_text: str,
+    mistral_api_key: str,
+    model_name: str,
+    logger: logging.Logger,
+    max_retries: int = 3,
+    initial_backoff: int = 5
+) -> Dict[str, Any]:
+    """
+    Analyse le sentiment d'un texte d'article en utilisant l'API Mistral avec structured outputs.
+    Utilise client.chat.parse() avec un modèle Pydantic pour la validation automatique.
+    Retourne un dictionnaire avec les champs de SentimentAnalysisOutput et un champ 'analysis_error'.
+    """
+    default_error_result = {
+        "centralite_islam_musulmans": "ERREUR_ANALYSE",
+        "centralite_justification": "Erreur lors de l'analyse Mistral.",
+        "subjectivite_score": None,
+        "subjectivite_justification": "Erreur lors de l'analyse Mistral.",
+        "polarite": "ERREUR_ANALYSE",
+        "polarite_justification": "Erreur lors de l'analyse Mistral.",
+        "analysis_error": "Erreur inconnue"
+    }
+
+    if not article_text or not article_text.strip():
+        logger.warning("Texte de l'article vide ou manquant pour l'analyse Mistral.")
+        return {
+            **default_error_result,
+            "centralite_islam_musulmans": "Non abordé",
+            "centralite_justification": "Texte de l'article non fourni ou vide.",
+            "subjectivite_justification": "Non applicable car le texte de l'article est vide.",
+            "polarite": "Non applicable",
+            "polarite_justification": "Non applicable car le texte de l'article est vide.",
+            "analysis_error": "Texte vide fourni pour analyse"
+        }
+
+    try:
+        client = Mistral(api_key=mistral_api_key)
+    except Exception as e:
+        logger.error(f"Erreur lors de l'initialisation du client Mistral: {e}")
+        return {**default_error_result, "analysis_error": f"Erreur client Mistral: {e}"}
+
+    # Use structured outputs with chat.parse() - system instruction in messages
+    user_prompt = create_user_prompt_for_structured(article_text)
+
+    for attempt in range(max_retries):
+        try:
+            # Use chat.parse() for structured outputs with Pydantic
+            # Mistral uses response_format with the Pydantic model directly
+            completion = client.chat.parse(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": SYSTEM_INSTRUCTION},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format=SentimentAnalysisOutput,
+                max_tokens=512,
+                temperature=0.2
+            )
+
+            message = completion.choices[0].message
+            
+            # With structured outputs via parse(), message.parsed contains the Pydantic model instance
+            if hasattr(message, 'parsed') and message.parsed:
+                validated_output = message.parsed.model_dump()
+                return {**validated_output, "analysis_error": None}
+            
+            # Fallback to content parsing if parsed is not available
+            if not message.content:
+                logger.warning(f"Réponse vide de Mistral pour le texte (essai {attempt + 1}/{max_retries}).")
+                if attempt == max_retries - 1:
+                    return {**default_error_result, "analysis_error": "Réponse vide de Mistral après plusieurs essais."}
+                time.sleep(initial_backoff * (2 ** attempt))
+                continue
+            
+            try:
+                json_payload = json.loads(message.content)
+                validated_output = validate_sentiment_output(json_payload)
+                return {**validated_output, "analysis_error": None}
+            except json.JSONDecodeError as je:
+                logger.error(f"Échec parsing JSON Mistral (essai {attempt + 1}/{max_retries}): {je}. Extrait: {message.content[:200]}")
+                if attempt == max_retries - 1:
+                    return {**default_error_result, "analysis_error": f"JSON parse error: {je}", "raw_response_snippet": message.content[:500]}
+                time.sleep(initial_backoff * (2 ** attempt))
+                continue
+            except (ValueError, KeyError) as ve:
+                logger.error(f"Validation Mistral échouée (essai {attempt + 1}/{max_retries}): {ve}")
+                if attempt == max_retries - 1:
+                    return {**default_error_result, "analysis_error": f"ValidationError: {ve}", "parsed_data": json_payload}
+                time.sleep(initial_backoff * (2 ** attempt))
+                continue
+
+        except Exception as e:
+            logger.error(f"Erreur lors de l'appel à Mistral (essai {attempt + 1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:
+                return {**default_error_result, "analysis_error": f"Exception: {e}"}
+            time.sleep(initial_backoff * (2 ** attempt))
+
+    return {**default_error_result, "analysis_error": "Échec de l'analyse Mistral après plusieurs tentatives."}
+
+
 def process_batch_with_analysis(
     batch: Dict[str, List[Any]], 
     model_choice: str,
@@ -422,8 +538,10 @@ def process_batch_with_analysis(
                 logger.info(f"Entrée avec erreur trouvée dans le cache pour l'ID '{cache_key}', ré-analyse en cours...")
                 if model_choice == "gemini":
                     analysis_result = analyze_text_with_gemini(text, api_key, model_name, logger)
-                else:  # chatgpt
+                elif model_choice == "chatgpt":
                     analysis_result = analyze_text_with_chatgpt(text, api_key, model_name, logger)
+                else:  # mistral
+                    analysis_result = analyze_text_with_mistral(text, api_key, model_name, logger)
                 cache[cache_key] = analysis_result
                 processed_in_batch += 1
             else:
@@ -433,8 +551,10 @@ def process_batch_with_analysis(
             logger.debug(f"Analyse {model_choice.upper()} pour l'ID '{cache_key}' (texte début): {text[:50]}...")
             if model_choice == "gemini":
                 analysis_result = analyze_text_with_gemini(text, api_key, model_name, logger)
-            else:  # chatgpt
+            elif model_choice == "chatgpt":
                 analysis_result = analyze_text_with_chatgpt(text, api_key, model_name, logger)
+            else:  # mistral
+                analysis_result = analyze_text_with_mistral(text, api_key, model_name, logger)
             cache[cache_key] = analysis_result
             processed_in_batch += 1
         
@@ -482,12 +602,12 @@ def main():
     else:
         console.print(f"[yellow]⚠[/yellow] Fichier .env non trouvé à {dotenv_path}")
 
-    parser = argparse.ArgumentParser(description="Ajoute des colonnes d'analyse de sentiment via Gemini ou ChatGPT à un dataset Hugging Face.")
+    parser = argparse.ArgumentParser(description="Ajoute des colonnes d'analyse de sentiment via Gemini, ChatGPT ou Mistral à un dataset Hugging Face.")
     parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="ID du repository sur le Hugging Face Hub (ex: utilisateur/nom_dataset).")
     parser.add_argument("--config-name", type=str, default=None, help="Nom de la configuration à traiter (ex: 'articles', 'publications'). Sera demandé si non fourni.")
     parser.add_argument("--text-column", default="OCR", help="Nom de la colonne contenant le texte à analyser.")
     parser.add_argument("--id-column", default="o:id", help="Nom de la colonne contenant les identifiants uniques pour le cache.")
-    parser.add_argument("--model", type=str, default=None, help="Modèle à utiliser ('gemini' ou 'chatgpt'). Sera demandé si non fourni.")
+    parser.add_argument("--model", type=str, default=None, help="Modèle à utiliser ('gemini', 'chatgpt' ou 'mistral'). Sera demandé si non fourni.")
     parser.add_argument("--batch-size", type=int, default=10, help="Taille des batchs pour le traitement .map().")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille maximale des shards Parquet lors du push vers le Hub.")
     
@@ -504,7 +624,7 @@ def main():
     if not model_choice:
         model_choice = Prompt.ask(
             "[cyan]Modèle à utiliser[/cyan]",
-            choices=["gemini", "chatgpt"],
+            choices=["gemini", "chatgpt", "mistral"],
             default="gemini"
         )
     console.print(f"[blue]→[/blue] Modèle sélectionné: [bold]{model_choice.upper()}[/bold]")
@@ -533,7 +653,7 @@ def main():
                 return
         console.print(f"[green]✓[/green] Clé API Google valide. Modèle: [bold]{model_name}[/bold]")
             
-    else:  # chatgpt
+    elif model_choice == "chatgpt":
         if OpenAI is None:
             console.print("[red]✗[/red] Le SDK OpenAI n'est pas installé.")
             console.print("  [dim]pip install openai[/dim]")
@@ -555,6 +675,29 @@ def main():
                 console.print(f"[red]✗[/red] Erreur client ChatGPT: {e}")
                 return
         console.print(f"[green]✓[/green] Clé API OpenAI valide. Modèle: [bold]{model_name}[/bold]")
+
+    else:  # mistral
+        if Mistral is None:
+            console.print("[red]✗[/red] Le SDK Mistral AI n'est pas installé.")
+            console.print("  [dim]pip install mistralai[/dim]")
+            return
+        
+        api_key = os.getenv("MISTRAL_API_KEY")
+        if not api_key:
+            console.print("[red]✗[/red] Variable d'environnement [bold]MISTRAL_API_KEY[/bold] non définie.")
+            return
+        
+        model_name = MISTRAL_MODEL_NAME
+        cache_file_path = Path(script_dir / MISTRAL_CACHE_FILE_DEFAULT_NAME)
+        
+        # Test du client
+        with console.status("[bold green]Vérification de la clé API Mistral...", spinner="dots"):
+            try:
+                _ = Mistral(api_key=api_key)
+            except Exception as e:
+                console.print(f"[red]✗[/red] Erreur client Mistral: {e}")
+                return
+        console.print(f"[green]✓[/green] Clé API Mistral valide. Modèle: [bold]{model_name}[/bold]")
 
     # --- Choix de la configuration par l'utilisateur ---
     config_name_choice = args.config_name
