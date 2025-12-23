@@ -337,14 +337,14 @@ def analyze_text_with_chatgpt(
     for attempt in range(max_retries):
         try:
             # Use chat.completions.parse() for structured outputs with Pydantic
+            # Note: GPT-5 Mini only supports default temperature (1)
             completion = client.chat.completions.parse(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": SYSTEM_INSTRUCTION},
                     {"role": "user", "content": user_prompt}
                 ],
-                response_format=SentimentAnalysisOutput,
-                temperature=0.2
+                response_format=SentimentAnalysisOutput
             )
 
             message = completion.choices[0].message
