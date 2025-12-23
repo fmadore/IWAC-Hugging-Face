@@ -776,7 +776,8 @@ def main():
         batched=True,
         batch_size=batch_size,
         fn_kwargs=fn_kwargs_for_map,
-        desc=f"Analyse {model_choice.upper()}"
+        desc=f"Analyse {model_choice.upper()}",
+        num_proc=1  # Disable multiprocessing to avoid Pydantic pickling warnings
     )
     
     console.print(f"[green]✓[/green] Analyse {model_choice.upper()} terminée")
