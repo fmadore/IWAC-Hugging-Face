@@ -437,32 +437,34 @@ def analyze_text_with_mistral(
         logger.error(f"Erreur lors de l'initialisation du client Mistral: {e}")
         return {**default_error_result, "analysis_error": f"Erreur client Mistral: {e}"}
 
-    # Use structured outputs with chat.parse() - system instruction in messages
+    # Use structured outputs with chat.complete() - system instruction in messages
     user_prompt = create_user_prompt_for_structured(article_text)
 
     for attempt in range(max_retries):
         try:
-            # Use chat.parse() for structured outputs with Pydantic
-            # Mistral uses response_format with the Pydantic model directly
-            completion = client.chat.parse(
+            # Use chat.complete() with response_format as dict containing the Pydantic model
+            # The Mistral SDK will automatically convert the Pydantic model to JSON schema
+            completion = client.chat.complete(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": SYSTEM_INSTRUCTION},
                     {"role": "user", "content": user_prompt}
                 ],
-                response_format=SentimentAnalysisOutput,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "sentiment_analysis",
+                        "schema": SentimentAnalysisOutput.model_json_schema(),
+                        "strict": True
+                    }
+                },
                 max_tokens=512,
                 temperature=0.2
             )
 
             message = completion.choices[0].message
             
-            # With structured outputs via parse(), message.parsed contains the Pydantic model instance
-            if hasattr(message, 'parsed') and message.parsed:
-                validated_output = message.parsed.model_dump()
-                return {**validated_output, "analysis_error": None}
-            
-            # Fallback to content parsing if parsed is not available
+            # With structured outputs via chat.complete(), the response is in message.content as JSON
             if not message.content:
                 logger.warning(f"Réponse vide de Mistral pour le texte (essai {attempt + 1}/{max_retries}).")
                 if attempt == max_retries - 1:
@@ -488,9 +490,21 @@ def analyze_text_with_mistral(
                 continue
 
         except Exception as e:
-            logger.error(f"Erreur lors de l'appel à Mistral (essai {attempt + 1}/{max_retries}): {e}")
+            error_msg = str(e)
+            logger.error(f"Erreur lors de l'appel à Mistral (essai {attempt + 1}/{max_retries}): {error_msg}")
+            
+            # Check for specific Mistral API errors
+            if "Unexpected type" in error_msg:
+                logger.error("Erreur de type: vérifiez le format de response_format")
+                if attempt == max_retries - 1:
+                    return {**default_error_result, "analysis_error": f"Type error in API call: {error_msg}"}
+            elif hasattr(e, 'status_code'):
+                logger.error(f"HTTP status: {e.status_code}")
+                if attempt == max_retries - 1:
+                    return {**default_error_result, "analysis_error": f"HTTP {e.status_code}: {error_msg}"}
+            
             if attempt == max_retries - 1:
-                return {**default_error_result, "analysis_error": f"Exception: {e}"}
+                return {**default_error_result, "analysis_error": f"Exception: {error_msg}"}
             time.sleep(initial_backoff * (2 ** attempt))
 
     return {**default_error_result, "analysis_error": "Échec de l'analyse Mistral après plusieurs tentatives."}
