@@ -133,7 +133,7 @@ GEMINI_MODEL_NAME = "gemini-3-flash-preview"
 # GPT-5 Mini - latest efficient model with structured output support
 CHATGPT_MODEL_NAME = "gpt-5-mini"
 # Ministral 3 14B (2025-12) - efficient 14B parameter model with structured output support
-MISTRAL_MODEL_NAME = "ministral-3-14b-latest"
+MISTRAL_MODEL_NAME = "ministral-14b-2512"
 
 # --- Cache Configuration ---
 GEMINI_CACHE_FILE_DEFAULT_NAME = "gemini_sentiment_cache.json"
