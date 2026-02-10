@@ -23,11 +23,18 @@ if str(_PARENT) not in sys.path:
 from topic_modeling.constants import DOMAIN_STOPWORDS, LABEL_ONLY_STOPWORDS  # noqa: E402
 
 # LDA-specific defaults
-DEFAULT_NUM_TOPICS = 20
-DEFAULT_PASSES = 15
-DEFAULT_ITERATIONS = 400
+# For a ~12 000-doc corpus across 5 countries, 50 topics is a reasonable
+# starting point.  Use --optimize-topics to sweep a range and let C_v decide.
+DEFAULT_NUM_TOPICS = 50
+DEFAULT_PASSES = 20
+DEFAULT_ITERATIONS = 500
 DEFAULT_CHUNKSIZE = 2000
 DEFAULT_RANDOM_STATE = 42
 DEFAULT_MINIMUM_PROBABILITY = 0.01
 DEFAULT_NO_BELOW = 5        # ignore tokens appearing in fewer than 5 docs
 DEFAULT_NO_ABOVE = 0.5      # ignore tokens appearing in more than 50% of docs
+
+# Topic-number optimisation grid (used by --optimize-topics)
+DEFAULT_TOPIC_RANGE_START = 10
+DEFAULT_TOPIC_RANGE_END = 100
+DEFAULT_TOPIC_RANGE_STEP = 10

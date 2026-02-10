@@ -26,6 +26,9 @@ from .constants import (
     DEFAULT_MINIMUM_PROBABILITY,
     DEFAULT_NO_BELOW,
     DEFAULT_NO_ABOVE,
+    DEFAULT_TOPIC_RANGE_START,
+    DEFAULT_TOPIC_RANGE_END,
+    DEFAULT_TOPIC_RANGE_STEP,
 )
 
 
@@ -338,3 +341,97 @@ def save_model_parameters(
     if logger:
         logger.info(f"Parameters saved: {params_path}")
     return params_path
+
+
+def find_optimal_topics(
+    corpus: List[List[Tuple[int, int]]],
+    dictionary: Dictionary,
+    tokenized_docs: List[List[str]],
+    topic_range_start: int = DEFAULT_TOPIC_RANGE_START,
+    topic_range_end: int = DEFAULT_TOPIC_RANGE_END,
+    topic_range_step: int = DEFAULT_TOPIC_RANGE_STEP,
+    passes: int = DEFAULT_PASSES,
+    iterations: int = DEFAULT_ITERATIONS,
+    chunksize: int = DEFAULT_CHUNKSIZE,
+    random_state: int = DEFAULT_RANDOM_STATE,
+    logger: logging.Logger | None = None,
+) -> Tuple[int, List[Dict[str, Any]]]:
+    """Sweep a range of topic counts and return the k with highest C_v.
+
+    This is standard DH practice (Mimno et al.): train LDA at several k
+    values, compute C_v coherence for each, and pick the peak.
+
+    Returns:
+        best_k: the number of topics with the highest C_v score.
+        results: list of dicts with keys ``k``, ``c_v``, ``c_npmi``, ``u_mass``
+                 for every tested value, so users can inspect the full curve.
+    """
+    log = logger or logging.getLogger(__name__)
+
+    candidates = list(range(topic_range_start, topic_range_end + 1, topic_range_step))
+    log.info(
+        f"Optimising num_topics: testing {candidates} "
+        f"({len(candidates)} models to train)"
+    )
+
+    results: List[Dict[str, Any]] = []
+    best_k = candidates[0]
+    best_cv = -1.0
+
+    for k in tqdm(candidates, desc="Topic optimisation"):
+        log.info(f"Training LDA with k={k}...")
+        model = LdaModel(
+            corpus=corpus,
+            id2word=dictionary,
+            num_topics=k,
+            passes=passes,
+            iterations=iterations,
+            chunksize=chunksize,
+            random_state=random_state,
+            alpha="auto",
+            eta="auto",
+            per_word_topics=True,
+        )
+
+        entry: Dict[str, Any] = {"k": k}
+
+        # C_v (primary criterion)
+        try:
+            cm_cv = CoherenceModel(
+                model=model, texts=tokenized_docs,
+                dictionary=dictionary, coherence="c_v",
+            )
+            cv = cm_cv.get_coherence()
+            entry["c_v"] = float(cv)
+            log.info(f"  k={k}  C_v={cv:.4f}")
+            if cv > best_cv:
+                best_cv = cv
+                best_k = k
+        except Exception as e:
+            log.warning(f"  k={k}  C_v failed: {e}")
+            entry["c_v"] = None
+
+        # NPMI (secondary)
+        try:
+            cm_npmi = CoherenceModel(
+                model=model, texts=tokenized_docs,
+                dictionary=dictionary, coherence="c_npmi",
+            )
+            entry["c_npmi"] = float(cm_npmi.get_coherence())
+        except Exception:
+            entry["c_npmi"] = None
+
+        # U_Mass (secondary)
+        try:
+            cm_umass = CoherenceModel(
+                model=model, corpus=corpus,
+                dictionary=dictionary, coherence="u_mass",
+            )
+            entry["u_mass"] = float(cm_umass.get_coherence())
+        except Exception:
+            entry["u_mass"] = None
+
+        results.append(entry)
+
+    log.info(f"Best num_topics by C_v: {best_k} (C_v={best_cv:.4f})")
+    return best_k, results

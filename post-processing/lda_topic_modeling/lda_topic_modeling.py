@@ -50,6 +50,9 @@ from lda_topic_modeling.constants import (  # type: ignore
     DEFAULT_CHUNKSIZE,
     DEFAULT_NO_BELOW,
     DEFAULT_NO_ABOVE,
+    DEFAULT_TOPIC_RANGE_START,
+    DEFAULT_TOPIC_RANGE_END,
+    DEFAULT_TOPIC_RANGE_STEP,
 )
 from lda_topic_modeling.modeling import (  # type: ignore
     tokenize_documents,
@@ -62,6 +65,7 @@ from lda_topic_modeling.modeling import (  # type: ignore
     compute_coherence,
     save_model_parameters,
     get_topic_label,
+    find_optimal_topics,
 )
 
 console = Console()
@@ -153,6 +157,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Extra stopwords file (one word per line, UTF-8)",
     )
     p.add_argument("--topic-label-words", type=int, default=6, help="Number of words in topic labels")
+    # Topic-number optimisation (DH best practice: sweep k, pick best C_v)
+    p.add_argument(
+        "--optimize-topics",
+        action="store_true",
+        help="Sweep a range of topic counts and pick the k with best C_v coherence (recommended for first run)",
+    )
+    p.add_argument("--topic-range-start", type=int, default=DEFAULT_TOPIC_RANGE_START, help="Optimisation: first k to try")
+    p.add_argument("--topic-range-end", type=int, default=DEFAULT_TOPIC_RANGE_END, help="Optimisation: last k to try")
+    p.add_argument("--topic-range-step", type=int, default=DEFAULT_TOPIC_RANGE_STEP, help="Optimisation: step between k values")
     return p
 
 
@@ -290,11 +303,32 @@ def main() -> None:
         logger.info(f"Dictionary: {len(dictionary)} terms")
         corpus = build_corpus(dictionary, tokenized_valid)
 
+        # Optimise num_topics if requested (DH best practice)
+        num_topics = args.num_topics
+        optimization_results = None
+        if args.optimize_topics:
+            logger.info("Running topic-number optimisation (this may take a while)...")
+            best_k, optimization_results = find_optimal_topics(
+                corpus,
+                dictionary,
+                tokenized_valid,
+                topic_range_start=args.topic_range_start,
+                topic_range_end=args.topic_range_end,
+                topic_range_step=args.topic_range_step,
+                passes=args.passes,
+                iterations=args.iterations,
+                chunksize=args.chunksize,
+                logger=logger,
+            )
+            _display_optimization_results(optimization_results, best_k)
+            num_topics = best_k
+            logger.info(f"Using optimal num_topics={num_topics}")
+
         # Train
         lda_model = create_lda_model(
             corpus,
             dictionary,
-            num_topics=args.num_topics,
+            num_topics=num_topics,
             passes=args.passes,
             iterations=args.iterations,
             chunksize=args.chunksize,
@@ -321,9 +355,21 @@ def main() -> None:
             _display_coherence(coherence_metrics)
 
         # Save parameters
+        extra_info: dict = {
+            "config_name": config_name,
+            "num_training_docs": len(tokenized_valid),
+            "dictionary_size": len(dictionary),
+        }
+        if optimization_results is not None:
+            extra_info["topic_optimization"] = {
+                "method": "C_v coherence grid search",
+                "range_tested": f"{args.topic_range_start}-{args.topic_range_end} step {args.topic_range_step}",
+                "best_k": num_topics,
+                "results": optimization_results,
+            }
         save_model_parameters(
             model_dir,
-            num_topics=args.num_topics,
+            num_topics=num_topics,
             passes=args.passes,
             iterations=args.iterations,
             chunksize=args.chunksize,
@@ -331,11 +377,7 @@ def main() -> None:
             no_above=args.no_above,
             stopwords_used=sorted(stopwords),
             coherence_metrics=coherence_metrics,
-            extra_info={
-                "config_name": config_name,
-                "num_training_docs": len(tokenized_valid),
-                "dictionary_size": len(dictionary),
-            },
+            extra_info=extra_info,
             logger=logger,
         )
     else:
@@ -440,6 +482,27 @@ def main() -> None:
     console.print("[green]\u2713[/green] Done!")
     if mode == "fit":
         console.print(f"[blue]\u2192[/blue] Parameters: [cyan]{model_dir / 'training_parameters.json'}[/cyan]")
+
+
+def _display_optimization_results(results: list[dict], best_k: int) -> None:
+    """Display the topic-number optimisation grid as a Rich table."""
+    table = Table(title="Topic Number Optimisation (C_v)", box=box.ROUNDED)
+    table.add_column("k", style="cyan", justify="right")
+    table.add_column("C_v", style="green", justify="right")
+    table.add_column("NPMI", style="dim", justify="right")
+    table.add_column("U_Mass", style="dim", justify="right")
+    table.add_column("", justify="center")
+
+    for r in results:
+        marker = "[bold green]<-- best[/bold green]" if r["k"] == best_k else ""
+        cv = f"{r['c_v']:.4f}" if r.get("c_v") is not None else "—"
+        npmi = f"{r['c_npmi']:.4f}" if r.get("c_npmi") is not None else "—"
+        umass = f"{r['u_mass']:.4f}" if r.get("u_mass") is not None else "—"
+        table.add_row(str(r["k"]), cv, npmi, umass, marker)
+
+    console.print()
+    console.print(table)
+    console.print()
 
 
 def _display_coherence(metrics: dict) -> None:
