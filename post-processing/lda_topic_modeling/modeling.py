@@ -1,0 +1,340 @@
+"""
+modeling.py
+-----------
+LDA model creation, training, loading, and inference utilities using gensim.
+"""
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+from gensim.corpora import Dictionary
+from gensim.models import LdaModel, LdaMulticore, CoherenceModel
+from tqdm import tqdm
+
+from .constants import (
+    DOMAIN_STOPWORDS,
+    DEFAULT_NUM_TOPICS,
+    DEFAULT_PASSES,
+    DEFAULT_ITERATIONS,
+    DEFAULT_CHUNKSIZE,
+    DEFAULT_RANDOM_STATE,
+    DEFAULT_MINIMUM_PROBABILITY,
+    DEFAULT_NO_BELOW,
+    DEFAULT_NO_ABOVE,
+)
+
+
+def tokenize_documents(
+    docs: List[str],
+    stopwords: set[str] | None = None,
+    min_token_length: int = 2,
+) -> List[List[str]]:
+    """Tokenize documents for LDA.
+
+    Since ``lemma_nostop`` is already lemmatized and partially cleaned,
+    we only need to split on whitespace and apply minimal filtering.
+    """
+    if stopwords is None:
+        stopwords = set()
+    tokenized: List[List[str]] = []
+    for doc in docs:
+        if not doc or not str(doc).strip():
+            tokenized.append([])
+            continue
+        tokens = [
+            t
+            for t in str(doc).lower().split()
+            if len(t) >= min_token_length and t not in stopwords
+        ]
+        tokenized.append(tokens)
+    return tokenized
+
+
+def build_dictionary(
+    tokenized_docs: List[List[str]],
+    no_below: int = DEFAULT_NO_BELOW,
+    no_above: float = DEFAULT_NO_ABOVE,
+) -> Dictionary:
+    """Build a gensim Dictionary with frequency filtering."""
+    dictionary = Dictionary(tokenized_docs)
+    dictionary.filter_extremes(no_below=no_below, no_above=no_above)
+    return dictionary
+
+
+def build_corpus(
+    dictionary: Dictionary,
+    tokenized_docs: List[List[str]],
+) -> List[List[Tuple[int, int]]]:
+    """Convert tokenized documents to bag-of-words corpus."""
+    return [dictionary.doc2bow(doc) for doc in tokenized_docs]
+
+
+def create_lda_model(
+    corpus: List[List[Tuple[int, int]]],
+    dictionary: Dictionary,
+    num_topics: int = DEFAULT_NUM_TOPICS,
+    passes: int = DEFAULT_PASSES,
+    iterations: int = DEFAULT_ITERATIONS,
+    chunksize: int = DEFAULT_CHUNKSIZE,
+    random_state: int = DEFAULT_RANDOM_STATE,
+    minimum_probability: float = DEFAULT_MINIMUM_PROBABILITY,
+    workers: int | None = None,
+    logger: logging.Logger | None = None,
+) -> LdaModel:
+    """Train an LDA model.
+
+    Uses LdaMulticore when *workers* > 1, otherwise single-core LdaModel
+    for strict reproducibility.
+    """
+    log = logger or logging.getLogger(__name__)
+
+    log.info(f"Training LDA: {num_topics} topics, {passes} passes, "
+             f"{iterations} iterations, chunksize={chunksize}")
+
+    common_kwargs: Dict[str, Any] = dict(
+        corpus=corpus,
+        id2word=dictionary,
+        num_topics=num_topics,
+        passes=passes,
+        iterations=iterations,
+        chunksize=chunksize,
+        random_state=random_state,
+        minimum_probability=minimum_probability,
+        alpha="auto",
+        eta="auto",
+        per_word_topics=True,
+    )
+
+    if workers and workers > 1:
+        log.info(f"Using LdaMulticore with {workers} workers")
+        model = LdaMulticore(workers=workers, **common_kwargs)
+    else:
+        log.info("Using single-core LdaModel (reproducible)")
+        model = LdaModel(**common_kwargs)
+
+    log.info("LDA training complete.")
+    return model
+
+
+def save_lda_model(
+    model: LdaModel,
+    dictionary: Dictionary,
+    model_dir: Path,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Persist model and dictionary to disk."""
+    log = logger or logging.getLogger(__name__)
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = model_dir / "lda_model"
+    dict_path = model_dir / "dictionary"
+
+    model.save(str(model_path))
+    dictionary.save(str(dict_path))
+    log.info(f"LDA model saved to {model_dir}")
+
+
+def load_lda_model(
+    model_dir: Path,
+    logger: logging.Logger | None = None,
+) -> Tuple[LdaModel, Dictionary]:
+    """Load a previously saved LDA model and dictionary."""
+    log = logger or logging.getLogger(__name__)
+    model_path = model_dir / "lda_model"
+    dict_path = model_dir / "dictionary"
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"LDA model not found: {model_path}")
+    if not dict_path.exists():
+        raise FileNotFoundError(f"Dictionary not found: {dict_path}")
+
+    model = LdaModel.load(str(model_path))
+    dictionary = Dictionary.load(str(dict_path))
+    log.info(f"LDA model loaded from {model_dir} ({model.num_topics} topics)")
+    return model, dictionary
+
+
+def get_topic_label(model: LdaModel, topic_id: int, top_n: int = 6) -> str:
+    """Return a human-readable label for a topic (top-N words joined by ' - ')."""
+    words = model.show_topic(topic_id, topn=top_n)
+    return " - ".join(word for word, _ in words)
+
+
+def predict_document(
+    model: LdaModel,
+    dictionary: Dictionary,
+    tokens: List[str],
+    minimum_probability: float = DEFAULT_MINIMUM_PROBABILITY,
+) -> Tuple[int | None, float | None, str | None]:
+    """Predict the dominant topic for a single tokenized document.
+
+    Returns (topic_id, probability, label) or (None, None, None) for empty docs.
+    """
+    if not tokens:
+        return None, None, None
+
+    bow = dictionary.doc2bow(tokens)
+    if not bow:
+        return None, None, None
+
+    topic_distribution = model.get_document_topics(bow, minimum_probability=0.0)
+    if not topic_distribution:
+        return None, None, None
+
+    best_topic_id, best_prob = max(topic_distribution, key=lambda x: x[1])
+    label = get_topic_label(model, best_topic_id)
+    return int(best_topic_id), float(best_prob), label
+
+
+def predict_batch(
+    model: LdaModel,
+    dictionary: Dictionary,
+    batch: Dict[str, List[Any]],
+    text_col: str,
+    topic_id_col: str,
+    topic_prob_col: str,
+    topic_label_col: str,
+    stopwords: set[str] | None = None,
+    min_token_length: int = 2,
+) -> Dict[str, List[Any]]:
+    """Predict topics for a HuggingFace dataset batch (batched map function).
+
+    Only processes French documents; others get None values.
+    """
+    texts = batch[text_col]
+    languages = batch.get("language", [None] * len(texts))
+
+    topics: List[int | None] = [None] * len(texts)
+    probabilities: List[float | None] = [None] * len(texts)
+    labels: List[str | None] = [None] * len(texts)
+
+    sw = stopwords or set()
+
+    for i, text in enumerate(texts):
+        lang = languages[i] if i < len(languages) else None
+        if lang is not None and lang != "Français":
+            continue
+        if not text or not str(text).strip():
+            continue
+
+        tokens = [
+            t
+            for t in str(text).lower().split()
+            if len(t) >= min_token_length and t not in sw
+        ]
+        tid, prob, label = predict_document(model, dictionary, tokens)
+        topics[i] = tid
+        probabilities[i] = prob
+        labels[i] = label
+
+    batch[topic_id_col] = topics
+    batch[topic_prob_col] = probabilities
+    batch[topic_label_col] = labels
+    return batch
+
+
+def compute_coherence(
+    model: LdaModel,
+    tokenized_docs: List[List[str]],
+    dictionary: Dictionary,
+    corpus: List[List[Tuple[int, int]]],
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    """Compute coherence metrics (C_v, NPMI, U_Mass) and topic diversity."""
+    metrics: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(),
+        "num_topics": model.num_topics,
+        "num_documents": len(tokenized_docs),
+    }
+
+    for coherence_type, needs_corpus in [("c_v", False), ("c_npmi", False), ("u_mass", True)]:
+        try:
+            kwargs: Dict[str, Any] = dict(
+                model=model,
+                texts=tokenized_docs,
+                dictionary=dictionary,
+                coherence=coherence_type,
+            )
+            if needs_corpus:
+                kwargs["corpus"] = corpus
+            cm = CoherenceModel(**kwargs)
+            score = cm.get_coherence()
+            per_topic = cm.get_coherence_per_topic()
+            metrics[coherence_type] = {
+                "score": float(score),
+                "per_topic": [float(s) for s in per_topic],
+            }
+            logger.info(f"Coherence {coherence_type}: {score:.4f}")
+        except Exception as e:
+            logger.warning(f"Could not compute {coherence_type}: {e}")
+            metrics[coherence_type] = {"error": str(e)}
+
+    # Topic diversity
+    all_words: List[str] = []
+    for tid in range(model.num_topics):
+        all_words.extend(w for w, _ in model.show_topic(tid, topn=10))
+    unique = set(all_words)
+    diversity = len(unique) / len(all_words) if all_words else 0
+    metrics["topic_diversity"] = {"score": float(diversity)}
+    logger.info(f"Topic diversity: {diversity:.4f}")
+
+    return metrics
+
+
+def save_model_parameters(
+    model_dir: Path,
+    num_topics: int,
+    passes: int,
+    iterations: int,
+    chunksize: int,
+    no_below: int,
+    no_above: float,
+    stopwords_used: List[str],
+    coherence_metrics: Dict[str, Any] | None = None,
+    extra_info: Dict[str, Any] | None = None,
+    logger: logging.Logger | None = None,
+) -> Path:
+    """Save training parameters to JSON for reproducibility."""
+    params: Dict[str, Any] = {
+        "metadata": {
+            "created_at": datetime.now().isoformat(),
+            "method": "LDA (gensim)",
+            "pipeline_version": "1.0.0",
+        },
+        "lda": {
+            "num_topics": num_topics,
+            "passes": passes,
+            "iterations": iterations,
+            "chunksize": chunksize,
+            "alpha": "auto",
+            "eta": "auto",
+            "random_state": DEFAULT_RANDOM_STATE,
+        },
+        "dictionary_filter": {
+            "no_below": no_below,
+            "no_above": no_above,
+        },
+        "stopwords": {
+            "count": len(stopwords_used),
+            "words": sorted(stopwords_used),
+        },
+    }
+
+    if coherence_metrics:
+        params["coherence_metrics"] = coherence_metrics
+    if extra_info:
+        params["extra"] = extra_info
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+    params_path = model_dir / "training_parameters.json"
+    with open(params_path, "w", encoding="utf-8") as f:
+        json.dump(params, f, ensure_ascii=False, indent=2)
+
+    if logger:
+        logger.info(f"Parameters saved: {params_path}")
+    return params_path
