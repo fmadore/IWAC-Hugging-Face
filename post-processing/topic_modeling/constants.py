@@ -51,6 +51,23 @@ LABEL_ONLY_STOPWORDS = {
     
     # H. Very generic words that don't add meaning to labels
     "grand", "mondial", "international", "national", "régional", "regional",
+
+    # I. Generic French functional/filler words that leak through lemmatization
+    "ensuite", "puis", "donc", "aussi", "toujours", "encore", "bien",
+    "tout", "tres", "très", "avoir", "etre", "être", "plus", "entre",
+    "apres", "après", "avant", "autre", "autres", "même", "meme",
+    "deja", "déjà", "selon", "lors", "ainsi", "car", "vers",
+    "depuis", "pendant", "contre", "sous", "sans", "chez",
+    "cela", "ceci", "celle", "ceux", "celui",
+    "quelque", "quelques", "certain", "certains", "certaine", "certaines",
+    "chaque", "tel", "telle", "tels", "telles",
+    "beaucoup", "peu", "assez", "trop", "combien",
+    "comme", "comment", "pourquoi", "quand",
+    "premier", "première", "premiere", "deuxième", "deuxieme",
+    "dernier", "dernière", "derniere",
+    "nouveau", "nouvelle", "nouveaux",
+    "seul", "seule", "seuls", "seules",
+    "petit", "petite", "petits", "petites",
 }
 
 # Minimal set to drop during vectorization (impacts clustering). 
@@ -69,6 +86,13 @@ VECTORIZE_STOPWORDS = {
     # OCR artifacts
     "lp", "bf", "wa", "adj", "octet", "sem", "at",
     
+    # Generic French functional words that hurt clustering (no topical signal)
+    "ensuite", "puis", "donc", "aussi", "toujours", "encore", "bien",
+    "tout", "tres", "très", "avoir", "etre", "être", "plus", "entre",
+    "apres", "après", "avant", "autre", "autres", "même", "meme",
+    "selon", "ainsi", "car", "vers", "depuis", "pendant", "contre",
+    "sans", "chez", "comme",
+
     # ENGLISH stopwords (critical for filtering non-French documents)
     "the", "of", "to", "and", "in", "for", "is", "on", "that", "by",
     "this", "with", "are", "from", "or", "an", "be", "as", "at", "was",
