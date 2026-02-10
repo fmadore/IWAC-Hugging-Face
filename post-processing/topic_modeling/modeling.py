@@ -361,8 +361,27 @@ def _normalize_token(token: str) -> str:
     return "".join(cleaned).strip()
 
 
+def _is_subsumed_by_ngram(token_norm: str, selected_norms: List[str]) -> bool:
+    """Check if a unigram is already contained within a selected multi-word ngram.
+
+    For example, "cote" is subsumed by "cote ivoire", and "ivoire" is subsumed
+    by "cote ivoire".  This prevents labels like "Ivoire - Cote Ivoire - Cote"
+    where three slots say the same thing.
+    """
+    if " " in token_norm:
+        # token is itself a multi-word ngram; don't drop it as a substring
+        return False
+    for selected in selected_norms:
+        if " " not in selected:
+            continue  # only check against multi-word ngrams
+        parts = selected.split()
+        if token_norm in parts:
+            return True
+    return False
+
+
 def clean_topic_labels(topic_model: BERTopic, max_words: int = 8) -> BERTopic:
-    """Clean topic labels by removing duplicates and limiting word count."""
+    """Clean topic labels by removing duplicates, subsumed unigrams, and limiting word count."""
     topic_info = topic_model.get_topic_info()
 
     for _, row in topic_info.iterrows():
@@ -374,25 +393,36 @@ def clean_topic_labels(topic_model: BERTopic, max_words: int = 8) -> BERTopic:
         if not topic_words:
             continue
 
-        seen_words = set()
-        unique_words: List[str] = []
+        # First pass: collect candidates (deduplicated, stopwords removed)
+        seen_norms: set[str] = set()
+        candidates: List[Tuple[str, str]] = []  # (original_word, normalized)
         for word, _ in topic_words:
             w_norm = _normalize_token(word)
             if not w_norm:
                 continue
-            # skip if token or its normalized form is in label-only or vectorizer stopwords
             if (w_norm in LABEL_ONLY_STOPWORDS) or (w_norm in DOMAIN_STOPWORDS):
                 continue
-            if w_norm in seen_words:
+            if w_norm in seen_norms:
                 continue
-            seen_words.add(w_norm)
-            unique_words.append(word)
-            if len(unique_words) >= max_words:
+            seen_norms.add(w_norm)
+            candidates.append((word, w_norm))
+
+        # Second pass: prefer multi-word ngrams over their component unigrams.
+        # Process longer ngrams first so they claim their component words.
+        candidates.sort(key=lambda c: c[1].count(" "), reverse=True)
+
+        selected_words: List[str] = []
+        selected_norms: List[str] = []
+        for word, w_norm in candidates:
+            if _is_subsumed_by_ngram(w_norm, selected_norms):
+                continue
+            selected_words.append(word)
+            selected_norms.append(w_norm)
+            if len(selected_words) >= max_words:
                 break
 
-        if unique_words:
-            # shorter, cleaner label: join with " - " and no id prefix (BERTopic UI shows id)
-            new_label = " - ".join(unique_words)
+        if selected_words:
+            new_label = " - ".join(selected_words)
             topic_info.loc[topic_info['Topic'] == topic_id, 'Name'] = new_label
 
     # Apply labels through the public API when available (BERTopic >= 0.16)

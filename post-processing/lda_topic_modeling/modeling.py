@@ -16,8 +16,11 @@ from gensim.corpora import Dictionary
 from gensim.models import LdaModel, LdaMulticore, CoherenceModel
 from tqdm import tqdm
 
+import unicodedata
+
 from .constants import (
     DOMAIN_STOPWORDS,
+    LABEL_ONLY_STOPWORDS,
     DEFAULT_NUM_TOPICS,
     DEFAULT_PASSES,
     DEFAULT_ITERATIONS,
@@ -162,10 +165,68 @@ def load_lda_model(
     return model, dictionary
 
 
+def _normalize_token(token: str) -> str:
+    """Lowercase and strip accents for robust matching."""
+    if not token:
+        return ""
+    t = token.lower()
+    t = unicodedata.normalize("NFKD", t)
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    return "".join(ch for ch in t if ch.isalnum() or ch in {" ", "-", "_"}).strip()
+
+
+def _is_subsumed_by_ngram(token_norm: str, selected_norms: List[str]) -> bool:
+    """Check if a unigram is already contained within a selected multi-word ngram.
+
+    For example, "cote" is subsumed by "cote ivoire", and "ivoire" is subsumed
+    by "cote ivoire".  This prevents labels like "Ivoire - Cote Ivoire - Cote".
+    """
+    if " " in token_norm:
+        return False
+    for selected in selected_norms:
+        if " " not in selected:
+            continue
+        if token_norm in selected.split():
+            return True
+    return False
+
+
 def get_topic_label(model: LdaModel, topic_id: int, top_n: int = 6) -> str:
-    """Return a human-readable label for a topic (top-N words joined by ' - ')."""
-    words = model.show_topic(topic_id, topn=top_n)
-    return " - ".join(word for word, _ in words)
+    """Return a human-readable label for a topic.
+
+    Applies stopword removal and substring-aware deduplication so that
+    e.g. "Cote", "Ivoire", "Cote Ivoire" collapse to just "Cote Ivoire".
+    """
+    # Fetch more candidates than needed so we can filter and still fill top_n slots
+    raw_words = model.show_topic(topic_id, topn=top_n * 3)
+
+    seen_norms: set[str] = set()
+    candidates: List[Tuple[str, str]] = []  # (original, normalized)
+    for word, _ in raw_words:
+        w_norm = _normalize_token(word)
+        if not w_norm:
+            continue
+        if w_norm in LABEL_ONLY_STOPWORDS or w_norm in DOMAIN_STOPWORDS:
+            continue
+        if w_norm in seen_norms:
+            continue
+        seen_norms.add(w_norm)
+        candidates.append((word, w_norm))
+
+    # Prefer multi-word ngrams; drop unigrams subsumed by them
+    candidates.sort(key=lambda c: c[1].count(" "), reverse=True)
+
+    selected_words: List[str] = []
+    selected_norms: List[str] = []
+    for word, w_norm in candidates:
+        if _is_subsumed_by_ngram(w_norm, selected_norms):
+            continue
+        selected_words.append(word)
+        selected_norms.append(w_norm)
+        if len(selected_words) >= top_n:
+            break
+
+    return " - ".join(selected_words) if selected_words else f"Topic_{topic_id}"
 
 
 def predict_document(
