@@ -33,7 +33,7 @@ import logging
 import os
 import re
 from datasets import load_dataset, Dataset
-from huggingface_hub import HfFolder, login
+from huggingface_hub import get_token, login
 import textstat # Ajout de l'import
 
 def configure_logging() -> None:
@@ -139,12 +139,12 @@ def main():
     logger.info(f"Configuration sélectionnée: {config_name_choice}")
 
     # --- Authentification avec le Hub ---
-    token = os.getenv("HF_TOKEN") or HfFolder.get_token()
+    token = os.getenv("HF_TOKEN") or get_token()
     if not token:
         logger.info("Token Hugging Face non trouvé. Tentative de connexion interactive.")
         try:
             login()
-            token = HfFolder.get_token()
+            token = get_token()
             if not token:
                 logger.error("Connexion interactive échouée ou token non obtenu. Veuillez définir HF_TOKEN ou vous connecter manuellement.")
                 return

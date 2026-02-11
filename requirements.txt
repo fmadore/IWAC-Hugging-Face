@@ -12,13 +12,6 @@ textstat
 transformers
 sentence-transformers
 torch
-google-genai
-openai
-mistralai
-# Dépendances pour topic modeling
-bertopic
-umap-learn
-hdbscan
-scikit-learn
+# Topic modeling (LDA)
+gensim
 numpy
-gensim  # For topic coherence metrics (C_v, NPMI, U_Mass)

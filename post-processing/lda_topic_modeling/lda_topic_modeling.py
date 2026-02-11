@@ -44,6 +44,9 @@ from topic_modeling.patches import apply_all_patches  # type: ignore
 from lda_topic_modeling.constants import (  # type: ignore
     DOMAIN_STOPWORDS,
     LABEL_ONLY_STOPWORDS,
+    LDA_GEO_STOPWORDS,
+    LDA_GENERIC_STOPWORDS,
+    CUSTOM_COLLOCATIONS,
     DEFAULT_NUM_TOPICS,
     DEFAULT_PASSES,
     DEFAULT_ITERATIONS,
@@ -56,6 +59,8 @@ from lda_topic_modeling.constants import (  # type: ignore
 )
 from lda_topic_modeling.modeling import (  # type: ignore
     tokenize_documents,
+    apply_custom_collocations,
+    apply_phraser,
     build_dictionary,
     build_corpus,
     create_lda_model,
@@ -68,7 +73,7 @@ from lda_topic_modeling.modeling import (  # type: ignore
     find_optimal_topics,
 )
 
-console = Console()
+console = Console(force_terminal=True)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -137,6 +142,8 @@ def choose_mode() -> str:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Add LDA topic columns to a Hugging Face dataset.")
     p.add_argument("--repo", default="fmadore/islam-west-africa-collection")
+    p.add_argument("--config", type=str, default=None, help="Dataset config name (skip interactive prompt)")
+    p.add_argument("--mode", type=str, choices=["fit", "predict"], default=None, help="Run mode (skip interactive prompt)")
     p.add_argument("--num-topics", type=int, default=DEFAULT_NUM_TOPICS, help="Number of LDA topics")
     p.add_argument("--passes", type=int, default=DEFAULT_PASSES, help="Training passes over the corpus")
     p.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS, help="Max iterations per pass")
@@ -166,6 +173,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--topic-range-start", type=int, default=DEFAULT_TOPIC_RANGE_START, help="Optimisation: first k to try")
     p.add_argument("--topic-range-end", type=int, default=DEFAULT_TOPIC_RANGE_END, help="Optimisation: last k to try")
     p.add_argument("--topic-range-step", type=int, default=DEFAULT_TOPIC_RANGE_STEP, help="Optimisation: step between k values")
+    p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts")
     return p
 
 
@@ -202,11 +210,17 @@ def main() -> None:
             return
 
     # ── Config ──────────────────────────────────────────────────────
-    available_configs = get_available_configs(repo_id, token)
-    config_name = choose_config(available_configs)
+    if args.config:
+        config_name = args.config
+    else:
+        available_configs = get_available_configs(repo_id, token)
+        config_name = choose_config(available_configs)
     logger.info(f"Config: '{config_name}'")
 
-    mode = choose_mode()
+    if args.mode:
+        mode = args.mode
+    else:
+        mode = choose_mode()
     logger.info(f"Mode: '{mode}'")
 
     # ── Load dataset ────────────────────────────────────────────────
@@ -238,17 +252,18 @@ def main() -> None:
     existing = [c for c in new_columns if c in ds.column_names]
     if existing:
         logger.warning(f"Columns already exist and will be overwritten: {existing}")
-        try:
-            confirm = input("Continue and overwrite? (y/N): ").strip().lower()
-            if confirm not in ("y", "yes", "o", "oui"):
-                logger.info("Cancelled.")
+        if not args.yes:
+            try:
+                confirm = input("Continue and overwrite? (y/N): ").strip().lower()
+                if confirm not in ("y", "yes", "o", "oui"):
+                    logger.info("Cancelled.")
+                    return
+            except KeyboardInterrupt:
+                logger.info("\nCancelled.")
                 return
-        except KeyboardInterrupt:
-            logger.info("\nCancelled.")
-            return
 
     # ── Build stopwords ─────────────────────────────────────────────
-    stopwords = set(DOMAIN_STOPWORDS)
+    stopwords = set(DOMAIN_STOPWORDS) | LDA_GEO_STOPWORDS | LDA_GENERIC_STOPWORDS
     if args.domain_stopwords_file:
         try:
             sw_path = Path(args.domain_stopwords_file)
@@ -265,6 +280,7 @@ def main() -> None:
     # ── Train or load ───────────────────────────────────────────────
     lda_model = None
     dictionary = None
+    phraser = None
 
     if mode == "fit":
         # Extract French texts
@@ -286,9 +302,9 @@ def main() -> None:
             logger.info(f"Limiting to {args.max_documents} docs")
             docs = docs[: args.max_documents]
 
-        # Tokenize
-        logger.info("Tokenizing...")
-        tokenized = tokenize_documents(docs, stopwords=stopwords)
+        # Tokenize (with bigram/trigram phrase detection)
+        logger.info("Tokenizing (with phrase detection)...")
+        tokenized, phraser = tokenize_documents(docs, stopwords=stopwords)
         valid = [(d, t) for d, t in zip(docs, tokenized) if t]
         if not valid:
             logger.error("No valid tokenized documents.")
@@ -342,8 +358,8 @@ def main() -> None:
             label = get_topic_label(lda_model, tid, top_n=args.topic_label_words)
             logger.info(f"  Topic {tid}: {label}")
 
-        # Save model
-        save_lda_model(lda_model, dictionary, model_dir, logger)
+        # Save model (including phrasers for prediction)
+        save_lda_model(lda_model, dictionary, model_dir, logger, phraser=phraser)
 
         # Coherence
         coherence_metrics = None
@@ -385,7 +401,7 @@ def main() -> None:
         if not model_dir.exists():
             logger.error(f"Model directory not found: {model_dir}")
             return
-        lda_model, dictionary = load_lda_model(model_dir, logger)
+        lda_model, dictionary, phraser = load_lda_model(model_dir, logger)
 
     # ── Predict on full dataset ─────────────────────────────────────
     logger.info("Predicting topics for all documents...")
@@ -400,6 +416,7 @@ def main() -> None:
             topic_prob_col=topic_prob_col,
             topic_label_col=topic_label_col,
             stopwords=stopwords,
+            phraser=phraser,
         ),
         batched=True,
         batch_size=args.batch_size,

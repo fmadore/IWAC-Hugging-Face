@@ -1,1 +1,1 @@
-"""Topic modeling pipeline package (BERTopic orchestration and utilities)."""
+"""Shared topic modeling utilities (stopwords, encoding patches)."""

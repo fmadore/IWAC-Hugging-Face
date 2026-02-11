@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 from gensim.corpora import Dictionary
 from gensim.models import LdaModel, LdaMulticore, CoherenceModel
+from gensim.models.phrases import Phrases, Phraser
 from tqdm import tqdm
 
 import unicodedata
@@ -21,6 +22,9 @@ import unicodedata
 from .constants import (
     DOMAIN_STOPWORDS,
     LABEL_ONLY_STOPWORDS,
+    LDA_GEO_STOPWORDS,
+    LDA_GENERIC_STOPWORDS,
+    CUSTOM_COLLOCATIONS,
     DEFAULT_NUM_TOPICS,
     DEFAULT_PASSES,
     DEFAULT_ITERATIONS,
@@ -34,16 +38,32 @@ from .constants import (
     DEFAULT_TOPIC_RANGE_STEP,
 )
 
+# Combined stopword set for label filtering (module-level to avoid
+# rebuilding on every call).  Includes both accented and unaccented
+# forms so the accent-stripped w_norm always finds a match.
+_ALL_LABEL_STOPWORDS = (
+    LABEL_ONLY_STOPWORDS | DOMAIN_STOPWORDS
+    | LDA_GEO_STOPWORDS | LDA_GENERIC_STOPWORDS
+)
+
 
 def tokenize_documents(
     docs: List[str],
     stopwords: set[str] | None = None,
     min_token_length: int = 2,
+    detect_phrases: bool = True,
+    phrase_min_count: int = 20,
+    phrase_threshold: float = 10.0,
+    custom_collocations: List[Tuple[str, ...]] | None = None,
 ) -> List[List[str]]:
     """Tokenize documents for LDA.
 
     Since ``lemma_nostop`` is already lemmatized and partially cleaned,
     we only need to split on whitespace and apply minimal filtering.
+
+    When *detect_phrases* is True, gensim ``Phrases`` is used to join
+    frequent collocations (e.g. "côte" + "ivoire" → "côte_ivoire",
+    "burkina" + "faso" → "burkina_faso").
     """
     if stopwords is None:
         stopwords = set()
@@ -58,7 +78,70 @@ def tokenize_documents(
             if len(t) >= min_token_length and t not in stopwords
         ]
         tokenized.append(tokens)
-    return tokenized
+
+    phraser = None
+    if detect_phrases and tokenized:
+        # Bigrams (côte_ivoire, burkina_faso, el_hadj, ...)
+        bigram_model = Phrases(tokenized, min_count=phrase_min_count, threshold=phrase_threshold)
+        bigram_phraser = Phraser(bigram_model)
+        tokenized = [bigram_phraser[doc] for doc in tokenized]
+        # Trigrams (e.g. chained bigrams)
+        trigram_model = Phrases(tokenized, min_count=phrase_min_count, threshold=phrase_threshold)
+        trigram_phraser = Phraser(trigram_model)
+        tokenized = [trigram_phraser[doc] for doc in tokenized]
+        phraser = (bigram_phraser, trigram_phraser)
+
+    # Apply custom collocations as a safety net after phrase detection
+    collocations = custom_collocations if custom_collocations is not None else CUSTOM_COLLOCATIONS
+    if collocations:
+        tokenized = [apply_custom_collocations(doc, collocations) for doc in tokenized]
+
+    return tokenized, phraser
+
+
+def apply_custom_collocations(
+    tokens: List[str],
+    collocations: List[Tuple[str, ...]] | None = None,
+) -> List[str]:
+    """Join custom collocations in a token list.
+
+    Scans for consecutive tokens matching predefined multi-word
+    expressions and joins them with underscores.  Supports bigrams,
+    trigrams, and longer patterns.
+
+    This is applied *after* gensim phrase detection as a safety net
+    for domain-specific collocations the statistics miss.
+    """
+    if not collocations or not tokens:
+        return tokens
+
+    # Build lookup keyed on first token for O(n) scanning
+    by_first: Dict[str, List[Tuple[str, ...]]] = {}
+    for colloc in collocations:
+        by_first.setdefault(colloc[0], []).append(colloc)
+
+    # Sort each group longest-first so longer patterns match before shorter
+    for first in by_first:
+        by_first[first].sort(key=len, reverse=True)
+
+    result: List[str] = []
+    i = 0
+    while i < len(tokens):
+        matched = False
+        candidates = by_first.get(tokens[i])
+        if candidates:
+            for colloc in candidates:
+                n = len(colloc)
+                if i + n <= len(tokens) and tuple(tokens[i : i + n]) == colloc:
+                    result.append("_".join(colloc))
+                    i += n
+                    matched = True
+                    break
+        if not matched:
+            result.append(tokens[i])
+            i += 1
+
+    return result
 
 
 def build_dictionary(
@@ -132,8 +215,9 @@ def save_lda_model(
     dictionary: Dictionary,
     model_dir: Path,
     logger: logging.Logger | None = None,
+    phraser: Tuple[Phraser, Phraser] | None = None,
 ) -> None:
-    """Persist model and dictionary to disk."""
+    """Persist model, dictionary and optional phrasers to disk."""
     log = logger or logging.getLogger(__name__)
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -142,17 +226,26 @@ def save_lda_model(
 
     model.save(str(model_path))
     dictionary.save(str(dict_path))
+
+    if phraser is not None:
+        bigram_phraser, trigram_phraser = phraser
+        bigram_phraser.save(str(model_dir / "bigram_phraser"))
+        trigram_phraser.save(str(model_dir / "trigram_phraser"))
+        log.info("Bigram and trigram phrasers saved")
+
     log.info(f"LDA model saved to {model_dir}")
 
 
 def load_lda_model(
     model_dir: Path,
     logger: logging.Logger | None = None,
-) -> Tuple[LdaModel, Dictionary]:
-    """Load a previously saved LDA model and dictionary."""
+) -> Tuple[LdaModel, Dictionary, Tuple[Phraser, Phraser] | None]:
+    """Load a previously saved LDA model, dictionary and optional phrasers."""
     log = logger or logging.getLogger(__name__)
     model_path = model_dir / "lda_model"
     dict_path = model_dir / "dictionary"
+    bigram_path = model_dir / "bigram_phraser"
+    trigram_path = model_dir / "trigram_phraser"
 
     if not model_path.exists():
         raise FileNotFoundError(f"LDA model not found: {model_path}")
@@ -161,8 +254,16 @@ def load_lda_model(
 
     model = LdaModel.load(str(model_path))
     dictionary = Dictionary.load(str(dict_path))
+
+    phraser = None
+    if bigram_path.exists() and trigram_path.exists():
+        bigram_phraser = Phraser.load(str(bigram_path))
+        trigram_phraser = Phraser.load(str(trigram_path))
+        phraser = (bigram_phraser, trigram_phraser)
+        log.info("Bigram and trigram phrasers loaded")
+
     log.info(f"LDA model loaded from {model_dir} ({model.num_topics} topics)")
-    return model, dictionary
+    return model, dictionary, phraser
 
 
 def _normalize_token(token: str) -> str:
@@ -206,7 +307,7 @@ def get_topic_label(model: LdaModel, topic_id: int, top_n: int = 6) -> str:
         w_norm = _normalize_token(word)
         if not w_norm:
             continue
-        if w_norm in LABEL_ONLY_STOPWORDS or w_norm in DOMAIN_STOPWORDS:
+        if w_norm in _ALL_LABEL_STOPWORDS:
             continue
         if w_norm in seen_norms:
             continue
@@ -255,6 +356,16 @@ def predict_document(
     return int(best_topic_id), float(best_prob), label
 
 
+def apply_phraser(tokens: List[str], phraser: Tuple[Phraser, Phraser] | None) -> List[str]:
+    """Apply bigram+trigram phrasers to a token list."""
+    if phraser is None:
+        return tokens
+    bigram_phraser, trigram_phraser = phraser
+    tokens = bigram_phraser[tokens]
+    tokens = trigram_phraser[tokens]
+    return list(tokens)
+
+
 def predict_batch(
     model: LdaModel,
     dictionary: Dictionary,
@@ -265,6 +376,7 @@ def predict_batch(
     topic_label_col: str,
     stopwords: set[str] | None = None,
     min_token_length: int = 2,
+    phraser: Tuple[Phraser, Phraser] | None = None,
 ) -> Dict[str, List[Any]]:
     """Predict topics for a HuggingFace dataset batch (batched map function).
 
@@ -291,6 +403,8 @@ def predict_batch(
             for t in str(text).lower().split()
             if len(t) >= min_token_length and t not in sw
         ]
+        tokens = apply_phraser(tokens, phraser)
+        tokens = apply_custom_collocations(tokens, CUSTOM_COLLOCATIONS)
         tid, prob, label = predict_document(model, dictionary, tokens)
         topics[i] = tid
         probabilities[i] = prob

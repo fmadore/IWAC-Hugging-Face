@@ -59,6 +59,8 @@ LABEL_ONLY_STOPWORDS = {
     "deja", "déjà", "selon", "lors", "ainsi", "car", "vers",
     "depuis", "pendant", "contre", "sous", "sans", "chez",
     "cela", "ceci", "celle", "ceux", "celui",
+    "aller", "falloir", "vouloir", "savoir", "voir", "celer",
+    "el",  # fragment from "El Hadj"
     "quelque", "quelques", "certain", "certains", "certaine", "certaines",
     "chaque", "tel", "telle", "tels", "telles",
     "beaucoup", "peu", "assez", "trop", "combien",
@@ -92,6 +94,8 @@ VECTORIZE_STOPWORDS = {
     "apres", "après", "avant", "autre", "autres", "même", "meme",
     "selon", "ainsi", "car", "vers", "depuis", "pendant", "contre",
     "sans", "chez", "comme",
+    "aller", "falloir", "vouloir", "savoir", "voir", "celer",
+    "el",  # fragment from "El Hadj"
 
     # ENGLISH stopwords (critical for filtering non-French documents)
     "the", "of", "to", "and", "in", "for", "is", "on", "that", "by",

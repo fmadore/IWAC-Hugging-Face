@@ -9,7 +9,7 @@ Hub.
 
 Usage
 -----
-    python upload_newspaper_hf.py \
+    python articles/upload_newspaper_hf.py \
         --repo fmadore/islam-west-africa-collection \
         --max-shard-size 1GB
 
@@ -23,6 +23,7 @@ Variables d'environnement
 """
 
 import os
+import sys
 import json
 import io
 import gzip
@@ -33,6 +34,9 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Union, Type
 
+# Add parent directory to path for country_mapper import
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import pandas as pd # Added import
 import aiohttp
 import aiofiles # Added import for async file operations
@@ -40,7 +44,7 @@ from dotenv import load_dotenv
 from datasets import Dataset, load_dataset # Modified import
 from huggingface_hub import login, get_token, utils as hf_utils
 import huggingface_hub
-from country_mapper import get_country_from_newspaper # Added import
+from country_mapper import get_country_from_newspaper
 
 # Rich console imports for beautiful output
 from rich.console import Console
@@ -233,6 +237,37 @@ class OmekaApiClient:
 # Fonctions d'aide pour mapper les champs Omeka → plat
 # ---------------------------------------------------------------------------
 
+# Mapping for subjectivity score labels (Mistral uses resource:item instead of numeric)
+SUBJECTIVITY_LABEL_TO_SCORE = {
+    "Très objectif": 1,
+    "Plutôt objectif": 2,
+    "Mixte": 3,
+    "Plutôt subjectif": 4,
+    "Très subjectif": 5,
+    "Non applicable": None,
+}
+
+
+def _get_subjectivity_score(item: Dict[str, Any], field: str) -> Optional[int]:
+    """Extract subjectivity score, handling both numeric:integer and resource:item types."""
+    if field not in item or item[field] is None:
+        return None
+    val = item[field]
+    if isinstance(val, list) and val:
+        val = val[0]
+    if isinstance(val, dict):
+        at_value = val.get("@value")
+        if at_value is not None:
+            try:
+                return int(at_value)
+            except (ValueError, TypeError):
+                pass
+        display_title = val.get("display_title", "")
+        if display_title in SUBJECTIVITY_LABEL_TO_SCORE:
+            return SUBJECTIVITY_LABEL_TO_SCORE[display_title]
+    return None
+
+
 def _get_value(item: Dict[str, Any], field: str) -> str:
     if field not in item or item[field] is None:
         return ""
@@ -370,6 +405,27 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
         "URL": extracted_fabio_url, # Use the specifically extracted URL
         "source": _get_value(item, "dcterms:source"),
         "OCR": _get_value(item, "bibo:content"),
+        # Gemini sentiment analysis
+        "gemini_centralite_islam_musulmans": _get_value(item, "iwac:geminiCentralite"),
+        "gemini_centralite_justification": _get_value(item, "iwac:geminiCentraliteJustification"),
+        "gemini_polarite": _get_value(item, "iwac:geminiPolarite"),
+        "gemini_polarite_justification": _get_value(item, "iwac:geminiPolariteJustification"),
+        "gemini_subjectivite_score": _get_subjectivity_score(item, "iwac:geminiSubjectiviteScore"),
+        "gemini_subjectivite_justification": _get_value(item, "iwac:geminiSubjectiviteJustification"),
+        # ChatGPT sentiment analysis
+        "chatgpt_centralite_islam_musulmans": _get_value(item, "iwac:chatgptCentralite"),
+        "chatgpt_centralite_justification": _get_value(item, "iwac:chatgptCentraliteJustification"),
+        "chatgpt_polarite": _get_value(item, "iwac:chatgptPolarite"),
+        "chatgpt_polarite_justification": _get_value(item, "iwac:chatgptPolariteJustification"),
+        "chatgpt_subjectivite_score": _get_subjectivity_score(item, "iwac:chatgptSubjectiviteScore"),
+        "chatgpt_subjectivite_justification": _get_value(item, "iwac:chatgptSubjectiviteJustification"),
+        # Mistral sentiment analysis
+        "mistral_centralite_islam_musulmans": _get_value(item, "iwac:mistralCentralite"),
+        "mistral_centralite_justification": _get_value(item, "iwac:mistralCentraliteJustification"),
+        "mistral_polarite": _get_value(item, "iwac:mistralPolarite"),
+        "mistral_polarite_justification": _get_value(item, "iwac:mistralPolariteJustification"),
+        "mistral_subjectivite_score": _get_subjectivity_score(item, "iwac:mistralSubjectiviteScore"),
+        "mistral_subjectivite_justification": _get_value(item, "iwac:mistralSubjectiviteJustification"),
     }
 
 
@@ -499,9 +555,10 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
             await conn_manager.close()
             return
 
-        # Convert nb_pages to nullable integer type to preserve integer dtype with null values
-        if 'nb_pages' in final_df.columns:
-            final_df['nb_pages'] = final_df['nb_pages'].astype('Int64')  # Nullable integer type
+        # Convert integer columns to nullable integer type to preserve dtype with null values
+        for int_col in ['nb_pages', 'gemini_subjectivite_score', 'chatgpt_subjectivite_score', 'mistral_subjectivite_score']:
+            if int_col in final_df.columns:
+                final_df[int_col] = final_df[int_col].astype('Int64')
 
         ds = Dataset.from_pandas(final_df, preserve_index=False)
         

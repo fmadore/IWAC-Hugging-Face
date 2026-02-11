@@ -7,11 +7,13 @@
 .cache_omk_references
 .cache_word_count
 __pycache__
-bertopic_model
-bertopic_model_merge_full
 data/iwac_articles.csv
 data/iwac_audiovisual.csv
 data/iwac_documents.csv
 data/iwac_index.csv
 data/iwac_publications.csv
 data/iwac_references.csv
+bertopic_model/
+lda_model/
+nul
+.agents/
