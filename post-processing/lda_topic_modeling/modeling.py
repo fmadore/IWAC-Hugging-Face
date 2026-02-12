@@ -299,7 +299,7 @@ def get_topic_label(model: LdaModel, topic_id: int, top_n: int = 6) -> str:
     e.g. "Cote", "Ivoire", "Cote Ivoire" collapse to just "Cote Ivoire".
     """
     # Fetch more candidates than needed so we can filter and still fill top_n slots
-    raw_words = model.show_topic(topic_id, topn=top_n * 3)
+    raw_words = model.show_topic(int(topic_id), topn=top_n * 3)
 
     seen_norms: set[str] = set()
     candidates: List[Tuple[str, str]] = []  # (original, normalized)
