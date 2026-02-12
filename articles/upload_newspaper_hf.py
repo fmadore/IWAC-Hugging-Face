@@ -546,6 +546,12 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
                     if nan_count > 0:
                         console.print(f"[yellow]ℹ[/yellow] Column '{col_name}' has {nan_count} null values (new items needing processing)")
 
+    # Reorder columns: move AI sentiment columns to the very end
+    sentiment_prefixes = ("gemini_", "chatgpt_", "mistral_")
+    sentiment_cols = [c for c in final_df.columns if c.startswith(sentiment_prefixes)]
+    other_cols = [c for c in final_df.columns if not c.startswith(sentiment_prefixes)]
+    final_df = final_df[other_cols + sentiment_cols]
+
     # 4. Conversion to Dataset and Push
     console.print("\n[bold cyan]Step 4:[/bold cyan] Preparing and pushing to Hub...")
     if not final_df.empty:
