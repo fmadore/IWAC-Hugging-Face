@@ -382,6 +382,7 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
         "country": country,
         "pub_date": _get_value(item, "dcterms:date"),
         "issue": _get_value(item, "bibo:issue"), # Added issue field
+        "tableOfContents": _get_value(item, "dcterms:tableOfContents"),
         "subject": _join(item, "dcterms:subject"),
         "spatial": _get_value(item, "dcterms:spatial"),
         "language": _get_value(item, "dcterms:language"),
@@ -435,8 +436,8 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
             else:
                 console.print("[yellow]ℹ[/yellow] Existing dataset on Hub is empty. Creating empty dataset with default schema.")
                 expected_cols = [
-                    "o:id", "identifier", "added_date", "url", "iiif_manifest", "PDF", "thumbnail", "title", "author", 
-                    "newspaper", "country", "pub_date", "issue", "subject", "spatial", 
+                    "o:id", "identifier", "added_date", "url", "iiif_manifest", "PDF", "thumbnail", "title", "author",
+                    "newspaper", "country", "pub_date", "issue", "tableOfContents", "subject", "spatial",
                     "language", "nb_pages", "URL", "source", "OCR"
                 ]
                 final_df = pd.DataFrame(columns=expected_cols)
