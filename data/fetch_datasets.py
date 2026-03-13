@@ -1,8 +1,18 @@
-from datasets import load_dataset
+import json
 import os
+
+import numpy as np
 
 # Suppress HuggingFace Hub symlinks warning on Windows
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+# Prevent datasets from importing torch (avoids DLL issues on CPU-only machines)
+os.environ["USE_TORCH"] = "0"
+# Disable HF usage tracking (avoids httpx SSL hangs on Windows)
+os.environ["DO_NOT_TRACK"] = "1"
+# Set httpx timeout to avoid indefinite hangs
+os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "30"
+
+from datasets import load_dataset
 
 from rich.console import Console
 from rich.panel import Panel
@@ -46,16 +56,22 @@ def main():
             try:
                 # Load the dataset with specific config from the unified IWAC dataset
                 with console.status(f"[bold green]Downloading {config_name} from HF Hub...", spinner="dots"):
-                    dataset = load_dataset(DATASET_ID, config_name)
-                
+                    dataset = load_dataset(DATASET_ID, config_name, split="train")
+
                 # Access the data
-                console.print(f"[green]✓[/green] Dataset loaded: {len(dataset['train']):,} rows")
-                
+                console.print(f"[green]✓[/green] Dataset loaded: {len(dataset):,} rows")
+
                 # Convert to pandas DataFrame and save as CSV
-                df = dataset['train'].to_pandas()
+                df = dataset.to_pandas()
+
+                # Convert array/list columns to JSON strings for CSV compatibility
+                for col in df.columns:
+                    if df[col].apply(lambda x: isinstance(x, (list, np.ndarray))).any():
+                        df[col] = df[col].apply(lambda x: json.dumps(x.tolist() if isinstance(x, np.ndarray) else x) if isinstance(x, (list, np.ndarray)) else x)
+
                 csv_filename = f"iwac_{config_name}.csv"
                 csv_path = os.path.join(os.path.dirname(__file__), csv_filename)
-                
+
                 with console.status("[bold green]Saving to CSV...", spinner="dots"):
                     df.to_csv(csv_path, index=False, encoding='utf-8')
                 

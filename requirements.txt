@@ -10,8 +10,8 @@ huggingface_hub[hf_xet]
 spacy
 textstat
 transformers
-sentence-transformers
 torch
+google-genai
 # Topic modeling (LDA)
 gensim
-numpy
+numpy<2.4
