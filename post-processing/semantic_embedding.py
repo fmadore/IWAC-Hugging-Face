@@ -3,23 +3,25 @@
 semantic_embedding.py
 =====================
 
-Adds semantic embedding column to the 'articles' subset of a Hugging Face
-dataset, based on the 'OCR' column (full article text). Uses Google's
+Adds semantic embedding columns to Hugging Face dataset subsets using Google's
 gemini-embedding-2-preview model via the Gemini API for high-quality
 multilingual embeddings.
+
+Supported configurations:
+- **articles**: embeds the 'OCR' column → 'embedding_OCR'
+- **publications**: embeds the 'tableOfContents' column → 'embedding_tableOfContents'
+  (rows without tableOfContents are left with empty embeddings)
 
 Long texts exceeding the model's 8192-token limit are split into overlapping
 chunks, each chunk is embedded separately, and the chunk embeddings are
 averaged into a single vector per row.
 
-The new column name is: "embedding_OCR".
-
 Usage
 -----
-    python post-processing/semantic_embedding.py [--repo USER/DATASET]
+    python post-processing/semantic_embedding.py [--config articles|publications]
 
 Example:
-    python post-processing/semantic_embedding.py --dry-run
+    python post-processing/semantic_embedding.py --config publications --dry-run
     python post-processing/semantic_embedding.py --dimensionality 768
 
 Environment Variables
@@ -44,7 +46,7 @@ from datasets import load_dataset
 from huggingface_hub import get_token, login
 from google import genai
 from google.genai import types
-import uuid
+import pyarrow as pa
 
 # Load .env from project root
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -74,9 +76,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Constants ---
-CONFIG_NAME = "articles"
-TEXT_COLUMN = "OCR"
-EMBEDDING_COLUMN = "embedding_OCR"
 MODEL_NAME = "gemini-embedding-2-preview"
 # Rough estimate: ~3.5 chars/token for French → 8192 tokens ≈ 28K chars
 CHUNK_SIZE = 28_000
@@ -86,45 +85,50 @@ DEFAULT_BATCH_SIZE = 20
 MAX_RETRIES = 6
 BASE_RETRY_DELAY = 5  # seconds
 CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache_embeddings"
-CACHE_FILE = CACHE_DIR / "ocr_embeddings.json.gz"
 CHECKPOINT_EVERY = 5  # save cache every N API batches
+
+# Per-config settings: (text_column, embedding_column, cache_filename)
+CONFIG_SETTINGS = {
+    "articles": ("OCR", "embedding_OCR", "ocr_embeddings.json.gz"),
+    "publications": ("tableOfContents", "embedding_tableOfContents", "toc_embeddings.json.gz"),
+}
 
 
 # --- Cache helpers ---
 
-def load_cache() -> Dict[str, List[float]]:
+def load_cache(cache_file: Path) -> Dict[str, List[float]]:
     """Load cached embeddings from gzipped JSON. Returns {o_id: embedding}."""
-    if not CACHE_FILE.exists():
+    if not cache_file.exists():
         return {}
     try:
-        with gzip.open(CACHE_FILE, "rt", encoding="utf-8") as f:
+        with gzip.open(cache_file, "rt", encoding="utf-8") as f:
             data = json.load(f)
-        logger.info(f"Loaded {len(data)} cached embeddings from {CACHE_FILE}")
+        logger.info(f"Loaded {len(data)} cached embeddings from {cache_file}")
         return data
     except Exception as e:
         logger.warning(f"Failed to load cache ({e}), starting fresh.")
         return {}
 
 
-def save_cache(cache: Dict[str, List[float]]) -> None:
+def save_cache(cache: Dict[str, List[float]], cache_file: Path) -> None:
     """Save embeddings cache to gzipped JSON."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = CACHE_FILE.with_suffix(".tmp.gz")
+    tmp = cache_file.with_suffix(".tmp.gz")
     try:
         with gzip.open(tmp, "wt", encoding="utf-8") as f:
             json.dump(cache, f)
-        tmp.replace(CACHE_FILE)
+        tmp.replace(cache_file)
     except Exception as e:
         logger.warning(f"Failed to save cache: {e}")
         if tmp.exists():
             tmp.unlink()
 
 
-def delete_cache() -> None:
+def delete_cache(cache_file: Path) -> None:
     """Remove the cache file after a successful push."""
     try:
-        if CACHE_FILE.exists():
-            CACHE_FILE.unlink()
+        if cache_file.exists():
+            cache_file.unlink()
             logger.info("Cache file deleted after successful push.")
     except Exception as e:
         logger.warning(f"Failed to delete cache: {e}")
@@ -172,6 +176,29 @@ def average_embeddings(embeddings: List[List[float]]) -> List[float]:
             averaged[j] += emb[j]
     n = len(embeddings)
     return [v / n for v in averaged]
+
+
+def choose_config() -> str:
+    """Prompt the user to choose which dataset configuration to process."""
+    console.print("\n[bold]Dataset Configuration:[/bold]")
+    table = Table(box=box.SIMPLE)
+    table.add_column("#", style="cyan", justify="center")
+    table.add_column("Config", style="green")
+    table.add_column("Source Column", style="white")
+    table.add_column("Embedding Column", style="white")
+
+    config_keys = list(CONFIG_SETTINGS.keys())
+    for i, (name, (text_col, emb_col, _)) in enumerate(CONFIG_SETTINGS.items(), 1):
+        table.add_row(str(i), name, text_col, emb_col)
+
+    console.print(table)
+
+    choice = Prompt.ask(
+        "Choose configuration",
+        choices=[str(i) for i in range(1, len(config_keys) + 1)],
+        default="1",
+    )
+    return config_keys[int(choice) - 1]
 
 
 def choose_update_mode() -> str:
@@ -249,7 +276,8 @@ def embed_texts_with_retry(
 
 
 def display_config_panel(
-    repo_id: str, model_name: str, update_mode: str,
+    repo_id: str, config_name: str, text_column: str, embedding_column: str,
+    model_name: str, update_mode: str,
     batch_size: int, dimensionality: int, task_type: str, dry_run: bool,
 ):
     """Display configuration in a Rich panel."""
@@ -258,9 +286,9 @@ def display_config_panel(
     table.add_column("Value", style="green")
 
     table.add_row("Repository", repo_id)
-    table.add_row("Configuration", CONFIG_NAME)
-    table.add_row("Source Column", TEXT_COLUMN)
-    table.add_row("Embedding Column", EMBEDDING_COLUMN)
+    table.add_row("Configuration", config_name)
+    table.add_row("Source Column", text_column)
+    table.add_row("Embedding Column", embedding_column)
     table.add_row("Model", model_name)
     table.add_row("Task Type", task_type)
     table.add_row("Output Dimensionality", str(dimensionality))
@@ -333,6 +361,7 @@ def _save_completed_to_cache(
     flat_embeddings: List[Any],
     row_ids: List[Any],
     all_embeddings: List[Any],
+    cache_file: Path,
 ) -> None:
     """Reassemble completed chunk embeddings into row embeddings and save cache."""
     flat_offset = 0
@@ -352,19 +381,24 @@ def _save_completed_to_cache(
                 updated += 1
         flat_offset += len(chunks)
     if updated > 0:
-        save_cache(cache)
+        save_cache(cache, cache_file)
         logger.info(f"Checkpoint: saved {len(cache)} total embeddings to cache")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Add semantic embedding column ('embedding_OCR') to the "
-                    "'articles' subset using Google Gemini embeddings on the full OCR text."
+        description="Add semantic embedding column to a dataset subset using "
+                    "Google Gemini embeddings."
     )
     parser.add_argument(
         "--repo",
         default="fmadore/islam-west-africa-collection",
         help="Repository ID on Hugging Face Hub.",
+    )
+    parser.add_argument(
+        "--config",
+        choices=list(CONFIG_SETTINGS.keys()),
+        help="Dataset configuration to process. If omitted, an interactive menu is shown.",
     )
     parser.add_argument(
         "--dimensionality",
@@ -415,6 +449,17 @@ def main():
     max_shard_size = args.max_shard_size
     dry_run = args.dry_run
 
+    # --- Configuration selection ---
+    if args.config:
+        config_name = args.config
+    else:
+        config_name = choose_config()
+    console.print(f"[green]✓[/green] Configuration: [cyan]{config_name}[/cyan]")
+
+    # Resolve per-config settings
+    text_column, embedding_column, cache_filename = CONFIG_SETTINGS[config_name]
+    cache_file = CACHE_DIR / cache_filename
+
     # --- Step 1: Authentication ---
     console.print("\n[bold cyan]Step 1:[/bold cyan] Authenticating...")
 
@@ -463,13 +508,13 @@ def main():
 
     # --- Display configuration ---
     console.print()
-    display_config_panel(repo_id, MODEL_NAME, update_mode, batch_size, dimensionality, task_type, dry_run)
+    display_config_panel(repo_id, config_name, text_column, embedding_column, MODEL_NAME, update_mode, batch_size, dimensionality, task_type, dry_run)
 
     # --- Step 3: Load dataset ---
     console.print(f"\n[bold cyan]Step 3:[/bold cyan] Loading dataset...")
     try:
-        with console.status(f"[bold green]Loading '{repo_id}' (config: {CONFIG_NAME})...", spinner="dots"):
-            ds = load_dataset(repo_id, name=CONFIG_NAME, split="train", token=hf_token)
+        with console.status(f"[bold green]Loading '{repo_id}' (config: {config_name})...", spinner="dots"):
+            ds = load_dataset(repo_id, name=config_name, split="train", token=hf_token)
     except Exception as e:
         console.print(f"[red]✗[/red] Failed to load dataset: {e}")
         return
@@ -477,43 +522,44 @@ def main():
     console.print(f"[green]✓[/green] Dataset loaded: [cyan]{len(ds)}[/cyan] rows")
 
     # --- Column checks ---
-    if TEXT_COLUMN not in ds.column_names:
-        console.print(f"[red]✗[/red] Source column '{TEXT_COLUMN}' not found in dataset.")
+    if text_column not in ds.column_names:
+        console.print(f"[red]✗[/red] Source column '{text_column}' not found in dataset.")
         console.print(f"[yellow]ℹ[/yellow] Available columns: {', '.join(ds.column_names)}")
         return
 
     # --- Dimension consistency check ---
-    if update_mode == "missing" and EMBEDDING_COLUMN in ds.column_names:
+    if update_mode == "missing" and embedding_column in ds.column_names:
         try:
-            validate_existing_embeddings(ds, EMBEDDING_COLUMN, actual_dim)
+            validate_existing_embeddings(ds, embedding_column, actual_dim)
             console.print(f"[green]✓[/green] Existing embeddings are compatible (dim={actual_dim}).")
         except ValueError as e:
             console.print(f"[red]✗[/red] {e}")
             return
 
-    if EMBEDDING_COLUMN in ds.column_names:
+    if embedding_column in ds.column_names:
         if update_mode == "all":
-            console.print(f"[yellow]⚠[/yellow] Embedding column '{EMBEDDING_COLUMN}' exists and will be overwritten.")
+            console.print(f"[yellow]⚠[/yellow] Embedding column '{embedding_column}' exists and will be overwritten.")
         else:
-            console.print(f"[yellow]ℹ[/yellow] Embedding column '{EMBEDDING_COLUMN}' exists. Only missing values will be computed.")
+            console.print(f"[yellow]ℹ[/yellow] Embedding column '{embedding_column}' exists. Only missing values will be computed.")
     else:
-        console.print(f"[blue]→[/blue] Embedding column '{EMBEDDING_COLUMN}' will be created.")
+        console.print(f"[blue]→[/blue] Embedding column '{embedding_column}' will be created.")
 
     # --- Step 4: Analyze source data ---
     console.print(f"\n[bold cyan]Step 4:[/bold cyan] Analyzing source data...")
-    texts = ds[TEXT_COLUMN]
-    display_text_stats(texts, TEXT_COLUMN)
+    texts = ds[text_column]
+    display_text_stats(texts, text_column)
 
     # --- Load embedding cache ---
-    cache = load_cache()
+    cache = load_cache(cache_file)
     if cache:
         console.print(f"[green]✓[/green] Resuming with [cyan]{len(cache)}[/cyan] cached embeddings")
 
     # --- Identify rows to process ---
-    existing_embeddings = ds[EMBEDDING_COLUMN] if EMBEDDING_COLUMN in ds.column_names else [None] * len(ds)
+    # Use [] instead of None for missing embeddings so PyArrow infers a consistent list<float> type
+    existing_embeddings = ds[embedding_column] if embedding_column in ds.column_names else [[] for _ in range(len(ds))]
     row_ids = ds["o:id"]  # stable row identifier for cache keys
 
-    if update_mode == "missing" and EMBEDDING_COLUMN in ds.column_names:
+    if update_mode == "missing" and embedding_column in ds.column_names:
         valid_count, missing_count = display_embedding_stats(existing_embeddings)
         if missing_count == 0 and not cache:
             console.print(Panel(
@@ -524,7 +570,8 @@ def main():
             return
 
     # Build the full embeddings list, pre-filling from cache
-    all_embeddings: List[Any] = list(existing_embeddings)
+    # Normalize None to [] for consistent PyArrow typing
+    all_embeddings: List[Any] = [emb if emb is not None else [] for emb in existing_embeddings]
     cache_hits = 0
     for i, oid in enumerate(row_ids):
         oid_str = str(oid)
@@ -581,7 +628,7 @@ def main():
 
         console.print(
             f"[blue]→[/blue] {len(flat_chunks)} total chunks from "
-            f"{len(indices_to_process)} articles "
+            f"{len(indices_to_process)} rows "
             f"({error_counter['chunked']} multi-chunk)"
         )
 
@@ -619,7 +666,7 @@ def main():
                 # Checkpoint: reassemble completed rows and save cache
                 if batch_count % CHECKPOINT_EVERY == 0:
                     _save_completed_to_cache(
-                        cache, row_chunks, flat_embeddings, row_ids, all_embeddings,
+                        cache, row_chunks, flat_embeddings, row_ids, all_embeddings, cache_file,
                     )
 
                 # Delay between API calls to respect rate limits
@@ -628,14 +675,14 @@ def main():
 
         # Final reassemble: group chunk embeddings by row and average
         _save_completed_to_cache(
-            cache, row_chunks, flat_embeddings, row_ids, all_embeddings,
+            cache, row_chunks, flat_embeddings, row_ids, all_embeddings, cache_file,
         )
 
         console.print("[green]✓[/green] Embedding computation complete.")
 
         if error_counter["chunked"] > 0:
             console.print(
-                f"[yellow]ℹ[/yellow] {error_counter['chunked']} long articles were split "
+                f"[yellow]ℹ[/yellow] {error_counter['chunked']} long texts were split "
                 f"into {error_counter['total_chunks']} chunks (averaged back to 1 vector each)."
             )
         if error_counter["failed"] > 0:
@@ -647,47 +694,54 @@ def main():
     # --- Update the dataset ---
     console.print(f"\n[bold cyan]Step 6:[/bold cyan] Updating dataset...")
 
-    ds_processed = ds.map(
-        lambda batch, idx: {EMBEDDING_COLUMN: [all_embeddings[i] for i in idx]},
-        batched=True,
-        batch_size=1000,
-        with_indices=True,
-        load_from_cache_file=False,
-        new_fingerprint=str(uuid.uuid4()),
-    )
+    # Build column directly to avoid PyArrow type inference issues with sparse embeddings.
+    emb_col_data = []
+    for emb in all_embeddings:
+        if is_empty_embedding(emb):
+            emb_col_data.append(None)
+        else:
+            emb_col_data.append(emb)
+
+    # Create a typed PyArrow array so nulls and float lists coexist
+    pa_array = pa.array(emb_col_data, type=pa.list_(pa.float64()))
+
+    if embedding_column in ds.column_names:
+        ds_processed = ds.remove_columns([embedding_column]).add_column(embedding_column, pa_array)
+    else:
+        ds_processed = ds.add_column(embedding_column, pa_array)
 
     # --- Verify results ---
     console.print("\n[bold]Sample embeddings (first 3 non-empty):[/bold]")
     shown = 0
-    for i, emb in enumerate(ds_processed[EMBEDDING_COLUMN]):
+    for i, emb in enumerate(ds_processed[embedding_column]):
         if shown >= 3:
             break
         if not is_empty_embedding(emb):
             console.print(f"  [cyan]#{i+1}[/cyan]: dim={len(emb)}, values=[{emb[0]:.4f}, {emb[1]:.4f}, ...]")
             shown += 1
 
-    # --- Reorder columns: place embedding_OCR after OCR ---
-    if TEXT_COLUMN in ds_processed.column_names:
+    # --- Reorder columns: place embedding column after source text column ---
+    if text_column in ds_processed.column_names:
         existing_columns = list(ds_processed.column_names)
-        insert_index = existing_columns.index(TEXT_COLUMN) + 1
+        insert_index = existing_columns.index(text_column) + 1
 
         new_columns = existing_columns[:insert_index]
-        if EMBEDDING_COLUMN in existing_columns and EMBEDDING_COLUMN not in new_columns:
-            new_columns.append(EMBEDDING_COLUMN)
+        if embedding_column in existing_columns and embedding_column not in new_columns:
+            new_columns.append(embedding_column)
         for col in existing_columns[insert_index:]:
             if col not in new_columns:
                 new_columns.append(col)
 
         ds_processed = ds_processed.select_columns(new_columns)
-        console.print(f"[blue]→[/blue] Columns reordered ('{EMBEDDING_COLUMN}' after '{TEXT_COLUMN}')")
+        console.print(f"[blue]→[/blue] Columns reordered ('{embedding_column}' after '{text_column}')")
 
     # --- Step 7: Push to Hub ---
     if dry_run:
         console.print(Panel(
             "[yellow]Dry run mode — no changes pushed to Hub.[/yellow]\n\n"
             f"Would have pushed [cyan]{len(ds_processed)}[/cyan] rows to "
-            f"[cyan]{repo_id}[/cyan] (config: {CONFIG_NAME}).\n\n"
-            f"[yellow]Embeddings are cached in {CACHE_FILE}[/yellow]\n"
+            f"[cyan]{repo_id}[/cyan] (config: {config_name}).\n\n"
+            f"[yellow]Embeddings are cached in {cache_file}[/yellow]\n"
             f"Re-run without --dry-run to push (cached results will be reused).",
             title="Dry Run Complete",
             border_style="yellow",
@@ -698,27 +752,27 @@ def main():
 
     try:
         commit_message = (
-            f"Add/update '{EMBEDDING_COLUMN}' embeddings using {MODEL_NAME} "
-            f"(dim={dimensionality}, task={task_type}, config={CONFIG_NAME})"
+            f"Add/update '{embedding_column}' embeddings using {MODEL_NAME} "
+            f"(dim={dimensionality}, task={task_type}, config={config_name})"
         )
 
         with console.status("[bold green]Pushing dataset to Hub...", spinner="dots"):
             ds_processed.push_to_hub(
                 repo_id=repo_id,
-                config_name=CONFIG_NAME,
+                config_name=config_name,
                 commit_message=commit_message,
                 token=hf_token,
                 max_shard_size=max_shard_size,
             )
 
-        action = "updated" if EMBEDDING_COLUMN in ds.column_names else "created"
+        action = "updated" if embedding_column in ds.column_names else "created"
         total_valid = sum(1 for e in all_embeddings if not is_empty_embedding(e))
 
         summary = (
             f"[bold green]Dataset successfully published![/bold green]\n\n"
             f"Repository: [cyan]{repo_id}[/cyan]\n"
-            f"Configuration: [cyan]{CONFIG_NAME}[/cyan]\n"
-            f"Column: [cyan]{EMBEDDING_COLUMN}[/cyan] ({action})\n"
+            f"Configuration: [cyan]{config_name}[/cyan]\n"
+            f"Column: [cyan]{embedding_column}[/cyan] ({action})\n"
             f"Model: [cyan]{MODEL_NAME}[/cyan]\n"
             f"Embedding dimension: [cyan]{dimensionality}[/cyan]\n"
             f"Task type: [cyan]{task_type}[/cyan]\n"
@@ -730,13 +784,13 @@ def main():
         console.print(Panel(summary, title="Upload Complete", border_style="green"))
 
         # Clean up cache after successful push
-        delete_cache()
+        delete_cache(cache_file)
 
     except Exception as e:
         console.print(Panel(
             f"[bold red]Failed to push dataset[/bold red]\n\n"
             f"{e}\n\n"
-            f"[yellow]Embeddings are cached in {CACHE_FILE}[/yellow]\n"
+            f"[yellow]Embeddings are cached in {cache_file}[/yellow]\n"
             f"Re-run the script to resume from where it left off.",
             title="Error",
             border_style="red",

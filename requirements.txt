@@ -9,8 +9,6 @@ datasets
 huggingface_hub[hf_xet]
 spacy
 textstat
-transformers
-torch
 google-genai
 # Topic modeling (LDA)
 gensim

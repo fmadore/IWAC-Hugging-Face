@@ -34,10 +34,9 @@ AI sentiment analysis (Gemini, ChatGPT, Mistral) is fetched directly from the Om
 
 Scripts that enrich the dataset with computed columns:
 - `lemmatize_update_hf.py` — French lemmatization with spaCy
-- `post-processing/calculate_sentiment.py` — Transformer-based sentiment (distilcamembert)
 - `post-processing/calculate_lexical_richness.py` — Text statistics
 - `post-processing/calculate_word_count.py` — Word counts
-- `post-processing/semantic_embedding.py` — Sentence embeddings
+- `post-processing/semantic_embedding.py` — Sentence embeddings (articles: OCR, publications: tableOfContents)
 - `post-processing/topic_modeling/` — Shared topic modeling utilities (stopwords, patches)
 - `post-processing/lda_topic_modeling/` — LDA topic modeling (gensim)
 
