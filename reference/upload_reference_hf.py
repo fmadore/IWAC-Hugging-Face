@@ -459,7 +459,7 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
 
     return {
         "o:id": item["o:id"],
-        "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
+        "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "identifier": _get_iwac_identifier(item, "dcterms:identifier"),
         "added_date": added_date,
         "o:resource_class": _get_resource_class(item),

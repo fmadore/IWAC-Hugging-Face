@@ -369,7 +369,7 @@ async def map_index_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
         "o:id": item["o:id"],
         "identifier": _get_value_only(item, "dcterms:identifier"),
         "added_date": added_date, # Date when item was added to Omeka
-        "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
+        "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "thumbnail": thumbnail_url,
         "Titre": item.get("o:title", ""),
         "Titre alternatif": _get_value(item, "dcterms:alternative"),

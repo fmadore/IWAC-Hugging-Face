@@ -388,7 +388,7 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
         "o:id": item["o:id"],
         "identifier": _get_value(item, "dcterms:identifier"),
         "added_date": added_date, # Date when item was added to Omeka
-        "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
+        "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "iiif_manifest": iiif_manifest_url,
         "PDF": primary_url,
         "thumbnail": thumbnail_url, # Added thumbnail field

@@ -330,7 +330,7 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
         "o:id": item["o:id"],
         "identifier": _get_value(item, "dcterms:identifier"),
         "added_date": added_date,
-        "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
+        "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "iiif_manifest": iiif_manifest_url,
         "PDF": primary_url,  # Keeping as PDF for consistency, though it might be video/audio
         "thumbnail": thumbnail_url,

@@ -372,7 +372,7 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
         "o:id": item["o:id"],
         "identifier": _get_value(item, "dcterms:identifier"),
         "added_date": added_date, # Date when item was added to Omeka
-        "url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
+        "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "iiif_manifest": iiif_manifest_url,
         "PDF": primary_url,
         "thumbnail": thumbnail_url, # Added thumbnail field
@@ -387,7 +387,7 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
         "spatial": _get_value(item, "dcterms:spatial"),
         "language": _get_value(item, "dcterms:language"),
         "nb_pages": _to_int(_get_value(item, "bibo:numPages")),
-        "URL": extracted_fabio_url, 
+        "URL": extracted_fabio_url,
         "source": _get_value(item, "dcterms:source"),
         "OCR": _get_value(item, "bibo:content"),
     }
@@ -436,7 +436,7 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
             else:
                 console.print("[yellow]ℹ[/yellow] Existing dataset on Hub is empty. Creating empty dataset with default schema.")
                 expected_cols = [
-                    "o:id", "identifier", "added_date", "url", "iiif_manifest", "PDF", "thumbnail", "title", "author",
+                    "o:id", "identifier", "added_date", "iwac_url", "iiif_manifest", "PDF", "thumbnail", "title", "author",
                     "newspaper", "country", "pub_date", "issue", "tableOfContents", "subject", "spatial",
                     "language", "nb_pages", "URL", "source", "OCR"
                 ]
@@ -445,8 +445,8 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
         except Exception as e_load_meta:
             console.print(f"[yellow]⚠[/yellow] Could not load existing dataset schema: {e_load_meta}")
             expected_cols = [
-                "o:id", "identifier", "added_date", "url", "iiif_manifest", "PDF", "thumbnail", "title", "author", 
-                "newspaper", "country", "pub_date", "issue", "subject", "spatial", 
+                "o:id", "identifier", "added_date", "iwac_url", "iiif_manifest", "PDF", "thumbnail", "title", "author",
+                "newspaper", "country", "pub_date", "issue", "subject", "spatial",
                 "language", "nb_pages", "URL", "source", "OCR"
             ]
             final_df = pd.DataFrame(columns=expected_cols)
