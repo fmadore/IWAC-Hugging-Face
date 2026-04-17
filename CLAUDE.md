@@ -15,6 +15,20 @@ Dataset subsets:
 - `references` — Academic references
 - `index` — Index entries
 
+## Always use the `iwac-dataset` skill
+
+Before writing or modifying any script that reads, transforms, or pushes the HF dataset (anything in `articles/`, `audiovisual/`, `document/`, `index/`, `islamic-publications/`, `reference/`, or `post-processing/`), invoke the **`iwac-dataset` skill**. It is the single source of truth for:
+
+- **Per-subset schemas** verified against the live HF dataset card — exact field names, types, and which embedding column belongs to which subset (`embedding_OCR` for `articles`, `embedding_tableOfContents` for `publications`).
+- **Conventions** — pipe separator for multi-values, ISO dates, `lda_topic_id == -1` outliers, country canonicalization (raw `Benin` vs display `Bénin`), `articles.lda_topic_id` is `float64` (not int).
+- **AI sentiment shape** — the three-model `gemini_*` / `chatgpt_*` / `mistral_*` six-field block, polarité / centralité / subjectivité scales. There is **no** DistilCamemBERT `sentiment_label` / `sentiment_score` — older docs that mention those are wrong.
+- **Authority join** — `articles.subject` strings match `index.Titre` exactly (controlled vocabulary). Use this rather than substring matching on `subject`.
+- **Place geocoding** — `index.Coordonnées` (`"lat, lng"` string) for `Lieux` entities.
+- **Omeka resource templates ↔ classes** — most importantly that **`articles` and `publications` both use template 8** and are split only by RDF class (36 `bibo:Article` vs 60 `bibo:Issue`). Several upload scripts hinge on this.
+- **The full reference-type → class table** (8 reference types, including `Article de revue` → 35 `bibo:AcademicArticle`, `Compte rendu` → 178 `fabio:BookReview`, `Entrée encyclopédique` → 197 `fabio:ReferenceEntry`, etc.).
+
+The skill's `references/data-pipeline.md` documents the end-to-end Omeka → HF flow that this very repo implements; keep it in sync if the pipeline changes (resource class IDs, new computed columns, new upload scripts).
+
 ## Architecture
 
 ### Upload Scripts
