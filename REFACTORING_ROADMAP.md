@@ -191,6 +191,11 @@ Pure organizational move. No behavior change.
 - [x] **Tier 1c** — `iwac_common/hub_merge.py` extracted, all 6 scripts migrated, reference's outer-merge preserved via parameters (−81 lines net)
 - [x] **Tier 2** — `post-processing/_common.py` (auth + config picker + config-list lookup) extracted; 4 of 5 post-processing scripts migrated. `calculate_word_count.py` keeps its custom config picker (different UX); `semantic_embedding.py` keeps its custom config picker (per-config metadata table).
 - [x] **Tier 2b** — `post-processing/_embedding_utils.py` extracted (cache I/O, chunking, mean-pooling, embedding validation). `semantic_embedding.py`: 797 → 730 lines (−67).
-- [ ] Tier 3 — small fixes (country_mapper, requirements pin, __init__ re-exports, cache dir audit) ← *next*
+- [x] **Tier 3** — small fixes:
+  - `country_mapper.py`: O(n) `elif` chain replaced with O(1) reverse dict; unused empty `NEWSPAPER_TO_COUNTRY = {}` removed.
+  - `requirements.txt`: major-version caps added on `aiohttp`, `python-dotenv`, `rich`, `tqdm`, `pandas`, `datasets`, `huggingface_hub`, `spacy`, `gensim` (lower bounds intentionally absent so existing installs continue working).
+  - `post-processing/topic_modeling/__init__.py`: re-exports `apply_all_patches`, `apply_json_patches`, `apply_utf8_open_patch`, `DOMAIN_STOPWORDS`, `LABEL_ONLY_STOPWORDS`, `VECTORIZE_STOPWORDS`.
+  - `post-processing/lda_topic_modeling/__init__.py`: deliberately left as docstring-only — its `constants.py` runs sys.path manipulation at import-time, which would fire as a side-effect of any package re-export.
+  - `articles` / `islamic-publications` `.cache_omk` collision: confirmed safe — different resource_class_ids produce different cache keys, so directory sharing never causes corruption.
 
 **Tier 1 cumulative:** 6 upload scripts shed 1,267 lines (621 → 393, 477 → 273, 571 → 343, 655 → 432, 759 → 568, 713 → 520). 505 lines added across 3 shared modules. Net **−762 lines** with no behavioral regressions.

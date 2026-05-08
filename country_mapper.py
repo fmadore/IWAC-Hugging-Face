@@ -113,28 +113,17 @@ TOGO_NEWSPAPERS = [
     "Togo-Presse",
 ]
 
-NEWSPAPER_TO_COUNTRY = {
-    # Example:
-    # "Le Monde": "France",
-    # "The Guardian": "United Kingdom",
-    # "New York Times": "United States",
-    # Add mappings for other countries here
+# Reverse-index built once at import: name → country. O(1) lookup vs the
+# previous O(n) sequential ``elif`` chain.
+_NEWSPAPER_TO_COUNTRY: dict[str, str] = {
+    **{name: "Benin" for name in BENIN_NEWSPAPERS},
+    **{name: "Burkina Faso" for name in BURKINA_FASO_NEWSPAPERS},
+    **{name: "Côte d'Ivoire" for name in COTE_DIVOIRE_NEWSPAPERS},
+    **{name: "Niger" for name in NIGER_NEWSPAPERS},
+    **{name: "Togo" for name in TOGO_NEWSPAPERS},
 }
 
+
 def get_country_from_newspaper(newspaper_name: str) -> str:
-    """
-    Retrieves the country for a given newspaper name.
-    Checks against lists for specific countries first, then a general dictionary.
-    Returns the country name or an empty string if not found.
-    """
-    if newspaper_name in BENIN_NEWSPAPERS:
-        return "Benin"
-    elif newspaper_name in BURKINA_FASO_NEWSPAPERS:
-        return "Burkina Faso"
-    elif newspaper_name in COTE_DIVOIRE_NEWSPAPERS:
-        return "Côte d'Ivoire"
-    elif newspaper_name in NIGER_NEWSPAPERS:
-        return "Niger"
-    elif newspaper_name in TOGO_NEWSPAPERS:
-        return "Togo"
-    return NEWSPAPER_TO_COUNTRY.get(newspaper_name, "")
+    """Return the country for a known newspaper, or ``""`` if unknown."""
+    return _NEWSPAPER_TO_COUNTRY.get(newspaper_name, "")
