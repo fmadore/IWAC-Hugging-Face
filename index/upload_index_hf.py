@@ -46,6 +46,7 @@ from iwac_common.omeka_client import (
     async_retry,
     conn_manager,
 )
+from iwac_common.field_mappers import extract_added_date, get_value
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -71,19 +72,6 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Fonctions d'aide pour mapper les champs Omeka → plat
 # ---------------------------------------------------------------------------
-
-def _get_value(item: Dict[str, Any], field: str) -> str:
-    """Extrait une valeur simple d'un champ Omeka"""
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        parts = [str(v.get("display_title") or v.get("@value") or v.get("@id", "")) for v in val]
-        return "|".join(filter(None, parts))
-    if isinstance(val, dict):
-        return val.get("display_title", "") or val.get("@value", "")
-    return str(val)
-
 
 def _get_value_only(item: Dict[str, Any], field: str) -> str:
     """Extrait seulement les valeurs @value d'un champ Omeka (pour dcterms:identifier)"""
@@ -212,17 +200,8 @@ async def fetch_iiif_thumbnail_url(omeka_id: Union[str, int], session: aiohttp.C
 async def map_index_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item d'index Omeka en dict plat pour HF datasets."""
     
-    # Extract date when item was added to Omeka (YYYY-MM-DD format)
-    added_date = ""
-    if "o:created" in item and isinstance(item["o:created"], dict):
-        created_value = item["o:created"].get("@value", "")
-        if created_value:
-            try:
-                # Extract date part from ISO format (e.g., "2025-07-09T14:02:51+00:00" -> "2025-07-09")
-                added_date = created_value.split("T")[0]
-            except Exception:
-                logger.warning(f"Could not parse added date '{created_value}' for item {item['o:id']}")
-    
+    added_date = extract_added_date(item)
+
     # Fetch thumbnail URL
     session = await conn_manager.get()
     thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
@@ -234,21 +213,21 @@ async def map_index_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
         "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "thumbnail": thumbnail_url,
         "Titre": item.get("o:title", ""),
-        "Titre alternatif": _get_value(item, "dcterms:alternative"),
+        "Titre alternatif": get_value(item, "dcterms:alternative"),
         "Type": _get_resource_class_type(item),
         "Description": _get_value_with_lang(item, "dcterms:description", "fr"),
-        "Date création": _get_value(item, "dcterms:created"),
-        "date": _get_value(item, "dcterms:date"),
+        "Date création": get_value(item, "dcterms:created"),
+        "date": get_value(item, "dcterms:date"),
         "Relation": _get_display_title(item, "dcterms:relation"),
-        "Remplacé par": _get_value(item, "dcterms:isReplacedBy"),
+        "Remplacé par": get_value(item, "dcterms:isReplacedBy"),
         "Partie de": _get_display_title(item, "dcterms:isPartOf"),
-        "spatial": _get_value(item, "dcterms:spatial"),
+        "spatial": get_value(item, "dcterms:spatial"),
         "A une partie": _get_display_title(item, "dcterms:hasPart"),
-        "Prénom": _get_value(item, "foaf:firstName"),
-        "Nom": _get_value(item, "foaf:lastName"),
+        "Prénom": get_value(item, "foaf:firstName"),
+        "Nom": get_value(item, "foaf:lastName"),
         "Genre": _get_display_title(item, "foaf:gender"),
-        "Naissance": _get_value(item, "foaf:birthday"),
-        "Coordonnées": _get_value(item, "curation:coordinates"),
+        "Naissance": get_value(item, "foaf:birthday"),
+        "Coordonnées": get_value(item, "curation:coordinates"),
     }
 
 

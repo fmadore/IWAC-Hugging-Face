@@ -55,6 +55,12 @@ from iwac_common.omeka_client import (
     async_retry,
     conn_manager,
 )
+from iwac_common.field_mappers import (
+    extract_added_date,
+    get_media_ids,
+    get_value,
+    to_int_or_none,
+)
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -89,18 +95,6 @@ load_dotenv(dotenv_path=dotenv_path)
 # Fonctions d'aide pour mapper les champs Omeka → plat
 # ---------------------------------------------------------------------------
 
-def _get_value(item: Dict[str, Any], field: str) -> str:
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        parts = [str(v.get("display_title") or v.get("@value") or v.get("@id", "")) for v in val]
-        return "|".join(filter(None, parts))
-    if isinstance(val, dict):
-        return val.get("display_title", "") or val.get("@value", "")
-    return str(val)
-
-
 @async_retry(max_tries=3, exceptions=(aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError))
 async def fetch_iiif_thumbnail_url(omeka_id: Union[str, int], session: aiohttp.ClientSession) -> str:
     """Fetches and extracts the thumbnail URL from an IIIF manifest."""
@@ -133,24 +127,6 @@ async def fetch_iiif_thumbnail_url(omeka_id: Union[str, int], session: aiohttp.C
         logger.error(f"Unexpected error fetching IIIF manifest for {omeka_id}: {e_general}. URL: {manifest_url}")
     return thumbnail_url
 
-def _to_int(value: str) -> Optional[int]:
-    """Safely convert a string to an integer, returning None if conversion fails."""
-    if not value or not value.strip():
-        return None
-    try:
-        return int(value.strip())
-    except (ValueError, TypeError):
-        return None
-
-
-def _join(item: Dict[str, Any], field: str) -> str:
-    return _get_value(item, field)
-
-
-def _get_media_ids(item: Dict[str, Any]) -> str:
-    if "o:media" in item and isinstance(item["o:media"], list):
-        return "|".join(str(m["o:id"]) for m in item["o:media"]) # Corrected indentation
-    return ""
 
 
 async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]: # Renamed function
@@ -168,7 +144,7 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
             primary_url = ""
 
 
-    publisher_name = _join(item, "dcterms:publisher") # Changed newspaper_name to publisher_name for clarity
+    publisher_name = get_value(item, "dcterms:publisher") # Changed newspaper_name to publisher_name for clarity
     country = get_country_from_newspaper(publisher_name) # Assumes country_mapper is generic enough
 
     # Custom logic to extract URL from fabio:hasURL, prioritizing @id
@@ -191,16 +167,7 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
         extracted_fabio_url = fabio_has_url_data
     # If none of the above, extracted_fabio_url remains ""
 
-    # Extract date when item was added to Omeka (YYYY-MM-DD format)
-    added_date = ""
-    if "o:created" in item and isinstance(item["o:created"], dict):
-        created_value = item["o:created"].get("@value", "")
-        if created_value:
-            try:
-                # Extract date part from ISO format (e.g., "2025-07-09T14:02:51+00:00" -> "2025-07-09")
-                added_date = created_value.split("T")[0]
-            except Exception:
-                logger.warning(f"Could not parse added date '{created_value}' for item {item['o:id']}")
+    added_date = extract_added_date(item)
 
     # Fetch thumbnail URL and set IIIF manifest URL only if PDF exists
     session = await conn_manager.get()
@@ -218,26 +185,26 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
 
     return {
         "o:id": item["o:id"],
-        "identifier": _get_value(item, "dcterms:identifier"),
+        "identifier": get_value(item, "dcterms:identifier"),
         "added_date": added_date, # Date when item was added to Omeka
         "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "iiif_manifest": iiif_manifest_url,
         "PDF": primary_url,
         "thumbnail": thumbnail_url, # Added thumbnail field
-        "title": _get_value(item, "dcterms:title"),
-        "author": _join(item, "dcterms:creator"),
+        "title": get_value(item, "dcterms:title"),
+        "author": get_value(item, "dcterms:creator"),
         "newspaper": publisher_name, # This was 'newspaper', for publications might be 'journal' or 'publisher'
         "country": country,
-        "pub_date": _get_value(item, "dcterms:date"),
-        "issue": _get_value(item, "bibo:issue"), # Added issue field
-        "tableOfContents": _get_value(item, "dcterms:tableOfContents"),
-        "subject": _join(item, "dcterms:subject"),
-        "spatial": _get_value(item, "dcterms:spatial"),
-        "language": _get_value(item, "dcterms:language"),
-        "nb_pages": _to_int(_get_value(item, "bibo:numPages")),
+        "pub_date": get_value(item, "dcterms:date"),
+        "issue": get_value(item, "bibo:issue"), # Added issue field
+        "tableOfContents": get_value(item, "dcterms:tableOfContents"),
+        "subject": get_value(item, "dcterms:subject"),
+        "spatial": get_value(item, "dcterms:spatial"),
+        "language": get_value(item, "dcterms:language"),
+        "nb_pages": to_int_or_none(get_value(item, "bibo:numPages")),
         "URL": extracted_fabio_url,
-        "source": _get_value(item, "dcterms:source"),
-        "OCR": _get_value(item, "bibo:content"),
+        "source": get_value(item, "dcterms:source"),
+        "OCR": get_value(item, "bibo:content"),
     }
 
 

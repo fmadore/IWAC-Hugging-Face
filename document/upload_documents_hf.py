@@ -40,6 +40,12 @@ from iwac_common.omeka_client import (
     async_retry,
     conn_manager,
 )
+from iwac_common.field_mappers import (
+    extract_added_date,
+    get_media_ids,
+    get_value,
+    to_int_or_none,
+)
 
 # Rich console imports for beautiful output
 from rich.console import Console
@@ -92,28 +98,6 @@ def _get_label(item: Dict[str, Any], field: str) -> str:
         return "|".join(filter(None, labels))
     elif isinstance(val, dict) and "o:label" in val:
         return str(val["o:label"])
-    return ""
-
-
-def _get_value(item: Dict[str, Any], field: str) -> str:
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        parts = [str(v.get("display_title") or v.get("@value") or v.get("@id", "")) for v in val]
-        return "|".join(filter(None, parts))
-    if isinstance(val, dict):
-        return val.get("display_title", "") or val.get("@value", "")
-    return str(val)
-
-
-def _join(item: Dict[str, Any], field: str) -> str:
-    return _get_value(item, field)
-
-
-def _get_media_ids(item: Dict[str, Any]) -> str:
-    if "o:media" in item and isinstance(item["o:media"], list):
-        return "|".join(str(m["o:id"]) for m in item["o:media"])
     return ""
 
 
@@ -174,27 +158,8 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
                     country = "Togo"
                     break
 
-    # Convert nb_pages to int
-    nb_pages_str = _get_value(item, "bibo:numPages")
-    nb_pages_int = None
-    if nb_pages_str:
-        try:
-            nb_pages_int = int(nb_pages_str)
-        except ValueError:
-            logger.warning(
-                f"Could not convert nb_pages '{nb_pages_str}' to int for item {item['o:id']}. Defaulting to null."
-            )
-
-    # Extract date when item was added to Omeka (YYYY-MM-DD format)
-    added_date = ""
-    if "o:created" in item and isinstance(item["o:created"], dict):
-        created_value = item["o:created"].get("@value", "")
-        if created_value:
-            try:
-                # Extract date part from ISO format (e.g., "2025-07-09T14:02:51+00:00" -> "2025-07-09")
-                added_date = created_value.split("T")[0]
-            except Exception:
-                logger.warning(f"Could not parse added date '{created_value}' for item {item['o:id']}")
+    nb_pages_int = to_int_or_none(get_value(item, "bibo:numPages"))
+    added_date = extract_added_date(item)
 
     # Fetch thumbnail URL and set IIIF manifest URL only if PDF exists
     session = await conn_manager.get()
@@ -207,25 +172,25 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
 
     return {
         "o:id": item["o:id"],
-        "identifier": _get_value(item, "dcterms:identifier"),
+        "identifier": get_value(item, "dcterms:identifier"),
         "added_date": added_date, # Date when item was added to Omeka
         "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "iiif_manifest": iiif_manifest_url,
         "PDF": primary_url,
         "thumbnail": thumbnail_url,
-        "title": _get_value(item, "dcterms:title"),
-        "author": _join(item, "dcterms:creator"),
+        "title": get_value(item, "dcterms:title"),
+        "author": get_value(item, "dcterms:creator"),
         "country": country,
-        "pub_date": _get_value(item, "dcterms:date"),
-        "descriptionAI": _get_value(item, "bibo:shortDescription"),
-        "subject": _join(item, "dcterms:subject"),
-        "spatial": _get_value(item, "dcterms:spatial"),
-        "language": _get_value(item, "dcterms:language"),
-        "type": _get_value(item, "dcterms:type"),
+        "pub_date": get_value(item, "dcterms:date"),
+        "descriptionAI": get_value(item, "bibo:shortDescription"),
+        "subject": get_value(item, "dcterms:subject"),
+        "spatial": get_value(item, "dcterms:spatial"),
+        "language": get_value(item, "dcterms:language"),
+        "type": get_value(item, "dcterms:type"),
         "nb_pages": nb_pages_int,
-        "source": _get_value(item, "dcterms:source"),
+        "source": get_value(item, "dcterms:source"),
         "rights": _get_label(item, "dcterms:rights"),
-        "OCR": _get_value(item, "bibo:content"),
+        "OCR": get_value(item, "bibo:content"),
     }
 
 

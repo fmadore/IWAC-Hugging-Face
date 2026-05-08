@@ -45,6 +45,12 @@ from iwac_common.omeka_client import (
     async_retry,
     conn_manager,
 )
+from iwac_common.field_mappers import (
+    extract_added_date,
+    get_media_ids,
+    get_value,
+    to_int_or_none,
+)
 
 # Rich console imports for beautiful output
 from rich.console import Console
@@ -115,28 +121,6 @@ def _get_subjectivity_score(item: Dict[str, Any], field: str) -> Optional[int]:
     return None
 
 
-def _get_value(item: Dict[str, Any], field: str) -> str:
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        parts = [str(v.get("display_title") or v.get("@value") or v.get("@id", "")) for v in val]
-        return "|".join(filter(None, parts))
-    if isinstance(val, dict):
-        return val.get("display_title", "") or val.get("@value", "")
-    return str(val)
-
-
-def _join(item: Dict[str, Any], field: str) -> str:
-    return _get_value(item, field)
-
-
-def _get_media_ids(item: Dict[str, Any]) -> str:
-    if "o:media" in item and isinstance(item["o:media"], list):
-        return "|".join(str(m["o:id"]) for m in item["o:media"])
-    return ""
-
-
 @async_retry(max_tries=3, exceptions=(aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError))
 async def fetch_iiif_thumbnail_url(omeka_id: Union[str, int], session: aiohttp.ClientSession) -> str:
     """Fetches and extracts the thumbnail URL from an IIIF manifest."""
@@ -178,7 +162,7 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
         mdata = await api.fetch_media_data(mid)
         primary_url = mdata.get("o:original_url", "")
 
-    newspaper_name = _join(item, "dcterms:publisher")
+    newspaper_name = get_value(item, "dcterms:publisher")
     country = get_country_from_newspaper(newspaper_name)
 
     # Custom logic to extract URL from fabio:hasURL, prioritizing @id
@@ -199,28 +183,8 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
             extracted_fabio_url = id_val
     elif isinstance(fabio_has_url_data, str) and fabio_has_url_data: # If it's already a non-empty string
         extracted_fabio_url = fabio_has_url_data
-    # If none of the above, extracted_fabio_url remains ""    # Convert nb_pages to int
-    nb_pages_str = _get_value(item, "bibo:numPages")
-    nb_pages_int = None
-    if nb_pages_str:
-        try:
-            nb_pages_int = int(nb_pages_str)
-        except ValueError:
-            logger.warning(
-                f"Could not convert nb_pages '{nb_pages_str}' to int for item {item['o:id']}. Defaulting to null."
-            )
-            # nb_pages_int remains None
-
-    # Extract date when item was added to Omeka (YYYY-MM-DD format)
-    added_date = ""
-    if "o:created" in item and isinstance(item["o:created"], dict):
-        created_value = item["o:created"].get("@value", "")
-        if created_value:
-            try:
-                # Extract date part from ISO format (e.g., "2025-07-09T14:02:51+00:00" -> "2025-07-09")
-                added_date = created_value.split("T")[0]
-            except Exception:
-                logger.warning(f"Could not parse added date '{created_value}' for item {item['o:id']}")
+    nb_pages_int = to_int_or_none(get_value(item, "bibo:numPages"))
+    added_date = extract_added_date(item)
 
     # Fetch thumbnail URL and set IIIF manifest URL only if PDF exists
     session = await conn_manager.get()
@@ -233,47 +197,49 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
 
     return {
         "o:id": item["o:id"],
-        "identifier": _get_value(item, "dcterms:identifier"),
+        "identifier": get_value(item, "dcterms:identifier"),
         "added_date": added_date, # Date when item was added to Omeka
         "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "iiif_manifest": iiif_manifest_url,
         "PDF": primary_url,
         "thumbnail": thumbnail_url, # Added thumbnail field
-        "title": _get_value(item, "dcterms:title"),
-        "author": _join(item, "dcterms:creator"),
+        "title": get_value(item, "dcterms:title"),
+        "author": get_value(item, "dcterms:creator"),
         "newspaper": newspaper_name,
         "country": country, # Added country field
-        "pub_date": _get_value(item, "dcterms:date"),
-        "descriptionAI": _get_value(item, "bibo:shortDescription"),
-        "subject": _join(item, "dcterms:subject"),
-        "spatial": _get_value(item, "dcterms:spatial"),
-        "language": _get_value(item, "dcterms:language"),
+        "pub_date": get_value(item, "dcterms:date"),
+        "descriptionAI": get_value(item, "bibo:shortDescription"),
+        "subject": get_value(item, "dcterms:subject"),
+        "spatial": get_value(item, "dcterms:spatial"),
+        "language": get_value(item, "dcterms:language"),
         "nb_pages": nb_pages_int, # Use converted integer value
         "URL": extracted_fabio_url, # Use the specifically extracted URL
-        "source": _get_value(item, "dcterms:source"),
-        "OCR": _get_value(item, "bibo:content"),
-        # Gemini sentiment analysis
-        "gemini_centralite_islam_musulmans": _get_value(item, "iwac:geminiCentralite"),
-        "gemini_centralite_justification": _get_value(item, "iwac:geminiCentraliteJustification"),
-        "gemini_polarite": _get_value(item, "iwac:geminiPolarite"),
-        "gemini_polarite_justification": _get_value(item, "iwac:geminiPolariteJustification"),
-        "gemini_subjectivite_score": _get_subjectivity_score(item, "iwac:geminiSubjectiviteScore"),
-        "gemini_subjectivite_justification": _get_value(item, "iwac:geminiSubjectiviteJustification"),
-        # ChatGPT sentiment analysis
-        "chatgpt_centralite_islam_musulmans": _get_value(item, "iwac:chatgptCentralite"),
-        "chatgpt_centralite_justification": _get_value(item, "iwac:chatgptCentraliteJustification"),
-        "chatgpt_polarite": _get_value(item, "iwac:chatgptPolarite"),
-        "chatgpt_polarite_justification": _get_value(item, "iwac:chatgptPolariteJustification"),
-        "chatgpt_subjectivite_score": _get_subjectivity_score(item, "iwac:chatgptSubjectiviteScore"),
-        "chatgpt_subjectivite_justification": _get_value(item, "iwac:chatgptSubjectiviteJustification"),
-        # Mistral sentiment analysis
-        "mistral_centralite_islam_musulmans": _get_value(item, "iwac:mistralCentralite"),
-        "mistral_centralite_justification": _get_value(item, "iwac:mistralCentraliteJustification"),
-        "mistral_polarite": _get_value(item, "iwac:mistralPolarite"),
-        "mistral_polarite_justification": _get_value(item, "iwac:mistralPolariteJustification"),
-        "mistral_subjectivite_score": _get_subjectivity_score(item, "iwac:mistralSubjectiviteScore"),
-        "mistral_subjectivite_justification": _get_value(item, "iwac:mistralSubjectiviteJustification"),
+        "source": get_value(item, "dcterms:source"),
+        "OCR": get_value(item, "bibo:content"),
+        **_sentiment_columns(item),
     }
+
+
+# (gemini, chatgpt, mistral) × (centralite, polarite, subjectivite) sentiment
+# fields. Mistral stores ``subjectivite_score`` as a resource:item rather than
+# a numeric @value, so it goes through ``_get_subjectivity_score``.
+_SENTIMENT_MODELS = (
+    ("gemini", "iwac:gemini"),
+    ("chatgpt", "iwac:chatgpt"),
+    ("mistral", "iwac:mistral"),
+)
+
+
+def _sentiment_columns(item: Dict[str, Any]) -> Dict[str, Any]:
+    cols: Dict[str, Any] = {}
+    for prefix, omeka_prefix in _SENTIMENT_MODELS:
+        cols[f"{prefix}_centralite_islam_musulmans"] = get_value(item, f"{omeka_prefix}Centralite")
+        cols[f"{prefix}_centralite_justification"] = get_value(item, f"{omeka_prefix}CentraliteJustification")
+        cols[f"{prefix}_polarite"] = get_value(item, f"{omeka_prefix}Polarite")
+        cols[f"{prefix}_polarite_justification"] = get_value(item, f"{omeka_prefix}PolariteJustification")
+        cols[f"{prefix}_subjectivite_score"] = _get_subjectivity_score(item, f"{omeka_prefix}SubjectiviteScore")
+        cols[f"{prefix}_subjectivite_justification"] = get_value(item, f"{omeka_prefix}SubjectiviteJustification")
+    return cols
 
 
 # ---------------------------------------------------------------------------

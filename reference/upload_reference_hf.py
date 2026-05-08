@@ -54,6 +54,7 @@ from iwac_common.omeka_client import (
     async_retry,
     conn_manager,
 )
+from iwac_common.field_mappers import extract_added_date, get_value
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -167,18 +168,6 @@ def count_words(text: str) -> int:
     return len(words)
 
 
-def _get_value(item: Dict[str, Any], field: str) -> str:
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        parts = [str(v.get("display_title") or v.get("@value") or v.get("@id", "")) for v in val]
-        return "|".join(filter(None, parts))
-    if isinstance(val, dict):
-        return val.get("display_title", "") or val.get("@value", "")
-    return str(val)
-
-
 def _get_iwac_identifier(item: Dict[str, Any], field: str) -> str:
     """Extract identifier values that start with 'iwac-reference'"""
     if field not in item or item[field] is None:
@@ -198,10 +187,6 @@ def _get_iwac_identifier(item: Dict[str, Any], field: str) -> str:
         if identifier.startswith("iwac-reference"):
             return identifier
     return ""
-
-
-def _join(item: Dict[str, Any], field: str) -> str:
-    return _get_value(item, field)
 
 
 def _get_resource_class(item: Dict[str, Any]) -> str:
@@ -254,13 +239,13 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
     # If none of the above, extracted_fabio_url remains ""
 
     # Keep volume as string (can contain multiple values like "1|2")
-    volume_str = _get_value(item, "bibo:volume")
+    volume_str = get_value(item, "bibo:volume")
 
     # Keep issue as string (can contain multiple values like "3|4")
-    issue_str = _get_value(item, "bibo:issue")
+    issue_str = get_value(item, "bibo:issue")
 
     # Convert edition to int
-    edition_str = _get_value(item, "bibo:edition")
+    edition_str = get_value(item, "bibo:edition")
     edition_int = ""
     if edition_str:
         try:
@@ -271,7 +256,7 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
             )
 
     # Convert chapter to int
-    chapter_str = _get_value(item, "bibo:chapter")
+    chapter_str = get_value(item, "bibo:chapter")
     chapter_int = ""
     if chapter_str:
         try:
@@ -282,7 +267,7 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
             )
 
     # Convert nb_pages to int
-    nb_pages_str = _get_value(item, "bibo:numPages")
+    nb_pages_str = get_value(item, "bibo:numPages")
     nb_pages_int = ""
     if nb_pages_str:
         try:
@@ -293,7 +278,7 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
             )
 
     # Convert page start/end to int
-    page_start_str = _get_value(item, "bibo:pageStart")
+    page_start_str = get_value(item, "bibo:pageStart")
     page_start_int = ""
     if page_start_str:
         try:
@@ -303,7 +288,7 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
                 f"Could not convert pageStart '{page_start_str}' to int for item {item['o:id']}. Defaulting to empty."
             )
 
-    page_end_str = _get_value(item, "bibo:pageEnd")
+    page_end_str = get_value(item, "bibo:pageEnd")
     page_end_int = ""
     if page_end_str:
         try:
@@ -313,18 +298,10 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
                 f"Could not convert pageEnd '{page_end_str}' to int for item {item['o:id']}. Defaulting to empty."
             )
 
-    # Extract date when item was added to Omeka (YYYY-MM-DD format)
-    added_date = ""
-    if "o:created" in item and isinstance(item["o:created"], dict):
-        created_value = item["o:created"].get("@value", "")
-        if created_value:
-            try:
-                added_date = created_value.split("T")[0]
-            except Exception:
-                logger.warning(f"Could not parse added date '{created_value}' for item {item['o:id']}")
+    added_date = extract_added_date(item)
 
     # Calculate word count from bibo:content (but don't include content in output)
-    content_text = _get_value(item, "bibo:content")
+    content_text = get_value(item, "bibo:content")
     nb_mots = count_words(content_text)
 
     return {
@@ -333,29 +310,29 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
         "identifier": _get_iwac_identifier(item, "dcterms:identifier"),
         "added_date": added_date,
         "o:resource_class": _get_resource_class(item),
-        "title": _get_value(item, "dcterms:title"),
-        "author": _join(item, "bibo:authorList"),
-        "editor": _join(item, "bibo:editorList"),
-        "review_of": _get_value(item, "bibo:reviewOf"),
-        "publisher": _get_value(item, "dcterms:publisher"),
-        "pub_date": _get_value(item, "dcterms:date"),
-        "type": _get_value(item, "dcterms:type"),
-        "book_title": _get_value(item, "dcterms:alternative"),
+        "title": get_value(item, "dcterms:title"),
+        "author": get_value(item, "bibo:authorList"),
+        "editor": get_value(item, "bibo:editorList"),
+        "review_of": get_value(item, "bibo:reviewOf"),
+        "publisher": get_value(item, "dcterms:publisher"),
+        "pub_date": get_value(item, "dcterms:date"),
+        "type": get_value(item, "dcterms:type"),
+        "book_title": get_value(item, "dcterms:alternative"),
         "chapter": chapter_int,
         "volume": volume_str,
         "issue": issue_str,
-        "abstract": _get_value(item, "dcterms:abstract"),
+        "abstract": get_value(item, "dcterms:abstract"),
         "edition": edition_int,
         "nb_pages": nb_pages_int,
         "page_start": page_start_int,
         "page_end": page_end_int,
-        "extent": _get_value(item, "dcterms:extent"),
-        "is_part_of": _get_value(item, "dcterms:isPartOf"),
-        "provenance": _get_value(item, "dcterms:provenance"),
-        "subject": _join(item, "dcterms:subject"),
-        "spatial": _get_value(item, "dcterms:spatial"),
-        "language": _get_value(item, "dcterms:language"),
-        "doi": _get_value(item, "bibo:doi"),
+        "extent": get_value(item, "dcterms:extent"),
+        "is_part_of": get_value(item, "dcterms:isPartOf"),
+        "provenance": get_value(item, "dcterms:provenance"),
+        "subject": get_value(item, "dcterms:subject"),
+        "spatial": get_value(item, "dcterms:spatial"),
+        "language": get_value(item, "dcterms:language"),
+        "doi": get_value(item, "bibo:doi"),
         "URL": extracted_fabio_url,
         "nb_mots": nb_mots,
         "country": country,

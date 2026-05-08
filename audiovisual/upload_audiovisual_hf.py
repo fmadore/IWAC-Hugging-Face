@@ -44,6 +44,11 @@ from iwac_common.omeka_client import (
     async_retry,
     conn_manager,
 )
+from iwac_common.field_mappers import (
+    extract_added_date,
+    get_media_ids,
+    get_value,
+)
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -69,22 +74,6 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Fonctions d'aide pour mapper les champs Omeka → plat
 # ---------------------------------------------------------------------------
-
-def _get_value(item: Dict[str, Any], field: str) -> str:
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        parts = [str(v.get("display_title") or v.get("@value") or v.get("@id", "")) for v in val]
-        return "|".join(filter(None, parts))
-    if isinstance(val, dict):
-        return val.get("display_title", "") or val.get("@value", "")
-    return str(val)
-
-
-def _join(item: Dict[str, Any], field: str) -> str:
-    return _get_value(item, field)
-
 
 def _get_display_title(item: Dict[str, Any], field: str) -> str:
     """Extract display_title from a field."""
@@ -115,12 +104,6 @@ def _get_at_value(item: Dict[str, Any], field: str) -> str:
         return "|".join(filter(None, values))
     elif isinstance(val, dict) and "@value" in val:
         return str(val["@value"])
-    return ""
-
-
-def _get_media_ids(item: Dict[str, Any]) -> str:
-    if "o:media" in item and isinstance(item["o:media"], list):
-        return "|".join(str(m["o:id"]) for m in item["o:media"])
     return ""
 
 
@@ -165,15 +148,7 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
     publisher = _get_display_title(item, "dcterms:publisher")
     country = "Nigeria"  # Fixed country for all audiovisual documents
 
-    # Extract date when item was added to Omeka (YYYY-MM-DD format)
-    added_date = ""
-    if "o:created" in item and isinstance(item["o:created"], dict):
-        created_value = item["o:created"].get("@value", "")
-        if created_value:
-            try:
-                added_date = created_value.split("T")[0]
-            except Exception:
-                logger.warning(f"Could not parse added date '{created_value}' for item {item['o:id']}")
+    added_date = extract_added_date(item)
 
     # Fetch thumbnail URL and set IIIF manifest URL only if media exists
     session = await conn_manager.get()
@@ -186,27 +161,27 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
 
     return {
         "o:id": item["o:id"],
-        "identifier": _get_value(item, "dcterms:identifier"),
+        "identifier": get_value(item, "dcterms:identifier"),
         "added_date": added_date,
         "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
         "iiif_manifest": iiif_manifest_url,
         "PDF": primary_url,  # Keeping as PDF for consistency, though it might be video/audio
         "thumbnail": thumbnail_url,
-        "title": _get_value(item, "dcterms:title"),
-        "creator": _join(item, "dcterms:creator"),
+        "title": get_value(item, "dcterms:title"),
+        "creator": get_value(item, "dcterms:creator"),
         "publisher": publisher,
         "country": country,
-        "pub_date": _get_value(item, "dcterms:date"),
-        "descriptionAI": _get_value(item, "bibo:shortDescription"),
+        "pub_date": get_value(item, "dcterms:date"),
+        "descriptionAI": get_value(item, "bibo:shortDescription"),
         "volume": _get_at_value(item, "bibo:volume"),
         "issue": _get_at_value(item, "bibo:issue"),
         "is_part_of": _get_at_value(item, "dcterms:isPartOf"),
         "extent": _get_at_value(item, "dcterms:extent"),
         "medium": _get_display_title(item, "dcterms:medium"),
-        "subject": _join(item, "dcterms:subject"),
-        "spatial": _get_value(item, "dcterms:spatial"),
-        "language": _get_value(item, "dcterms:language"),
-        "source": _get_value(item, "dcterms:source"),
+        "subject": get_value(item, "dcterms:subject"),
+        "spatial": get_value(item, "dcterms:spatial"),
+        "language": get_value(item, "dcterms:language"),
+        "source": get_value(item, "dcterms:source"),
     }
 
 
