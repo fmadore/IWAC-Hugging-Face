@@ -44,9 +44,17 @@ from pathlib import Path
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 from datasets import load_dataset
-# Make ``post-processing/_common.py`` importable.
+# Make ``post-processing/_common.py`` and ``_embedding_utils.py`` importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import ensure_hf_token  # noqa: E402
+from _embedding_utils import (  # noqa: E402
+    average_embeddings,
+    chunk_text as _chunk_text_chars,
+    delete_cache,
+    is_empty_embedding,
+    load_cache,
+    save_cache,
+)
 from google import genai
 from google.genai import types
 import pyarrow as pa
@@ -97,88 +105,13 @@ CONFIG_SETTINGS = {
 }
 
 
-# --- Cache helpers ---
-
-def load_cache(cache_file: Path) -> Dict[str, List[float]]:
-    """Load cached embeddings from gzipped JSON. Returns {o_id: embedding}."""
-    if not cache_file.exists():
-        return {}
-    try:
-        with gzip.open(cache_file, "rt", encoding="utf-8") as f:
-            data = json.load(f)
-        logger.info(f"Loaded {len(data)} cached embeddings from {cache_file}")
-        return data
-    except Exception as e:
-        logger.warning(f"Failed to load cache ({e}), starting fresh.")
-        return {}
-
-
-def save_cache(cache: Dict[str, List[float]], cache_file: Path) -> None:
-    """Save embeddings cache to gzipped JSON."""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = cache_file.with_suffix(".tmp.gz")
-    try:
-        with gzip.open(tmp, "wt", encoding="utf-8") as f:
-            json.dump(cache, f)
-        tmp.replace(cache_file)
-    except Exception as e:
-        logger.warning(f"Failed to save cache: {e}")
-        if tmp.exists():
-            tmp.unlink()
-
-
-def delete_cache(cache_file: Path) -> None:
-    """Remove the cache file after a successful push."""
-    try:
-        if cache_file.exists():
-            cache_file.unlink()
-            logger.info("Cache file deleted after successful push.")
-    except Exception as e:
-        logger.warning(f"Failed to delete cache: {e}")
-
-
-def is_empty_embedding(emb: Any) -> bool:
-    """Check whether an embedding value is missing or invalid."""
-    if emb is None:
-        return True
-    if isinstance(emb, list):
-        if len(emb) == 0:
-            return True
-        if all(x == 0.0 for x in emb):
-            return True
-    return False
+# Cache + chunking + averaging helpers live in _embedding_utils. The
+# module-level CHUNK_SIZE / CHUNK_OVERLAP constants are still applied —
+# we wrap chunk_text() so call sites stay parameter-free.
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-    """Split text into overlapping chunks that fit within the Gemini token limit.
-
-    Short texts are returned as a single-element list. Long texts are split at
-    chunk_size boundaries with `overlap` characters of overlap between
-    consecutive chunks to preserve context continuity.
-    """
-    if len(text) <= chunk_size:
-        return [text]
-
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - overlap
-    return chunks
-
-
-def average_embeddings(embeddings: List[List[float]]) -> List[float]:
-    """Average multiple embedding vectors into a single vector (mean pooling)."""
-    if len(embeddings) == 1:
-        return embeddings[0]
-    dim = len(embeddings[0])
-    averaged = [0.0] * dim
-    for emb in embeddings:
-        for j in range(dim):
-            averaged[j] += emb[j]
-    n = len(embeddings)
-    return [v / n for v in averaged]
+    return _chunk_text_chars(text, chunk_size=chunk_size, overlap=overlap)
 
 
 def choose_config() -> str:
