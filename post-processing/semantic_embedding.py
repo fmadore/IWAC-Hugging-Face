@@ -38,12 +38,15 @@ import gzip
 import json
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 from datasets import load_dataset
-from huggingface_hub import get_token, login
+# Make ``post-processing/_common.py`` importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _common import ensure_hf_token  # noqa: E402
 from google import genai
 from google.genai import types
 import pyarrow as pa
@@ -471,18 +474,10 @@ def main():
     console.print("[green]✓[/green] Gemini API key found.")
 
     # Hugging Face token
-    hf_token = os.getenv("HF_TOKEN") or get_token()
-    if not hf_token:
-        console.print("[yellow]ℹ[/yellow] HF token not found. Attempting interactive login...")
-        try:
-            login()
-            hf_token = get_token()
-            if not hf_token:
-                console.print("[red]✗[/red] Interactive login failed. Please set HF_TOKEN.")
-                return
-        except Exception as e:
-            console.print(f"[red]✗[/red] Login error: {e}")
-            return
+    try:
+        hf_token = ensure_hf_token(console=console)
+    except SystemExit:
+        return
     console.print("[green]✓[/green] Hugging Face authenticated.")
 
     # --- Step 2: Initialize Gemini client ---
