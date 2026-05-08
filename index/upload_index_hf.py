@@ -47,6 +47,7 @@ from iwac_common.omeka_client import (
     conn_manager,
 )
 from iwac_common.field_mappers import extract_added_date, get_value
+from iwac_common.hub_merge import merge_with_hub_dataset, resolve_hf_token
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -448,9 +449,7 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
     api = OmekaApiClient(cfg, use_cache=True)
 
     # 1. Charger les datasets de référence pour calculer les statistiques
-    hf_token_env = os.getenv("HF_TOKEN")
-    hf_token_stored = get_token()
-    token_to_use = hf_token_env if hf_token_env else hf_token_stored
+    token_to_use = resolve_hf_token()
     
     articles_df, publications_df, references_df = await load_reference_datasets(token_to_use)
     
@@ -515,44 +514,13 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
         else:
             new_omeka_df.at[idx, 'countries'] = ''
 
-    # 5. Load existing dataset from Hugging Face Hub
-    existing_df = pd.DataFrame()
-    
-    try:
-        logger.info(f"Attempting to load existing index dataset from Hugging Face Hub: {repo}")
-        existing_ds = load_dataset(repo, name="index", split="train", token=token_to_use, download_mode="force_redownload", verification_mode="no_checks")
-        existing_df = existing_ds.to_pandas()
-        
-        if 'o:id' not in existing_df.columns or existing_df['o:id'].isnull().all():
-            logger.warning("'o:id' column missing or all null in existing Hub dataset. Treating as empty.")
-            existing_df = pd.DataFrame() 
-        else:
-            existing_df['o:id'] = existing_df['o:id'].astype(str)
-            logger.info(f"Successfully loaded {len(existing_df)} records from {repo}")
-            
-    except Exception as e:
-        logger.warning(f"Could not load existing dataset from {repo}: {e}. Proceeding as if Hub dataset is empty.")
-        existing_df = pd.DataFrame()
-
-    # 6. Merge logic
-    if existing_df.empty:
-        logger.info("No existing data on Hub; using new Omeka data directly.")
-        final_df = new_omeka_df
-    else:
-        logger.info(f"Merging new Omeka data ({len(new_omeka_df)} records) with existing Hub data ({len(existing_df)} records).")
-        
-        # Identifier les colonnes à préserver
-        extra_cols_to_preserve = [col for col in existing_df.columns if col not in new_omeka_df.columns]
-        
-        if extra_cols_to_preserve:
-            logger.info(f"Preserving these columns from existing dataset: {extra_cols_to_preserve}")
-            cols_from_existing_for_merge = ['o:id'] + extra_cols_to_preserve
-            final_df = pd.merge(new_omeka_df, existing_df[cols_from_existing_for_merge], on='o:id', how='left')
-        else:
-            logger.info("No unique columns to preserve from existing dataset.")
-            final_df = new_omeka_df
-
-        logger.info(f"Merge complete. Resulting dataset has {len(final_df)} records.")
+    # 5-6. Load existing Hub dataset and merge to preserve computed columns.
+    final_df = merge_with_hub_dataset(
+        new_omeka_df,
+        repo,
+        config_name="index",
+        token=token_to_use,
+    )
 
     # 7. Conversion to Dataset and Push
     if not final_df.empty:

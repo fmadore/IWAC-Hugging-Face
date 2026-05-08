@@ -186,9 +186,11 @@ Pure organizational move. No behavior change.
 ## Progress tracker
 
 - [x] Roadmap written
-- [ ] **Tier 1a** — `iwac_common/omeka_client.py` extracted, all 6 scripts migrated ← *in progress*
-- [ ] Tier 1b — field-mapping helpers
-- [ ] Tier 1c — HF Hub merge helper
-- [ ] Tier 2 — post-processing common module
+- [x] **Tier 1a** — `iwac_common/omeka_client.py` extracted, all 6 scripts migrated (−602 lines net)
+- [x] **Tier 1b** — `iwac_common/field_mappers.py` extracted, all 6 scripts migrated (−79 lines net)
+- [x] **Tier 1c** — `iwac_common/hub_merge.py` extracted, all 6 scripts migrated, reference's outer-merge preserved via parameters (−81 lines net)
+- [ ] Tier 2 — post-processing common module ← *next*
 - [ ] Tier 2b — semantic_embedding split
 - [ ] Tier 3 — small fixes (country_mapper, requirements pin, __init__ re-exports, cache dir audit)
+
+**Tier 1 cumulative:** 6 upload scripts shed 1,267 lines (621 → 393, 477 → 273, 571 → 343, 655 → 432, 759 → 568, 713 → 520). 505 lines added across 3 shared modules. Net **−762 lines** with no behavioral regressions.

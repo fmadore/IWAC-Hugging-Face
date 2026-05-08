@@ -61,6 +61,7 @@ from iwac_common.field_mappers import (
     get_value,
     to_int_or_none,
 )
+from iwac_common.hub_merge import merge_with_hub_dataset, resolve_hf_token
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -332,55 +333,16 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
         return
     new_omeka_df['o:id'] = new_omeka_df['o:id'].astype(str)
 
-    # 2. Load existing dataset from Hugging Face Hub
-    console.print("\n[bold cyan]Step 2:[/bold cyan] Loading existing dataset from Hub...")
-    existing_df = pd.DataFrame()
-    hf_token_env = os.getenv("HF_TOKEN")
-    hf_token_stored = get_token()
-    token_to_use = hf_token_env if hf_token_env else hf_token_stored
-
-    try:
-        with console.status("[bold green]Loading existing dataset from Hub...", spinner="dots"):
-            existing_ds = load_dataset(repo, name="publications", split="train", token=token_to_use, download_mode="force_redownload", verification_mode="no_checks")
-            existing_df = existing_ds.to_pandas()
-        
-        if 'o:id' not in existing_df.columns or existing_df['o:id'].isnull().all():
-            console.print("[yellow]⚠[/yellow] 'o:id' column missing or all null in existing Hub dataset. Treating as empty.")
-            existing_df = pd.DataFrame() 
-        else:
-            existing_df['o:id'] = existing_df['o:id'].astype(str)
-            console.print(f"[green]✓[/green] Loaded {len(existing_df)} records from {repo}")
-            
-    except Exception as e:
-        console.print(f"[yellow]⚠[/yellow] Could not load existing dataset (may be first run): {e}")
-        existing_df = pd.DataFrame()
-
-    # 3. Merge logic
-    console.print("\n[bold cyan]Step 3:[/bold cyan] Merging datasets...")
-    if existing_df.empty:
-        console.print("[yellow]ℹ[/yellow] No existing data on Hub; using new Omeka data directly.")
-        final_df = new_omeka_df.copy()
-    else:
-        console.print(f"[blue]→[/blue] Merging new Omeka data ({len(new_omeka_df)} records) with existing Hub data ({len(existing_df)} records).")
-        
-        # Identify columns in existing_df that are NOT in new_omeka_df
-        extra_cols_to_preserve = [col for col in existing_df.columns if col not in new_omeka_df.columns]
-        
-        if extra_cols_to_preserve:
-            console.print(f"[green]✓[/green] Preserving columns: {', '.join(extra_cols_to_preserve)}")
-            cols_from_existing_for_merge = ['o:id'] + extra_cols_to_preserve
-            final_df = pd.merge(new_omeka_df, existing_df[cols_from_existing_for_merge], on='o:id', how='left')
-        else:
-            console.print("[yellow]ℹ[/yellow] No unique columns to preserve from existing dataset.")
-            final_df = new_omeka_df.copy()
-
-        console.print(f"[green]✓[/green] Merge complete: {len(final_df)} records, {len(final_df.columns)} columns")
-        if extra_cols_to_preserve:
-            for col_name in extra_cols_to_preserve:
-                if col_name in final_df.columns:
-                    nan_count = final_df[col_name].isnull().sum()
-                    if nan_count > 0:
-                        console.print(f"[yellow]ℹ[/yellow] Column '{col_name}' has {nan_count} null values (new items needing processing)")
+    # 2-3. Load existing Hub dataset and merge to preserve computed columns.
+    console.print("\n[bold cyan]Steps 2-3:[/bold cyan] Loading and merging with existing Hub dataset...")
+    token_to_use = resolve_hf_token()
+    final_df = merge_with_hub_dataset(
+        new_omeka_df,
+        repo,
+        config_name="publications",
+        token=token_to_use,
+        console=console,
+    )
 
     # 4. Conversion to Dataset and Push
     console.print("\n[bold cyan]Step 4:[/bold cyan] Preparing and pushing to Hub...")
