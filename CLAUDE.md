@@ -15,9 +15,9 @@ Dataset subsets:
 - `references` — Academic references
 - `index` — Index entries
 
-## Always use the `iwac-dataset` skill
+## Always use the `iwac-data` skill
 
-Before writing or modifying any script that reads, transforms, or pushes the HF dataset (anything in `articles/`, `audiovisual/`, `document/`, `index/`, `islamic-publications/`, `reference/`, or `post-processing/`), invoke the **`iwac-dataset` skill**. It is the single source of truth for:
+Before writing or modifying any script that reads, transforms, or pushes the HF dataset (anything in `articles/`, `audiovisual/`, `document/`, `index/`, `islamic-publications/`, `reference/`, or `post-processing/`), invoke the **`iwac-data` skill**. It is the single source of truth for:
 
 - **Per-subset schemas** verified against the live HF dataset card — exact field names, types, and which embedding column belongs to which subset (`embedding_OCR` for `articles`, `embedding_tableOfContents` for `publications`).
 - **Conventions** — pipe separator for multi-values, ISO dates, `lda_topic_id == -1` outliers, country canonicalization (raw `Benin` vs display `Bénin`), `articles.lda_topic_id` is `float64` (not int).
@@ -25,9 +25,9 @@ Before writing or modifying any script that reads, transforms, or pushes the HF 
 - **Authority join** — `articles.subject` strings match `index.Titre` exactly (controlled vocabulary). Use this rather than substring matching on `subject`.
 - **Place geocoding** — `index.Coordonnées` (`"lat, lng"` string) for `Lieux` entities.
 - **Omeka resource templates ↔ classes** — most importantly that **`articles` and `publications` both use template 8** and are split only by RDF class (36 `bibo:Article` vs 60 `bibo:Issue`). Several upload scripts hinge on this.
-- **The full reference-type → class table** (8 reference types, including `Article de revue` → 35 `bibo:AcademicArticle`, `Compte rendu` → 178 `fabio:BookReview`, `Entrée encyclopédique` → 197 `fabio:ReferenceEntry`, etc.).
+- **The full reference-type → class table** (the `references` subset = **9 classes**: `Article de revue` 35, `Chapitre` 43, `Thèse` 88, `Livre` 40, `Rapport` 82, `Compte rendu` 178, `Ouvrage collectif` 52, `Communication` 77, `Article de blog` 305). Note: `Entrée encyclopédique` (197) has 0 items and is **not** fetched.
 
-The skill's `references/data-pipeline.md` documents the end-to-end Omeka → HF flow that this very repo implements; keep it in sync if the pipeline changes (resource class IDs, new computed columns, new upload scripts).
+The skill's `references/omeka-to-hf-mapping.md` documents the end-to-end Omeka → HF flow that this very repo implements; keep it in sync if the pipeline changes (resource class IDs, new computed columns, new upload scripts).
 
 ## Architecture
 
