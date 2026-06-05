@@ -34,6 +34,7 @@ Dependencies
 """
 
 import os
+import sys
 import argparse
 import logging
 from typing import List
@@ -42,8 +43,11 @@ import unicodedata
 
 import datasets
 from datasets import Dataset
-from huggingface_hub import login, get_token
 import spacy
+
+# Make ``post-processing/_common.py`` importable.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "post-processing"))
+from _common import ensure_hf_token  # noqa: E402
 
 # Rich console imports for beautiful output
 from rich.console import Console
@@ -179,10 +183,7 @@ def main():
     # ------------------------------------------------------------------
     # Authenticate with the Hub
     # ------------------------------------------------------------------
-    if os.getenv("HF_TOKEN") is None and get_token() is None:
-        login()
-
-    token = os.getenv("HF_TOKEN") or get_token()
+    token = ensure_hf_token(console=console)
 
     # ------------------------------------------------------------------
     # Load dataset from the Hub

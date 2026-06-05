@@ -30,13 +30,17 @@ import argparse
 import logging
 import os
 import re
+import sys
 import uuid
 from collections import Counter
 from typing import List, Dict, Any, Optional
 
 from datasets import load_dataset
-from huggingface_hub import get_token, login, dataset_info
 import textstat
+
+# Make ``post-processing/_common.py`` importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _common import choose_config, ensure_hf_token, get_available_configs  # noqa: E402
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -112,46 +116,6 @@ def calculate_readability(text: str) -> Optional[float]:
         return textstat.flesch_reading_ease(text)
     except Exception:
         return None
-
-
-def get_available_configs(repo_id: str, token: str) -> List[str]:
-    """Retrieve the list of available configurations for a dataset."""
-    try:
-        info = dataset_info(repo_id, token=token)
-        if hasattr(info, 'config_names') and info.config_names:
-            return info.config_names
-        else:
-            return ['articles', 'publications', 'documents']
-    except Exception:
-        return ['articles', 'publications', 'documents']
-
-
-def choose_config(available_configs: List[str]) -> str:
-    """Prompt the user to choose a configuration."""
-    if len(available_configs) == 1:
-        console.print(f"[yellow]ℹ[/yellow] Single configuration available: [cyan]{available_configs[0]}[/cyan]")
-        return available_configs[0]
-
-    table = Table(title="Available Configurations", box=box.ROUNDED)
-    table.add_column("#", style="cyan", justify="center")
-    table.add_column("Configuration", style="green")
-
-    for i, config in enumerate(available_configs, 1):
-        table.add_row(str(i), config)
-
-    console.print(table)
-
-    while True:
-        try:
-            choice = IntPrompt.ask(
-                "Choose a configuration",
-                choices=[str(i) for i in range(1, len(available_configs) + 1)],
-                show_choices=False
-            )
-            return available_configs[choice - 1]
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Operation cancelled.[/yellow]")
-            raise SystemExit(0)
 
 
 def choose_update_mode() -> str:
@@ -355,26 +319,15 @@ def main():
 
     # --- Authentication ---
     console.print("\n[bold cyan]Step 1:[/bold cyan] Authenticating with Hugging Face Hub...")
-    token = os.getenv("HF_TOKEN") or get_token()
-    if not token:
-        console.print("[yellow]ℹ[/yellow] HF token not found. Attempting interactive login...")
-        try:
-            login()
-            token = get_token()
-            if not token:
-                console.print("[red]✗[/red] Interactive login failed. Please set HF_TOKEN or login manually.")
-                return
-        except Exception as e:
-            console.print(f"[red]✗[/red] Login error: {e}")
-            return
+    token = ensure_hf_token(console=console)
     console.print("[green]✓[/green] Authenticated successfully.")
 
     # --- Configuration selection ---
     console.print("\n[bold cyan]Step 2:[/bold cyan] Selecting configuration...")
     with console.status("[bold green]Fetching available configurations...", spinner="dots"):
-        available_configs = get_available_configs(repo_id, token)
+        available_configs = get_available_configs(repo_id, token=token)
 
-    config_name_choice = choose_config(available_configs)
+    config_name_choice = choose_config(available_configs, console=console)
     console.print(f"[green]✓[/green] Selected configuration: [cyan]{config_name_choice}[/cyan]")
 
     # --- Update mode selection ---

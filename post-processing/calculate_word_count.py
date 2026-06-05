@@ -48,7 +48,6 @@ import aiohttp
 import pandas as pd
 from datasets import load_dataset, Dataset
 from dotenv import load_dotenv
-from huggingface_hub import get_token, login
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -56,6 +55,10 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.logging import RichHandler
 from rich import box
 from rich.prompt import Prompt, Confirm
+
+# Make ``post-processing/_common.py`` importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _common import ensure_hf_token  # noqa: E402
 
 load_dotenv()
 
@@ -340,15 +343,7 @@ def main() -> None:
     text_column_fixed = None if is_references else "OCR"
 
     # --- Authentification avec le Hub ---
-    with console.status("[bold blue]Authentification Hugging Face...", spinner="dots"):
-        token = os.getenv("HF_TOKEN") or get_token()
-        if not token:
-            console.print("[yellow]ℹ[/yellow] Token Hugging Face non trouvé. Tentative de connexion interactive.")
-            login()
-            token = get_token()
-            if not token:
-                console.print("[red]✗[/red] Échec de la connexion au Hugging Face Hub.")
-                return
+    token = ensure_hf_token(console=console)
     console.print("[green]✓[/green] Authentification Hugging Face réussie")
 
     # --- For references, check Omeka API credentials ---

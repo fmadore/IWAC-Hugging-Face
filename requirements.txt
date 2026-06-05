@@ -1,15 +1,17 @@
-aiohttp
+# Major-version caps protect against silent breaks on upgrades.
+# Lower bounds intentionally absent to keep existing installs working.
+aiohttp<4
 aiofiles
-python-dotenv
-rich
-tqdm
-pandas
+python-dotenv<2
+rich<14
+tqdm<5
+pandas<3
 pyarrow
-datasets
-huggingface_hub[hf_xet]
-spacy
+datasets<5
+huggingface_hub[hf_xet]<1
+spacy<4
 textstat
 google-genai
 # Topic modeling (LDA)
-gensim
+gensim<5
 numpy<2.4

@@ -25,19 +25,13 @@ Variables d'environnement
 import os
 import sys
 import json
-import io
-import gzip
-import hashlib
 import asyncio
 import logging
 import re
 import time
 import pandas as pd
 import aiohttp
-import aiofiles
-from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import Dict, Any, List, Optional, Union, Type
+from typing import Dict, Any, List, Optional, Union
 
 # Add parent directory to path to import from root
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -53,6 +47,15 @@ from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich.logging import RichHandler
 from rich import box
+
+from iwac_common.omeka_client import (
+    Config,
+    OmekaApiClient as _BaseOmekaApiClient,
+    async_retry,
+    conn_manager,
+)
+from iwac_common.field_mappers import extract_added_date, get_value
+from iwac_common.hub_merge import merge_with_hub_dataset, resolve_hf_token
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -75,15 +78,11 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-@dataclass
-class Config:
-    """Paramètres globaux chargés depuis .env ou variables d'environnement"""
 
-    API_URL: str = os.getenv("OMEKA_BASE_URL", "https://islam.zmo.de/api")
-    API_KEY_IDENTITY: str = os.getenv("OMEKA_KEY_IDENTITY", "")
-    API_KEY_CREDENTIAL: str = os.getenv("OMEKA_KEY_CREDENTIAL", "")
-    CACHE_DIR: str = ".cache_omk_references"
-    CACHE_HOURS: int = 24
+# Config, Cache, ConnectionManager, async_retry and OmekaApiClient now live
+# in iwac_common.omeka_client. We subclass OmekaApiClient below to preserve
+# the resource-type label in the per-class success message and to add the
+# ``fetch_all_reference_items`` helper.
 
 
 # Reference resource classes
@@ -114,147 +113,20 @@ COUNTRY_ITEM_SETS = {
 
 
 # ---------------------------------------------------------------------------
-# Cache disque (JSON Gzip) pour économiser l'API
+# Reference-specific Omeka API client
 # ---------------------------------------------------------------------------
 
-class Cache:
-    def __init__(self, directory: str, hours: int = 24):
-        self.dir = directory
-        self.duration = timedelta(hours=hours)
-        os.makedirs(directory, exist_ok=True)
 
-    def _path(self, key: str) -> str:
-        name = hashlib.md5(key.encode()).hexdigest() + ".json.gz"
-        return os.path.join(self.dir, name)
-
-    async def get(self, key: str) -> Optional[Any]:
-        path = self._path(key)
-        if not os.path.exists(path):
-            return None
-        mtime = datetime.fromtimestamp(os.path.getmtime(path))
-        if datetime.now() - mtime > self.duration:
-            return None
-        async with aiofiles.open(path, "rb") as f:
-            data = await f.read()
-        with gzip.open(io.BytesIO(data), "rt", encoding="utf-8") as gz:
-            return json.load(gz)
-
-    async def set(self, key: str, value: Any):
-        path = self._path(key)
-        buf = io.BytesIO()
-        with gzip.open(buf, "wt", encoding="utf-8") as gz:
-            json.dump(value, gz)
-        async with aiofiles.open(path, "wb") as f:
-            await f.write(buf.getvalue())
-
-
-# ---------------------------------------------------------------------------
-# Gestion de la connexion HTTP
-# ---------------------------------------------------------------------------
-
-class ConnectionManager:
-    def __init__(self):
-        self._session: Optional[aiohttp.ClientSession] = None
-
-    async def get(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(limit=20, ssl=False),
-                timeout=aiohttp.ClientTimeout(total=30),
-            )
-        return self._session
-
-    async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-
-conn_manager = ConnectionManager()
-
-
-# ---------------------------------------------------------------------------
-# Decorateur retry asynchrone simple
-# ---------------------------------------------------------------------------
-
-def async_retry(max_tries: int = 5, exceptions: Union[Type[Exception], tuple] = (aiohttp.ClientError, asyncio.TimeoutError)):
-    def decorator(func):
-        async def wrapper(*args, **kwargs):
-            for attempt in range(max_tries):
-                try:
-                    return await func(*args, **kwargs)
-                except exceptions as e:
-                    if attempt == max_tries - 1:
-                        raise
-                    await asyncio.sleep(2 ** attempt)
-            raise
-
-        return wrapper
-
-    return decorator
-
-
-# ---------------------------------------------------------------------------
-# Client API Omeka minimum viable
-# ---------------------------------------------------------------------------
-
-class OmekaApiClient:
-    def __init__(self, cfg: Config, use_cache: bool = True):
-        self.cfg = cfg
-        self.cache = Cache(cfg.CACHE_DIR, cfg.CACHE_HOURS) if use_cache else None
-
-    @async_retry()
-    async def _get(self, endpoint: str, params: Dict[str, Any]) -> Any:
-        params.update(
-            {
-                "key_identity": self.cfg.API_KEY_IDENTITY,
-                "key_credential": self.cfg.API_KEY_CREDENTIAL,
-            }
-        )
-        url = f"{self.cfg.API_URL}/{endpoint}"
-        sess = await conn_manager.get()
-        async with sess.get(url, params=params) as resp:
-            resp.raise_for_status()
-            return await resp.json()
-
-    async def request(self, endpoint: str, params: Dict[str, Any]):
-        key = f"{endpoint}:{json.dumps(params, sort_keys=True)}"
-        if self.cache:
-            cached = await self.cache.get(key)
-            if cached is not None:
-                return cached
-        data = await self._get(endpoint, params)
-        if self.cache:
-            await self.cache.set(key, data)
-        return data
-
-    async def fetch_items_page(self, rcid: int, page: int, per: int = 100):
-        return await self.request("items", {"resource_class_id": rcid, "page": page, "per_page": per})
+class OmekaApiClient(_BaseOmekaApiClient):
+    """Reference subset client: appends the resource-type label after the
+    generic per-class confirmation, and adds ``fetch_all_reference_items``.
+    """
 
     async def fetch_items(self, rcid: int) -> List[Dict[str, Any]]:
-        first = await self.fetch_items_page(rcid, 1)
-        items = list(first)
-        per = 100
-        if len(first) == per:
-            page = 2
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]Fetching pages..."),
-                BarColumn(),
-                TaskProgressColumn(),
-                TimeElapsedColumn(),
-                console=console,
-            ) as progress:
-                task = progress.add_task(f"[cyan]Fetching pages for class {rcid}", total=None)
-                while True:
-                    batch = await self.fetch_items_page(rcid, page)
-                    if not batch:
-                        break
-                    items.extend(batch)
-                    progress.update(task, advance=1, description=f"[cyan]Class {rcid} - Page {page} fetched")
-                    if len(batch) < per:
-                        break
-                    page += 1
-        console.print(f"[green]✓[/green] {len(items)} items retrieved for class {rcid} ({RESOURCE_CLASS_MAPPING.get(rcid, 'Unknown')})")
+        items = await super().fetch_items(rcid)
+        self.console.print(
+            f"[green]✓[/green] (reference type: {RESOURCE_CLASS_MAPPING.get(rcid, 'Unknown')})"
+        )
         return items
 
     async def fetch_all_reference_items(self) -> List[Dict[str, Any]]:
@@ -297,18 +169,6 @@ def count_words(text: str) -> int:
     return len(words)
 
 
-def _get_value(item: Dict[str, Any], field: str) -> str:
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        parts = [str(v.get("display_title") or v.get("@value") or v.get("@id", "")) for v in val]
-        return "|".join(filter(None, parts))
-    if isinstance(val, dict):
-        return val.get("display_title", "") or val.get("@value", "")
-    return str(val)
-
-
 def _get_iwac_identifier(item: Dict[str, Any], field: str) -> str:
     """Extract identifier values that start with 'iwac-reference'"""
     if field not in item or item[field] is None:
@@ -328,10 +188,6 @@ def _get_iwac_identifier(item: Dict[str, Any], field: str) -> str:
         if identifier.startswith("iwac-reference"):
             return identifier
     return ""
-
-
-def _join(item: Dict[str, Any], field: str) -> str:
-    return _get_value(item, field)
 
 
 def _get_resource_class(item: Dict[str, Any]) -> str:
@@ -384,13 +240,13 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
     # If none of the above, extracted_fabio_url remains ""
 
     # Keep volume as string (can contain multiple values like "1|2")
-    volume_str = _get_value(item, "bibo:volume")
+    volume_str = get_value(item, "bibo:volume")
 
     # Keep issue as string (can contain multiple values like "3|4")
-    issue_str = _get_value(item, "bibo:issue")
+    issue_str = get_value(item, "bibo:issue")
 
     # Convert edition to int
-    edition_str = _get_value(item, "bibo:edition")
+    edition_str = get_value(item, "bibo:edition")
     edition_int = ""
     if edition_str:
         try:
@@ -401,7 +257,7 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
             )
 
     # Convert chapter to int
-    chapter_str = _get_value(item, "bibo:chapter")
+    chapter_str = get_value(item, "bibo:chapter")
     chapter_int = ""
     if chapter_str:
         try:
@@ -412,7 +268,7 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
             )
 
     # Convert nb_pages to int
-    nb_pages_str = _get_value(item, "bibo:numPages")
+    nb_pages_str = get_value(item, "bibo:numPages")
     nb_pages_int = ""
     if nb_pages_str:
         try:
@@ -423,7 +279,7 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
             )
 
     # Convert page start/end to int
-    page_start_str = _get_value(item, "bibo:pageStart")
+    page_start_str = get_value(item, "bibo:pageStart")
     page_start_int = ""
     if page_start_str:
         try:
@@ -433,7 +289,7 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
                 f"Could not convert pageStart '{page_start_str}' to int for item {item['o:id']}. Defaulting to empty."
             )
 
-    page_end_str = _get_value(item, "bibo:pageEnd")
+    page_end_str = get_value(item, "bibo:pageEnd")
     page_end_int = ""
     if page_end_str:
         try:
@@ -443,18 +299,10 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
                 f"Could not convert pageEnd '{page_end_str}' to int for item {item['o:id']}. Defaulting to empty."
             )
 
-    # Extract date when item was added to Omeka (YYYY-MM-DD format)
-    added_date = ""
-    if "o:created" in item and isinstance(item["o:created"], dict):
-        created_value = item["o:created"].get("@value", "")
-        if created_value:
-            try:
-                added_date = created_value.split("T")[0]
-            except Exception:
-                logger.warning(f"Could not parse added date '{created_value}' for item {item['o:id']}")
+    added_date = extract_added_date(item)
 
     # Calculate word count from bibo:content (but don't include content in output)
-    content_text = _get_value(item, "bibo:content")
+    content_text = get_value(item, "bibo:content")
     nb_mots = count_words(content_text)
 
     return {
@@ -463,29 +311,29 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
         "identifier": _get_iwac_identifier(item, "dcterms:identifier"),
         "added_date": added_date,
         "o:resource_class": _get_resource_class(item),
-        "title": _get_value(item, "dcterms:title"),
-        "author": _join(item, "bibo:authorList"),
-        "editor": _join(item, "bibo:editorList"),
-        "review_of": _get_value(item, "bibo:reviewOf"),
-        "publisher": _get_value(item, "dcterms:publisher"),
-        "pub_date": _get_value(item, "dcterms:date"),
-        "type": _get_value(item, "dcterms:type"),
-        "book_title": _get_value(item, "dcterms:alternative"),
+        "title": get_value(item, "dcterms:title"),
+        "author": get_value(item, "bibo:authorList"),
+        "editor": get_value(item, "bibo:editorList"),
+        "review_of": get_value(item, "bibo:reviewOf"),
+        "publisher": get_value(item, "dcterms:publisher"),
+        "pub_date": get_value(item, "dcterms:date"),
+        "type": get_value(item, "dcterms:type"),
+        "book_title": get_value(item, "dcterms:alternative"),
         "chapter": chapter_int,
         "volume": volume_str,
         "issue": issue_str,
-        "abstract": _get_value(item, "dcterms:abstract"),
+        "abstract": get_value(item, "dcterms:abstract"),
         "edition": edition_int,
         "nb_pages": nb_pages_int,
         "page_start": page_start_int,
         "page_end": page_end_int,
-        "extent": _get_value(item, "dcterms:extent"),
-        "is_part_of": _get_value(item, "dcterms:isPartOf"),
-        "provenance": _get_value(item, "dcterms:provenance"),
-        "subject": _join(item, "dcterms:subject"),
-        "spatial": _get_value(item, "dcterms:spatial"),
-        "language": _get_value(item, "dcterms:language"),
-        "doi": _get_value(item, "bibo:doi"),
+        "extent": get_value(item, "dcterms:extent"),
+        "is_part_of": get_value(item, "dcterms:isPartOf"),
+        "provenance": get_value(item, "dcterms:provenance"),
+        "subject": get_value(item, "dcterms:subject"),
+        "spatial": get_value(item, "dcterms:spatial"),
+        "language": get_value(item, "dcterms:language"),
+        "doi": get_value(item, "bibo:doi"),
         "URL": extracted_fabio_url,
         "nb_mots": nb_mots,
         "country": country,
@@ -527,7 +375,7 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB", use_ca
     # Display configuration panel
     display_config_panel(cfg, repo, shard_size, use_cache)
     
-    api = OmekaApiClient(cfg, use_cache=use_cache)
+    api = OmekaApiClient(cfg, use_cache=use_cache, console=console)
 
     # 1. Fetch current Omeka items and map them
     console.print("\n[bold cyan]Step 1:[/bold cyan] Fetching reference items from Omeka API...")
@@ -569,63 +417,22 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB", use_ca
         return
     new_omeka_df['o:id'] = new_omeka_df['o:id'].astype(str) # Ensure consistent type for merging
 
-    # 2. Load existing dataset from Hugging Face Hub
-    console.print("\n[bold cyan]Step 2:[/bold cyan] Loading existing dataset from Hub...")
-    existing_df = pd.DataFrame()
-    hf_token_env = os.getenv("HF_TOKEN")
-    hf_token_stored = get_token()
-    token_to_use = hf_token_env if hf_token_env else hf_token_stored
-
-    try:
-        with console.status("[bold green]Loading existing dataset from Hub...", spinner="dots"):
-            existing_ds = load_dataset(repo, name="references", split="train", token=token_to_use, download_mode="force_redownload", verification_mode="no_checks")
-            existing_df = existing_ds.to_pandas()
-        
-        if 'o:id' not in existing_df.columns or existing_df['o:id'].isnull().all():
-            console.print("[yellow]⚠[/yellow] 'o:id' column missing or all null in existing Hub dataset. Treating as empty.")
-            existing_df = pd.DataFrame()
-        else:
-            existing_df['o:id'] = existing_df['o:id'].astype(str)
-            console.print(f"[green]✓[/green] Loaded {len(existing_df)} records from {repo}")
-            
-    except Exception as e:
-        console.print(f"[yellow]⚠[/yellow] Could not load existing dataset (may be first run): {e}")
-        existing_df = pd.DataFrame() # Ensure it's an empty DataFrame on error
-
-    # 3. Merge logic
-    console.print("\n[bold cyan]Step 3:[/bold cyan] Merging datasets...")
-    if existing_df.empty:
-        console.print("[yellow]ℹ[/yellow] No existing data on Hub; using new Omeka data directly.")
-        final_df = new_omeka_df
-    else:
-        console.print(f"[blue]→[/blue] Merging new Omeka data ({len(new_omeka_df)} records) with existing Hub data ({len(existing_df)} records).")
-        
-        # Define columns to exclude from existing data (old columns we want to remove)
-        columns_to_exclude = ['o:item_set', 'o:media/file', 'iiif_manifest', 'thumbnail']
-        
-        # Identify columns in existing_df that are NOT in new_omeka_df and NOT in the exclusion list
-        extra_cols_to_preserve = [col for col in existing_df.columns 
-                                 if col not in new_omeka_df.columns and col not in columns_to_exclude]
-        
-        if extra_cols_to_preserve:
-            console.print(f"[green]✓[/green] Preserving columns: {', '.join(extra_cols_to_preserve)}")
-            # Use outer merge to keep all records and preserve extra columns (excluding unwanted ones)
-            final_df = pd.merge(new_omeka_df, existing_df[['o:id'] + extra_cols_to_preserve], on='o:id', how='outer', suffixes=('', '_old'))
-            # Fill NaN values in new columns with data from existing columns where available
-            final_df = final_df.ffill(axis=1).bfill(axis=1)
-        else:
-            console.print("[yellow]ℹ[/yellow] No unique columns to preserve from existing dataset.")
-            final_df = new_omeka_df
-            
-        console.print(f"[dim]Excluded columns: {', '.join(columns_to_exclude)}[/dim]")
-        console.print(f"[green]✓[/green] Merge complete: {len(final_df)} records, {len(final_df.columns)} columns")
-        
-        if extra_cols_to_preserve:
-            for col_name in extra_cols_to_preserve:
-                if col_name in final_df.columns:
-                    nan_count = final_df[col_name].isnull().sum()
-                    if nan_count > 0:
-                        console.print(f"[yellow]ℹ[/yellow] Column '{col_name}' has {nan_count} null values (new items needing processing)")
+    # 2-3. Load existing Hub dataset and merge to preserve computed columns.
+    # Reference uses an outer merge with explicit suffixes, drops a few legacy
+    # columns, and runs an axis=1 ffill/bfill — encoded via shared helper params.
+    console.print("\n[bold cyan]Steps 2-3:[/bold cyan] Loading and merging with existing Hub dataset...")
+    token_to_use = resolve_hf_token()
+    final_df = merge_with_hub_dataset(
+        new_omeka_df,
+        repo,
+        config_name="references",
+        token=token_to_use,
+        how="outer",
+        suffixes=("", "_old"),
+        columns_to_exclude=("o:item_set", "o:media/file", "iiif_manifest", "thumbnail"),
+        fill_after_merge=True,
+        console=console,
+    )
 
     # 4. Conversion to Dataset and Push
     console.print("\n[bold cyan]Step 4:[/bold cyan] Preparing and pushing to Hub...")
@@ -710,4 +517,4 @@ if __name__ == "__main__":
     parser.add_argument("--no-cache", action="store_true", help="Disable API cache (force fresh fetch from Omeka)")
     args = parser.parse_args()
 
-    asyncio.run(build_and_push(Config(), repo=args.repo, shard_size=args.max_shard_size, use_cache=not args.no_cache))
+    asyncio.run(build_and_push(Config(CACHE_DIR=".cache_omk_references"), repo=args.repo, shard_size=args.max_shard_size, use_cache=not args.no_cache))

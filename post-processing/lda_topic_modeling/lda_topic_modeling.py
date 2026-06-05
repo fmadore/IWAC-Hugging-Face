@@ -24,7 +24,6 @@ from pathlib import Path
 
 import numpy as np
 from datasets import load_dataset
-from huggingface_hub import get_token, login
 from rich import box
 from rich.console import Console
 from rich.logging import RichHandler
@@ -39,6 +38,7 @@ PARENT_DIR = CURRENT_DIR.parent
 if str(PARENT_DIR) not in sys.path:
     sys.path.insert(0, str(PARENT_DIR))
 
+from _common import choose_config, ensure_hf_token, get_available_configs  # type: ignore  # noqa: E402
 from topic_modeling.patches import apply_all_patches  # type: ignore
 
 from lda_topic_modeling.constants import (  # type: ignore
@@ -86,42 +86,6 @@ def configure_logging() -> None:
         datefmt="[%X]",
         handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)],
     )
-
-
-def get_available_configs(repo_id: str, token: str) -> list[str]:
-    try:
-        from huggingface_hub import dataset_info
-
-        info = dataset_info(repo_id, token=token)
-        if hasattr(info, "config_names") and info.config_names:
-            return list(info.config_names)
-        return ["articles", "publications"]
-    except Exception:
-        return ["articles", "publications"]
-
-
-def choose_config(available: list[str]) -> str:
-    if len(available) == 1:
-        console.print(f"[green]\u2713[/green] Single config: [cyan]{available[0]}[/cyan]")
-        return available[0]
-
-    table = Table(title="Available configurations", box=box.ROUNDED)
-    table.add_column("#", style="cyan", justify="center")
-    table.add_column("Configuration", style="green")
-    for i, cfg in enumerate(available, 1):
-        table.add_row(str(i), cfg)
-    console.print(table)
-
-    while True:
-        try:
-            choice = IntPrompt.ask(
-                "[yellow]\u2192[/yellow] Choose a configuration",
-                choices=[str(i) for i in range(1, len(available) + 1)],
-                show_choices=False,
-            )
-            return available[choice - 1]
-        except KeyboardInterrupt:
-            raise SystemExit(0)
 
 
 def choose_mode() -> str:
@@ -196,25 +160,16 @@ def main() -> None:
     model_dir = Path(args.model_path)
 
     # ── Auth ────────────────────────────────────────────────────────
-    token = os.getenv("HF_TOKEN") or get_token()
-    if not token:
-        logger.info("HF token not found. Trying interactive login.")
-        try:
-            login()
-            token = get_token()
-            if not token:
-                logger.error("Login failed.")
-                return
-        except Exception as e:
-            logger.error(f"Login error: {e}")
-            return
+    token = ensure_hf_token(console=console)
 
     # ── Config ──────────────────────────────────────────────────────
     if args.config:
         config_name = args.config
     else:
-        available_configs = get_available_configs(repo_id, token)
-        config_name = choose_config(available_configs)
+        available_configs = get_available_configs(
+            repo_id, token=token, fallback=["articles", "publications"]
+        )
+        config_name = choose_config(available_configs, console=console)
     logger.info(f"Config: '{config_name}'")
 
     if args.mode:
