@@ -24,7 +24,7 @@ Before writing or modifying any script that reads, transforms, or pushes the HF 
 - **AI sentiment shape** — the three-model `gemini_*` / `chatgpt_*` / `mistral_*` six-field block, polarité / centralité / subjectivité scales. There is **no** DistilCamemBERT `sentiment_label` / `sentiment_score` — older docs that mention those are wrong.
 - **Authority join** — `articles.subject` strings match `index.Titre` exactly (controlled vocabulary). Use this rather than substring matching on `subject`.
 - **Place geocoding** — `index.Coordonnées` (`"lat, lng"` string) for `Lieux` entities.
-- **Omeka resource templates ↔ classes** — most importantly that **`articles` and `publications` both use template 8** and are split only by RDF class (36 `bibo:Article` vs 60 `bibo:Issue`). Several upload scripts hinge on this.
+- **Omeka resource templates ↔ classes** — each content subset has its own template now (`articles` = 8, `documents` = 22, `publications` = 21), but subsets are split by **RDF class, not template** (36 `bibo:Article` vs 60 `bibo:Issue` vs 49 `bibo:Document`) — the bibliographic `references` classes still share templates. Every upload script dispatches on `resource_class_id`.
 - **The full reference-type → class table** (the `references` subset = **9 classes**: `Article de revue` 35, `Chapitre` 43, `Thèse` 88, `Livre` 40, `Rapport` 82, `Compte rendu` 178, `Ouvrage collectif` 52, `Communication` 77, `Article de blog` 305). Note: `Entrée encyclopédique` (197) has 0 items and is **not** fetched.
 
 The skill's `references/omeka-to-hf-mapping.md` documents the end-to-end Omeka → HF flow that this very repo implements; keep it in sync if the pipeline changes (resource class IDs, new computed columns, new upload scripts).
