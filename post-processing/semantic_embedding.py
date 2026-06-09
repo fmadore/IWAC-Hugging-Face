@@ -4,7 +4,7 @@ semantic_embedding.py
 =====================
 
 Adds semantic embedding columns to Hugging Face dataset subsets using Google's
-gemini-embedding-2-preview model via the Gemini API for high-quality
+gemini-embedding-2 model via the Gemini API for high-quality
 multilingual embeddings.
 
 Supported configurations:
@@ -87,7 +87,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Constants ---
-MODEL_NAME = "gemini-embedding-2-preview"
+MODEL_NAME = "gemini-embedding-2"
 # Rough estimate: ~3.5 chars/token for French → 8192 tokens ≈ 28K chars
 CHUNK_SIZE = 28_000
 CHUNK_OVERLAP = 2_000
