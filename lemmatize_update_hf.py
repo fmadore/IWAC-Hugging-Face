@@ -10,8 +10,16 @@ stop‑words removed) and pushes the updated dataset back to the repository.
 
 Usage
 -----
+    # Articles (default subset)
+    python lemmatize_update_hf.py --config articles
+
+    # Publications (periodical issues) — same OCR text column as articles
+    python lemmatize_update_hf.py --config publications
+
+    # Full form
     python lemmatize_update_hf.py \
         --repo fmadore/islam-west-africa-collection \
+        --config articles \
         --text-column OCR \
         --lemma-column lemma_text \
         --clean-column lemma_nostop \
@@ -84,6 +92,8 @@ MAP_LIG = str.maketrans({"œ": "oe", "Œ": "OE", "æ": "ae", "Æ": "AE"})
 
 
 def normalize(text: str) -> str:
+    if not text:  # None or empty string (e.g. blank OCR rows) → nothing to lemmatise
+        return ""
     text = unicodedata.normalize("NFC", text)
     for old, new in QUOTE_REPLACEMENTS:
         text = text.replace(old, new)
@@ -173,9 +183,10 @@ def main():
 
     parser = argparse.ArgumentParser(description="Add lemmatised columns to a Hugging Face dataset")
     parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="Dataset repo on the Hugging Face Hub (e.g. fmadore/islam-west-africa-collection)")
+    parser.add_argument("--config", default="articles", help="Dataset subset/config to process (e.g. 'articles', 'publications'). Both lemmatise the OCR text column.")
     parser.add_argument("--text-column", default="OCR", help="Name of the column containing the raw French text to process")
     parser.add_argument("--lemma-column", default="lemma_text", help="Column name for the lemmatised text")
-    parser.add_argument("--clean-column", default="lemma_nostop", help="Column name for the lemmatised text with stop‑words removed")
+    parser.add_argument("--clean-column", default="lemma_nostop", help="Column name for the lemmatised text with stop-words removed")
     parser.add_argument("--spacy-model", default="fr_core_news_lg", help="spaCy model to use for French lemmatisation (use fr_core_news_lg for CPU)")
     parser.add_argument("--max-shard-size", default="1GB", help="Maximum Parquet shard size when pushing to the Hub")
     args = parser.parse_args()
@@ -190,15 +201,16 @@ def main():
     # ------------------------------------------------------------------
     console.print(Panel(
         f"[bold]Repository:[/bold] {args.repo}\n"
+        f"[bold]Subset:[/bold] {args.config}\n"
         f"[bold]Text column:[/bold] {args.text_column}\n"
         f"[bold]spaCy model:[/bold] {args.spacy_model}",
         title="[bold blue]Lemmatization Configuration[/bold blue]",
         border_style="blue"
     ))
-    
+
     with console.status("[bold green]Loading dataset from Hugging Face Hub...", spinner="dots"):
-        ds: Dataset = datasets.load_dataset(args.repo, name="articles", split="train", token=token)
-    console.print(f"[green]✓[/green] Loaded {len(ds):,} articles from '{args.repo}'")
+        ds: Dataset = datasets.load_dataset(args.repo, name=args.config, split="train", token=token)
+    console.print(f"[green]✓[/green] Loaded {len(ds):,} rows from '{args.repo}' (subset: {args.config})")
 
     if args.text_column not in ds.column_names:
         console.print(f"[red]✗[/red] Column '{args.text_column}' not found in the dataset.")
@@ -217,16 +229,24 @@ def main():
     if process_choice == "empty":
         if args.lemma_column not in ds.column_names:
             console.print(
-                f"[yellow]⚠[/yellow] Lemma column '{args.lemma_column}' not found. Processing all articles instead."
+                f"[yellow]⚠[/yellow] Lemma column '{args.lemma_column}' not found. Processing all rows instead."
             )
         else:
-            with console.status("[bold green]Filtering dataset...", spinner="dots"):
-                original_row_count = len(ds)
-                ds = ds.filter(lambda example: not example[args.lemma_column] or example[args.lemma_column].strip() == "")
-                filtered_row_count = len(ds)
-            console.print(f"[blue]→[/blue] Selected [bold]{filtered_row_count:,}[/bold] articles out of {original_row_count:,} for processing.")
-            if filtered_row_count == 0:
-                console.print(f"[green]✓[/green] No articles found with an empty '{args.lemma_column}'. Nothing to do.")
+            # Count rows needing work WITHOUT shrinking ``ds``. The full subset
+            # must be pushed back intact — filtering ``ds`` here and pushing the
+            # result would overwrite the whole config with only the processed
+            # rows. ``lemmatise_batch`` already preserves existing lemmas and
+            # only recomputes empty ones when process_choice == "empty".
+            with console.status("[bold green]Counting rows to process...", spinner="dots"):
+                empty_count = sum(
+                    1 for v in ds[args.lemma_column] if not v or not v.strip()
+                )
+            console.print(
+                f"[blue]→[/blue] [bold]{empty_count:,}[/bold] of {len(ds):,} rows have an empty "
+                f"'{args.lemma_column}' and will be processed."
+            )
+            if empty_count == 0:
+                console.print(f"[green]✓[/green] No rows found with an empty '{args.lemma_column}'. Nothing to do.")
                 return
 
     # ------------------------------------------------------------------
@@ -234,7 +254,11 @@ def main():
     # ------------------------------------------------------------------
     with console.status(f"[bold green]Loading spaCy model '{args.spacy_model}'...", spinner="dots"):
         nlp = load_spacy_model(args.spacy_model)
-    console.print(f"[green]✓[/green] Loaded spaCy model '{args.spacy_model}'")
+    # Publication issues are full periodicals and can exceed spaCy's default
+    # 1,000,000-char limit (largest OCR ≈ 1.1M chars). Parser/NER/textcat are
+    # disabled, so raising the cap stays memory-safe.
+    nlp.max_length = max(nlp.max_length, 2_000_000)
+    console.print(f"[green]✓[/green] Loaded spaCy model '{args.spacy_model}' (max_length={nlp.max_length:,})")
 
     # ------------------------------------------------------------------
     # Map lemmatisation over the dataset
@@ -257,14 +281,14 @@ def main():
     # ------------------------------------------------------------------
     # Push updated dataset to the Hub
     # ------------------------------------------------------------------
-    console.print(f"[blue]→[/blue] Pushing updated dataset back to {args.repo}…")
+    console.print(f"[blue]→[/blue] Pushing updated dataset back to {args.repo} (subset: {args.config})…")
     with console.status("[bold green]Uploading to Hugging Face Hub...", spinner="dots"):
         ds.push_to_hub(
             args.repo,
-            config_name="articles",
+            config_name=args.config,
             token=token,
             max_shard_size=args.max_shard_size,
-            commit_message=f"Add/update columns '{args.lemma_column}' and '{args.clean_column}' (French lemmatisation, mode: {process_choice})",
+            commit_message=f"Add/update columns '{args.lemma_column}' and '{args.clean_column}' for {args.config} (French lemmatisation, mode: {process_choice})",
         )
 
     # Summary table
@@ -272,7 +296,8 @@ def main():
     table.add_column("Property", style="cyan")
     table.add_column("Value", style="green")
     table.add_row("Repository", args.repo)
-    table.add_row("Articles processed", f"{len(ds):,}")
+    table.add_row("Subset", args.config)
+    table.add_row("Rows in subset", f"{len(ds):,}")
     table.add_row("Lemma column", args.lemma_column)
     table.add_row("Clean column", args.clean_column)
     table.add_row("Mode", process_choice)
