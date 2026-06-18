@@ -178,18 +178,46 @@ def lemmatise_batch(
     return {lemma_col: final_lemmas, clean_col: final_clean}
 
 
+# Subsets that carry an OCR text column worth lemmatising. Passing --config
+# with another subset still works; this list only drives the interactive menu.
+LEMMATIZABLE_SUBSETS = ["articles", "publications"]
+
+
+def choose_subset() -> str:
+    """Prompt the user to pick which dataset subset to lemmatise."""
+    console.print("\n[bold]Dataset subset:[/bold]")
+    table = Table(box=box.SIMPLE)
+    table.add_column("#", style="cyan", justify="center")
+    table.add_column("Subset", style="green")
+    table.add_column("Text column", style="white")
+    for i, name in enumerate(LEMMATIZABLE_SUBSETS, 1):
+        table.add_row(str(i), name, "OCR")
+    console.print(table)
+    choice = Prompt.ask(
+        "Choose subset",
+        choices=[str(i) for i in range(1, len(LEMMATIZABLE_SUBSETS) + 1)],
+        default="1",
+    )
+    return LEMMATIZABLE_SUBSETS[int(choice) - 1]
+
+
 def main():
     configure_logging()
 
     parser = argparse.ArgumentParser(description="Add lemmatised columns to a Hugging Face dataset")
     parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="Dataset repo on the Hugging Face Hub (e.g. fmadore/islam-west-africa-collection)")
-    parser.add_argument("--config", default="articles", help="Dataset subset/config to process (e.g. 'articles', 'publications'). Both lemmatise the OCR text column.")
+    parser.add_argument("--config", default=None, help="Dataset subset/config to lemmatise (e.g. 'articles', 'publications'). If omitted, you are prompted to choose. Any subset that has the --text-column is accepted.")
     parser.add_argument("--text-column", default="OCR", help="Name of the column containing the raw French text to process")
     parser.add_argument("--lemma-column", default="lemma_text", help="Column name for the lemmatised text")
     parser.add_argument("--clean-column", default="lemma_nostop", help="Column name for the lemmatised text with stop-words removed")
     parser.add_argument("--spacy-model", default="fr_core_news_lg", help="spaCy model to use for French lemmatisation (use fr_core_news_lg for CPU)")
     parser.add_argument("--max-shard-size", default="1GB", help="Maximum Parquet shard size when pushing to the Hub")
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Resolve which subset to process (interactive menu if --config omitted)
+    # ------------------------------------------------------------------
+    config_name = args.config or choose_subset()
 
     # ------------------------------------------------------------------
     # Authenticate with the Hub
@@ -201,7 +229,7 @@ def main():
     # ------------------------------------------------------------------
     console.print(Panel(
         f"[bold]Repository:[/bold] {args.repo}\n"
-        f"[bold]Subset:[/bold] {args.config}\n"
+        f"[bold]Subset:[/bold] {config_name}\n"
         f"[bold]Text column:[/bold] {args.text_column}\n"
         f"[bold]spaCy model:[/bold] {args.spacy_model}",
         title="[bold blue]Lemmatization Configuration[/bold blue]",
@@ -209,8 +237,8 @@ def main():
     ))
 
     with console.status("[bold green]Loading dataset from Hugging Face Hub...", spinner="dots"):
-        ds: Dataset = datasets.load_dataset(args.repo, name=args.config, split="train", token=token)
-    console.print(f"[green]✓[/green] Loaded {len(ds):,} rows from '{args.repo}' (subset: {args.config})")
+        ds: Dataset = datasets.load_dataset(args.repo, name=config_name, split="train", token=token)
+    console.print(f"[green]✓[/green] Loaded {len(ds):,} rows from '{args.repo}' (subset: {config_name})")
 
     if args.text_column not in ds.column_names:
         console.print(f"[red]✗[/red] Column '{args.text_column}' not found in the dataset.")
@@ -281,14 +309,14 @@ def main():
     # ------------------------------------------------------------------
     # Push updated dataset to the Hub
     # ------------------------------------------------------------------
-    console.print(f"[blue]→[/blue] Pushing updated dataset back to {args.repo} (subset: {args.config})…")
+    console.print(f"[blue]→[/blue] Pushing updated dataset back to {args.repo} (subset: {config_name})…")
     with console.status("[bold green]Uploading to Hugging Face Hub...", spinner="dots"):
         ds.push_to_hub(
             args.repo,
-            config_name=args.config,
+            config_name=config_name,
             token=token,
             max_shard_size=args.max_shard_size,
-            commit_message=f"Add/update columns '{args.lemma_column}' and '{args.clean_column}' for {args.config} (French lemmatisation, mode: {process_choice})",
+            commit_message=f"Add/update columns '{args.lemma_column}' and '{args.clean_column}' for {config_name} (French lemmatisation, mode: {process_choice})",
         )
 
     # Summary table
@@ -296,7 +324,7 @@ def main():
     table.add_column("Property", style="cyan")
     table.add_column("Value", style="green")
     table.add_row("Repository", args.repo)
-    table.add_row("Subset", args.config)
+    table.add_row("Subset", config_name)
     table.add_row("Rows in subset", f"{len(ds):,}")
     table.add_row("Lemma column", args.lemma_column)
     table.add_row("Clean column", args.clean_column)
