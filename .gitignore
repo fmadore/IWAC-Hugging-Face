@@ -7,6 +7,7 @@
 .cache_omk_references
 .cache_word_count
 .cache_embeddings
+.cache_lemmas
 __pycache__
 data/iwac_articles.csv
 data/iwac_audiovisual.csv

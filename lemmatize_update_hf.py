@@ -45,6 +45,7 @@ import os
 import sys
 import argparse
 import logging
+from pathlib import Path
 from typing import List
 import re
 import unicodedata
@@ -53,9 +54,10 @@ import datasets
 from datasets import Dataset
 import spacy
 
-# Make ``post-processing/_common.py`` importable.
+# Make ``post-processing/_common.py`` and ``_embedding_utils.py`` importable.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "post-processing"))
 from _common import ensure_hf_token  # noqa: E402
+from _embedding_utils import load_cache, save_cache, delete_cache  # noqa: E402
 
 # Rich console imports for beautiful output
 from rich.console import Console
@@ -90,6 +92,17 @@ QUOTE_REPLACEMENTS = [
 ]
 MAP_LIG = str.maketrans({"œ": "oe", "Œ": "OE", "æ": "ae", "Æ": "AE"})
 
+# Cap the characters handed to spaCy in a single call. A full periodical issue
+# (publications) can top 1M chars; tagging it whole-hog blows up tok2vec memory
+# on CPU, so long OCR is split into chunks of this size first.
+SPACY_MAX_CHUNK_CHARS = 100_000
+
+# Crash-resumable cache: freshly computed lemmas are checkpointed here (keyed
+# by o:id) every CHECKPOINT_EVERY rows, reloaded on restart, and deleted after
+# a successful push. Gitignored, like the other .cache_* dirs.
+CACHE_DIR = Path(__file__).resolve().parent / ".cache_lemmas"
+CHECKPOINT_EVERY = 100
+
 
 def normalize(text: str) -> str:
     if not text:  # None or empty string (e.g. blank OCR rows) → nothing to lemmatise
@@ -114,68 +127,125 @@ def load_spacy_model(name: str):
         return spacy.load(name, disable=["parser", "ner", "textcat"])
 
 
-def lemmatise_batch(
-    batch: dict,
+def chunk_on_whitespace(text: str, max_chars: int) -> List[str]:
+    """Split ``text`` into <= ``max_chars`` pieces, breaking at whitespace."""
+    if len(text) <= max_chars:
+        return [text]
+    chunks: List[str] = []
+    start, n = 0, len(text)
+    while start < n:
+        end = min(start + max_chars, n)
+        if end < n:
+            ws = text.rfind(" ", start, end)
+            if ws > start:
+                end = ws
+        chunks.append(text[start:end])
+        start = end
+    return chunks
+
+
+def lemmatise_one(nlp, text: str) -> List[str]:
+    """Lemmatise one already-normalized text, chunking long text to bound memory.
+
+    A full periodical issue can top 1M chars; feeding that to spaCy in one go
+    builds a huge tok2vec tensor and OOMs on CPU. Splitting into
+    SPACY_MAX_CHUNK_CHARS pieces keeps each call small. Parser/NER are
+    disabled, so chunk boundaries do not change the per-token lemmas.
+    """
+    if not text:
+        return []
+    tokens: List[str] = []
+    for chunk in chunk_on_whitespace(text, SPACY_MAX_CHUNK_CHARS):
+        doc = nlp(chunk)
+        tokens.extend(tok.lemma_.lower() for tok in doc if tok.is_alpha)
+    return tokens
+
+
+def lemmatise_dataset(
+    ds,
     nlp,
+    *,
     text_col: str,
     lemma_col: str,
     clean_col: str,
-    process_choice: str,  # Added process_choice
-) -> dict:
-    """Apply lemmatisation and stop‑word removal to one batch of examples."""
+    process_choice: str,
+    cache_file: Path,
+):
+    """Add lemma columns to ``ds``, checkpointing to ``cache_file`` for resume.
 
-    texts_in_batch: List[str] = batch[text_col]
-    num_items_in_batch = len(texts_in_batch)
+    Returns the updated dataset, or ``None`` when there is nothing to do.
 
-    # Initialize final lists to hold results for the entire batch
-    final_lemmas: List[str] = [""] * num_items_in_batch
-    final_clean: List[str] = [""] * num_items_in_batch
+    Resilience: each freshly lemmatised row is written to an on-disk cache
+    (keyed by ``o:id``) and flushed every CHECKPOINT_EVERY rows, so a crash
+    loses at most that many rows. On restart, cached rows are reused and only
+    the remainder is recomputed. Rows that already have a non-empty lemma are
+    kept as-is in "empty" mode; blank-text rows get empty lemmas.
+    """
+    n = len(ds)
+    row_ids = [str(x) for x in ds["o:id"]]
+    texts = ds[text_col]
+    existing_lemmas = ds[lemma_col] if lemma_col in ds.column_names else [None] * n
+    existing_clean = ds[clean_col] if clean_col in ds.column_names else [None] * n
 
-    indices_to_process = []
-    content_to_process = []
+    cache = load_cache(cache_file)
 
-    # Determine which items in the batch need processing
-    if process_choice == "empty" and lemma_col in batch:
-        for i in range(num_items_in_batch):
-            # Check if existing lemma is present and not just whitespace
-            if batch[lemma_col][i] and batch[lemma_col][i].strip():
-                final_lemmas[i] = batch[lemma_col][i]
-                # If lemma exists, clean version should also exist from a previous run
-                if clean_col in batch and i < len(batch[clean_col]):
-                    final_clean[i] = batch[clean_col][i]
-                else:
-                    # This case (lemma exists, clean does not) implies inconsistency
-                    # or clean_col is new. For safety, it will remain "" or be generated
-                    # if we decide to regenerate clean if missing.
-                    # For now, it will be "" if not in batch[clean_col]
-                    pass # final_clean[i] remains "" as initialized
-            else:
-                indices_to_process.append(i)
-                content_to_process.append(texts_in_batch[i])
-    else:  # Process all items if 'all' or if lemma_col doesn't exist yet
-        indices_to_process = list(range(num_items_in_batch))
-        content_to_process = texts_in_batch
+    final_lemmas: List[str] = [""] * n
+    final_clean: List[str] = [""] * n
+    indices_to_process: List[int] = []
+    for i in range(n):
+        cached = cache.get(row_ids[i])
+        if cached is not None:
+            final_lemmas[i], final_clean[i] = cached[0], cached[1]
+            continue
+        if process_choice == "empty" and existing_lemmas[i] and existing_lemmas[i].strip():
+            final_lemmas[i] = existing_lemmas[i]
+            final_clean[i] = existing_clean[i] or ""
+            continue
+        if not texts[i] or not str(texts[i]).strip():
+            continue  # blank text -> empty lemmas (already "")
+        indices_to_process.append(i)
 
-    # Perform lemmatisation only on the content that needs it
-    if content_to_process:
-        # Normalize text before spaCy processing
-        normalized_content_to_process = [normalize(text) for text in content_to_process]
+    if not indices_to_process and not cache:
+        return None  # nothing new to compute and nothing cached to flush
 
-        processed_lemmas_for_subset = []
-        processed_clean_for_subset = []
-        for doc in nlp.pipe(normalized_content_to_process, batch_size=32, n_process=1): # Use normalized content
-            lemma_tokens = [tok.lemma_.lower() for tok in doc if tok.is_alpha]
-            processed_lemmas_for_subset.append(" ".join(lemma_tokens))
+    console.print(
+        f"[blue]→[/blue] [bold]{len(indices_to_process):,}[/bold] of {n:,} rows to lemmatise"
+        + (f" ([green]{len(cache):,}[/green] restored from cache)" if cache else "")
+    )
 
-            nostop_tokens = [tok for tok in lemma_tokens if tok not in nlp.Defaults.stop_words]
-            processed_clean_for_subset.append(" ".join(nostop_tokens))
-        
-        # Populate the final lists with the newly processed data at correct original indices
-        for idx_in_subset, original_batch_idx in enumerate(indices_to_process):
-            final_lemmas[original_batch_idx] = processed_lemmas_for_subset[idx_in_subset]
-            final_clean[original_batch_idx] = processed_clean_for_subset[idx_in_subset]
+    stop_words = nlp.Defaults.stop_words
+    since_ckpt = 0
+    if indices_to_process:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("[cyan]lemmatising", total=len(indices_to_process))
+            for i in indices_to_process:
+                tokens = lemmatise_one(nlp, normalize(texts[i]))
+                lemma_text = " ".join(tokens)
+                clean_text = " ".join(t for t in tokens if t not in stop_words)
+                final_lemmas[i] = lemma_text
+                final_clean[i] = clean_text
+                cache[row_ids[i]] = [lemma_text, clean_text]
+                since_ckpt += 1
+                progress.update(task, advance=1)
+                if since_ckpt >= CHECKPOINT_EVERY:
+                    save_cache(cache, cache_file)
+                    since_ckpt = 0
+        if since_ckpt > 0:
+            save_cache(cache, cache_file)
 
-    return {lemma_col: final_lemmas, clean_col: final_clean}
+    for col in (lemma_col, clean_col):
+        if col in ds.column_names:
+            ds = ds.remove_columns([col])
+    ds = ds.add_column(lemma_col, final_lemmas)
+    ds = ds.add_column(clean_col, final_clean)
+    return ds
 
 
 # Subsets that carry an OCR text column worth lemmatising. Passing --config
@@ -254,70 +324,61 @@ def main():
         default="empty"
     )
 
-    if process_choice == "empty":
-        if args.lemma_column not in ds.column_names:
-            console.print(
-                f"[yellow]⚠[/yellow] Lemma column '{args.lemma_column}' not found. Processing all rows instead."
-            )
-        else:
-            # Count rows needing work WITHOUT shrinking ``ds``. The full subset
-            # must be pushed back intact — filtering ``ds`` here and pushing the
-            # result would overwrite the whole config with only the processed
-            # rows. ``lemmatise_batch`` already preserves existing lemmas and
-            # only recomputes empty ones when process_choice == "empty".
-            with console.status("[bold green]Counting rows to process...", spinner="dots"):
-                empty_count = sum(
-                    1 for v in ds[args.lemma_column] if not v or not v.strip()
-                )
-            console.print(
-                f"[blue]→[/blue] [bold]{empty_count:,}[/bold] of {len(ds):,} rows have an empty "
-                f"'{args.lemma_column}' and will be processed."
-            )
-            if empty_count == 0:
-                console.print(f"[green]✓[/green] No rows found with an empty '{args.lemma_column}'. Nothing to do.")
-                return
-
     # ------------------------------------------------------------------
     # Load the spaCy model once
     # ------------------------------------------------------------------
     with console.status(f"[bold green]Loading spaCy model '{args.spacy_model}'...", spinner="dots"):
         nlp = load_spacy_model(args.spacy_model)
-    # Publication issues are full periodicals and can exceed spaCy's default
-    # 1,000,000-char limit (largest OCR ≈ 1.1M chars). Parser/NER/textcat are
-    # disabled, so raising the cap stays memory-safe.
-    nlp.max_length = max(nlp.max_length, 2_000_000)
-    console.print(f"[green]✓[/green] Loaded spaCy model '{args.spacy_model}' (max_length={nlp.max_length:,})")
+    # Long OCR is chunked to SPACY_MAX_CHUNK_CHARS before tagging (see
+    # lemmatise_one), keeping each spaCy call well under the default 1M-char
+    # limit, so nlp.max_length does not need raising.
+    console.print(f"[green]✓[/green] Loaded spaCy model '{args.spacy_model}'")
 
     # ------------------------------------------------------------------
-    # Map lemmatisation over the dataset
+    # Lemmatise — crash-resumable: checkpoints to .cache_lemmas, resumes on
+    # restart, and the cache is deleted only after a successful push.
     # ------------------------------------------------------------------
+    cache_file = CACHE_DIR / f"{config_name}.json.gz"
     console.print(f"[blue]→[/blue] Applying lemmatisation – this can take a while…")
-    ds = ds.map(
-        lemmatise_batch,
-        batched=True,
-        batch_size=1000,  # Reverted to larger batch size for full processing
-        fn_kwargs={
-            "nlp": nlp,
-            "text_col": args.text_column,
-            "lemma_col": args.lemma_column,
-            "clean_col": args.clean_column,
-            "process_choice": process_choice,  # Pass process_choice to the map function
-        },
-        desc="lemmatising",
+    result = lemmatise_dataset(
+        ds,
+        nlp,
+        text_col=args.text_column,
+        lemma_col=args.lemma_column,
+        clean_col=args.clean_column,
+        process_choice=process_choice,
+        cache_file=cache_file,
     )
+    if result is None:
+        console.print("[green]✓[/green] No rows needed lemmatising. Nothing to do.")
+        return
+    ds = result
 
     # ------------------------------------------------------------------
     # Push updated dataset to the Hub
     # ------------------------------------------------------------------
     console.print(f"[blue]→[/blue] Pushing updated dataset back to {args.repo} (subset: {config_name})…")
-    with console.status("[bold green]Uploading to Hugging Face Hub...", spinner="dots"):
-        ds.push_to_hub(
-            args.repo,
-            config_name=config_name,
-            token=token,
-            max_shard_size=args.max_shard_size,
-            commit_message=f"Add/update columns '{args.lemma_column}' and '{args.clean_column}' for {config_name} (French lemmatisation, mode: {process_choice})",
-        )
+    try:
+        with console.status("[bold green]Uploading to Hugging Face Hub...", spinner="dots"):
+            ds.push_to_hub(
+                args.repo,
+                config_name=config_name,
+                token=token,
+                max_shard_size=args.max_shard_size,
+                commit_message=f"Add/update columns '{args.lemma_column}' and '{args.clean_column}' for {config_name} (French lemmatisation, mode: {process_choice})",
+            )
+    except Exception as e:  # noqa: BLE001
+        console.print(Panel(
+            f"[bold red]Push failed:[/bold red] {e}\n\n"
+            f"[yellow]Computed lemmas remain cached in {cache_file}.[/yellow]\n"
+            f"Re-run the script to resume from the cache without re-lemmatising.",
+            title="[red]Error[/red]", border_style="red",
+        ))
+        logging.getLogger(__name__).error("Push error", exc_info=True)
+        return
+
+    # The cache only exists for resume; the push succeeded, so drop it.
+    delete_cache(cache_file)
 
     # Summary table
     table = Table(title="Lemmatization Complete", box=box.ROUNDED)
