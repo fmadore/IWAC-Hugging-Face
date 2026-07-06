@@ -24,17 +24,15 @@ Variables d'environnement
 
 import os
 import sys
-import json
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional
 from collections import defaultdict, Counter
 
 # Add parent directory to path for iwac_common import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
-import aiohttp
 from tqdm import tqdm
 from dotenv import load_dotenv
 from datasets import Dataset, load_dataset
@@ -43,8 +41,8 @@ import huggingface_hub
 from iwac_common.omeka_client import (
     Config,
     OmekaApiClient,
-    async_retry,
     conn_manager,
+    fetch_iiif_thumbnail_url,
 )
 from iwac_common.field_mappers import extract_added_date, get_value
 from iwac_common.hub_merge import merge_with_hub_dataset, resolve_hf_token
@@ -170,34 +168,6 @@ def _get_item_set_ids(item: Dict[str, Any]) -> str:
     return ""
 
 
-@async_retry(max_tries=3, exceptions=(aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError))
-async def fetch_iiif_thumbnail_url(omeka_id: Union[str, int], session: aiohttp.ClientSession) -> str:
-    """Fetches and extracts the thumbnail URL from an IIIF manifest."""
-    manifest_url = f"https://islam.zmo.de/iiif/3/{omeka_id}/manifest"
-    thumbnail_url = ""
-    try:
-        async with session.get(manifest_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 200:
-                try:
-                    manifest = await resp.json()
-                    thumbnails = manifest.get("thumbnail")
-                    if isinstance(thumbnails, list) and thumbnails:
-                        thumbnail_info = thumbnails[0]
-                        if isinstance(thumbnail_info, dict):
-                            thumbnail_url = thumbnail_info.get("id", "")
-                except json.JSONDecodeError as e_json:
-                    logger.warning(f"JSON decoding error for IIIF manifest {omeka_id}: {e_json}")
-            elif resp.status not in [408, 429, 500, 502, 503, 504]:
-                logger.warning(f"IIIF manifest request for {omeka_id} returned status {resp.status}")
-    except asyncio.TimeoutError:
-        logger.warning(f"Timeout fetching IIIF manifest for {omeka_id}")
-    except aiohttp.ClientError as e_client:
-        logger.warning(f"Client error fetching IIIF manifest for {omeka_id}: {e_client}")
-    except Exception as e_general:
-        logger.error(f"Unexpected error fetching IIIF manifest for {omeka_id}: {e_general}")
-    return thumbnail_url
-
-
 async def map_index_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item d'index Omeka en dict plat pour HF datasets."""
     
@@ -243,6 +213,28 @@ def extract_terms_from_field(field_value: str) -> List[str]:
     return [term.strip() for term in str(field_value).split("|") if term.strip()]
 
 
+def _accumulate_term_stats(
+    term_stats: Dict[str, Dict[str, Any]],
+    row: pd.Series,
+    fields: List[str],
+) -> None:
+    """Met à jour fréquence / première-dernière occurrence / pays pour tous les
+    termes (séparés par |) des colonnes ``fields`` d'une ligne."""
+    date_str = row.get('pub_date', '') or row.get('date', '')
+    country = row.get('country', '')
+    for field in fields:
+        for term in extract_terms_from_field(row.get(field, '')):
+            stats = term_stats[term]
+            stats['frequency'] += 1
+            if country:
+                stats['countries'].add(country)
+            if date_str:
+                if not stats['first_occurrence'] or date_str < stats['first_occurrence']:
+                    stats['first_occurrence'] = date_str
+                if not stats['last_occurrence'] or date_str > stats['last_occurrence']:
+                    stats['last_occurrence'] = date_str
+
+
 def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.DataFrame, references_df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
     """Calcule les statistiques de fréquence pour tous les termes des colonnes subject, spatial et author des datasets articles et publications,
     ainsi que les colonnes author, editor et publisher du dataset references"""
@@ -252,148 +244,19 @@ def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.Dat
         'last_occurrence': None,
         'countries': set()
     })
-    
-    # Traiter les articles
-    logger.info("Calculating frequency stats from articles dataset...")
-    if not articles_df.empty:
-        for _, row in tqdm(articles_df.iterrows(), total=len(articles_df), desc="Processing articles"):
-            # Extraire la date
-            date_str = row.get('pub_date', '') or row.get('date', '')
-            country = row.get('country', '')
-            
-            # Traiter les sujets
-            subjects = extract_terms_from_field(row.get('subject', ''))
-            for subject in subjects:
-                if subject:
-                    term_stats[subject]['frequency'] += 1
-                    if country:
-                        term_stats[subject]['countries'].add(country)
-                    if date_str:
-                        if not term_stats[subject]['first_occurrence'] or date_str < term_stats[subject]['first_occurrence']:
-                            term_stats[subject]['first_occurrence'] = date_str
-                        if not term_stats[subject]['last_occurrence'] or date_str > term_stats[subject]['last_occurrence']:
-                            term_stats[subject]['last_occurrence'] = date_str
-            
-            # Traiter les données spatiales
-            spatials = extract_terms_from_field(row.get('spatial', ''))
-            for spatial in spatials:
-                if spatial:
-                    term_stats[spatial]['frequency'] += 1
-                    if country:
-                        term_stats[spatial]['countries'].add(country)
-                    if date_str:
-                        if not term_stats[spatial]['first_occurrence'] or date_str < term_stats[spatial]['first_occurrence']:
-                            term_stats[spatial]['first_occurrence'] = date_str
-                        if not term_stats[spatial]['last_occurrence'] or date_str > term_stats[spatial]['last_occurrence']:
-                            term_stats[spatial]['last_occurrence'] = date_str
-            
-            # Traiter les auteurs
-            authors = extract_terms_from_field(row.get('author', ''))
-            for author in authors:
-                if author:
-                    term_stats[author]['frequency'] += 1
-                    if country:
-                        term_stats[author]['countries'].add(country)
-                    if date_str:
-                        if not term_stats[author]['first_occurrence'] or date_str < term_stats[author]['first_occurrence']:
-                            term_stats[author]['first_occurrence'] = date_str
-                        if not term_stats[author]['last_occurrence'] or date_str > term_stats[author]['last_occurrence']:
-                            term_stats[author]['last_occurrence'] = date_str
-    
-    # Traiter les publications
-    logger.info("Calculating frequency stats from publications dataset...")
-    if not publications_df.empty:
-        for _, row in tqdm(publications_df.iterrows(), total=len(publications_df), desc="Processing publications"):
-            # Extraire la date
-            date_str = row.get('pub_date', '') or row.get('date', '')
-            country = row.get('country', '')
-            
-            # Traiter les sujets
-            subjects = extract_terms_from_field(row.get('subject', ''))
-            for subject in subjects:
-                if subject:
-                    term_stats[subject]['frequency'] += 1
-                    if country:
-                        term_stats[subject]['countries'].add(country)
-                    if date_str:
-                        if not term_stats[subject]['first_occurrence'] or date_str < term_stats[subject]['first_occurrence']:
-                            term_stats[subject]['first_occurrence'] = date_str
-                        if not term_stats[subject]['last_occurrence'] or date_str > term_stats[subject]['last_occurrence']:
-                            term_stats[subject]['last_occurrence'] = date_str
-            
-            # Traiter les données spatiales
-            spatials = extract_terms_from_field(row.get('spatial', ''))
-            for spatial in spatials:
-                if spatial:
-                    term_stats[spatial]['frequency'] += 1
-                    if country:
-                        term_stats[spatial]['countries'].add(country)
-                    if date_str:
-                        if not term_stats[spatial]['first_occurrence'] or date_str < term_stats[spatial]['first_occurrence']:
-                            term_stats[spatial]['first_occurrence'] = date_str
-                        if not term_stats[spatial]['last_occurrence'] or date_str > term_stats[spatial]['last_occurrence']:
-                            term_stats[spatial]['last_occurrence'] = date_str
-            
-            # Traiter les auteurs
-            authors = extract_terms_from_field(row.get('author', ''))
-            for author in authors:
-                if author:
-                    term_stats[author]['frequency'] += 1
-                    if country:
-                        term_stats[author]['countries'].add(country)
-                    if date_str:
-                        if not term_stats[author]['first_occurrence'] or date_str < term_stats[author]['first_occurrence']:
-                            term_stats[author]['first_occurrence'] = date_str
-                        if not term_stats[author]['last_occurrence'] or date_str > term_stats[author]['last_occurrence']:
-                            term_stats[author]['last_occurrence'] = date_str
-    
-    # Traiter les références
-    logger.info("Calculating frequency stats from references dataset...")
-    if not references_df.empty:
-        for _, row in tqdm(references_df.iterrows(), total=len(references_df), desc="Processing references"):
-            # Extraire la date
-            date_str = row.get('pub_date', '') or row.get('date', '')
-            country = row.get('country', '')
-            
-            # Traiter les auteurs
-            authors = extract_terms_from_field(row.get('author', ''))
-            for author in authors:
-                if author:
-                    term_stats[author]['frequency'] += 1
-                    if country:
-                        term_stats[author]['countries'].add(country)
-                    if date_str:
-                        if not term_stats[author]['first_occurrence'] or date_str < term_stats[author]['first_occurrence']:
-                            term_stats[author]['first_occurrence'] = date_str
-                        if not term_stats[author]['last_occurrence'] or date_str > term_stats[author]['last_occurrence']:
-                            term_stats[author]['last_occurrence'] = date_str
-            
-            # Traiter les éditeurs
-            editors = extract_terms_from_field(row.get('editor', ''))
-            for editor in editors:
-                if editor:
-                    term_stats[editor]['frequency'] += 1
-                    if country:
-                        term_stats[editor]['countries'].add(country)
-                    if date_str:
-                        if not term_stats[editor]['first_occurrence'] or date_str < term_stats[editor]['first_occurrence']:
-                            term_stats[editor]['first_occurrence'] = date_str
-                        if not term_stats[editor]['last_occurrence'] or date_str > term_stats[editor]['last_occurrence']:
-                            term_stats[editor]['last_occurrence'] = date_str
-            
-            # Traiter les éditeurs/maisons d'édition
-            publishers = extract_terms_from_field(row.get('publisher', ''))
-            for publisher in publishers:
-                if publisher:
-                    term_stats[publisher]['frequency'] += 1
-                    if country:
-                        term_stats[publisher]['countries'].add(country)
-                    if date_str:
-                        if not term_stats[publisher]['first_occurrence'] or date_str < term_stats[publisher]['first_occurrence']:
-                            term_stats[publisher]['first_occurrence'] = date_str
-                        if not term_stats[publisher]['last_occurrence'] or date_str > term_stats[publisher]['last_occurrence']:
-                            term_stats[publisher]['last_occurrence'] = date_str
-    
+
+    sources = [
+        (articles_df, ['subject', 'spatial', 'author'], 'articles'),
+        (publications_df, ['subject', 'spatial', 'author'], 'publications'),
+        (references_df, ['author', 'editor', 'publisher'], 'references'),
+    ]
+    for df, fields, name in sources:
+        logger.info(f"Calculating frequency stats from {name} dataset...")
+        if df.empty:
+            continue
+        for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Processing {name}"):
+            _accumulate_term_stats(term_stats, row, fields)
+
     # Convertir les sets en chaînes séparées par |
     result = {}
     for term, stats in term_stats.items():
@@ -403,7 +266,7 @@ def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.Dat
             'last_occurrence': stats['last_occurrence'] or '',
             'countries': "|".join(sorted(stats['countries'])) if stats['countries'] else ''
         }
-    
+
     logger.info(f"Calculated frequency stats for {len(result)} unique terms")
     return result
 
@@ -541,7 +404,7 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
         
         try:
             logger.info(f"Pushing index dataset to {repo} with config 'index'...")
-            ds.push_to_hub(repo, max_shard_size=shard_size, config_name="index")
+            ds.push_to_hub(repo, max_shard_size=shard_size, config_name="index", token=token_to_use)
             logger.info(f"Index dataset published/updated on {repo} with config 'index'")
         except Exception as e:
             logger.error(f"Failed to push index dataset to Hub: {e}")

@@ -24,16 +24,14 @@ Variables d'environnement
 
 import os
 import sys
-import json
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional
 
 # Add parent directory to path for country_mapper / iwac_common imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
-import aiohttp
 from dotenv import load_dotenv
 from datasets import Dataset, load_dataset
 from huggingface_hub import login, get_token, utils as hf_utils
@@ -42,8 +40,8 @@ from country_mapper import get_country_from_newspaper
 from iwac_common.omeka_client import (
     Config,
     OmekaApiClient,
-    async_retry,
     conn_manager,
+    fetch_iiif_thumbnail_url,
 )
 from iwac_common.field_mappers import (
     extract_added_date,
@@ -120,38 +118,6 @@ def _get_subjectivity_score(item: Dict[str, Any], field: str) -> Optional[int]:
         if display_title in SUBJECTIVITY_LABEL_TO_SCORE:
             return SUBJECTIVITY_LABEL_TO_SCORE[display_title]
     return None
-
-
-@async_retry(max_tries=3, exceptions=(aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError))
-async def fetch_iiif_thumbnail_url(omeka_id: Union[str, int], session: aiohttp.ClientSession) -> str:
-    """Fetches and extracts the thumbnail URL from an IIIF manifest."""
-    manifest_url = f"https://islam.zmo.de/iiif/3/{omeka_id}/manifest"
-    thumbnail_url = ""
-    try:
-        # Use a shorter timeout for this specific, potentially numerous, request type
-        async with session.get(manifest_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 200:
-                # It's crucial to handle potential JSONDecodeError here if the response is not valid JSON
-                try:
-                    manifest = await resp.json()
-                    thumbnails = manifest.get("thumbnail")
-                    if isinstance(thumbnails, list) and thumbnails:
-                        thumbnail_info = thumbnails[0]
-                        if isinstance(thumbnail_info, dict):
-                            thumbnail_url = thumbnail_info.get("id", "")
-                except json.JSONDecodeError as e_json:
-                    logger.warning(f"JSON decoding error for IIIF manifest {omeka_id}: {e_json}. URL: {manifest_url}")
-            # Log other non-200 responses that are not exceptions handled by async_retry
-            elif resp.status not in [408, 429, 500, 502, 503, 504]: # Avoid redundant logs for retryable http errors
-                logger.warning(f"IIIF manifest request for {omeka_id} returned status {resp.status}. URL: {manifest_url}")
-    except asyncio.TimeoutError: # Specifically catch timeout
-        logger.warning(f"Timeout fetching IIIF manifest for {omeka_id}. URL: {manifest_url}")
-    except aiohttp.ClientError as e_client: # Specifically catch client errors
-        logger.warning(f"Client error fetching IIIF manifest for {omeka_id}: {e_client}. URL: {manifest_url}")
-    # Catching general Exception for unexpected issues, though specific ones are better
-    except Exception as e_general:
-        logger.error(f"Unexpected error fetching IIIF manifest for {omeka_id}: {e_general}. URL: {manifest_url}")
-    return thumbnail_url
 
 
 async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
@@ -354,7 +320,7 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
         
         try:
             with console.status("[bold green]Pushing dataset to Hugging Face Hub...", spinner="dots"):
-                ds.push_to_hub(repo, max_shard_size=shard_size, config_name="articles")
+                ds.push_to_hub(repo, max_shard_size=shard_size, config_name="articles", token=token_to_use)
             
             # Success panel
             console.print(Panel(
@@ -387,7 +353,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Publie les articles de journaux IWAC sur le Hub HF")
+    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="Repository Hugging Face où publier")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
     args = parser.parse_args()
 
-    asyncio.run(build_and_push(Config(), repo="fmadore/islam-west-africa-collection", shard_size=args.max_shard_size))
+    asyncio.run(build_and_push(Config(), repo=args.repo, shard_size=args.max_shard_size))

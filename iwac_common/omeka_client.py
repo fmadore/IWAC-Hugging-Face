@@ -15,6 +15,7 @@ Each subset script builds its own ``Config`` (with the appropriate
 from __future__ import annotations
 
 import asyncio
+import functools
 import gzip
 import hashlib
 import io
@@ -120,7 +121,7 @@ class ConnectionManager:
     async def get(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(limit=20, ssl=False),
+                connector=aiohttp.TCPConnector(limit=20),
                 timeout=aiohttp.ClientTimeout(total=30),
             )
         return self._session
@@ -145,19 +146,25 @@ def async_retry(
         asyncio.TimeoutError,
     ),
 ):
-    """Retry an async callable with exponential backoff (1, 2, 4, … seconds)."""
+    """Retry an async callable with exponential backoff (1, 2, 4, … seconds).
+
+    The last failed attempt re-raises the original exception (no trailing
+    backoff sleep).
+    """
 
     def decorator(func):
+        @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             for attempt in range(max_tries):
                 try:
                     return await func(*args, **kwargs)
                 except exceptions as exc:
+                    if attempt == max_tries - 1:
+                        raise
                     logger.warning(
                         f"{func.__name__}: tentative {attempt + 1}/{max_tries} échouée ({exc})"
                     )
                     await asyncio.sleep(2**attempt)
-            raise
 
         return wrapper
 
@@ -256,6 +263,57 @@ class OmekaApiClient:
         return await self.request(f"media/{media_id}", {})
 
 
+# ---------------------------------------------------------------------------
+# IIIF helpers
+# ---------------------------------------------------------------------------
+
+IIIF_BASE_URL = "https://islam.zmo.de/iiif/3"
+
+
+async def fetch_iiif_thumbnail_url(
+    omeka_id: Union[str, int], session: aiohttp.ClientSession
+) -> str:
+    """Fetch the thumbnail URL from an item's IIIF manifest.
+
+    Returns ``""`` on any failure — every error is caught and logged here so
+    one bad manifest never aborts an upload run. (The per-script copies this
+    replaces wrapped it in ``async_retry``, but the internal exception
+    handling meant it never actually retried; the decorator was dropped.)
+    """
+    manifest_url = f"{IIIF_BASE_URL}/{omeka_id}/manifest"
+    thumbnail_url = ""
+    try:
+        # Shorter timeout: this request runs once per item.
+        async with session.get(manifest_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                try:
+                    manifest = await resp.json()
+                    thumbnails = manifest.get("thumbnail")
+                    if isinstance(thumbnails, list) and thumbnails:
+                        thumbnail_info = thumbnails[0]
+                        if isinstance(thumbnail_info, dict):
+                            thumbnail_url = thumbnail_info.get("id", "")
+                except json.JSONDecodeError as e_json:
+                    logger.warning(
+                        f"JSON decoding error for IIIF manifest {omeka_id}: {e_json}. URL: {manifest_url}"
+                    )
+            elif resp.status not in [408, 429, 500, 502, 503, 504]:
+                logger.warning(
+                    f"IIIF manifest request for {omeka_id} returned status {resp.status}. URL: {manifest_url}"
+                )
+    except asyncio.TimeoutError:
+        logger.warning(f"Timeout fetching IIIF manifest for {omeka_id}. URL: {manifest_url}")
+    except aiohttp.ClientError as e_client:
+        logger.warning(
+            f"Client error fetching IIIF manifest for {omeka_id}: {e_client}. URL: {manifest_url}"
+        )
+    except Exception as e_general:
+        logger.error(
+            f"Unexpected error fetching IIIF manifest for {omeka_id}: {e_general}. URL: {manifest_url}"
+        )
+    return thumbnail_url
+
+
 __all__ = [
     "Config",
     "Cache",
@@ -263,4 +321,6 @@ __all__ = [
     "conn_manager",
     "async_retry",
     "OmekaApiClient",
+    "IIIF_BASE_URL",
+    "fetch_iiif_thumbnail_url",
 ]

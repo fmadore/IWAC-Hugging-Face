@@ -418,8 +418,8 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB", use_ca
     new_omeka_df['o:id'] = new_omeka_df['o:id'].astype(str) # Ensure consistent type for merging
 
     # 2-3. Load existing Hub dataset and merge to preserve computed columns.
-    # Reference uses an outer merge with explicit suffixes, drops a few legacy
-    # columns, and runs an axis=1 ffill/bfill — encoded via shared helper params.
+    # Reference uses an outer merge (keeps Hub-only rows for items deleted
+    # from Omeka; the helper logs how many) and drops a few legacy columns.
     console.print("\n[bold cyan]Steps 2-3:[/bold cyan] Loading and merging with existing Hub dataset...")
     token_to_use = resolve_hf_token()
     final_df = merge_with_hub_dataset(
@@ -430,7 +430,6 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB", use_ca
         how="outer",
         suffixes=("", "_old"),
         columns_to_exclude=("o:item_set", "o:media/file", "iiif_manifest", "thumbnail"),
-        fill_after_merge=True,
         console=console,
     )
 

@@ -7,8 +7,12 @@ on ``o:id`` flow. The variations the helper accepts are:
   suffixes; the other 5 use a left merge.
 - ``columns_to_exclude``: ``reference`` drops a few legacy/computed columns
   (``o:item_set``, ``o:media/file``, ``iiif_manifest``, ``thumbnail``).
-- ``fill_after_merge``: ``reference`` runs ``.ffill(axis=1).bfill(axis=1)``
-  on the merged frame.
+
+Historical note: ``reference`` used to run ``.ffill(axis=1).bfill(axis=1)``
+after the merge (via a ``fill_after_merge`` flag). That filled NaN cells from
+*adjacent columns* — fabricating values for Hub-only rows and freshly added
+items — and was removed as a data-corruption bug. Outer merges now log the
+count of Hub-only rows instead, so genuinely deleted Omeka items are visible.
 
 Subset-specific *post-merge* steps (sentiment-column reordering in
 ``articles``, mixed-type-column casting in ``reference``, integer dtype
@@ -47,7 +51,6 @@ def merge_with_hub_dataset(
     how: str = "left",
     suffixes: Sequence[str] = ("", "_old"),
     columns_to_exclude: Iterable[str] = (),
-    fill_after_merge: bool = False,
     console: Optional[Console] = None,
 ) -> pd.DataFrame:
     """Merge ``new_df`` with the existing HF Hub config, preserving any
@@ -124,9 +127,16 @@ def merge_with_hub_dataset(
         on="o:id",
         how=how,
         suffixes=tuple(suffixes),
+        indicator=how == "outer",
     )
-    if fill_after_merge:
-        final_df = final_df.ffill(axis=1).bfill(axis=1)
+    if how == "outer":
+        hub_only = int((final_df["_merge"] == "right_only").sum())
+        final_df = final_df.drop(columns="_merge")
+        if hub_only:
+            console.print(
+                f"[yellow]⚠[/yellow] {hub_only} row(s) exist on the Hub but not in Omeka "
+                "(deleted items?). They are kept with empty Omeka fields — review before pushing."
+            )
 
     if excluded:
         console.print(f"[dim]Excluded columns: {', '.join(sorted(excluded))}[/dim]")
