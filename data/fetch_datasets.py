@@ -36,7 +36,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 console = Console()
 
 # Available configs in the IWAC dataset
-CONFIGS = ['articles', 'publications', 'documents', 'index', 'audiovisual', 'references']
+CONFIGS = ['articles', 'publications', 'documents', 'index', 'audiovisual', 'references', 'images']
 
 
 def choose_dataset(cli_choice=None):

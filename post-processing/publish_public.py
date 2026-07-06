@@ -75,7 +75,7 @@ from rich.table import Table  # noqa: E402
 
 console = Console()
 
-ALL_CONFIGS = ["articles", "publications", "index", "references", "audiovisual", "documents"]
+ALL_CONFIGS = ["articles", "publications", "index", "references", "audiovisual", "documents", "images"]
 
 # Long-text columns that are legitimately public (shown on the public Omeka
 # pages or derived commentary, not the protected full text).

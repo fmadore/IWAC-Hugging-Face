@@ -24,6 +24,7 @@ Dataset subsets:
 - `publications` — Islamic publications
 - `references` — Academic references
 - `index` — Index entries
+- `images` — Photographs (resource_class_id = 58, `bibo:Image`; 30 items, all public). Curator field photos (mosques, Islamic radio stations, …) with geo-coordinates but almost no free text; each carries a multimodal `embedding_image` (768-dim, same space as the text embeddings). Has no `OCR`/`lemma` columns and all rows are public, so `publish_public.py` projects it in full (nothing masked).
 
 ## Always use the `iwac-data` skill
 
@@ -51,6 +52,7 @@ Each subset has an upload script that fetches from Omeka S API, maps fields to f
 - `index/upload_index_hf.py`
 - `islamic-publications/upload_Islamic_publications_hf.py`
 - `reference/upload_reference_hf.py`
+- `images/upload_image_hf.py` — Photographs (resource_class_id = 58; country from item-set membership; image kept as a URL pointer, not bytes)
 
 AI sentiment analysis (Gemini, ChatGPT, Mistral) is fetched directly from the Omeka API in upload scripts — there is no separate sentiment computation step.
 
@@ -61,6 +63,7 @@ Scripts that enrich the dataset with computed columns (all target the private re
 - `post-processing/calculate_lexical_richness.py` — Text statistics
 - `post-processing/calculate_word_count.py` — Word counts (`--config`/`-y` for non-interactive runs; references fetch `bibo:content` via `iwac_common` client)
 - `post-processing/semantic_embedding.py` — Gemini embeddings (articles: OCR, publications: tableOfContents, references: OCR; `--update-mode missing|all` for non-interactive runs)
+- `post-processing/semantic_embedding_images.py` — **Multimodal** Gemini embeddings for the `images` subset: embeds each photograph itself (downloaded + downscaled) via `gemini-embedding-2` → `embedding_image`. Same 768-dim space as the text embeddings, so cross-modal search (text query → photo) works. `--update-mode missing|all`, `--dry-run`.
 - `post-processing/lda_topic_modeling/` — LDA topic modeling (gensim); stopword sets live in its `constants.py`; prediction adds `lda_topic_id`, `lda_topic_prob`, `lda_topic_label`, and `lda_topic_topk` ("id:prob|…" top-k distribution). **Per-config presets** (`CONFIG_PRESETS` in `constants.py`) make `--config <subset> --mode fit -y` run the recommended recipe (model path, `--chunk-words 1000` for long-document subsets, k-sweep); resolution order: explicit CLI > `training_parameters.json` (predict) > preset > defaults. `--language` trains/predicts one language at a time; skipped rows **keep** their existing topic values, so per-language models compose (e.g. references: FR model `lda_model_references` + EN model `lda_model_references_en`). Models: `lda_model/` (articles, whole-doc), `lda_model_references*/`, `lda_model_publications/`.
 - `post-processing/sentiment_agreement.py` — Inter-model agreement (κ, Krippendorff α) on the 3-model sentiment block; report-only by default, `--push` adds `consensus_*` / `sentiment_disagreement` columns
 - `post-processing/related_articles.py` — Top-k cosine neighbors from existing embeddings; report-only by default, `--push` adds `related_articles` ("o:id:cos|…")
