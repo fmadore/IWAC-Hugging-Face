@@ -199,3 +199,32 @@ Pure organizational move. No behavior change.
   - `articles` / `islamic-publications` `.cache_omk` collision: confirmed safe — different resource_class_ids produce different cache keys, so directory sharing never causes corruption.
 
 **Tier 1 cumulative:** 6 upload scripts shed 1,267 lines (621 → 393, 477 → 273, 571 → 343, 655 → 432, 759 → 568, 713 → 520). 505 lines added across 3 shared modules. Net **−762 lines** with no behavioral regressions.
+
+---
+
+## Post-roadmap pass (2026-07-05)
+
+A second cleanup pass, done together with four bug fixes (broken `async_retry`
+re-raise, `ssl=False`, the references `ffill(axis=1)` merge smearing,
+`LdaMulticore` + `alpha="auto"` crash):
+
+- **`calculate_word_count.py`** migrated onto `iwac_common.omeka_client`
+  (the one script Tier 1a missed): local Cache/ConnectionManager/async_retry/
+  OmekaApiClient deleted, reference-specific fetches kept in a
+  `ReferenceContentClient` subclass; `--config`/`-y` flags added for
+  non-interactive runs. 576 → 481 lines.
+- **`fetch_iiif_thumbnail_url`** deduplicated from 5 upload scripts into
+  `iwac_common.omeka_client` (the 5 copies were verified functionally
+  identical; the dead `@async_retry` decorator — all exceptions were caught
+  internally, so it never retried — was dropped explicitly).
+- **`index/upload_index_hf.py`**: `calculate_frequency_stats`'s 8 copy-pasted
+  blocks collapsed into `_accumulate_term_stats` (~160 → ~57 lines); verified
+  output-identical on the full local mirrors (7,555 terms).
+- **`topic_modeling/` package deleted**: the global `builtins.open` / `json`
+  monkey-patches (`patches.py`) replaced by an opt-in `_NumpyJSONEncoder` at
+  the single call site; BERTopic-era stopword sets folded verbatim into
+  `lda_topic_modeling/constants.py` (byte-identical, training union still 237).
+- **Consistency**: every `push_to_hub` now passes `token=`; `--repo` added to
+  articles/audiovisual/document.
+- **Packaging**: minimal `pyproject.toml`; `iwac_common` + `country_mapper`
+  editable-installed (`pip install -e . --no-deps`); sys.path fallbacks kept.

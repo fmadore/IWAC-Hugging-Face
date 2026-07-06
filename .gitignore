@@ -19,3 +19,5 @@ bertopic_model/
 lda_model/
 nul
 .agents/
+analyses/output/
+*.egg-info/

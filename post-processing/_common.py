@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from typing import List, Optional
 
 from huggingface_hub import dataset_info, get_token, login
@@ -26,6 +27,61 @@ from rich import box
 
 
 _DEFAULT_CONFIGS: List[str] = ["articles", "publications", "documents"]
+
+# Repo root (parent of post-processing/), used to locate the data/ CSV mirrors.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def load_subset_dataframe(
+    repo_id: str,
+    config_name: str,
+    *,
+    token: Optional[str] = None,
+    source: str = "hub",
+    csv_path: Optional[Path] = None,
+    columns: Optional[List[str]] = None,
+    console: Optional[Console] = None,
+):
+    """Load one IWAC subset as a pandas DataFrame.
+
+    source="hub" downloads the live dataset (authoritative, needs network);
+    source="csv" reads the local ``data/iwac_<config>.csv`` mirror written by
+    ``data/fetch_datasets.py`` (fast, offline — but may lag the Hub).
+
+    ``columns`` restricts the frame (and, for CSV, what is parsed at all —
+    important for the 388 MB articles mirror). ``o:id`` is always cast to str.
+    """
+    import pandas as pd  # local import: keep module import light
+
+    console = console or Console()
+    if source == "csv":
+        path = csv_path or (REPO_ROOT / "data" / f"iwac_{config_name}.csv")
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Local mirror not found: {path}. Run data/fetch_datasets.py or use --source hub."
+            )
+        console.print(f"[blue]→[/blue] Loading local mirror [cyan]{path.name}[/cyan]")
+        df = pd.read_csv(path, usecols=columns, dtype={"o:id": str}, low_memory=False)
+        console.print(
+            f"[yellow]ℹ[/yellow] Local CSV mirror may lag the live Hub dataset "
+            f"(file date: {pd.Timestamp(path.stat().st_mtime, unit='s').date()})."
+        )
+    elif source == "hub":
+        from datasets import load_dataset
+
+        with console.status(f"[bold green]Loading '{repo_id}' ({config_name}) from Hub...", spinner="dots"):
+            ds = load_dataset(repo_id, name=config_name, split="train", token=token)
+        if columns:
+            keep = [c for c in columns if c in ds.column_names]
+            ds = ds.select_columns(keep)
+        df = ds.to_pandas()
+    else:
+        raise ValueError(f"Unknown source '{source}' (expected 'hub' or 'csv').")
+
+    if "o:id" in df.columns:
+        df["o:id"] = df["o:id"].astype(str)
+    console.print(f"[green]✓[/green] Loaded {len(df):,} rows ({config_name}, source={source})")
+    return df
 
 
 def ensure_hf_token(console: Optional[Console] = None) -> str:
@@ -105,4 +161,10 @@ def choose_config(available: List[str], console: Optional[Console] = None) -> st
             sys.exit(0)
 
 
-__all__ = ["ensure_hf_token", "get_available_configs", "choose_config"]
+__all__ = [
+    "ensure_hf_token",
+    "get_available_configs",
+    "choose_config",
+    "load_subset_dataframe",
+    "REPO_ROOT",
+]

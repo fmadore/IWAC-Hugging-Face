@@ -1,0 +1,22 @@
+# Minimal packaging so `iwac_common` and `country_mapper` are importable
+# without per-script sys.path manipulation. Install once per venv:
+#
+#     .venv\Scripts\python -m pip install -e . --no-deps
+#
+# Runtime dependencies intentionally stay in requirements.txt (single source);
+# the scripts also keep their sys.path fallbacks, so nothing breaks if the
+# package is not installed.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iwac-hugging-face"
+version = "0.1.0"
+description = "Pipeline scripts for the Islam West Africa Collection dataset on Hugging Face Hub"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["iwac_common"]
+py-modules = ["country_mapper"]

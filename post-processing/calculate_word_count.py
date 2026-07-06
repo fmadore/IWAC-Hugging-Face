@@ -16,11 +16,11 @@ Pour la configuration 'references', le script récupère le contenu bibo:content
 
 Usage
 -----
-    python post-processing/calculate_word_count.py
+    python post-processing/calculate_word_count.py [--config articles|publications|documents|references] [-y]
 
 Exemple:
-    python post-processing/calculate_word_count.py
-    (Le script demandera ensuite la configuration)
+    python post-processing/calculate_word_count.py            # menu interactif
+    python post-processing/calculate_word_count.py --config articles -y   # non interactif
 
 Variables d'environnement
 ---------------------
@@ -30,21 +30,14 @@ OMEKA_BASE_URL        Base URL de l'API Omeka (pour references)
 OMEKA_KEY_IDENTITY    Identité de la clé Omeka (pour references, accès aux valeurs privées)
 OMEKA_KEY_CREDENTIAL  Credential de la clé Omeka (pour references, accès aux valeurs privées)
 """
+import argparse
 import asyncio
-import gzip
-import hashlib
-import io
-import json
 import logging
 import os
 import re
 import sys
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Dict, List, Optional
 
-import aiofiles
-import aiohttp
 import pandas as pd
 from datasets import load_dataset, Dataset
 from dotenv import load_dotenv
@@ -56,143 +49,34 @@ from rich.logging import RichHandler
 from rich import box
 from rich.prompt import Prompt, Confirm
 
-# Make ``post-processing/_common.py`` importable.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Make ``post-processing/_common.py`` and ``iwac_common`` importable.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _THIS_DIR)
+sys.path.insert(0, os.path.dirname(_THIS_DIR))
 from _common import ensure_hf_token  # noqa: E402
+from iwac_common.omeka_client import Config, OmekaApiClient, conn_manager  # noqa: E402
 
 load_dotenv()
 
 console = Console()
 
 # ---------------------------------------------------------------------------
-# Configuration for Omeka API (for references)
+# Omeka client — shared infra from iwac_common + reference-specific fetches
 # ---------------------------------------------------------------------------
-
-@dataclass
-class OmekaConfig:
-    """Paramètres globaux chargés depuis .env ou variables d'environnement"""
-    API_URL: str = os.getenv("OMEKA_BASE_URL", "https://islam.zmo.de/api")
-    API_KEY_IDENTITY: str = os.getenv("OMEKA_KEY_IDENTITY", "")
-    API_KEY_CREDENTIAL: str = os.getenv("OMEKA_KEY_CREDENTIAL", "")
-    CACHE_DIR: str = ".cache_word_count"
-    CACHE_HOURS: int = 24
-
 
 # Reference resource classes
 REFERENCE_RESOURCE_CLASSES = [35, 43, 88, 40, 82, 178, 52, 77, 305]
 
-
-# ---------------------------------------------------------------------------
-# Cache disque (JSON Gzip) pour économiser l'API
-# ---------------------------------------------------------------------------
-
-class Cache:
-    def __init__(self, directory: str, hours: int = 24):
-        self.dir = directory
-        self.duration = timedelta(hours=hours)
-        os.makedirs(directory, exist_ok=True)
-
-    def _path(self, key: str) -> str:
-        name = hashlib.md5(key.encode()).hexdigest() + ".json.gz"
-        return os.path.join(self.dir, name)
-
-    async def get(self, key: str) -> Optional[Any]:
-        path = self._path(key)
-        if not os.path.exists(path):
-            return None
-        mtime = datetime.fromtimestamp(os.path.getmtime(path))
-        if datetime.now() - mtime > self.duration:
-            return None
-        async with aiofiles.open(path, "rb") as f:
-            data = await f.read()
-        with gzip.open(io.BytesIO(data), "rt", encoding="utf-8") as gz:
-            return json.load(gz)
-
-    async def set(self, key: str, value: Any):
-        path = self._path(key)
-        buf = io.BytesIO()
-        with gzip.open(buf, "wt", encoding="utf-8") as gz:
-            json.dump(value, gz)
-        async with aiofiles.open(path, "wb") as f:
-            await f.write(buf.getvalue())
+WORD_COUNT_CACHE_DIR = ".cache_word_count"
 
 
-# ---------------------------------------------------------------------------
-# Gestion de la connexion HTTP
-# ---------------------------------------------------------------------------
+class ReferenceContentClient(OmekaApiClient):
+    """Omeka client with per-item ``bibo:content`` fetches for references.
 
-class ConnectionManager:
-    def __init__(self):
-        self._session: Optional[aiohttp.ClientSession] = None
-
-    async def get(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(limit=20, ssl=False),
-                timeout=aiohttp.ClientTimeout(total=30),
-            )
-        return self._session
-
-    async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-
-conn_manager = ConnectionManager()
-
-
-# ---------------------------------------------------------------------------
-# Décorateur retry asynchrone
-# ---------------------------------------------------------------------------
-
-def async_retry(max_tries: int = 5, exceptions: Union[Type[Exception], tuple] = (aiohttp.ClientError, asyncio.TimeoutError)):
-    def decorator(func):
-        async def wrapper(*args, **kwargs):
-            for attempt in range(max_tries):
-                try:
-                    return await func(*args, **kwargs)
-                except exceptions as e:
-                    if attempt == max_tries - 1:
-                        raise
-                    await asyncio.sleep(2 ** attempt)
-            raise
-        return wrapper
-    return decorator
-
-
-# ---------------------------------------------------------------------------
-# Client API Omeka pour récupérer le contenu des références
-# ---------------------------------------------------------------------------
-
-class OmekaApiClient:
-    def __init__(self, cfg: OmekaConfig, use_cache: bool = True):
-        self.cfg = cfg
-        self.cache = Cache(cfg.CACHE_DIR, cfg.CACHE_HOURS) if use_cache else None
-
-    @async_retry()
-    async def _get(self, endpoint: str, params: Dict[str, Any]) -> Any:
-        params.update(
-            {
-                "key_identity": self.cfg.API_KEY_IDENTITY,
-                "key_credential": self.cfg.API_KEY_CREDENTIAL,
-            }
-        )
-        url = f"{self.cfg.API_URL}/{endpoint}"
-        sess = await conn_manager.get()
-        async with sess.get(url, params=params) as resp:
-            resp.raise_for_status()
-            return await resp.json()
-
-    async def request(self, endpoint: str, params: Dict[str, Any]):
-        key = f"{endpoint}:{json.dumps(params, sort_keys=True)}"
-        if self.cache:
-            cached = await self.cache.get(key)
-            if cached is not None:
-                return cached
-        data = await self._get(endpoint, params)
-        if self.cache:
-            await self.cache.set(key, data)
-        return data
+    Cache, retry, connection pooling and auth come from
+    ``iwac_common.omeka_client``; only the content extraction (which needs
+    the API key to see private values) is specific to this script.
+    """
 
     async def fetch_item(self, item_id: int) -> Dict[str, Any]:
         """Fetch a single item by ID to get its bibo:content including private values."""
@@ -201,10 +85,10 @@ class OmekaApiClient:
     async def fetch_items_content(self, item_ids: List[int]) -> Dict[int, str]:
         """Fetch bibo:content for multiple items concurrently."""
         results = {}
-        
+
         # Use semaphore to limit concurrent requests
         semaphore = asyncio.Semaphore(10)
-        
+
         async def fetch_one(item_id: int) -> tuple:
             async with semaphore:
                 try:
@@ -214,9 +98,9 @@ class OmekaApiClient:
                 except Exception as e:
                     console.print(f"[yellow]⚠[/yellow] Failed to fetch item {item_id}: {e}")
                     return (item_id, "")
-        
+
         tasks = [fetch_one(item_id) for item_id in item_ids]
-        
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[bold blue]{task.description}"),
@@ -227,12 +111,12 @@ class OmekaApiClient:
             console=console,
         ) as progress:
             task = progress.add_task("[cyan]Fetching content from Omeka API", total=len(tasks))
-            
+
             for coro in asyncio.as_completed(tasks):
                 item_id, content = await coro
                 results[item_id] = content
                 progress.update(task, advance=1)
-        
+
         return results
 
     def _extract_content(self, item: Dict[str, Any]) -> str:
@@ -318,23 +202,42 @@ def main() -> None:
         border_style="cyan"
     ))
 
-    # Hardcoded values
-    repo_id = "fmadore/islam-west-africa-collection"
+    parser = argparse.ArgumentParser(
+        description="Ajoute/actualise la colonne 'nb_mots' d'un subset du dataset IWAC."
+    )
+    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection")
+    parser.add_argument(
+        "--config",
+        choices=["articles", "publications", "documents", "references"],
+        default=None,
+        help="Subset à traiter (évite le menu interactif)",
+    )
+    parser.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        help="Recalculer sans confirmation quand 'nb_mots' existe déjà",
+    )
+    args = parser.parse_args()
+
+    repo_id = args.repo
     count_column_name = "nb_mots"
     max_shard_size = "1GB"
     batch_size = 1000
 
-    # --- Choix de la configuration par l'utilisateur ---
+    # --- Choix de la configuration (CLI ou menu interactif) ---
     valid_configs = ["articles", "publications", "documents", "references"]
-    try:
-        config_name_choice = Prompt.ask(
-            "[cyan]Quelle configuration traiter?[/cyan]",
-            choices=valid_configs,
-            default="articles"
-        )
-    except KeyboardInterrupt:
-        console.print("\n[yellow]⚠[/yellow] Opération annulée par l'utilisateur.")
-        return
+    if args.config:
+        config_name_choice = args.config
+    else:
+        try:
+            config_name_choice = Prompt.ask(
+                "[cyan]Quelle configuration traiter?[/cyan]",
+                choices=valid_configs,
+                default="articles"
+            )
+        except KeyboardInterrupt:
+            console.print("\n[yellow]⚠[/yellow] Opération annulée par l'utilisateur.")
+            return
     
     console.print(f"[green]→[/green] Configuration sélectionnée: [bold]{config_name_choice}[/bold]")
     
@@ -348,7 +251,7 @@ def main() -> None:
 
     # --- For references, check Omeka API credentials ---
     if is_references:
-        omeka_cfg = OmekaConfig()
+        omeka_cfg = Config(CACHE_DIR=WORD_COUNT_CACHE_DIR)
         if not omeka_cfg.API_KEY_IDENTITY or not omeka_cfg.API_KEY_CREDENTIAL:
             console.print("[red]✗[/red] Les credentials Omeka (OMEKA_KEY_IDENTITY et OMEKA_KEY_CREDENTIAL) sont requis pour les références.")
             console.print("[yellow]ℹ[/yellow] Ces credentials sont nécessaires pour accéder aux valeurs privées de bibo:content.")
@@ -388,16 +291,19 @@ def main() -> None:
     if count_column_name in ds.column_names:
         # Ask user if they want to recalculate existing word counts
         console.print(f"\n[yellow]⚠[/yellow] La colonne [bold]{count_column_name}[/bold] existe déjà.")
-        try:
-            recalculate = Confirm.ask("Voulez-vous recalculer les comptes de mots existants?", default=False)
-            if not recalculate:
-                console.print("[yellow]ℹ[/yellow] Opération annulée. Les comptes de mots existants sont conservés.")
+        if args.yes:
+            console.print("[green]→[/green] Recalcul confirmé via --yes.")
+        else:
+            try:
+                recalculate = Confirm.ask("Voulez-vous recalculer les comptes de mots existants?", default=False)
+                if not recalculate:
+                    console.print("[yellow]ℹ[/yellow] Opération annulée. Les comptes de mots existants sont conservés.")
+                    return
+                else:
+                    console.print("[green]→[/green] Recalcul des comptes de mots confirmé.")
+            except KeyboardInterrupt:
+                console.print("\n[yellow]⚠[/yellow] Opération annulée par l'utilisateur.")
                 return
-            else:
-                console.print("[green]→[/green] Recalcul des comptes de mots confirmé.")
-        except KeyboardInterrupt:
-            console.print("\n[yellow]⚠[/yellow] Opération annulée par l'utilisateur.")
-            return
 
     # --- Process based on configuration type ---
     if is_references:
@@ -492,7 +398,7 @@ def main() -> None:
         console.print(f"[red]✗[/red] Erreur lors du push du dataset vers le Hub: {e}")
 
 
-async def process_references_word_count(ds: Dataset, omeka_cfg: OmekaConfig, count_column_name: str) -> Optional[Dataset]:
+async def process_references_word_count(ds: Dataset, omeka_cfg: Config, count_column_name: str) -> Optional[Dataset]:
     """
     Process word count for references by fetching bibo:content from Omeka API.
     
@@ -525,7 +431,7 @@ async def process_references_word_count(ds: Dataset, omeka_cfg: OmekaConfig, cou
     console.print(f"[blue]→[/blue] {len(item_ids_int)} références à traiter...")
     
     # Fetch content for all items
-    api = OmekaApiClient(omeka_cfg, use_cache=True)
+    api = ReferenceContentClient(omeka_cfg, use_cache=True, console=console)
     try:
         content_map = await api.fetch_items_content(item_ids_int)
     finally:
