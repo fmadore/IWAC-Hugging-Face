@@ -1,26 +1,112 @@
 """
 constants.py
 -------------
-Shared constants for LDA topic modeling pipeline.
-
-Reuses the shared domain stopwords and adds LDA-specific defaults,
-custom collocations, and geographic / generic stopwords.
+Constants for the LDA topic modeling pipeline: stopword sets, custom
+collocations, and training defaults.
 
 IMPORTANT: This is a collection about Islam in West Africa.
 Islamic organizations (COSIM, FAIB, UIB, etc.) and religious events
 (Ramadan, Tabaski, Maouloud, etc.) are CORE to the research and should
 appear in topic labels. We only remove truly non-informative noise.
+
+Lower-case throughout — tokenization lowercases before matching.
 """
 
-# Import shared stopwords
-import sys
-from pathlib import Path
+# ── Modeling stopwords ─────────────────────────────────────────────
+# Removed from tokens BEFORE training/inference (affects the topics
+# themselves). Be VERY conservative here — only words that truly add
+# noise. (Historical note: this set was born as the BERTopic
+# ``VECTORIZE_STOPWORDS``; the name DOMAIN_STOPWORDS is kept because
+# every call site uses it.)
+DOMAIN_STOPWORDS = {
+    # Generic courtesy/boilerplate
+    "monsieur", "madame", "excellence", "communiqué", "communique",
+    "chers", "cher", "chère", "chere",
 
-_PARENT = Path(__file__).resolve().parent.parent
-if str(_PARENT) not in sys.path:
-    sys.path.insert(0, str(_PARENT))
+    # Generic words without topical signal
+    "grand", "mondial", "international",
 
-from topic_modeling.constants import DOMAIN_STOPWORDS, LABEL_ONLY_STOPWORDS  # noqa: E402
+    # Functional words that leak through lemmatization
+    "ledit", "faire", "devoir", "pouvoir",
+
+    # OCR artifacts
+    "lp", "bf", "wa", "adj", "octet", "sem", "at",
+
+    # Generic French functional words that hurt clustering (no topical signal)
+    "ensuite", "puis", "donc", "aussi", "toujours", "encore", "bien",
+    "tout", "tres", "très", "avoir", "etre", "être", "plus", "entre",
+    "apres", "après", "avant", "autre", "autres", "même", "meme",
+    "selon", "ainsi", "car", "vers", "depuis", "pendant", "contre",
+    "sans", "chez", "comme",
+    "aller", "falloir", "vouloir", "savoir", "voir", "celer",
+    "el",  # fragment from "El Hadj"
+
+    # ENGLISH stopwords (critical for filtering non-French documents)
+    "the", "of", "to", "and", "in", "for", "is", "on", "that", "by",
+    "this", "with", "are", "from", "or", "an", "be", "as", "at", "was",
+}
+
+# ── Label-only stopwords ───────────────────────────────────────────
+# Dropped from topic LABELS only (keeps labels readable); these words
+# still participate in training.
+LABEL_ONLY_STOPWORDS = {
+    # A. Devotional formulae (abbreviations that are hard to interpret in labels)
+    "psl", "saw", "swt",
+
+    # B. ENGLISH stopwords (from OCR/non-French docs leaking through)
+    "the", "of", "to", "and", "in", "for", "is", "on", "that", "by",
+    "this", "with", "are", "from", "or", "an", "be", "as", "at", "was",
+    "which", "have", "has", "their", "it", "its", "they", "will", "can",
+    "all", "we", "been", "would", "were", "there", "who", "what", "more",
+    "but", "if", "not", "so", "when", "other", "than", "no", "also", "into",
+
+    # C. Dates & meeting filler (not topic-specific)
+    "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
+    "janvier", "février", "fevrier", "mars", "avril", "mai", "juin", "juillet",
+    "août", "aout", "septembre", "octobre", "novembre", "décembre", "decembre",
+    "année", "annee", "jour",
+    "aujourd'hui", "hier", "demain",
+
+    # D. Currency/quantities (numbers, not concepts)
+    "fcfa", "franc", "francs", "cfa",
+    "montant", "montants", "somme", "sommes",
+    "millier", "milliers", "million", "millions", "milliard", "milliards",
+
+    # E. Generic boilerplate (not domain-specific)
+    "monsieur", "madame", "excellence",
+    "communiqué", "communique",
+    "chers", "cher", "chère", "chere",
+
+    # F. OCR artifacts & abbreviations (garbage tokens)
+    "lp", "bf", "dr", "mr", "mme", "mm", "wa",
+    "ii", "iii", "iv", "vi", "vii", "viii", "ix", "xi", "xii",
+    "octet", "sem", "at", "adj",
+
+    # G. Generic location words (not specific places)
+    "place", "rond", "point",
+
+    # H. Very generic words that don't add meaning to labels
+    "grand", "mondial", "international", "national", "régional", "regional",
+
+    # I. Generic French functional/filler words that leak through lemmatization
+    "ensuite", "puis", "donc", "aussi", "toujours", "encore", "bien",
+    "tout", "tres", "très", "avoir", "etre", "être", "plus", "entre",
+    "apres", "après", "avant", "autre", "autres", "même", "meme",
+    "deja", "déjà", "selon", "lors", "ainsi", "car", "vers",
+    "depuis", "pendant", "contre", "sous", "sans", "chez",
+    "cela", "ceci", "celle", "ceux", "celui",
+    "aller", "falloir", "vouloir", "savoir", "voir", "celer",
+    "el",  # fragment from "El Hadj"
+    "quelque", "quelques", "certain", "certains", "certaine", "certaines",
+    "chaque", "tel", "telle", "tels", "telles",
+    "beaucoup", "peu", "assez", "trop", "combien",
+    "comme", "comment", "pourquoi", "quand",
+    "premier", "première", "premiere", "deuxième", "deuxieme",
+    "dernier", "dernière", "derniere",
+    "nouveau", "nouvelle", "nouveaux",
+    "seul", "seule", "seuls", "seules",
+    "petit", "petite", "petits", "petites",
+}
 
 # ── Geographic stopwords ───────────────────────────────────────────
 # The dataset already has a 'country' metadata field, so geographic
@@ -148,3 +234,13 @@ DEFAULT_NO_ABOVE = 0.40      # ignore tokens in more than 40% of docs (was 0.5; 
 DEFAULT_TOPIC_RANGE_START = 15
 DEFAULT_TOPIC_RANGE_END = 80
 DEFAULT_TOPIC_RANGE_STEP = 5
+
+# Sweep models only need to be good enough for *relative* C_v comparison, so
+# they train at reduced settings; the final model retrains at full
+# DEFAULT_PASSES / DEFAULT_ITERATIONS. Cuts the sweep cost roughly 3-5x.
+DEFAULT_SWEEP_PASSES = 10
+DEFAULT_SWEEP_ITERATIONS = 200
+
+# How many topics to keep in the per-document distribution column
+# (lda_topic_topk): "id:prob|id:prob|..." sorted by descending probability.
+DEFAULT_TOPIC_TOPK = 3

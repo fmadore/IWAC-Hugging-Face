@@ -36,6 +36,9 @@ from .constants import (
     DEFAULT_TOPIC_RANGE_START,
     DEFAULT_TOPIC_RANGE_END,
     DEFAULT_TOPIC_RANGE_STEP,
+    DEFAULT_SWEEP_PASSES,
+    DEFAULT_SWEEP_ITERATIONS,
+    DEFAULT_TOPIC_TOPK,
 )
 
 # Combined stopword set for label filtering (module-level to avoid
@@ -45,6 +48,24 @@ _ALL_LABEL_STOPWORDS = (
     LABEL_ONLY_STOPWORDS | DOMAIN_STOPWORDS
     | LDA_GEO_STOPWORDS | LDA_GENERIC_STOPWORDS
 )
+
+
+class _NumpyJSONEncoder(json.JSONEncoder):
+    """JSON encoder tolerant of NumPy scalars/arrays in metrics dicts.
+
+    Replaces the former global ``json`` monkey-patch from
+    ``topic_modeling/patches.py`` — encoding is now opt-in at the one
+    call site that needs it (``save_model_parameters``).
+    """
+
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
 
 def tokenize_documents(
@@ -200,7 +221,13 @@ def create_lda_model(
     )
 
     if workers and workers > 1:
-        log.info(f"Using LdaMulticore with {workers} workers")
+        # LdaMulticore raises NotImplementedError for alpha="auto"; the
+        # closest supported prior is a fixed asymmetric one.
+        common_kwargs["alpha"] = "asymmetric"
+        log.info(
+            f"Using LdaMulticore with {workers} workers "
+            "(alpha='asymmetric'; learned 'auto' alpha needs the single-core path)"
+        )
         model = LdaMulticore(workers=workers, **common_kwargs)
     else:
         log.info("Using single-core LdaModel (reproducible)")
@@ -335,25 +362,35 @@ def predict_document(
     dictionary: Dictionary,
     tokens: List[str],
     minimum_probability: float = DEFAULT_MINIMUM_PROBABILITY,
-) -> Tuple[int | None, float | None, str | None]:
-    """Predict the dominant topic for a single tokenized document.
+    topk: int = DEFAULT_TOPIC_TOPK,
+) -> Tuple[int | None, float | None, str | None, str | None]:
+    """Predict topics for a single tokenized document.
 
-    Returns (topic_id, probability, label) or (None, None, None) for empty docs.
+    Returns (topic_id, probability, label, topk_str) — the dominant topic
+    plus a compact top-k distribution string ``"id:prob|id:prob|..."``
+    (descending probability, entries below *minimum_probability* dropped).
+    Returns (None, None, None, None) for empty docs.
     """
     if not tokens:
-        return None, None, None
+        return None, None, None, None
 
     bow = dictionary.doc2bow(tokens)
     if not bow:
-        return None, None, None
+        return None, None, None, None
 
     topic_distribution = model.get_document_topics(bow, minimum_probability=0.0)
     if not topic_distribution:
-        return None, None, None
+        return None, None, None, None
 
-    best_topic_id, best_prob = max(topic_distribution, key=lambda x: x[1])
+    ranked = sorted(topic_distribution, key=lambda x: x[1], reverse=True)
+    best_topic_id, best_prob = ranked[0]
     label = get_topic_label(model, best_topic_id)
-    return int(best_topic_id), float(best_prob), label
+    topk_str = "|".join(
+        f"{int(tid)}:{prob:.4f}"
+        for tid, prob in ranked[:topk]
+        if prob >= minimum_probability
+    )
+    return int(best_topic_id), float(best_prob), label, topk_str or None
 
 
 def apply_phraser(tokens: List[str], phraser: Tuple[Phraser, Phraser] | None) -> List[str]:
@@ -377,10 +414,14 @@ def predict_batch(
     stopwords: set[str] | None = None,
     min_token_length: int = 2,
     phraser: Tuple[Phraser, Phraser] | None = None,
+    topic_topk_col: str | None = None,
+    topk: int = DEFAULT_TOPIC_TOPK,
 ) -> Dict[str, List[Any]]:
     """Predict topics for a HuggingFace dataset batch (batched map function).
 
-    Only processes French documents; others get None values.
+    Only processes French documents; others get None values. When
+    *topic_topk_col* is set, a compact top-k distribution string
+    (``"id:prob|id:prob|..."``) is stored alongside the dominant topic.
     """
     texts = batch[text_col]
     languages = batch.get("language", [None] * len(texts))
@@ -388,6 +429,7 @@ def predict_batch(
     topics: List[int | None] = [None] * len(texts)
     probabilities: List[float | None] = [None] * len(texts)
     labels: List[str | None] = [None] * len(texts)
+    topks: List[str | None] = [None] * len(texts)
 
     sw = stopwords or set()
 
@@ -405,14 +447,17 @@ def predict_batch(
         ]
         tokens = apply_phraser(tokens, phraser)
         tokens = apply_custom_collocations(tokens, CUSTOM_COLLOCATIONS)
-        tid, prob, label = predict_document(model, dictionary, tokens)
+        tid, prob, label, topk_str = predict_document(model, dictionary, tokens, topk=topk)
         topics[i] = tid
         probabilities[i] = prob
         labels[i] = label
+        topks[i] = topk_str
 
     batch[topic_id_col] = topics
     batch[topic_prob_col] = probabilities
     batch[topic_label_col] = labels
+    if topic_topk_col is not None:
+        batch[topic_topk_col] = topks
     return batch
 
 
@@ -476,20 +521,21 @@ def save_model_parameters(
     coherence_metrics: Dict[str, Any] | None = None,
     extra_info: Dict[str, Any] | None = None,
     logger: logging.Logger | None = None,
+    alpha: str = "auto",
 ) -> Path:
     """Save training parameters to JSON for reproducibility."""
     params: Dict[str, Any] = {
         "metadata": {
             "created_at": datetime.now().isoformat(),
             "method": "LDA (gensim)",
-            "pipeline_version": "1.0.0",
+            "pipeline_version": "1.1.0",
         },
         "lda": {
             "num_topics": num_topics,
             "passes": passes,
             "iterations": iterations,
             "chunksize": chunksize,
-            "alpha": "auto",
+            "alpha": alpha,
             "eta": "auto",
             "random_state": DEFAULT_RANDOM_STATE,
         },
@@ -511,7 +557,7 @@ def save_model_parameters(
     model_dir.mkdir(parents=True, exist_ok=True)
     params_path = model_dir / "training_parameters.json"
     with open(params_path, "w", encoding="utf-8") as f:
-        json.dump(params, f, ensure_ascii=False, indent=2)
+        json.dump(params, f, ensure_ascii=False, indent=2, cls=_NumpyJSONEncoder)
 
     if logger:
         logger.info(f"Parameters saved: {params_path}")
@@ -525,8 +571,8 @@ def find_optimal_topics(
     topic_range_start: int = DEFAULT_TOPIC_RANGE_START,
     topic_range_end: int = DEFAULT_TOPIC_RANGE_END,
     topic_range_step: int = DEFAULT_TOPIC_RANGE_STEP,
-    passes: int = DEFAULT_PASSES,
-    iterations: int = DEFAULT_ITERATIONS,
+    sweep_passes: int = DEFAULT_SWEEP_PASSES,
+    sweep_iterations: int = DEFAULT_SWEEP_ITERATIONS,
     chunksize: int = DEFAULT_CHUNKSIZE,
     random_state: int = DEFAULT_RANDOM_STATE,
     logger: logging.Logger | None = None,
@@ -535,6 +581,10 @@ def find_optimal_topics(
 
     This is standard DH practice (Mimno et al.): train LDA at several k
     values, compute C_v coherence for each, and pick the peak.
+
+    Sweep models train at reduced settings (*sweep_passes* /
+    *sweep_iterations*) — enough for a stable *relative* C_v ranking; the
+    caller retrains the winning k at full production settings afterwards.
 
     Returns:
         best_k: the number of topics with the highest C_v score.
@@ -546,7 +596,8 @@ def find_optimal_topics(
     candidates = list(range(topic_range_start, topic_range_end + 1, topic_range_step))
     log.info(
         f"Optimising num_topics: testing {candidates} "
-        f"({len(candidates)} models to train)"
+        f"({len(candidates)} models to train at sweep settings: "
+        f"passes={sweep_passes}, iterations={sweep_iterations})"
     )
 
     results: List[Dict[str, Any]] = []
@@ -559,8 +610,8 @@ def find_optimal_topics(
             corpus=corpus,
             id2word=dictionary,
             num_topics=k,
-            passes=passes,
-            iterations=iterations,
+            passes=sweep_passes,
+            iterations=sweep_iterations,
             chunksize=chunksize,
             random_state=random_state,
             alpha="auto",

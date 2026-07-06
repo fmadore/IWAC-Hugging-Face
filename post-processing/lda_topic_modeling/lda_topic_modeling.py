@@ -12,6 +12,9 @@ New columns added:
   - lda_topic_id    : dominant topic id
   - lda_topic_prob  : probability of the dominant topic
   - lda_topic_label : top words for the dominant topic
+  - lda_topic_topk  : top-k topic distribution "id:prob|id:prob|..."
+                      (descending probability; enables probability-weighted
+                      analyses like topic prevalence over time)
 """
 from __future__ import annotations
 
@@ -39,11 +42,9 @@ if str(PARENT_DIR) not in sys.path:
     sys.path.insert(0, str(PARENT_DIR))
 
 from _common import choose_config, ensure_hf_token, get_available_configs  # type: ignore  # noqa: E402
-from topic_modeling.patches import apply_all_patches  # type: ignore
 
 from lda_topic_modeling.constants import (  # type: ignore
     DOMAIN_STOPWORDS,
-    LABEL_ONLY_STOPWORDS,
     LDA_GEO_STOPWORDS,
     LDA_GENERIC_STOPWORDS,
     CUSTOM_COLLOCATIONS,
@@ -56,11 +57,13 @@ from lda_topic_modeling.constants import (  # type: ignore
     DEFAULT_TOPIC_RANGE_START,
     DEFAULT_TOPIC_RANGE_END,
     DEFAULT_TOPIC_RANGE_STEP,
+    DEFAULT_SWEEP_PASSES,
+    DEFAULT_SWEEP_ITERATIONS,
+    DEFAULT_TOPIC_TOPK,
 )
 from lda_topic_modeling.modeling import (  # type: ignore
     tokenize_documents,
     apply_custom_collocations,
-    apply_phraser,
     build_dictionary,
     build_corpus,
     create_lda_model,
@@ -128,6 +131,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Extra stopwords file (one word per line, UTF-8)",
     )
     p.add_argument("--topic-label-words", type=int, default=6, help="Number of words in topic labels")
+    p.add_argument(
+        "--topic-topk",
+        type=int,
+        default=DEFAULT_TOPIC_TOPK,
+        help="Number of topics kept in the lda_topic_topk distribution column",
+    )
     # Topic-number optimisation (DH best practice: sweep k, pick best C_v)
     p.add_argument(
         "--optimize-topics",
@@ -137,6 +146,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--topic-range-start", type=int, default=DEFAULT_TOPIC_RANGE_START, help="Optimisation: first k to try")
     p.add_argument("--topic-range-end", type=int, default=DEFAULT_TOPIC_RANGE_END, help="Optimisation: last k to try")
     p.add_argument("--topic-range-step", type=int, default=DEFAULT_TOPIC_RANGE_STEP, help="Optimisation: step between k values")
+    p.add_argument(
+        "--sweep-passes",
+        type=int,
+        default=DEFAULT_SWEEP_PASSES,
+        help="Optimisation: passes per sweep model (reduced; final model retrains at --passes)",
+    )
+    p.add_argument(
+        "--sweep-iterations",
+        type=int,
+        default=DEFAULT_SWEEP_ITERATIONS,
+        help="Optimisation: iterations per sweep model (reduced; final model retrains at --iterations)",
+    )
     p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts")
     return p
 
@@ -145,7 +166,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    apply_all_patches()
     configure_logging()
     logger = logging.getLogger(__name__)
 
@@ -156,7 +176,8 @@ def main() -> None:
     topic_id_col = "lda_topic_id"
     topic_prob_col = "lda_topic_prob"
     topic_label_col = "lda_topic_label"
-    new_columns = [topic_id_col, topic_prob_col, topic_label_col]
+    topic_topk_col = "lda_topic_topk"
+    new_columns = [topic_id_col, topic_prob_col, topic_label_col, topic_topk_col]
     model_dir = Path(args.model_path)
 
     # ── Auth ────────────────────────────────────────────────────────
@@ -278,7 +299,11 @@ def main() -> None:
         num_topics = args.num_topics
         optimization_results = None
         if args.optimize_topics:
-            logger.info("Running topic-number optimisation (this may take a while)...")
+            logger.info(
+                "Running topic-number optimisation "
+                f"(sweep models at passes={args.sweep_passes}, iterations={args.sweep_iterations}; "
+                "the winning k retrains at full settings)..."
+            )
             best_k, optimization_results = find_optimal_topics(
                 corpus,
                 dictionary,
@@ -286,8 +311,8 @@ def main() -> None:
                 topic_range_start=args.topic_range_start,
                 topic_range_end=args.topic_range_end,
                 topic_range_step=args.topic_range_step,
-                passes=args.passes,
-                iterations=args.iterations,
+                sweep_passes=args.sweep_passes,
+                sweep_iterations=args.sweep_iterations,
                 chunksize=args.chunksize,
                 logger=logger,
             )
@@ -335,6 +360,8 @@ def main() -> None:
             extra_info["topic_optimization"] = {
                 "method": "C_v coherence grid search",
                 "range_tested": f"{args.topic_range_start}-{args.topic_range_end} step {args.topic_range_step}",
+                "sweep_passes": args.sweep_passes,
+                "sweep_iterations": args.sweep_iterations,
                 "best_k": num_topics,
                 "results": optimization_results,
             }
@@ -350,6 +377,7 @@ def main() -> None:
             coherence_metrics=coherence_metrics,
             extra_info=extra_info,
             logger=logger,
+            alpha="asymmetric" if args.workers and args.workers > 1 else "auto",
         )
     else:
         # Load existing model
@@ -372,6 +400,8 @@ def main() -> None:
             topic_label_col=topic_label_col,
             stopwords=stopwords,
             phraser=phraser,
+            topic_topk_col=topic_topk_col,
+            topk=args.topic_topk,
         ),
         batched=True,
         batch_size=args.batch_size,
