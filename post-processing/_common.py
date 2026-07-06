@@ -31,6 +31,14 @@ _DEFAULT_CONFIGS: List[str] = ["articles", "publications", "documents"]
 # Repo root (parent of post-processing/), used to locate the data/ CSV mirrors.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Canonical repo IDs (re-exported so post-processing scripts can use
+# ``from _common import PRIVATE_REPO_ID`` without touching sys.path).
+try:
+    from iwac_common.repos import PRIVATE_REPO_ID, PUBLIC_REPO_ID  # noqa: F401
+except ImportError:  # venv without the editable install
+    sys.path.insert(0, str(REPO_ROOT))
+    from iwac_common.repos import PRIVATE_REPO_ID, PUBLIC_REPO_ID  # noqa: F401
+
 
 def load_subset_dataframe(
     repo_id: str,
@@ -167,4 +175,6 @@ __all__ = [
     "choose_config",
     "load_subset_dataframe",
     "REPO_ROOT",
+    "PRIVATE_REPO_ID",
+    "PUBLIC_REPO_ID",
 ]

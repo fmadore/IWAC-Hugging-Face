@@ -57,9 +57,11 @@ from iwac_common.field_mappers import (
     extract_added_date,
     get_media_ids,
     get_value,
+    is_content_public,
     to_int_or_none,
 )
 from iwac_common.hub_merge import merge_with_hub_dataset, resolve_hf_token
+from iwac_common.repos import PRIVATE_REPO_ID
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -170,6 +172,7 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
         "URL": extracted_fabio_url,
         "source": get_value(item, "dcterms:source"),
         "OCR": get_value(item, "bibo:content"),
+        "OCR_is_public": is_content_public(item),
     }
 
 
@@ -373,8 +376,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--repo",
-        default="fmadore/islam-west-africa-collection",
-        help="Dataset repository on the Hugging Face Hub"
+        default=PRIVATE_REPO_ID,
+        help="Dataset repository on the Hugging Face Hub (default: private full mirror)"
     )
     parser.add_argument(
         "--max-shard-size",

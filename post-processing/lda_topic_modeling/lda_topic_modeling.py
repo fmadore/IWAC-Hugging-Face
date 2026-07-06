@@ -41,9 +41,10 @@ PARENT_DIR = CURRENT_DIR.parent
 if str(PARENT_DIR) not in sys.path:
     sys.path.insert(0, str(PARENT_DIR))
 
-from _common import choose_config, ensure_hf_token, get_available_configs  # type: ignore  # noqa: E402
+from _common import choose_config, ensure_hf_token, get_available_configs, PRIVATE_REPO_ID  # type: ignore  # noqa: E402
 
 from lda_topic_modeling.constants import (  # type: ignore
+    CONFIG_PRESETS,
     DOMAIN_STOPWORDS,
     LDA_GEO_STOPWORDS,
     LDA_GENERIC_STOPWORDS,
@@ -66,6 +67,7 @@ from lda_topic_modeling.modeling import (  # type: ignore
     apply_custom_collocations,
     build_dictionary,
     build_corpus,
+    chunk_tokens,
     create_lda_model,
     save_lda_model,
     load_lda_model,
@@ -108,21 +110,40 @@ def choose_mode() -> str:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Add LDA topic columns to a Hugging Face dataset.")
-    p.add_argument("--repo", default="fmadore/islam-west-africa-collection")
+    p.add_argument("--repo", default=PRIVATE_REPO_ID)
     p.add_argument("--config", type=str, default=None, help="Dataset config name (skip interactive prompt)")
     p.add_argument("--mode", type=str, choices=["fit", "predict"], default=None, help="Run mode (skip interactive prompt)")
-    p.add_argument("--num-topics", type=int, default=DEFAULT_NUM_TOPICS, help="Number of LDA topics")
+    p.add_argument(
+        "--language",
+        type=str,
+        default=None,
+        help="Language of documents to train/predict on (exact 'language' value, e.g. 'Français' or "
+             "'Anglais'). Rows in other languages keep their existing topic values. "
+             "Default: per-config preset, else 'Français'.",
+    )
+    p.add_argument("--num-topics", type=int, default=None,
+                   help=f"Number of LDA topics (default: preset/optimizer, else {DEFAULT_NUM_TOPICS})")
     p.add_argument("--passes", type=int, default=DEFAULT_PASSES, help="Training passes over the corpus")
     p.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS, help="Max iterations per pass")
     p.add_argument("--chunksize", type=int, default=DEFAULT_CHUNKSIZE, help="Documents per training chunk")
     p.add_argument("--no-below", type=int, default=DEFAULT_NO_BELOW, help="Min document frequency for dictionary")
     p.add_argument("--no-above", type=float, default=DEFAULT_NO_ABOVE, help="Max document frequency ratio for dictionary")
     p.add_argument("--workers", type=int, default=1, help="Parallel workers (1 = reproducible single-core)")
-    p.add_argument("--model-path", default="lda_model", help="Directory to save/load the LDA model")
+    p.add_argument("--model-path", default=None, help="Directory to save/load the LDA model (default: per-config preset, else 'lda_model')")
     p.add_argument("--max-shard-size", default="1GB")
     p.add_argument("--batch-size", type=int, default=500, help="Batch size for HF dataset map")
     p.add_argument("--max-documents", type=int, default=None, help="Limit training docs (for testing)")
     p.add_argument("--min-train-tokens", type=int, default=5, help="Min tokens to include a doc in training")
+    p.add_argument(
+        "--chunk-words",
+        type=int,
+        default=None,
+        help="Train/predict on N-token chunks instead of whole documents "
+             "(recommended for long-document subsets: references, publications). "
+             "Prediction averages chunk distributions back to one mixture per document. "
+             "In predict mode the value is read from the model's training_parameters.json "
+             "when not given.",
+    )
     p.add_argument("--skip-coherence", action="store_true", help="Skip coherence metric computation")
     p.add_argument(
         "--domain-stopwords-file",
@@ -141,11 +162,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--optimize-topics",
         action="store_true",
-        help="Sweep a range of topic counts and pick the k with best C_v coherence (recommended for first run)",
+        help="Sweep a range of topic counts and pick the k with best C_v coherence "
+             "(auto-enabled by the publications/references presets when --num-topics is not given)",
     )
-    p.add_argument("--topic-range-start", type=int, default=DEFAULT_TOPIC_RANGE_START, help="Optimisation: first k to try")
-    p.add_argument("--topic-range-end", type=int, default=DEFAULT_TOPIC_RANGE_END, help="Optimisation: last k to try")
-    p.add_argument("--topic-range-step", type=int, default=DEFAULT_TOPIC_RANGE_STEP, help="Optimisation: step between k values")
+    p.add_argument("--topic-range-start", type=int, default=None, help=f"Optimisation: first k to try (default: preset, else {DEFAULT_TOPIC_RANGE_START})")
+    p.add_argument("--topic-range-end", type=int, default=None, help=f"Optimisation: last k to try (default: preset, else {DEFAULT_TOPIC_RANGE_END})")
+    p.add_argument("--topic-range-step", type=int, default=None, help=f"Optimisation: step between k values (default: preset, else {DEFAULT_TOPIC_RANGE_STEP})")
     p.add_argument(
         "--sweep-passes",
         type=int,
@@ -178,7 +200,6 @@ def main() -> None:
     topic_label_col = "lda_topic_label"
     topic_topk_col = "lda_topic_topk"
     new_columns = [topic_id_col, topic_prob_col, topic_label_col, topic_topk_col]
-    model_dir = Path(args.model_path)
 
     # ── Auth ────────────────────────────────────────────────────────
     token = ensure_hf_token(console=console)
@@ -199,6 +220,29 @@ def main() -> None:
         mode = choose_mode()
     logger.info(f"Mode: '{mode}'")
 
+    # ── Resolve settings: explicit CLI > params file (predict) > preset > defaults
+    preset = CONFIG_PRESETS.get(config_name, {})
+    language: str = args.language or preset.get("language", "Français")
+    model_dir = Path(args.model_path or preset.get("model_path", "lda_model"))
+    chunk_words: int | None = (
+        args.chunk_words if args.chunk_words is not None else preset.get("chunk_words")
+    )
+    p_range = preset.get("topic_range")
+    range_start = args.topic_range_start if args.topic_range_start is not None else (p_range[0] if p_range else DEFAULT_TOPIC_RANGE_START)
+    range_end = args.topic_range_end if args.topic_range_end is not None else (p_range[1] if p_range else DEFAULT_TOPIC_RANGE_END)
+    range_step = args.topic_range_step if args.topic_range_step is not None else (p_range[2] if p_range else DEFAULT_TOPIC_RANGE_STEP)
+    # Preset may auto-enable the k-sweep, but an explicit --num-topics wins.
+    optimize_topics = args.optimize_topics or (
+        mode == "fit" and args.num_topics is None and preset.get("optimize_topics", False)
+    )
+    if preset:
+        logger.info(
+            f"Preset '{config_name}': language={language}, model_path={model_dir}, "
+            f"chunk_words={chunk_words}"
+            + (f", k-sweep {range_start}-{range_end} step {range_step}" if optimize_topics else "")
+            + " (explicit CLI flags override)"
+        )
+
     # ── Load dataset ────────────────────────────────────────────────
     logger.info(f"Loading dataset '{repo_id}' config '{config_name}'...")
     try:
@@ -211,11 +255,11 @@ def main() -> None:
     # Language stats
     if "language" in ds.column_names:
         langs = ds["language"]
-        fr_count = sum(1 for l in langs if l == "Français")
-        other_count = sum(1 for l in langs if l and l != "Français")
-        logger.info(f"French: {fr_count} | Other: {other_count} | Total: {len(ds)}")
-        if fr_count == 0:
-            logger.error("No French documents found.")
+        lang_count = sum(1 for l in langs if l == language)
+        other_count = sum(1 for l in langs if l and l != language)
+        logger.info(f"{language}: {lang_count} | Other: {other_count} | Total: {len(ds)}")
+        if lang_count == 0:
+            logger.error(f"No '{language}' documents found.")
             return
     else:
         logger.warning("No 'language' column — all texts will be processed.")
@@ -259,20 +303,20 @@ def main() -> None:
     phraser = None
 
     if mode == "fit":
-        # Extract French texts
-        logger.info("Extracting French texts from lemma_nostop...")
+        # Extract training texts in the target language
+        logger.info(f"Extracting '{language}' texts from lemma_nostop...")
         if "language" in ds.column_names:
             docs = [
                 str(t)
                 for t, lang in zip(ds[text_column], ds["language"])
-                if lang == "Français"
+                if lang == language
                 and t
                 and str(t).strip()
                 and len(str(t).split()) >= args.min_train_tokens
             ]
         else:
             docs = [str(t) for t in ds[text_column] if t and str(t).strip()]
-        logger.info(f"French docs for training: {len(docs)}")
+        logger.info(f"{language} docs for training: {len(docs)}")
 
         if args.max_documents and len(docs) > args.max_documents:
             logger.info(f"Limiting to {args.max_documents} docs")
@@ -289,6 +333,21 @@ def main() -> None:
         tokenized_valid = [t for _, t in valid]
         logger.info(f"Valid tokenized docs: {len(tokenized_valid)}")
 
+        # Long-document subsets train on fixed-size chunks: phrase
+        # detection above ran on whole documents, so phrase tokens
+        # survive the split intact.
+        if chunk_words:
+            tokenized_valid = [
+                chunk
+                for doc_tokens in tokenized_valid
+                for chunk in chunk_tokens(doc_tokens, chunk_words)
+                if chunk
+            ]
+            logger.info(
+                f"Chunking at {chunk_words} tokens: "
+                f"{len(valid)} documents -> {len(tokenized_valid)} training chunks"
+            )
+
         # Dictionary + corpus
         logger.info("Building dictionary and corpus...")
         dictionary = build_dictionary(tokenized_valid, no_below=args.no_below, no_above=args.no_above)
@@ -296,9 +355,9 @@ def main() -> None:
         corpus = build_corpus(dictionary, tokenized_valid)
 
         # Optimise num_topics if requested (DH best practice)
-        num_topics = args.num_topics
+        num_topics = args.num_topics if args.num_topics is not None else DEFAULT_NUM_TOPICS
         optimization_results = None
-        if args.optimize_topics:
+        if optimize_topics:
             logger.info(
                 "Running topic-number optimisation "
                 f"(sweep models at passes={args.sweep_passes}, iterations={args.sweep_iterations}; "
@@ -308,9 +367,9 @@ def main() -> None:
                 corpus,
                 dictionary,
                 tokenized_valid,
-                topic_range_start=args.topic_range_start,
-                topic_range_end=args.topic_range_end,
-                topic_range_step=args.topic_range_step,
+                topic_range_start=range_start,
+                topic_range_end=range_end,
+                topic_range_step=range_step,
                 sweep_passes=args.sweep_passes,
                 sweep_iterations=args.sweep_iterations,
                 chunksize=args.chunksize,
@@ -355,11 +414,13 @@ def main() -> None:
             "config_name": config_name,
             "num_training_docs": len(tokenized_valid),
             "dictionary_size": len(dictionary),
+            "chunk_words": chunk_words,
+            "language": language,
         }
         if optimization_results is not None:
             extra_info["topic_optimization"] = {
                 "method": "C_v coherence grid search",
-                "range_tested": f"{args.topic_range_start}-{args.topic_range_end} step {args.topic_range_step}",
+                "range_tested": f"{range_start}-{range_end} step {range_step}",
                 "sweep_passes": args.sweep_passes,
                 "sweep_iterations": args.sweep_iterations,
                 "best_k": num_topics,
@@ -386,6 +447,24 @@ def main() -> None:
             return
         lda_model, dictionary, phraser = load_lda_model(model_dir, logger)
 
+        # A chunk-trained model must predict with the same chunking and
+        # language filter. The params file reflects how THIS model was
+        # trained, so it overrides the preset (but not explicit CLI flags).
+        params_path = model_dir / "training_parameters.json"
+        if params_path.exists():
+            try:
+                import json
+
+                saved_extra = json.loads(params_path.read_text(encoding="utf-8")).get("extra", {})
+                if args.chunk_words is None and saved_extra.get("chunk_words"):
+                    chunk_words = int(saved_extra["chunk_words"])
+                    logger.info(f"Using chunk_words={chunk_words} from training_parameters.json")
+                if args.language is None and saved_extra.get("language"):
+                    language = str(saved_extra["language"])
+                    logger.info(f"Using language={language} from training_parameters.json")
+            except Exception as e:
+                logger.warning(f"Could not read settings from {params_path}: {e}")
+
     # ── Predict on full dataset ─────────────────────────────────────
     logger.info("Predicting topics for all documents...")
 
@@ -402,6 +481,8 @@ def main() -> None:
             phraser=phraser,
             topic_topk_col=topic_topk_col,
             topk=args.topic_topk,
+            chunk_words=chunk_words,
+            language=language,
         ),
         batched=True,
         batch_size=args.batch_size,
@@ -416,7 +497,7 @@ def main() -> None:
 
     processed = sum(1 for t in topic_ids if t is not None)
     skipped = sum(1 for t in topic_ids if t is None)
-    logger.info(f"Processed (French): {processed} | Skipped: {skipped} | Total: {len(topic_ids)}")
+    logger.info(f"With topics ({language} + preserved): {processed} | Without: {skipped} | Total: {len(topic_ids)}")
 
     valid_ids = [t for t in topic_ids if t is not None]
     if valid_ids:
@@ -469,9 +550,11 @@ def main() -> None:
     table.add_column("Value", style="green")
     table.add_row("Columns added", ", ".join(new_columns))
     table.add_row("Method", "LDA (gensim)")
+    table.add_row("Language", language)
+    table.add_row("Chunk words", str(chunk_words) if chunk_words else "— (whole documents)")
     table.add_row("Num topics", str(lda_model.num_topics))
-    table.add_row("French docs processed", str(processed))
-    table.add_row("Docs skipped", str(skipped))
+    table.add_row("Docs with topics", str(processed))
+    table.add_row("Docs without topics", str(skipped))
     table.add_row("Total docs", str(len(ds)))
     table.add_row("Model saved", str(model_dir))
     if mode == "fit":

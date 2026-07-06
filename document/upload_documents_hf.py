@@ -42,9 +42,11 @@ from iwac_common.field_mappers import (
     extract_added_date,
     get_media_ids,
     get_value,
+    is_content_public,
     to_int_or_none,
 )
 from iwac_common.hub_merge import merge_with_hub_dataset, resolve_hf_token
+from iwac_common.repos import PRIVATE_REPO_ID
 
 # Rich console imports for beautiful output
 from rich.console import Console
@@ -160,6 +162,7 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
         "source": get_value(item, "dcterms:source"),
         "rights": _get_label(item, "dcterms:rights"),
         "OCR": get_value(item, "bibo:content"),
+        "OCR_is_public": is_content_public(item),
     }
 
 
@@ -305,8 +308,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Upload IWAC documents to Hugging Face Hub")
-    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="Hugging Face repository to publish to")
+    parser.add_argument("--repo", default=PRIVATE_REPO_ID, help="Hugging Face repository to publish to (default: private full mirror)")
     parser.add_argument("--max-shard-size", default="1GB", help="Max shard size for Parquet (e.g., 500MB, 1GB)")
     args = parser.parse_args()
 
-    asyncio.run(build_and_push(Config(CACHE_DIR=".cache_omk_documents"), repo="fmadore/islam-west-africa-collection", shard_size=args.max_shard_size))
+    asyncio.run(build_and_push(Config(CACHE_DIR=".cache_omk_documents"), repo=args.repo, shard_size=args.max_shard_size))

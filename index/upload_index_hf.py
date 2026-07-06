@@ -46,6 +46,7 @@ from iwac_common.omeka_client import (
 )
 from iwac_common.field_mappers import extract_added_date, get_value
 from iwac_common.hub_merge import merge_with_hub_dataset, resolve_hf_token
+from iwac_common.repos import PRIVATE_REPO_ID
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -271,36 +272,36 @@ def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.Dat
     return result
 
 
-async def load_reference_datasets(token: Optional[str] = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+async def load_reference_datasets(token: Optional[str] = None, repo: str = PRIVATE_REPO_ID) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Charge les datasets articles, publications et references depuis Hugging Face Hub"""
     articles_df = pd.DataFrame()
     publications_df = pd.DataFrame()
     references_df = pd.DataFrame()
-    
+
     try:
-        logger.info("Loading articles dataset from Hugging Face Hub...")
-        articles_ds = load_dataset("fmadore/islam-west-africa-collection", name="articles", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
+        logger.info(f"Loading articles dataset from {repo}...")
+        articles_ds = load_dataset(repo, name="articles", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
         articles_df = articles_ds.to_pandas()
         logger.info(f"Loaded {len(articles_df)} articles")
     except Exception as e:
         logger.warning(f"Could not load articles dataset: {e}")
-    
+
     try:
-        logger.info("Loading publications dataset from Hugging Face Hub...")
-        publications_ds = load_dataset("fmadore/islam-west-africa-collection", name="publications", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
+        logger.info(f"Loading publications dataset from {repo}...")
+        publications_ds = load_dataset(repo, name="publications", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
         publications_df = publications_ds.to_pandas()
         logger.info(f"Loaded {len(publications_df)} publications")
     except Exception as e:
         logger.warning(f"Could not load publications dataset: {e}")
-    
+
     try:
-        logger.info("Loading references dataset from Hugging Face Hub...")
-        references_ds = load_dataset("fmadore/islam-west-africa-collection", name="references", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
+        logger.info(f"Loading references dataset from {repo}...")
+        references_ds = load_dataset(repo, name="references", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
         references_df = references_ds.to_pandas()
         logger.info(f"Loaded {len(references_df)} references")
     except Exception as e:
         logger.warning(f"Could not load references dataset: {e}")
-    
+
     return articles_df, publications_df, references_df
 
 
@@ -314,7 +315,7 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
     # 1. Charger les datasets de référence pour calculer les statistiques
     token_to_use = resolve_hf_token()
     
-    articles_df, publications_df, references_df = await load_reference_datasets(token_to_use)
+    articles_df, publications_df, references_df = await load_reference_datasets(token_to_use, repo=repo)
     
     # 2. Calculer les statistiques de fréquence
     frequency_stats = calculate_frequency_stats(articles_df, publications_df, references_df)
@@ -424,7 +425,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Publie l'index IWAC sur le Hub HF")
-    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="Nom du repo HF (ex. fmadore/islam-west-africa-collection)")
+    parser.add_argument("--repo", default=PRIVATE_REPO_ID, help="Nom du repo HF (défaut: miroir privé complet)")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
     args = parser.parse_args()
 

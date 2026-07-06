@@ -4,8 +4,18 @@
 
 Python scripts to manage the **Islam West Africa Collection (IWAC)** dataset on Hugging Face Hub.
 
-- **Dataset**: https://huggingface.co/datasets/fmadore/islam-west-africa-collection
 - **Source**: Omeka S API at https://islam.zmo.de/api
+- **Private full mirror** (canonical pipeline target): https://huggingface.co/datasets/fmadore/islam-west-africa-collection-full
+- **Public dataset** (projection, minus private full text): https://huggingface.co/datasets/fmadore/islam-west-africa-collection
+
+### Two-repo architecture (since 2026-07)
+
+The full text (`OCR`) is private on the Omeka side, so the Hub side is split:
+
+1. **`fmadore/islam-west-africa-collection-full` (private)** — complete superset, including `OCR`, `lemma_text`, `lemma_nostop`. Every upload and post-processing script targets it by default (constant `PRIVATE_REPO_ID` in `iwac_common/repos.py`; override with `IWAC_HF_PRIVATE_REPO`). Module build pipelines (IwacVisualizations CI) read it with a fine-grained HF token.
+2. **`fmadore/islam-west-africa-collection` (public)** — written ONLY by `post-processing/publish_public.py`, which copies each subset from the private repo minus the private columns (`PRIVATE_COLUMNS` in `iwac_common/repos.py`: `OCR` everywhere it exists, plus `lemma_text`/`lemma_nostop`). Embeddings, LDA topics, AI sentiment (incl. justifications), `descriptionAI`, `abstract`, `tableOfContents`, and all metrics stay public.
+
+Never push a full-text column to the public repo; run `publish_public.py` (it has a prose-length guard that aborts if an unexpected long-text column appears).
 
 Dataset subsets:
 - `articles` — Newspaper articles (resource_class_id = 36)
@@ -33,7 +43,7 @@ The skill's `references/omeka-to-hf-mapping.md` documents the end-to-end Omeka �
 
 ### Upload Scripts
 
-Each subset has an upload script that fetches from Omeka S API, maps fields to flat columns, merges with the existing HF dataset (preserving computed columns), and pushes to Hub.
+Each subset has an upload script that fetches from Omeka S API, maps fields to flat columns, merges with the existing HF dataset (preserving computed columns), and pushes to Hub — to the **private** repo by default.
 
 - `articles/upload_newspaper_hf.py` — Articles (main template)
 - `audiovisual/upload_audiovisual_hf.py`
@@ -46,14 +56,15 @@ AI sentiment analysis (Gemini, ChatGPT, Mistral) is fetched directly from the Om
 
 ### Post-Processing Scripts
 
-Scripts that enrich the dataset with computed columns:
-- `lemmatize_update_hf.py` — French lemmatization with spaCy
+Scripts that enrich the dataset with computed columns (all target the private repo by default):
+- `lemmatize_update_hf.py` — spaCy lemmatization (articles, publications, references; `--mode all|empty` for non-interactive runs). Mixed-language subsets run **one pass per language**: `--language Français` / `--language Anglais` filters rows (pipe-membership) and auto-picks the spaCy model (`fr_core_news_lg` / `en_core_web_lg`); skipped rows keep their existing values, so passes compose. (`--french-only` is a deprecated alias.)
 - `post-processing/calculate_lexical_richness.py` — Text statistics
 - `post-processing/calculate_word_count.py` — Word counts (`--config`/`-y` for non-interactive runs; references fetch `bibo:content` via `iwac_common` client)
-- `post-processing/semantic_embedding.py` — Sentence embeddings (articles: OCR, publications: tableOfContents)
-- `post-processing/lda_topic_modeling/` — LDA topic modeling (gensim); stopword sets live in its `constants.py`; prediction adds `lda_topic_id`, `lda_topic_prob`, `lda_topic_label`, and `lda_topic_topk` ("id:prob|…" top-k distribution)
+- `post-processing/semantic_embedding.py` — Gemini embeddings (articles: OCR, publications: tableOfContents, references: OCR; `--update-mode missing|all` for non-interactive runs)
+- `post-processing/lda_topic_modeling/` — LDA topic modeling (gensim); stopword sets live in its `constants.py`; prediction adds `lda_topic_id`, `lda_topic_prob`, `lda_topic_label`, and `lda_topic_topk` ("id:prob|…" top-k distribution). **Per-config presets** (`CONFIG_PRESETS` in `constants.py`) make `--config <subset> --mode fit -y` run the recommended recipe (model path, `--chunk-words 1000` for long-document subsets, k-sweep); resolution order: explicit CLI > `training_parameters.json` (predict) > preset > defaults. `--language` trains/predicts one language at a time; skipped rows **keep** their existing topic values, so per-language models compose (e.g. references: FR model `lda_model_references` + EN model `lda_model_references_en`). Models: `lda_model/` (articles, whole-doc), `lda_model_references*/`, `lda_model_publications/`.
 - `post-processing/sentiment_agreement.py` — Inter-model agreement (κ, Krippendorff α) on the 3-model sentiment block; report-only by default, `--push` adds `consensus_*` / `sentiment_disagreement` columns
 - `post-processing/related_articles.py` — Top-k cosine neighbors from existing embeddings; report-only by default, `--push` adds `related_articles` ("o:id:cos|…")
+- `post-processing/publish_public.py` — **the only writer to the public repo**: projects the private mirror minus `PRIVATE_COLUMNS`, with a prose-length guard against new full-text columns; `--dry-run` to preview, `--squash` for the one-time public history purge
 
 ### Analysis Scripts (aggregate outputs, no Hub columns)
 
@@ -88,7 +99,9 @@ OMEKA_BASE_URL=https://islam.zmo.de/api
 OMEKA_KEY_IDENTITY=your_key
 OMEKA_KEY_CREDENTIAL=your_credential
 HF_TOKEN=your_huggingface_token
+GOOGLE_API_KEY=your_gemini_key   # semantic_embedding.py
 ```
+Optional: `IWAC_HF_PRIVATE_REPO` / `IWAC_HF_PUBLIC_REPO` override the repo IDs in `iwac_common/repos.py` (useful for testing against a scratch repo).
 
 ## Hardware Constraints
 

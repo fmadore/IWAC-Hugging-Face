@@ -40,7 +40,7 @@ import textstat
 
 # Make ``post-processing/_common.py`` importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import choose_config, ensure_hf_token, get_available_configs  # noqa: E402
+from _common import choose_config, ensure_hf_token, get_available_configs, PRIVATE_REPO_ID  # noqa: E402
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -280,8 +280,8 @@ def main():
     )
     parser.add_argument(
         "--repo",
-        default="fmadore/islam-west-africa-collection",
-        help="Repository ID on Hugging Face Hub (e.g., user/dataset_name)."
+        default=PRIVATE_REPO_ID,
+        help="Repository ID on Hugging Face Hub (default: private full mirror)."
     )
     parser.add_argument(
         "--max-shard-size",

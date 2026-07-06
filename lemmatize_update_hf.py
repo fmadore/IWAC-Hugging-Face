@@ -56,7 +56,7 @@ import spacy
 
 # Make ``post-processing/_common.py`` and ``_embedding_utils.py`` importable.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "post-processing"))
-from _common import ensure_hf_token  # noqa: E402
+from _common import ensure_hf_token, PRIVATE_REPO_ID  # noqa: E402
 from _embedding_utils import load_cache, save_cache, delete_cache  # noqa: E402
 
 # Rich console imports for beautiful output
@@ -170,6 +170,7 @@ def lemmatise_dataset(
     clean_col: str,
     process_choice: str,
     cache_file: Path,
+    language_filter: str | None = None,
 ):
     """Add lemma columns to ``ds``, checkpointing to ``cache_file`` for resume.
 
@@ -180,6 +181,12 @@ def lemmatise_dataset(
     loses at most that many rows. On restart, cached rows are reused and only
     the remainder is recomputed. Rows that already have a non-empty lemma are
     kept as-is in "empty" mode; blank-text rows get empty lemmas.
+
+    ``language_filter`` skips rows whose ``language`` does not include the
+    given label (pipe-split membership, e.g. "Français" or "Anglais"): a
+    wrong-language pipeline would emit garbage lemmas. Skipped rows keep
+    their existing values, so per-language passes compose (French pass with
+    the French model, then English pass with the English model).
     """
     n = len(ds)
     row_ids = [str(x) for x in ds["o:id"]]
@@ -187,12 +194,30 @@ def lemmatise_dataset(
     existing_lemmas = ds[lemma_col] if lemma_col in ds.column_names else [None] * n
     existing_clean = ds[clean_col] if clean_col in ds.column_names else [None] * n
 
+    in_scope = [True] * n
+    if language_filter:
+        if "language" not in ds.column_names:
+            console.print(f"[yellow]⚠[/yellow] --language '{language_filter}' requested but no 'language' column; processing all rows.")
+        else:
+            in_scope = [
+                language_filter in str(lang).split("|") if lang else False
+                for lang in ds["language"]
+            ]
+            console.print(
+                f"[blue]→[/blue] Language filter '{language_filter}': [bold]{sum(in_scope):,}[/bold] of {n:,} rows eligible"
+            )
+
     cache = load_cache(cache_file)
 
     final_lemmas: List[str] = [""] * n
     final_clean: List[str] = [""] * n
     indices_to_process: List[int] = []
     for i in range(n):
+        if not in_scope[i]:
+            # Out of scope: keep whatever the row already has.
+            final_lemmas[i] = existing_lemmas[i] or ""
+            final_clean[i] = existing_clean[i] or ""
+            continue
         cached = cache.get(row_ids[i])
         if cached is not None:
             final_lemmas[i], final_clean[i] = cached[0], cached[1]
@@ -250,7 +275,13 @@ def lemmatise_dataset(
 
 # Subsets that carry an OCR text column worth lemmatising. Passing --config
 # with another subset still works; this list only drives the interactive menu.
-LEMMATIZABLE_SUBSETS = ["articles", "publications"]
+LEMMATIZABLE_SUBSETS = ["articles", "publications", "references"]
+
+# Default spaCy model per --language label (CPU-friendly large models).
+LANGUAGE_MODEL_DEFAULTS = {
+    "Français": "fr_core_news_lg",
+    "Anglais": "en_core_web_lg",
+}
 
 
 def choose_subset() -> str:
@@ -275,14 +306,20 @@ def main():
     configure_logging()
 
     parser = argparse.ArgumentParser(description="Add lemmatised columns to a Hugging Face dataset")
-    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="Dataset repo on the Hugging Face Hub (e.g. fmadore/islam-west-africa-collection)")
-    parser.add_argument("--config", default=None, help="Dataset subset/config to lemmatise (e.g. 'articles', 'publications'). If omitted, you are prompted to choose. Any subset that has the --text-column is accepted.")
+    parser.add_argument("--repo", default=PRIVATE_REPO_ID, help="Dataset repo on the Hugging Face Hub (default: private full mirror)")
+    parser.add_argument("--config", default=None, help="Dataset subset/config to lemmatise (e.g. 'articles', 'publications', 'references'). If omitted, you are prompted to choose. Any subset that has the --text-column is accepted.")
     parser.add_argument("--text-column", default="OCR", help="Name of the column containing the raw French text to process")
     parser.add_argument("--lemma-column", default="lemma_text", help="Column name for the lemmatised text")
     parser.add_argument("--clean-column", default="lemma_nostop", help="Column name for the lemmatised text with stop-words removed")
-    parser.add_argument("--spacy-model", default="fr_core_news_lg", help="spaCy model to use for French lemmatisation (use fr_core_news_lg for CPU)")
+    parser.add_argument("--spacy-model", default=None, help="spaCy model to use (default: chosen from --language via LANGUAGE_MODEL_DEFAULTS, else fr_core_news_lg)")
     parser.add_argument("--max-shard-size", default="1GB", help="Maximum Parquet shard size when pushing to the Hub")
+    parser.add_argument("--mode", choices=["all", "empty"], default=None, help="Process all rows or only rows with an empty lemma column (skips the interactive prompt)")
+    parser.add_argument("--language", default=None, metavar="LABEL", help="Only lemmatise rows whose 'language' includes LABEL (e.g. 'Français', 'Anglais'); picks the matching spaCy model unless --spacy-model is given. Other rows keep their existing values — run one pass per language on mixed subsets like 'references'.")
+    parser.add_argument("--french-only", action="store_true", help="Deprecated alias for --language Français")
     args = parser.parse_args()
+
+    language_filter = args.language or ("Français" if args.french_only else None)
+    spacy_model = args.spacy_model or LANGUAGE_MODEL_DEFAULTS.get(language_filter or "", "fr_core_news_lg")
 
     # ------------------------------------------------------------------
     # Resolve which subset to process (interactive menu if --config omitted)
@@ -301,7 +338,8 @@ def main():
         f"[bold]Repository:[/bold] {args.repo}\n"
         f"[bold]Subset:[/bold] {config_name}\n"
         f"[bold]Text column:[/bold] {args.text_column}\n"
-        f"[bold]spaCy model:[/bold] {args.spacy_model}",
+        f"[bold]Language filter:[/bold] {language_filter or 'none (all rows)'}\n"
+        f"[bold]spaCy model:[/bold] {spacy_model}",
         title="[bold blue]Lemmatization Configuration[/bold blue]",
         border_style="blue"
     ))
@@ -316,29 +354,36 @@ def main():
         raise ValueError(f"Column '{args.text_column}' not found in the dataset.")
 
     # ------------------------------------------------------------------
-    # Ask user for processing preference
+    # Ask user for processing preference (skipped when --mode is given)
     # ------------------------------------------------------------------
-    process_choice = Prompt.ask(
-        f"Process all articles or only those with empty '[cyan]{args.lemma_column}[/cyan]'?",
-        choices=["all", "empty"],
-        default="empty"
-    )
+    if args.mode:
+        process_choice = args.mode
+        console.print(f"[green]✓[/green] Mode: [cyan]{process_choice}[/cyan] (from --mode)")
+    else:
+        process_choice = Prompt.ask(
+            f"Process all articles or only those with empty '[cyan]{args.lemma_column}[/cyan]'?",
+            choices=["all", "empty"],
+            default="empty"
+        )
 
     # ------------------------------------------------------------------
     # Load the spaCy model once
     # ------------------------------------------------------------------
-    with console.status(f"[bold green]Loading spaCy model '{args.spacy_model}'...", spinner="dots"):
-        nlp = load_spacy_model(args.spacy_model)
+    with console.status(f"[bold green]Loading spaCy model '{spacy_model}'...", spinner="dots"):
+        nlp = load_spacy_model(spacy_model)
     # Long OCR is chunked to SPACY_MAX_CHUNK_CHARS before tagging (see
     # lemmatise_one), keeping each spaCy call well under the default 1M-char
     # limit, so nlp.max_length does not need raising.
-    console.print(f"[green]✓[/green] Loaded spaCy model '{args.spacy_model}'")
+    console.print(f"[green]✓[/green] Loaded spaCy model '{spacy_model}'")
 
     # ------------------------------------------------------------------
     # Lemmatise — crash-resumable: checkpoints to .cache_lemmas, resumes on
     # restart, and the cache is deleted only after a successful push.
     # ------------------------------------------------------------------
-    cache_file = CACHE_DIR / f"{config_name}.json.gz"
+    # Per-language cache files: a crashed English pass must not feed its
+    # rows into a resumed French pass (and vice versa).
+    cache_suffix = f"_{language_filter}" if language_filter else ""
+    cache_file = CACHE_DIR / f"{config_name}{cache_suffix}.json.gz"
     console.print(f"[blue]→[/blue] Applying lemmatisation – this can take a while…")
     result = lemmatise_dataset(
         ds,
@@ -348,6 +393,7 @@ def main():
         clean_col=args.clean_column,
         process_choice=process_choice,
         cache_file=cache_file,
+        language_filter=language_filter,
     )
     if result is None:
         console.print("[green]✓[/green] No rows needed lemmatising. Nothing to do.")

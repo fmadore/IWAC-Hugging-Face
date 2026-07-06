@@ -48,6 +48,7 @@ from iwac_common.field_mappers import (
     get_value,
 )
 from iwac_common.hub_merge import merge_with_hub_dataset, resolve_hf_token
+from iwac_common.repos import PRIVATE_REPO_ID
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -238,7 +239,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Publie les documents audiovisuels IWAC sur le Hub HF")
-    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="Repository Hugging Face où publier")
+    parser.add_argument("--repo", default=PRIVATE_REPO_ID, help="Repository Hugging Face où publier (défaut: miroir privé complet)")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
     args = parser.parse_args()
 

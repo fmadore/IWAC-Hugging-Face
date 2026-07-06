@@ -53,7 +53,7 @@ from rich.prompt import Prompt, Confirm
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _THIS_DIR)
 sys.path.insert(0, os.path.dirname(_THIS_DIR))
-from _common import ensure_hf_token  # noqa: E402
+from _common import ensure_hf_token, PRIVATE_REPO_ID  # noqa: E402
 from iwac_common.omeka_client import Config, OmekaApiClient, conn_manager  # noqa: E402
 
 load_dotenv()
@@ -205,7 +205,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Ajoute/actualise la colonne 'nb_mots' d'un subset du dataset IWAC."
     )
-    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection")
+    parser.add_argument("--repo", default=PRIVATE_REPO_ID)
     parser.add_argument(
         "--config",
         choices=["articles", "publications", "documents", "references"],

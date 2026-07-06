@@ -35,6 +35,36 @@ def get_value(item: Dict[str, Any], field: str) -> str:
     return str(val)
 
 
+def is_content_public(item: Dict[str, Any], field: str = "bibo:content") -> bool:
+    """True iff ``field``'s full text is publicly visible on Omeka.
+
+    Omeka value dicts carry a per-value ``is_public`` flag; the
+    authenticated API returns private values too (with the flag False). We
+    treat the text as public only when there is non-empty text **and every**
+    non-empty value is public — a mixed item (some values private) is
+    treated as private, the safe direction, so the private text never leaks
+    into the public HF projection. Cross-checked against the anonymous API:
+    public-flagged items return their text anonymously, private-flagged
+    ones return nothing.
+
+    Consumed by ``post-processing/publish_public.py`` (via the
+    ``OCR_is_public`` column) to keep public full text public while
+    stripping private full text.
+    """
+    val = item.get(field)
+    if not val:
+        return False
+    if isinstance(val, dict):
+        val = [val]
+    if not isinstance(val, list):
+        return False
+    text_vals = [
+        v for v in val
+        if isinstance(v, dict) and str(v.get("@value") or v.get("display_title") or "").strip()
+    ]
+    return bool(text_vals) and all(v.get("is_public") is True for v in text_vals)
+
+
 def get_media_ids(item: Dict[str, Any]) -> str:
     """Pipe-joined ``o:media`` IDs, or ``""`` if none."""
     if "o:media" in item and isinstance(item["o:media"], list):
@@ -86,6 +116,7 @@ def extract_added_date(item: Dict[str, Any]) -> str:
 
 __all__ = [
     "get_value",
+    "is_content_public",
     "get_media_ids",
     "to_int_or_none",
     "extract_added_date",

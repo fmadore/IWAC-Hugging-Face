@@ -52,7 +52,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import REPO_ROOT, ensure_hf_token, load_subset_dataframe  # noqa: E402
+from _common import REPO_ROOT, ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
 
 from rich import box
 from rich.console import Console
@@ -200,7 +200,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Inter-model sentiment agreement (Gemini/ChatGPT/Mistral) + consensus columns."
     )
-    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection")
+    parser.add_argument("--repo", default=PRIVATE_REPO_ID)
     parser.add_argument("--config", default="articles", help="Subset with sentiment columns (articles)")
     parser.add_argument("--source", choices=["hub", "csv"], default="hub",
                         help="hub = live dataset (default); csv = local data/ mirror")

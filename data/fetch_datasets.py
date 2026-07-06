@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 
 import numpy as np
 
@@ -13,6 +14,8 @@ os.environ["DO_NOT_TRACK"] = "1"
 os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "30"
 
 from datasets import load_dataset
+from dotenv import load_dotenv
+from huggingface_hub import get_token
 
 from rich.console import Console
 from rich.panel import Panel
@@ -20,11 +23,21 @@ from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich import box
 
+try:
+    from iwac_common.repos import PRIVATE_REPO_ID
+except ImportError:  # venv without the editable install
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from iwac_common.repos import PRIVATE_REPO_ID
+
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
 console = Console()
 
 # Available configs in the IWAC dataset
 CONFIGS = ['articles', 'publications', 'documents', 'index', 'audiovisual', 'references']
-DATASET_ID = "fmadore/islam-west-africa-collection"
+# The local mirrors feed lemma/OCR-based analyses, so they come from the
+# private full repo (needs HF_TOKEN).
+DATASET_ID = PRIVATE_REPO_ID
 
 
 def main():
@@ -56,7 +69,8 @@ def main():
             try:
                 # Load the dataset with specific config from the unified IWAC dataset
                 with console.status(f"[bold green]Downloading {config_name} from HF Hub...", spinner="dots"):
-                    dataset = load_dataset(DATASET_ID, config_name, split="train")
+                    dataset = load_dataset(DATASET_ID, config_name, split="train",
+                                           token=os.getenv("HF_TOKEN") or get_token())
 
                 # Access the data
                 console.print(f"[green]✓[/green] Dataset loaded: {len(dataset):,} rows")

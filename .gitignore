@@ -1,10 +1,6 @@
 .env
 .venv
-.cache_omk
-.cache_omk_audiovisual
-.cache_omk_documents
-.cache_omk_index
-.cache_omk_references
+.cache_omk*
 .cache_word_count
 .cache_embeddings
 .cache_lemmas
@@ -16,7 +12,7 @@ data/iwac_index.csv
 data/iwac_publications.csv
 data/iwac_references.csv
 bertopic_model/
-lda_model/
+lda_model*/
 nul
 .agents/
 analyses/output/

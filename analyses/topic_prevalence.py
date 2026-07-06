@@ -36,7 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "post-processing"))
 sys.path.insert(0, str(REPO_ROOT))
 
-from _common import ensure_hf_token, load_subset_dataframe  # noqa: E402
+from _common import ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
 from lda_topic_modeling.constants import (  # noqa: E402
     DOMAIN_STOPWORDS,
     LDA_GEO_STOPWORDS,
@@ -71,7 +71,7 @@ def tokenize_like_training(text: str, stopwords: set, phraser) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Probability-weighted topic prevalence over time.")
-    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection")
+    parser.add_argument("--repo", default=PRIVATE_REPO_ID)
     parser.add_argument("--config", default="articles")
     parser.add_argument("--source", choices=["hub", "csv"], default="hub")
     parser.add_argument("--model-path", default=str(REPO_ROOT / "lda_model"))

@@ -46,7 +46,7 @@ from dotenv import load_dotenv
 from datasets import load_dataset
 # Make ``post-processing/_common.py`` and ``_embedding_utils.py`` importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import ensure_hf_token  # noqa: E402
+from _common import ensure_hf_token, PRIVATE_REPO_ID  # noqa: E402
 from _embedding_utils import (  # noqa: E402
     average_embeddings,
     chunk_text as _chunk_text_chars,
@@ -102,6 +102,7 @@ CHECKPOINT_EVERY = 5  # save cache every N API batches
 CONFIG_SETTINGS = {
     "articles": ("OCR", "embedding_OCR", "ocr_embeddings.json.gz"),
     "publications": ("tableOfContents", "embedding_tableOfContents", "toc_embeddings.json.gz"),
+    "references": ("OCR", "embedding_OCR", "references_ocr_embeddings.json.gz"),
 }
 
 
@@ -328,8 +329,8 @@ def main():
     )
     parser.add_argument(
         "--repo",
-        default="fmadore/islam-west-africa-collection",
-        help="Repository ID on Hugging Face Hub.",
+        default=PRIVATE_REPO_ID,
+        help="Repository ID on Hugging Face Hub (default: private full mirror).",
     )
     parser.add_argument(
         "--config",
@@ -373,6 +374,12 @@ def main():
         "--dry-run",
         action="store_true",
         help="Compute embeddings but do not push to Hub.",
+    )
+    parser.add_argument(
+        "--update-mode",
+        choices=["missing", "all"],
+        default=None,
+        help="Update only missing embeddings or recompute all (skips the interactive prompt).",
     )
 
     args = parser.parse_args()
@@ -431,7 +438,10 @@ def main():
         return
 
     # --- Update mode selection ---
-    update_mode = choose_update_mode()
+    if args.update_mode:
+        update_mode = args.update_mode
+    else:
+        update_mode = choose_update_mode()
     console.print(f"[green]✓[/green] Update mode: [cyan]{update_mode}[/cyan]")
 
     # --- Display configuration ---

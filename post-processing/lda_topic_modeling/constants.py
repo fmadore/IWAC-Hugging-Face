@@ -44,6 +44,20 @@ DOMAIN_STOPWORDS = {
     # ENGLISH stopwords (critical for filtering non-French documents)
     "the", "of", "to", "and", "in", "for", "is", "on", "that", "by",
     "this", "with", "are", "from", "or", "an", "be", "as", "at", "was",
+
+    # FRENCH function words (the mirror problem: English-language references
+    # quote French sources, and the English spaCy stopword list keeps these —
+    # without them the EN reference model grows French-residue junk topics).
+    # Harmless for the French pipeline: spaCy fr already strips them.
+    # Deliberately NOT included (French content homographs): vol (theft),
+    # est (East), son (sound).
+    "la", "le", "les", "des", "du", "de", "un", "une", "et", "ou",
+    "au", "aux", "dans", "sur", "par", "pour", "que", "qui",
+    "sont", "ce", "cette", "ces", "sa", "ses", "leur", "leurs",
+    "de_la", "de_l", "à", "a_la",
+
+    # Bibliographic apparatus abbreviations (reference lists, citations)
+    "ed", "eds", "éd", "dir", "pp", "cit", "op_cit", "ibid",
 }
 
 # ── Label-only stopwords ───────────────────────────────────────────
@@ -244,3 +258,37 @@ DEFAULT_SWEEP_ITERATIONS = 200
 # How many topics to keep in the per-document distribution column
 # (lda_topic_topk): "id:prob|id:prob|..." sorted by descending probability.
 DEFAULT_TOPIC_TOPK = 3
+
+# ── Per-config presets ─────────────────────────────────────────────
+# Recommended settings per subset, applied automatically when the
+# corresponding CLI flag is NOT given, so a plain
+#   lda_topic_modeling.py --config publications --mode fit -y
+# runs the recommended recipe. Resolution order:
+#   explicit CLI > training_parameters.json (predict mode) > preset > defaults.
+# "optimize_topics" only kicks in when --num-topics is not given.
+CONFIG_PRESETS: dict[str, dict] = {
+    "articles": {
+        # Whole-document model (press articles are short); k=30 chosen
+        # by an earlier sweep — no auto-optimize to protect the existing
+        # column semantics on re-predict runs.
+        "model_path": "lda_model",
+        "language": "Français",
+    },
+    "publications": {
+        # Full periodical issues are long: chunked training/prediction.
+        "model_path": "lda_model_publications",
+        "chunk_words": 1000,
+        "language": "Français",
+        "topic_range": (15, 40, 5),
+        "optimize_topics": True,
+    },
+    "references": {
+        # Scholarly texts (French model; run the English pass with
+        # --language Anglais --model-path lda_model_references_en).
+        "model_path": "lda_model_references",
+        "chunk_words": 1000,
+        "language": "Français",
+        "topic_range": (8, 24, 4),
+        "optimize_topics": True,
+    },
+}

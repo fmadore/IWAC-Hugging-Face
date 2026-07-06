@@ -39,7 +39,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import REPO_ROOT, ensure_hf_token, load_subset_dataframe  # noqa: E402
+from _common import REPO_ROOT, ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
 
 from rich import box
 from rich.console import Console
@@ -109,7 +109,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Top-k related items per row from existing Gemini embeddings."
     )
-    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection")
+    parser.add_argument("--repo", default=PRIVATE_REPO_ID)
     parser.add_argument("--config", choices=list(CONFIG_SETTINGS), default="articles")
     parser.add_argument("--source", choices=["hub", "csv"], default="hub")
     parser.add_argument("--topk", type=int, default=10)

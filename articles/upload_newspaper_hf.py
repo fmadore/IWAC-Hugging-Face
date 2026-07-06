@@ -47,9 +47,11 @@ from iwac_common.field_mappers import (
     extract_added_date,
     get_media_ids,
     get_value,
+    is_content_public,
     to_int_or_none,
 )
 from iwac_common.hub_merge import merge_with_hub_dataset, resolve_hf_token
+from iwac_common.repos import PRIVATE_REPO_ID
 
 # Rich console imports for beautiful output
 from rich.console import Console
@@ -183,6 +185,9 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
         "URL": extracted_fabio_url, # Use the specifically extracted URL
         "source": get_value(item, "dcterms:source"),
         "OCR": get_value(item, "bibo:content"),
+        # Whether the full text is publicly visible on Omeka; drives
+        # per-row OCR masking in publish_public.py.
+        "OCR_is_public": is_content_public(item),
         **_sentiment_columns(item),
     }
 
@@ -353,7 +358,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Publie les articles de journaux IWAC sur le Hub HF")
-    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="Repository Hugging Face où publier")
+    parser.add_argument("--repo", default=PRIVATE_REPO_ID, help="Repository Hugging Face où publier (défaut: miroir privé complet)")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
     args = parser.parse_args()
 

@@ -3,14 +3,17 @@
 upload_reference_hf.py
 =====================
 
-Extrait les références bibliographiques (resource_class_id = [35, 43, 88, 40, 82, 178, 52, 77, 305]) 
+Extrait les références bibliographiques (resource_class_id = [35, 43, 88, 40, 82, 178, 52, 77, 305])
 depuis l'API Omeka S d'IWAC, les convertit en dataset Arrow/Parquet et les pousse sur le Hugging Face
-Hub comme subset 'references' du repository fmadore/islam-west-africa-collection.
+Hub comme subset 'references' du miroir privé (fmadore/islam-west-africa-collection-full).
+
+La colonne OCR (bibo:content, texte intégral privé côté Omeka) n'est poussée
+que vers le repo privé; publish_public.py produit la projection publique.
 
 Usage
 -----
     python upload_reference_hf.py \
-        --repo fmadore/islam-west-africa-collection \
+        --repo fmadore/islam-west-africa-collection-full \
         --max-shard-size 1GB
 
 Variables d'environnement
@@ -54,8 +57,9 @@ from iwac_common.omeka_client import (
     async_retry,
     conn_manager,
 )
-from iwac_common.field_mappers import extract_added_date, get_value
+from iwac_common.field_mappers import extract_added_date, get_value, is_content_public
 from iwac_common.hub_merge import merge_with_hub_dataset, resolve_hf_token
+from iwac_common.repos import PRIVATE_REPO_ID
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -301,7 +305,9 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
 
     added_date = extract_added_date(item)
 
-    # Calculate word count from bibo:content (but don't include content in output)
+    # Full text (bibo:content) — kept as the OCR column. This is private on
+    # the Omeka side, so the references subset must only be pushed to the
+    # PRIVATE repo; publish_public.py strips OCR before the public push.
     content_text = get_value(item, "bibo:content")
     nb_mots = count_words(content_text)
 
@@ -335,6 +341,8 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
         "language": get_value(item, "dcterms:language"),
         "doi": get_value(item, "bibo:doi"),
         "URL": extracted_fabio_url,
+        "OCR": content_text,
+        "OCR_is_public": is_content_public(item),
         "nb_mots": nb_mots,
         "country": country,
     }
@@ -511,7 +519,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Publie les références bibliographiques IWAC sur le Hub HF")
-    parser.add_argument("--repo", default="fmadore/islam-west-africa-collection", help="Repository Hugging Face où publier")
+    parser.add_argument("--repo", default=PRIVATE_REPO_ID, help="Repository Hugging Face où publier (défaut: miroir privé complet)")
     parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
     parser.add_argument("--no-cache", action="store_true", help="Disable API cache (force fresh fetch from Omeka)")
     args = parser.parse_args()

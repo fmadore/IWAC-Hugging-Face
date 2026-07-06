@@ -165,6 +165,27 @@ def apply_custom_collocations(
     return result
 
 
+def chunk_tokens(tokens: List[str], chunk_size: int) -> List[List[str]]:
+    """Split a token list into consecutive ``chunk_size``-token chunks.
+
+    Long documents (periodical issues, books, theses) swamp LDA when
+    modeled whole: one doc contributes one topic mixture regardless of
+    length, and its vocabulary dominates the dictionary. Training on
+    fixed-size chunks instead is the standard DH remedy; a short tail
+    (< 25% of chunk_size) is merged into the previous chunk rather than
+    kept as a noisy fragment.
+    """
+    if not tokens:
+        return []
+    if chunk_size <= 0 or len(tokens) <= chunk_size:
+        return [tokens]
+    chunks = [tokens[i : i + chunk_size] for i in range(0, len(tokens), chunk_size)]
+    if len(chunks) > 1 and len(chunks[-1]) < chunk_size // 4:
+        chunks[-2].extend(chunks[-1])
+        chunks.pop()
+    return chunks
+
+
 def build_dictionary(
     tokenized_docs: List[List[str]],
     no_below: int = DEFAULT_NO_BELOW,
@@ -363,6 +384,7 @@ def predict_document(
     tokens: List[str],
     minimum_probability: float = DEFAULT_MINIMUM_PROBABILITY,
     topk: int = DEFAULT_TOPIC_TOPK,
+    chunk_words: int | None = None,
 ) -> Tuple[int | None, float | None, str | None, str | None]:
     """Predict topics for a single tokenized document.
 
@@ -370,19 +392,38 @@ def predict_document(
     plus a compact top-k distribution string ``"id:prob|id:prob|..."``
     (descending probability, entries below *minimum_probability* dropped).
     Returns (None, None, None, None) for empty docs.
+
+    With *chunk_words* set (models trained on chunks), the document is
+    split into chunks, each chunk is inferred separately, and the
+    distributions are averaged weighted by chunk length — so a book and
+    an article both yield one comparable document-level mixture.
     """
     if not tokens:
         return None, None, None, None
 
-    bow = dictionary.doc2bow(tokens)
-    if not bow:
-        return None, None, None, None
+    if chunk_words:
+        dist = np.zeros(model.num_topics)
+        total_weight = 0
+        for chunk in chunk_tokens(tokens, chunk_words):
+            bow = dictionary.doc2bow(chunk)
+            if not bow:
+                continue
+            for tid, prob in model.get_document_topics(bow, minimum_probability=0.0):
+                dist[int(tid)] += float(prob) * len(chunk)
+            total_weight += len(chunk)
+        if total_weight == 0:
+            return None, None, None, None
+        dist /= total_weight
+        ranked = [(int(tid), float(dist[tid])) for tid in np.argsort(dist)[::-1]]
+    else:
+        bow = dictionary.doc2bow(tokens)
+        if not bow:
+            return None, None, None, None
+        topic_distribution = model.get_document_topics(bow, minimum_probability=0.0)
+        if not topic_distribution:
+            return None, None, None, None
+        ranked = sorted(topic_distribution, key=lambda x: x[1], reverse=True)
 
-    topic_distribution = model.get_document_topics(bow, minimum_probability=0.0)
-    if not topic_distribution:
-        return None, None, None, None
-
-    ranked = sorted(topic_distribution, key=lambda x: x[1], reverse=True)
     best_topic_id, best_prob = ranked[0]
     label = get_topic_label(model, best_topic_id)
     topk_str = "|".join(
@@ -416,26 +457,36 @@ def predict_batch(
     phraser: Tuple[Phraser, Phraser] | None = None,
     topic_topk_col: str | None = None,
     topk: int = DEFAULT_TOPIC_TOPK,
+    chunk_words: int | None = None,
+    language: str = "Français",
 ) -> Dict[str, List[Any]]:
     """Predict topics for a HuggingFace dataset batch (batched map function).
 
-    Only processes French documents; others get None values. When
-    *topic_topk_col* is set, a compact top-k distribution string
-    (``"id:prob|id:prob|..."``) is stored alongside the dominant topic.
+    Only rows whose ``language`` equals *language* are processed. Skipped
+    rows KEEP whatever topic values the batch already carries (None on a
+    first run) — so per-language models compose: the French model fills
+    French rows, then an English model fills English rows without erasing
+    the French ones. When *topic_topk_col* is set, a compact top-k
+    distribution string (``"id:prob|id:prob|..."``) is stored alongside
+    the dominant topic.
     """
     texts = batch[text_col]
     languages = batch.get("language", [None] * len(texts))
 
-    topics: List[int | None] = [None] * len(texts)
-    probabilities: List[float | None] = [None] * len(texts)
-    labels: List[str | None] = [None] * len(texts)
-    topks: List[str | None] = [None] * len(texts)
+    def _existing(col: str | None) -> List[Any]:
+        vals = batch.get(col) if col else None
+        return list(vals) if vals is not None else [None] * len(texts)
+
+    topics: List[int | None] = _existing(topic_id_col)
+    probabilities: List[float | None] = _existing(topic_prob_col)
+    labels: List[str | None] = _existing(topic_label_col)
+    topks: List[str | None] = _existing(topic_topk_col)
 
     sw = stopwords or set()
 
     for i, text in enumerate(texts):
         lang = languages[i] if i < len(languages) else None
-        if lang is not None and lang != "Français":
+        if lang is not None and lang != language:
             continue
         if not text or not str(text).strip():
             continue
@@ -447,7 +498,9 @@ def predict_batch(
         ]
         tokens = apply_phraser(tokens, phraser)
         tokens = apply_custom_collocations(tokens, CUSTOM_COLLOCATIONS)
-        tid, prob, label, topk_str = predict_document(model, dictionary, tokens, topk=topk)
+        tid, prob, label, topk_str = predict_document(
+            model, dictionary, tokens, topk=topk, chunk_words=chunk_words
+        )
         topics[i] = tid
         probabilities[i] = prob
         labels[i] = label
