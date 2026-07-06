@@ -13,9 +13,9 @@ Python scripts to manage the **Islam West Africa Collection (IWAC)** dataset on 
 The full text (`OCR`) is private on the Omeka side, so the Hub side is split:
 
 1. **`fmadore/islam-west-africa-collection-full` (private)** — complete superset, including `OCR`, `lemma_text`, `lemma_nostop`. Every upload and post-processing script targets it by default (constant `PRIVATE_REPO_ID` in `iwac_common/repos.py`; override with `IWAC_HF_PRIVATE_REPO`). Module build pipelines (IwacVisualizations CI) read it with a fine-grained HF token.
-2. **`fmadore/islam-west-africa-collection` (public)** — written ONLY by `post-processing/publish_public.py`, which copies each subset from the private repo minus the private columns (`PRIVATE_COLUMNS` in `iwac_common/repos.py`: `OCR` everywhere it exists, plus `lemma_text`/`lemma_nostop`). Embeddings, LDA topics, AI sentiment (incl. justifications), `descriptionAI`, `abstract`, `tableOfContents`, and all metrics stay public.
+2. **`fmadore/islam-west-africa-collection` (public)** — written ONLY by `post-processing/publish_public.py`, which projects each subset from the private repo and **masks the content columns per row** (`CONTENT_COLUMNS` in `iwac_common/repos.py`: `OCR` + `lemma_text` + `lemma_nostop`). Full text is **kept public for items whose `bibo:content` is public on Omeka** (flagged by the `OCR_is_public` column — ~7,480 articles, 1,298 publications, 25/26 documents, 7/867 references) and blanked only for private-content items. Embeddings, LDA topics, AI sentiment (incl. justifications), `descriptionAI`, `abstract`, `tableOfContents`, metrics, and `OCR_is_public` itself always stay public.
 
-Never push a full-text column to the public repo; run `publish_public.py` (it has a prose-length guard that aborts if an unexpected long-text column appears).
+`OCR_is_public` is emitted by every OCR upload mapper via `is_content_public()` (`iwac_common/field_mappers.py`), reading the per-value `is_public` flag on `bibo:content`. `publish_public.py` aborts if a content subset lacks that flag (never silently leaks), and has a prose-length guard that aborts on any unclassified long-text column.
 
 Dataset subsets:
 - `articles` — Newspaper articles (resource_class_id = 36)
