@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import sys
@@ -19,15 +20,16 @@ from huggingface_hub import get_token
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich import box
 
 try:
-    from iwac_common.repos import PRIVATE_REPO_ID
+    from iwac_common.repos import PRIVATE_REPO_ID, PUBLIC_REPO_ID
 except ImportError:  # venv without the editable install
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from iwac_common.repos import PRIVATE_REPO_ID
+    from iwac_common.repos import PRIVATE_REPO_ID, PUBLIC_REPO_ID
 
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
@@ -35,16 +37,50 @@ console = Console()
 
 # Available configs in the IWAC dataset
 CONFIGS = ['articles', 'publications', 'documents', 'index', 'audiovisual', 'references']
-# The local mirrors feed lemma/OCR-based analyses, so they come from the
-# private full repo (needs HF_TOKEN).
-DATASET_ID = PRIVATE_REPO_ID
 
 
-def main():
+def choose_dataset(cli_choice=None):
+    """Resolve which repo to mirror: private full or public projection.
+
+    ``cli_choice`` (``private``/``public``) skips the prompt. The private
+    full mirror carries complete OCR / lemma columns (needs HF_TOKEN); the
+    public projection has full text masked per row (OCR only for items whose
+    bibo:content is public on Omeka).
+    """
+    choice = cli_choice
+    if choice is None:
+        console.print("\n[bold]Which dataset do you want to mirror locally?[/bold]")
+        table = Table(box=box.SIMPLE)
+        table.add_column("#", style="cyan", justify="center")
+        table.add_column("Dataset", style="green")
+        table.add_column("Repo", style="white")
+        table.add_column("Full text", style="white")
+        table.add_row("1", "private (full)", PRIVATE_REPO_ID, "complete OCR + lemmas — needs HF_TOKEN")
+        table.add_row("2", "public", PUBLIC_REPO_ID, "OCR masked per row (public-content items only)")
+        console.print(table)
+        sel = Prompt.ask("Choose dataset", choices=["1", "2"], default="1")
+        choice = "private" if sel == "1" else "public"
+
+    if choice == "public":
+        return PUBLIC_REPO_ID, "public"
+    return PRIVATE_REPO_ID, "private"
+
+
+def main(dataset_id=PRIVATE_REPO_ID, label="private"):
     """Download all IWAC dataset configurations from Hugging Face Hub."""
+    # Private mirror needs a token; public is open.
+    token = (os.getenv("HF_TOKEN") or get_token()) if label == "private" else None
+    if label == "private" and not token:
+        console.print("[red]✗[/red] The private full mirror needs HF_TOKEN (set it in .env "
+                      "or run `hf auth login`), or choose the public dataset instead.")
+        return
+
     console.print(Panel.fit(
         "[bold cyan]IWAC Dataset Downloader[/bold cyan]\n"
-        f"Fetching all configurations from [link={f'https://huggingface.co/datasets/{DATASET_ID}'}]{DATASET_ID}[/link]",
+        f"Fetching all configurations from [link={f'https://huggingface.co/datasets/{dataset_id}'}]{dataset_id}[/link] "
+        f"([cyan]{label}[/cyan])"
+        + ("\n[yellow]⚠ public projection: OCR/lemmas present only for public-content rows[/yellow]"
+           if label == "public" else ""),
         border_style="cyan"
     ))
 
@@ -69,8 +105,7 @@ def main():
             try:
                 # Load the dataset with specific config from the unified IWAC dataset
                 with console.status(f"[bold green]Downloading {config_name} from HF Hub...", spinner="dots"):
-                    dataset = load_dataset(DATASET_ID, config_name, split="train",
-                                           token=os.getenv("HF_TOKEN") or get_token())
+                    dataset = load_dataset(dataset_id, config_name, split="train", token=token)
 
                 # Access the data
                 console.print(f"[green]✓[/green] Dataset loaded: {len(dataset):,} rows")
@@ -157,4 +192,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Mirror the IWAC dataset locally as CSV files.")
+    parser.add_argument(
+        "--dataset",
+        choices=["private", "public"],
+        default=None,
+        help="Which repo to mirror (default: interactive prompt). "
+             "private = full mirror with complete OCR/lemmas (needs HF_TOKEN); "
+             "public = projection with OCR masked per row.",
+    )
+    args = parser.parse_args()
+
+    resolved_id, resolved_label = choose_dataset(args.dataset)
+    main(dataset_id=resolved_id, label=resolved_label)
