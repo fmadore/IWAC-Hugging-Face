@@ -8,8 +8,8 @@ Le script charge un dataset depuis le repository Hugging Face 'fmadore/islam-wes
 compte les mots dans la colonne 'OCR', et ajoute ces comptes dans une nouvelle
 colonne nommée 'nb_mots'. Le dataset mis à jour est ensuite poussé vers le Hub.
 
-L'utilisateur est invité à choisir la configuration ('articles', 'publications', 'documents' ou 'references')
-à traiter.
+L'utilisateur est invité à choisir la configuration ('articles', 'publications', 'documents',
+'references' ou 'audiovisual') à traiter.
 
 Pour la configuration 'references', le script récupère le contenu bibo:content depuis l'API Omeka
 (incluant les valeurs privées) pour calculer le nombre de mots, sans stocker le contenu complet.
@@ -208,7 +208,7 @@ def main() -> None:
     parser.add_argument("--repo", default=PRIVATE_REPO_ID)
     parser.add_argument(
         "--config",
-        choices=["articles", "publications", "documents", "references"],
+        choices=["articles", "publications", "documents", "references", "audiovisual"],
         default=None,
         help="Subset à traiter (évite le menu interactif)",
     )
@@ -225,7 +225,7 @@ def main() -> None:
     batch_size = 1000
 
     # --- Choix de la configuration (CLI ou menu interactif) ---
-    valid_configs = ["articles", "publications", "documents", "references"]
+    valid_configs = ["articles", "publications", "documents", "references", "audiovisual"]
     if args.config:
         config_name_choice = args.config
     else:

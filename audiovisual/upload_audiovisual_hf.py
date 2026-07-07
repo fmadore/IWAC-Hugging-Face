@@ -23,6 +23,7 @@ Variables d'environnement
 
 import os
 import sys
+import re
 import asyncio
 import logging
 from typing import Dict, Any, List, Optional
@@ -46,6 +47,7 @@ from iwac_common.field_mappers import (
     extract_added_date,
     get_media_ids,
     get_value,
+    is_content_public,
 )
 from iwac_common.hub_merge import merge_with_hub_dataset, resolve_hf_token
 from iwac_common.repos import PRIVATE_REPO_ID
@@ -74,6 +76,18 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Fonctions d'aide pour mapper les champs Omeka → plat
 # ---------------------------------------------------------------------------
+
+def count_words(text: Optional[str]) -> int:
+    """Compte le nombre de mots dans une chaîne. Retourne 0 si vide/None.
+
+    Même logique que ``reference/upload_reference_hf.py`` : les mots sont les
+    séquences alphanumériques (``\\b\\w+\\b``), ce qui gère la ponctuation et
+    les séparateurs multiples.
+    """
+    if not text:
+        return 0
+    return len(re.findall(r"\b\w+\b", str(text).lower()))
+
 
 def _get_display_title(item: Dict[str, Any], field: str) -> str:
     """Extract display_title from a field."""
@@ -122,6 +136,14 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
 
     added_date = extract_added_date(item)
 
+    # Full text / transcription (bibo:content), kept as the OCR column to
+    # match the other content subsets. Only ~4/47 audiovisual items carry a
+    # transcription. Private on the Omeka side, so ``OCR_is_public`` drives
+    # per-row masking in publish_public.py; the audiovisual subset must only
+    # be pushed to the PRIVATE repo.
+    content_text = get_value(item, "bibo:content")
+    nb_mots = count_words(content_text)
+
     # Fetch thumbnail URL and set IIIF manifest URL only if media exists
     session = await conn_manager.get()
     thumbnail_url = ""
@@ -154,6 +176,9 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
         "spatial": get_value(item, "dcterms:spatial"),
         "language": get_value(item, "dcterms:language"),
         "source": get_value(item, "dcterms:source"),
+        "OCR": content_text,
+        "nb_mots": nb_mots,
+        "OCR_is_public": is_content_public(item),
     }
 
 

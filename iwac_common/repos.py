@@ -34,6 +34,7 @@ CONTENT_COLUMNS = {
     "publications": ["OCR", "lemma_text", "lemma_nostop"],
     "documents": ["OCR"],
     "references": ["OCR", "lemma_text", "lemma_nostop"],
+    "audiovisual": ["OCR"],
 }
 
 # Back-compat alias (older docs/scripts referenced PRIVATE_COLUMNS).

@@ -173,6 +173,52 @@ def count_words(text: str) -> int:
     return len(words)
 
 
+# ``bibo:doi`` holds a URI value that is *usually* a DOI (as an https://doi.org/
+# link) but is sometimes a plain article/repository URL (ethnographiques.org,
+# hdl.handle.net, …). We normalise real DOIs to their bare form
+# (``10.xxxx/yyyy``) and route anything that is not a DOI to the URL column.
+_DOI_PREFIX_RE = re.compile(r"^https?://(?:dx\.)?doi\.org/", re.IGNORECASE)
+_DOI_CORE_RE = re.compile(r"^10\.\d{4,9}/\S+$")
+
+
+def _extract_doi_raw_values(item: Dict[str, Any]) -> List[str]:
+    """Return the raw ``bibo:doi`` values (URI ``@id`` or literal ``@value``)."""
+    val = item.get("bibo:doi")
+    if not val:
+        return []
+    if isinstance(val, dict):
+        val = [val]
+    if not isinstance(val, list):
+        return [str(val).strip()] if str(val).strip() else []
+    out: List[str] = []
+    for v in val:
+        if isinstance(v, dict):
+            s = str(v.get("@id") or v.get("@value") or "").strip()
+        else:
+            s = str(v).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def split_doi_and_urls(item: Dict[str, Any]) -> tuple[str, List[str]]:
+    """Split ``bibo:doi`` values into (bare DOIs, non-DOI URLs).
+
+    - ``https://doi.org/10.1163/x`` / bare ``10.1163/x`` → DOI ``10.1163/x``
+    - ``https://www.ethnographiques.org/...``, ``https://hdl.handle.net/...``
+      → returned as URLs (belong in the ``URL`` column, not ``doi``)
+    """
+    dois: List[str] = []
+    urls: List[str] = []
+    for raw in _extract_doi_raw_values(item):
+        core = _DOI_PREFIX_RE.sub("", raw).strip()
+        if _DOI_CORE_RE.match(core):
+            dois.append(core)
+        else:
+            urls.append(raw)
+    return "|".join(dois), urls
+
+
 def _get_iwac_identifier(item: Dict[str, Any], field: str) -> str:
     """Extract identifier values that start with 'iwac-reference'"""
     if field not in item or item[field] is None:
@@ -242,6 +288,16 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
     elif isinstance(fabio_has_url_data, str) and fabio_has_url_data: # If it's already a non-empty string
         extracted_fabio_url = fabio_has_url_data
     # If none of the above, extracted_fabio_url remains ""
+
+    # Normalise bibo:doi: keep real DOIs (bare form) in ``doi``, and fold any
+    # non-DOI URL mistakenly stored there into the ``URL`` column instead.
+    doi_clean, doi_urls = split_doi_and_urls(item)
+    if doi_urls:
+        url_parts = [u for u in extracted_fabio_url.split("|") if u]
+        for u in doi_urls:
+            if u not in url_parts:
+                url_parts.append(u)
+        extracted_fabio_url = "|".join(url_parts)
 
     # Keep volume as string (can contain multiple values like "1|2")
     volume_str = get_value(item, "bibo:volume")
@@ -339,7 +395,7 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
         "subject": get_value(item, "dcterms:subject"),
         "spatial": get_value(item, "dcterms:spatial"),
         "language": get_value(item, "dcterms:language"),
-        "doi": get_value(item, "bibo:doi"),
+        "doi": doi_clean,
         "URL": extracted_fabio_url,
         "OCR": content_text,
         "OCR_is_public": is_content_public(item),
