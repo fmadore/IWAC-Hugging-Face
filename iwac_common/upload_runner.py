@@ -76,9 +76,12 @@ class UploadSpec:
     merge_how: str = "left"
     merge_suffixes: Sequence[str] = ("", "_old")
     columns_to_exclude: Sequence[str] = ()  # legacy Hub columns to drop
-    # Async hook after mapping, before merge (receives df + api); used by
-    # index for its cross-subset frequency stats.
-    post_map: Optional[Callable[[pd.DataFrame, OmekaApiClient], Awaitable[pd.DataFrame]]] = None
+    # Async hook after mapping, before merge. Receives (df, api, repo, token)
+    # so it can load sibling Hub subsets; used by index for its cross-subset
+    # frequency stats. Returns the (possibly enriched) DataFrame.
+    post_map: Optional[
+        Callable[[pd.DataFrame, OmekaApiClient, str, Optional[str]], Awaitable[pd.DataFrame]]
+    ] = None
     # Sync hook after merge (column reordering, dtype fix-ups).
     post_merge: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None
     # Expose --stale-rows (only meaningful for outer merges).
@@ -176,13 +179,13 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
             return 1
         new_df["o:id"] = new_df["o:id"].astype(str)
 
+        token = resolve_hf_token()
         if spec.post_map is not None:
-            new_df = await spec.post_map(new_df, api)
+            new_df = await spec.post_map(new_df, api, args.repo, token)
 
         # 3. Merge with the Hub (preserves computed columns; safety rails
         # raise instead of silently shrinking or fanning out).
         console.print("\n[bold cyan]Step 2:[/bold cyan] Merging with existing Hub dataset...")
-        token = resolve_hf_token()
         final_df = merge_with_hub_dataset(
             new_df,
             args.repo,

@@ -26,6 +26,7 @@ SCRIPTS = [
     "post-processing/publish_public.py",
     "post-processing/calculate_lexical_richness.py",
     "post-processing/calculate_word_count.py",
+    "post-processing/calculate_ocr_quality.py",
     "post-processing/semantic_embedding.py",
     "post-processing/semantic_embedding_images.py",
     "post-processing/sentiment_agreement.py",
@@ -36,6 +37,8 @@ SCRIPTS = [
     "post-processing/lda_topic_modeling/constants.py",
     "analyses/topic_prevalence.py",
     "analyses/keyness_bursts.py",
+    "analyses/topic_sentiment.py",
+    "analyses/entity_networks.py",
     "data/fetch_datasets.py",
     "country_mapper.py",
 ]
