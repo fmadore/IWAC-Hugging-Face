@@ -342,3 +342,39 @@ effect — pushing code changes never mutates the Hub by itself.
 ## Progress tracker
 
 Updated as tiers land; see git history on this branch for the commit per tier.
+
+## v2 Progress tracker (2026-07-13)
+
+All six tiers landed on `claude/repo-refactor-analysis-rjxdj8`:
+
+- [x] **Tier A** — correctness fixes (A1–A10): publications empty-branch
+      removed; embedding cache fingerprint + no-partial-caching +
+      length-weighted pooling + `--resume`; shared `iwac_common/text_utils`
+      tokenizers (fixes keyness lowercase drift); `publish_public` explicit
+      column allowlist + hardened prose guard; `hub_merge` uniqueness asserts;
+      LDA exit codes/annotation/dead imports; lemmatize `is_stop` + primary
+      language; sentiment κ full-scale; MATTR-only + elision tokenizer.
+- [x] **Tier B** — safety rails: Omeka total-count reconciliation
+      (`TruncatedFetchError`); `hub_merge` 95% shrink tripwire + `--force-shrink`
+      + `stale_rows` keep|drop; `--no-cache`/reconciliation on every upload.
+- [x] **Tier C** — tests + CI: `tests/` (165 tests: publish_public masking +
+      allowlist, hub_merge, tokenizers, dunning/kleinberg/chunkers/MATTR,
+      _stats, upload_runner end-to-end, import-smoke of all scripts) + GitHub
+      Actions workflow.
+- [x] **Tier D** — upload-runner + CLI: `iwac_common/upload_runner.py` shared
+      orchestration; all 7 upload scripts migrated (tqdm/plain-logging
+      retired); `_common` metric-runner helpers; `_gemini_client` shared retry
+      ladder; unified CLI (`--config`/`--update-mode`/`--dry-run`/`--no-cache`)
+      across metric + lemmatize scripts.
+- [x] **Tier E** — methods: LDA multi-seed sweep + Jaccard stability +
+      held-out perplexity + relevance-weighted labels + `lda_model_name` +
+      theta export; `analyses/_stats.py` (Mann–Kendall, BH, weighted slope,
+      bootstrap); topic_prevalence significance + CIs + min-docs-cell; keyness
+      χ² + BH + log-ratio + subject dedup + calendar-gap bursts; new
+      `calculate_ocr_quality.py`.
+- [x] **Tier F** — new analyses: `analyses/topic_sentiment.py` (topic ×
+      sentiment × time × country), `analyses/entity_networks.py` (authority
+      co-occurrence graph, Gephi-ready), reprint-cluster groundwork.
+
+Net: 7 upload scripts share one runner; the analyses have significance
+testing throughout; first test suite + CI in the repo's history.

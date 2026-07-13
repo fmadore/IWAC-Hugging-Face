@@ -64,3 +64,13 @@ class TestCountWords:
     def test_empty_batch_guard(self):
         out = wc.add_word_count_batch({}, text_col="OCR", count_col="nb_mots")
         assert out == {"nb_mots": []}
+
+    def test_update_mode_all_recomputes(self):
+        batch = {"OCR": ["un deux", "trois"], "nb_mots": [999, None]}
+        out = wc.add_word_count_batch(batch, text_col="OCR", count_col="nb_mots", update_mode="all")
+        assert out["nb_mots"] == [2, 1]  # 999 overwritten
+
+    def test_update_mode_missing_preserves_existing(self):
+        batch = {"OCR": ["un deux", "trois"], "nb_mots": [999, None]}
+        out = wc.add_word_count_batch(batch, text_col="OCR", count_col="nb_mots", update_mode="missing")
+        assert out["nb_mots"] == [999, 1]  # existing kept, null filled

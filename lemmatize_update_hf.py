@@ -327,10 +327,25 @@ def main():
     parser.add_argument("--clean-column", default="lemma_nostop", help="Column name for the lemmatised text with stop-words removed")
     parser.add_argument("--spacy-model", default=None, help="spaCy model to use (default: chosen from --language via LANGUAGE_MODEL_DEFAULTS, else fr_core_news_lg)")
     parser.add_argument("--max-shard-size", default="1GB", help="Maximum Parquet shard size when pushing to the Hub")
-    parser.add_argument("--mode", choices=["all", "empty"], default=None, help="Process all rows or only rows with an empty lemma column (skips the interactive prompt)")
+    parser.add_argument("--update-mode", choices=["all", "missing"], default=None,
+                        help="Process all rows ('all') or only rows with an empty lemma column ('missing'). "
+                             "Preferred spelling; skips the interactive prompt.")
+    parser.add_argument("--mode", choices=["all", "empty"], default=None,
+                        help="Deprecated alias for --update-mode ('empty' == 'missing').")
     parser.add_argument("--language", default=None, metavar="LABEL", help="Only lemmatise rows whose PRIMARY (first-listed) 'language' is LABEL (e.g. 'Français', 'Anglais'); picks the matching spaCy model unless --spacy-model is given. Other rows keep their existing values — run one pass per language on mixed subsets like 'references'.")
     parser.add_argument("--french-only", action="store_true", help="Deprecated alias for --language Français")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Lemmatise and report what would change, but do not push to the Hub or delete the cache")
     args = parser.parse_args()
+
+    # Resolve the recompute mode: --update-mode wins; --mode is the deprecated
+    # alias (all|empty), where 'empty' maps to 'missing'.
+    resolved_mode = args.update_mode
+    if resolved_mode is None and args.mode is not None:
+        console.print("[yellow]⚠[/yellow] --mode is deprecated; use --update-mode {all,missing} ('empty'→'missing').")
+        resolved_mode = "missing" if args.mode == "empty" else args.mode
+    # The downstream code speaks the legacy vocabulary ('all'/'empty').
+    args.mode = None if resolved_mode is None else ("empty" if resolved_mode == "missing" else "all")
 
     language_filter = args.language or ("Français" if args.french_only else None)
     spacy_model = args.spacy_model or LANGUAGE_MODEL_DEFAULTS.get(language_filter or "", "fr_core_news_lg")
@@ -413,6 +428,17 @@ def main():
         console.print("[green]✓[/green] No rows needed lemmatising. Nothing to do.")
         return
     ds = result
+
+    # ------------------------------------------------------------------
+    # Dry-run: stop before mutating the Hub or the cache
+    # ------------------------------------------------------------------
+    if args.dry_run:
+        console.print(Panel(
+            "[yellow]Dry run — dataset lemmatised in memory but NOT pushed; "
+            "the resume cache is kept for a real run.[/yellow]",
+            border_style="yellow",
+        ))
+        return
 
     # ------------------------------------------------------------------
     # Push updated dataset to the Hub
