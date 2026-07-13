@@ -12,6 +12,7 @@ huggingface_hub[hf_xet]<1
 spacy<4
 textstat
 google-genai
+pillow<12  # semantic_embedding_images.py (image downscaling before embedding)
 # Topic modeling (LDA)
 gensim<5
 numpy<2.4

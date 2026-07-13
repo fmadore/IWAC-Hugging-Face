@@ -22,6 +22,11 @@ Pipeline: load ``images`` from the private mirror → download + downscale each
 photo (from ``image_url``, fallback ``thumbnail``) → embed the bytes → write
 ``embedding_image`` → push back to the private mirror.
 
+Progress is checkpointed to a resume cache in ``.cache_embeddings/``; the
+cache filename embeds a fingerprint of (model, dimensionality, task), so a
+cache written under one embedding configuration is never restored into a run
+with different parameters.
+
 Usage
 -----
     python post-processing/semantic_embedding_images.py                 # interactive-ish (single config)
@@ -56,6 +61,7 @@ from datasets import load_dataset
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import ensure_hf_token, PRIVATE_REPO_ID  # noqa: E402
 from _embedding_utils import (  # noqa: E402
+    cache_fingerprint,
     delete_cache,
     is_empty_embedding,
     load_cache,
@@ -104,7 +110,11 @@ DEFAULT_BATCH_SIZE = 6
 MAX_RETRIES = 6
 BASE_RETRY_DELAY = 5  # seconds
 CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache_embeddings"
-CACHE_FILENAME = "image_embeddings.json.gz"
+# Resume cache stem; the full filename embeds cache_fingerprint(model, dim,
+# task) so a cache written at one embedding configuration is never restored
+# into a run with different parameters. No task_type is sent for image
+# embedding (it's folded into the model), so the fixed tag "image" stands in.
+CACHE_STEM = "image_embeddings"
 CHECKPOINT_EVERY = 3  # save cache every N API batches
 DOWNLOAD_TIMEOUT = 30
 
@@ -215,6 +225,9 @@ def main() -> None:
                         help="Compute embeddings but do not push to Hub.")
     parser.add_argument("--update-mode", choices=["missing", "all"], default="missing",
                         help="Update only missing embeddings (default) or recompute all.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume a crashed --update-mode all run from its cache "
+                             "instead of starting fresh.")
     args = parser.parse_args()
 
     repo_id = args.repo
@@ -224,7 +237,23 @@ def main() -> None:
     delay = args.delay
     update_mode = args.update_mode
     dry_run = args.dry_run
-    cache_file = CACHE_DIR / CACHE_FILENAME
+    # Key the resume cache by (model, dimensionality, task) so a cache written
+    # at one embedding configuration can never be restored into a run with
+    # different parameters. Old un-fingerprinted cache files
+    # ("image_embeddings.json.gz") are simply ignored (fresh start), not migrated.
+    cache_file = CACHE_DIR / (
+        f"{CACHE_STEM}_{cache_fingerprint(MODEL_NAME, dimensionality, 'image')}.json.gz"
+    )
+
+    # 'all' means recompute everything: start from a fresh cache unless the
+    # user explicitly resumes a crashed run. 'missing' always reuses the cache.
+    if update_mode == "all" and cache_file.exists():
+        if args.resume:
+            console.print("[yellow]ℹ[/yellow] --resume: reusing the existing cache for this 'all' run.")
+        else:
+            cache_file.unlink()
+            console.print("[yellow]ℹ[/yellow] Update mode 'all': deleted existing resume cache "
+                          "(pass --resume to reuse a crashed run's cache).")
 
     # --- Step 1: Authentication ---
     console.print("\n[bold cyan]Step 1:[/bold cyan] Authenticating...")
@@ -425,7 +454,8 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         console.print(Panel(
             f"[bold red]Failed to push dataset[/bold red]\n\n{e}\n\n"
-            f"[yellow]Embeddings are cached in {cache_file}[/yellow] — re-run to resume.",
+            f"[yellow]Embeddings are cached in {cache_file}[/yellow] — re-run to resume "
+            f"(in --update-mode all, add --resume).",
             title="Error", border_style="red"))
         logger.error("Push error details:", exc_info=True)
 

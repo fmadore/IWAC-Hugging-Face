@@ -19,6 +19,14 @@ from tqdm import tqdm
 
 import unicodedata
 
+try:
+    from iwac_common.text_utils import simple_tokenize
+except ImportError:  # venv without the editable install
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from iwac_common.text_utils import simple_tokenize
+
 from .constants import (
     DOMAIN_STOPWORDS,
     LABEL_ONLY_STOPWORDS,
@@ -76,15 +84,20 @@ def tokenize_documents(
     phrase_min_count: int = 20,
     phrase_threshold: float = 10.0,
     custom_collocations: List[Tuple[str, ...]] | None = None,
-) -> List[List[str]]:
+) -> Tuple[List[List[str]], Tuple[Phraser, Phraser] | None]:
     """Tokenize documents for LDA.
 
     Since ``lemma_nostop`` is already lemmatized and partially cleaned,
-    we only need to split on whitespace and apply minimal filtering.
+    we only need to split on whitespace and apply minimal filtering
+    (via the shared :func:`simple_tokenize`).
 
     When *detect_phrases* is True, gensim ``Phrases`` is used to join
     frequent collocations (e.g. "côte" + "ivoire" → "côte_ivoire",
     "burkina" + "faso" → "burkina_faso").
+
+    Returns ``(tokenized_docs, phraser)`` where *phraser* is the
+    ``(bigram_phraser, trigram_phraser)`` pair when phrase detection ran,
+    else None.
     """
     if stopwords is None:
         stopwords = set()
@@ -93,12 +106,7 @@ def tokenize_documents(
         if not doc or not str(doc).strip():
             tokenized.append([])
             continue
-        tokens = [
-            t
-            for t in str(doc).lower().split()
-            if len(t) >= min_token_length and t not in stopwords
-        ]
-        tokenized.append(tokens)
+        tokenized.append(simple_tokenize(doc, stopwords, min_token_length))
 
     phraser = None
     if detect_phrases and tokenized:
@@ -491,11 +499,7 @@ def predict_batch(
         if not text or not str(text).strip():
             continue
 
-        tokens = [
-            t
-            for t in str(text).lower().split()
-            if len(t) >= min_token_length and t not in sw
-        ]
+        tokens = simple_tokenize(text, sw, min_token_length)
         tokens = apply_phraser(tokens, phraser)
         tokens = apply_custom_collocations(tokens, CUSTOM_COLLOCATIONS)
         tid, prob, label, topk_str = predict_document(
@@ -712,5 +716,11 @@ def find_optimal_topics(
 
         results.append(entry)
 
-    log.info(f"Best num_topics by C_v: {best_k} (C_v={best_cv:.4f})")
+    if all(r.get("c_v") is None for r in results):
+        log.error(
+            "Every C_v coherence computation failed — model selection did not run; "
+            f"returning k={best_k} (the smallest candidate), NOT a data-driven choice."
+        )
+    else:
+        log.info(f"Best num_topics by C_v: {best_k} (C_v={best_cv:.4f})")
     return best_k, results

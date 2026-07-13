@@ -34,8 +34,8 @@ import argparse
 import asyncio
 import logging
 import os
-import re
 import sys
+import uuid
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -55,6 +55,7 @@ sys.path.insert(0, _THIS_DIR)
 sys.path.insert(0, os.path.dirname(_THIS_DIR))
 from _common import ensure_hf_token, PRIVATE_REPO_ID  # noqa: E402
 from iwac_common.omeka_client import Config, OmekaApiClient, conn_manager  # noqa: E402
+from iwac_common.text_utils import tokenize_words  # noqa: E402
 
 load_dotenv()
 
@@ -144,22 +145,20 @@ def configure_logging() -> None:
 def count_words(text: str | None) -> int:
     """
     Compte le nombre de mots dans une chaîne de caractères.
-    
-    Utilise une expression régulière pour identifier les mots composés de
-    caractères alphanumériques, en ignorant la ponctuation et les espaces multiples.
-    
+
+    Utilise le tokenizer partagé ``iwac_common.text_utils.tokenize_words``
+    (sensible à l'élision française) : les clitiques élidés ne comptent plus
+    comme des mots séparés — « l'islam » = 1 mot (avant : 2).
+
     Args:
         text: Texte à analyser (peut être None)
-        
+
     Returns:
         Nombre de mots trouvés (0 si le texte est None ou vide)
     """
     if not text:
         return 0
-    # Utilise une expression régulière pour mieux gérer les séparateurs multiples
-    # et la ponctuation simple attachée aux mots.
-    words = re.findall(r"\b\w+\b", str(text).lower())
-    return len(words)
+    return len(tokenize_words(str(text)))
 
 def add_word_count_batch(batch: dict[str, list], text_col: str, count_col: str) -> dict[str, list]:
     """
@@ -177,7 +176,9 @@ def add_word_count_batch(batch: dict[str, list], text_col: str, count_col: str) 
         # Si la colonne de texte n'est pas dans ce batch (peut arriver avec des datasets hétérogènes)
         # ou si le batch est vide, retourner le batch tel quel ou avec une colonne de comptes vide.
         if count_col not in batch:
-            batch[count_col] = [0] * len(batch.get(next(iter(batch)), []))  # Crée une colonne de zéros
+            # Garde-fou: next(iter(batch)) lèverait StopIteration sur un batch vide.
+            first_col = next(iter(batch), None)
+            batch[count_col] = [0] * (len(batch[first_col]) if first_col is not None else 0)
         return batch
 
     texts_in_batch: list = batch[text_col]
@@ -332,6 +333,10 @@ def main() -> None:
                     "text_col": text_column_fixed,
                     "count_col": count_column_name,
                 },
+                # Ne jamais resservir un cache .map() périmé lors des re-runs
+                # (même pattern que calculate_lexical_richness.py).
+                load_from_cache_file=False,
+                new_fingerprint=str(uuid.uuid4()),
             )
         
         console.print(f"[green]✓[/green] Comptage des mots terminé")

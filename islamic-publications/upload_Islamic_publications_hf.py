@@ -30,8 +30,8 @@ from typing import Dict, Any, List, Optional
 
 import pandas as pd
 from dotenv import load_dotenv
-from datasets import Dataset, load_dataset
-from huggingface_hub import login, get_token, utils as hf_utils
+from datasets import Dataset
+from huggingface_hub import login, utils as hf_utils
 
 # Rich console imports for beautiful output
 from rich.console import Console
@@ -55,7 +55,6 @@ from iwac_common.omeka_client import (
 )
 from iwac_common.field_mappers import (
     extract_added_date,
-    get_media_ids,
     get_value,
     is_content_public,
     to_int_or_none,
@@ -207,63 +206,10 @@ async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
     omeka_items_raw = await api.fetch_items(60)  # Islamic publications only
 
     if not omeka_items_raw:
-        console.print("[bold yellow]⚠ Warning:[/bold yellow] No items returned from Omeka API.")
-        # Try to get schema from existing dataset or define a default one
-        final_df = pd.DataFrame()
-        try:
-            with console.status("[bold green]Loading existing dataset schema...", spinner="dots"):
-                existing_ds = load_dataset(repo, name="publications", split="train", token=token_to_use, download_mode="force_redownload", verification_mode="no_checks")
-            if existing_ds.num_rows > 0:
-                final_df = pd.DataFrame(columns=existing_ds.column_names)
-                console.print(f"[green]✓[/green] Using existing dataset schema with {len(existing_ds.column_names)} columns")
-            else:
-                console.print("[yellow]ℹ[/yellow] Existing dataset on Hub is empty. Creating empty dataset with default schema.")
-                expected_cols = [
-                    "o:id", "identifier", "added_date", "iwac_url", "iiif_manifest", "PDF", "thumbnail", "title", "author",
-                    "newspaper", "country", "pub_date", "issue", "tableOfContents", "subject", "spatial",
-                    "language", "nb_pages", "URL", "source", "OCR"
-                ]
-                final_df = pd.DataFrame(columns=expected_cols)
-
-        except Exception as e_load_meta:
-            console.print(f"[yellow]⚠[/yellow] Could not load existing dataset schema: {e_load_meta}")
-            expected_cols = [
-                "o:id", "identifier", "added_date", "iwac_url", "iiif_manifest", "PDF", "thumbnail", "title", "author",
-                "newspaper", "country", "pub_date", "issue", "subject", "spatial",
-                "language", "nb_pages", "URL", "source", "OCR"
-            ]
-            final_df = pd.DataFrame(columns=expected_cols)
-        
-        if 'o:id' in final_df.columns:
-            final_df['o:id'] = final_df['o:id'].astype(str)
-
-        if not final_df.empty or (final_df.empty and not omeka_items_raw):
-            console.print("[blue]→[/blue] Preparing to push empty dataset to the Hub...")
-            dataset_to_push = Dataset.from_pandas(final_df, preserve_index=False)
-            
-            hf_token_env = os.getenv("HF_TOKEN")
-            hf_token_stored = get_token()
-            token_to_use = hf_token_env if hf_token_env else hf_token_stored
-            if not token_to_use and not hf_utils.is_notebook():
-                login()
-                token_to_use = get_token()
-
-            try:
-                with console.status("[bold green]Pushing empty dataset...", spinner="dots"):
-                    dataset_to_push.push_to_hub(
-                        repo,
-                        config_name="publications",
-                        token=token_to_use,
-                        max_shard_size=shard_size,
-                        commit_message="Dataset cleared or initialized as empty (no Omeka items found)"
-                    )
-                console.print("[green]✓[/green] Successfully pushed empty dataset to the Hub.")
-            except Exception as e_push_empty:
-                console.print(Panel(
-                    f"[bold red]✗ Failed to push empty dataset[/bold red]\n\n{e_push_empty}",
-                    title="Error",
-                    border_style="red"
-                ))
+        console.print(
+            "[bold yellow]⚠ Warning:[/bold yellow] No items returned from Omeka API. "
+            "Leaving the existing Hub dataset untouched. Exiting."
+        )
         await conn_manager.close()
         return
 

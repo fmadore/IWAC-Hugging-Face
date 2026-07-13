@@ -144,8 +144,12 @@ def chunk_on_whitespace(text: str, max_chars: int) -> List[str]:
     return chunks
 
 
-def lemmatise_one(nlp, text: str) -> List[str]:
+def lemmatise_one(nlp, text: str) -> List[tuple]:
     """Lemmatise one already-normalized text, chunking long text to bound memory.
+
+    Returns a list of ``(lemma, is_stop)`` pairs. Stop-word status is spaCy's
+    ``token.is_stop`` on the SURFACE token — the semantically correct check —
+    rather than testing the lemma against the surface-form stop-word list.
 
     A full periodical issue can top 1M chars; feeding that to spaCy in one go
     builds a huge tok2vec tensor and OOMs on CPU. Splitting into
@@ -154,10 +158,10 @@ def lemmatise_one(nlp, text: str) -> List[str]:
     """
     if not text:
         return []
-    tokens: List[str] = []
+    tokens: List[tuple] = []
     for chunk in chunk_on_whitespace(text, SPACY_MAX_CHUNK_CHARS):
         doc = nlp(chunk)
-        tokens.extend(tok.lemma_.lower() for tok in doc if tok.is_alpha)
+        tokens.extend((tok.lemma_.lower(), tok.is_stop) for tok in doc if tok.is_alpha)
     return tokens
 
 
@@ -182,11 +186,15 @@ def lemmatise_dataset(
     the remainder is recomputed. Rows that already have a non-empty lemma are
     kept as-is in "empty" mode; blank-text rows get empty lemmas.
 
-    ``language_filter`` skips rows whose ``language`` does not include the
-    given label (pipe-split membership, e.g. "Français" or "Anglais"): a
-    wrong-language pipeline would emit garbage lemmas. Skipped rows keep
-    their existing values, so per-language passes compose (French pass with
-    the French model, then English pass with the English model).
+    ``language_filter`` skips rows whose PRIMARY language (the first
+    pipe-separated component of ``language``, whitespace-stripped) is not the
+    given label (e.g. "Français" or "Anglais"): a wrong-language pipeline
+    would emit garbage lemmas. Matching on the primary language only makes
+    bilingual rows ("Français|Anglais") deterministic — each row belongs to
+    exactly one language pass, so the result does not depend on --mode or
+    pass order. Skipped rows keep their existing values, so per-language
+    passes compose (French pass with the French model, then English pass
+    with the English model).
     """
     n = len(ds)
     row_ids = [str(x) for x in ds["o:id"]]
@@ -199,8 +207,13 @@ def lemmatise_dataset(
         if "language" not in ds.column_names:
             console.print(f"[yellow]⚠[/yellow] --language '{language_filter}' requested but no 'language' column; processing all rows.")
         else:
+            # A row is in scope only when its FIRST listed (primary) language
+            # matches the filter: bilingual rows ("Français|Anglais") are
+            # handled by exactly one pass, so output is deterministic
+            # regardless of --mode or pass order. Components are stripped so
+            # "Français | Anglais" parses correctly.
             in_scope = [
-                language_filter in str(lang).split("|") if lang else False
+                str(lang).split("|")[0].strip() == language_filter if lang else False
                 for lang in ds["language"]
             ]
             console.print(
@@ -238,7 +251,6 @@ def lemmatise_dataset(
         + (f" ([green]{len(cache):,}[/green] restored from cache)" if cache else "")
     )
 
-    stop_words = nlp.Defaults.stop_words
     since_ckpt = 0
     if indices_to_process:
         with Progress(
@@ -252,8 +264,10 @@ def lemmatise_dataset(
             task = progress.add_task("[cyan]lemmatising", total=len(indices_to_process))
             for i in indices_to_process:
                 tokens = lemmatise_one(nlp, normalize(texts[i]))
-                lemma_text = " ".join(tokens)
-                clean_text = " ".join(t for t in tokens if t not in stop_words)
+                lemma_text = " ".join(lemma for lemma, _ in tokens)
+                # Stop-word filtering uses token.is_stop on the surface token
+                # (not the lemma vs. the surface-form stop-word list).
+                clean_text = " ".join(lemma for lemma, is_stop in tokens if not is_stop)
                 final_lemmas[i] = lemma_text
                 final_clean[i] = clean_text
                 cache[row_ids[i]] = [lemma_text, clean_text]
@@ -314,7 +328,7 @@ def main():
     parser.add_argument("--spacy-model", default=None, help="spaCy model to use (default: chosen from --language via LANGUAGE_MODEL_DEFAULTS, else fr_core_news_lg)")
     parser.add_argument("--max-shard-size", default="1GB", help="Maximum Parquet shard size when pushing to the Hub")
     parser.add_argument("--mode", choices=["all", "empty"], default=None, help="Process all rows or only rows with an empty lemma column (skips the interactive prompt)")
-    parser.add_argument("--language", default=None, metavar="LABEL", help="Only lemmatise rows whose 'language' includes LABEL (e.g. 'Français', 'Anglais'); picks the matching spaCy model unless --spacy-model is given. Other rows keep their existing values — run one pass per language on mixed subsets like 'references'.")
+    parser.add_argument("--language", default=None, metavar="LABEL", help="Only lemmatise rows whose PRIMARY (first-listed) 'language' is LABEL (e.g. 'Français', 'Anglais'); picks the matching spaCy model unless --spacy-model is given. Other rows keep their existing values — run one pass per language on mixed subsets like 'references'.")
     parser.add_argument("--french-only", action="store_true", help="Deprecated alias for --language Français")
     args = parser.parse_args()
 

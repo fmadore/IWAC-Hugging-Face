@@ -14,7 +14,13 @@ Supported configurations:
 
 Long texts exceeding the model's 8192-token limit are split into overlapping
 chunks, each chunk is embedded separately, and the chunk embeddings are
-averaged into a single vector per row.
+pooled into a single vector per row with a length-weighted average.
+
+Progress is checkpointed to a resume cache in ``.cache_embeddings/``. The
+cache filename embeds a fingerprint of (model, dimensionality, task type),
+so a cache written under one embedding configuration is never restored into
+a run with different parameters. Only rows whose chunks ALL embedded
+successfully are cached — partially-embedded rows are retried on re-run.
 
 Usage
 -----
@@ -49,6 +55,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import ensure_hf_token, PRIVATE_REPO_ID  # noqa: E402
 from _embedding_utils import (  # noqa: E402
     average_embeddings,
+    cache_fingerprint,
     chunk_text as _chunk_text_chars,
     delete_cache,
     is_empty_embedding,
@@ -98,11 +105,14 @@ BASE_RETRY_DELAY = 5  # seconds
 CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache_embeddings"
 CHECKPOINT_EVERY = 5  # save cache every N API batches
 
-# Per-config settings: (text_column, embedding_column, cache_filename)
+# Per-config settings: (text_column, embedding_column, cache_stem).
+# The resume cache filename is "<stem>_<cache_fingerprint(model, dim, task)>.json.gz",
+# so a cache written at one embedding configuration is never restored into a
+# run with different parameters.
 CONFIG_SETTINGS = {
-    "articles": ("OCR", "embedding_OCR", "ocr_embeddings.json.gz"),
-    "publications": ("tableOfContents", "embedding_tableOfContents", "toc_embeddings.json.gz"),
-    "references": ("OCR", "embedding_OCR", "references_ocr_embeddings.json.gz"),
+    "articles": ("OCR", "embedding_OCR", "ocr_embeddings"),
+    "publications": ("tableOfContents", "embedding_tableOfContents", "toc_embeddings"),
+    "references": ("OCR", "embedding_OCR", "references_ocr_embeddings"),
 }
 
 
@@ -300,17 +310,20 @@ def _save_completed_to_cache(
     all_embeddings: List[Any],
     cache_file: Path,
 ) -> None:
-    """Reassemble completed chunk embeddings into row embeddings and save cache."""
+    """Reassemble fully-completed chunk embeddings into row embeddings and save cache.
+
+    A row is assembled and cached ONLY when every one of its chunks has a
+    vector. Partially-embedded rows (some chunk vectors None because a batch
+    failed) are left untouched — caching them would freeze a permanently
+    truncated average. Chunk vectors are pooled with a length-weighted mean
+    so short tail chunks don't count as much as full-size ones.
+    """
     flat_offset = 0
     updated = 0
     for row_idx, chunks in row_chunks:
-        chunk_embs = [
-            flat_embeddings[flat_offset + k]
-            for k in range(len(chunks))
-            if flat_embeddings[flat_offset + k] is not None
-        ]
-        if chunk_embs:
-            averaged = average_embeddings(chunk_embs)
+        chunk_embs = flat_embeddings[flat_offset:flat_offset + len(chunks)]
+        if all(emb is not None for emb in chunk_embs):
+            averaged = average_embeddings(chunk_embs, weights=[len(c) for c in chunks])
             all_embeddings[row_idx] = averaged
             oid_str = str(row_ids[row_idx])
             if oid_str not in cache:
@@ -381,6 +394,11 @@ def main():
         default=None,
         help="Update only missing embeddings or recompute all (skips the interactive prompt).",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a crashed --update-mode all run from its cache instead of starting fresh.",
+    )
 
     args = parser.parse_args()
 
@@ -400,8 +418,14 @@ def main():
     console.print(f"[green]✓[/green] Configuration: [cyan]{config_name}[/cyan]")
 
     # Resolve per-config settings
-    text_column, embedding_column, cache_filename = CONFIG_SETTINGS[config_name]
-    cache_file = CACHE_DIR / cache_filename
+    text_column, embedding_column, cache_stem = CONFIG_SETTINGS[config_name]
+    # Key the resume cache by (model, dimensionality, task type) so a cache
+    # written at one embedding configuration can never be restored into a run
+    # with different parameters. Old un-fingerprinted cache files (e.g.
+    # "ocr_embeddings.json.gz") are simply ignored (fresh start), not migrated.
+    cache_file = CACHE_DIR / (
+        f"{cache_stem}_{cache_fingerprint(MODEL_NAME, dimensionality, task_type)}.json.gz"
+    )
 
     # --- Step 1: Authentication ---
     console.print("\n[bold cyan]Step 1:[/bold cyan] Authenticating...")
@@ -443,6 +467,18 @@ def main():
     else:
         update_mode = choose_update_mode()
     console.print(f"[green]✓[/green] Update mode: [cyan]{update_mode}[/cyan]")
+
+    # 'all' means recompute everything: start from a fresh cache unless the
+    # user explicitly resumes a crashed run. 'missing' always reuses the cache.
+    if update_mode == "all" and cache_file.exists():
+        if args.resume:
+            console.print("[yellow]ℹ[/yellow] --resume: reusing the existing cache for this 'all' run.")
+        else:
+            cache_file.unlink()
+            console.print(
+                "[yellow]ℹ[/yellow] Update mode 'all': deleted existing resume cache "
+                "(pass --resume to reuse a crashed run's cache)."
+            )
 
     # --- Display configuration ---
     console.print()
@@ -526,7 +562,8 @@ def main():
     for i, (text, emb) in enumerate(zip(texts, all_embeddings)):
         if update_mode == "all":
             if text is not None and str(text).strip():
-                # In 'all' mode, skip only if already in cache (from this run)
+                # In 'all' mode, skip only if already in cache (this run's
+                # checkpoints, or a crashed run's cache kept via --resume)
                 oid_str = str(row_ids[i])
                 if oid_str not in cache:
                     indices_to_process.append(i)
@@ -611,10 +648,28 @@ def main():
                 if delay > 0 and batch_end < len(flat_chunks):
                     time.sleep(delay)
 
-        # Final reassemble: group chunk embeddings by row and average
+        # Final reassemble: group chunk embeddings by row and length-weighted
+        # average (only rows whose chunks ALL succeeded are assembled/cached).
         _save_completed_to_cache(
             cache, row_chunks, flat_embeddings, row_ids, all_embeddings, cache_file,
         )
+
+        # Rows with any failed chunk must end EMPTY — never a truncated
+        # average, never a stale pre-existing vector — so a re-run in
+        # 'missing' mode retries them.
+        partial_rows = 0
+        flat_offset = 0
+        for row_idx, chunks in row_chunks:
+            chunk_embs = flat_embeddings[flat_offset:flat_offset + len(chunks)]
+            if any(emb is None for emb in chunk_embs):
+                all_embeddings[row_idx] = []
+                partial_rows += 1
+            flat_offset += len(chunks)
+        if partial_rows > 0:
+            console.print(
+                f"[yellow]⚠[/yellow] {partial_rows} row(s) had failed chunks and were "
+                f"left empty — re-run in 'missing' mode to retry them."
+            )
 
         console.print("[green]✓[/green] Embedding computation complete.")
 
@@ -680,7 +735,9 @@ def main():
             f"Would have pushed [cyan]{len(ds_processed)}[/cyan] rows to "
             f"[cyan]{repo_id}[/cyan] (config: {config_name}).\n\n"
             f"[yellow]Embeddings are cached in {cache_file}[/yellow]\n"
-            f"Re-run without --dry-run to push (cached results will be reused).",
+            f"(filename is fingerprinted by model/dim/task)\n"
+            f"Re-run without --dry-run to push (cached results will be reused; "
+            f"in --update-mode all, add --resume to keep them).",
             title="Dry Run Complete",
             border_style="yellow",
         ))
@@ -729,7 +786,8 @@ def main():
             f"[bold red]Failed to push dataset[/bold red]\n\n"
             f"{e}\n\n"
             f"[yellow]Embeddings are cached in {cache_file}[/yellow]\n"
-            f"Re-run the script to resume from where it left off.",
+            f"Re-run the script to resume from where it left off "
+            f"(in --update-mode all, add --resume).",
             title="Error",
             border_style="red",
         ))

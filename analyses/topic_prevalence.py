@@ -37,6 +37,7 @@ sys.path.insert(0, str(REPO_ROOT / "post-processing"))
 sys.path.insert(0, str(REPO_ROOT))
 
 from _common import ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
+from iwac_common.text_utils import simple_tokenize  # noqa: E402
 from lda_topic_modeling.constants import (  # noqa: E402
     DOMAIN_STOPWORDS,
     LDA_GEO_STOPWORDS,
@@ -64,7 +65,7 @@ OUTPUT_DIR = REPO_ROOT / "analyses" / "output"
 
 def tokenize_like_training(text: str, stopwords: set, phraser) -> list[str]:
     """Reproduce the prediction-time tokenization of the LDA pipeline."""
-    tokens = [t for t in str(text).lower().split() if len(t) >= 2 and t not in stopwords]
+    tokens = simple_tokenize(text, stopwords)
     tokens = apply_phraser(tokens, phraser)
     return apply_custom_collocations(tokens, CUSTOM_COLLOCATIONS)
 

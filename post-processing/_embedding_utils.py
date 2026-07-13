@@ -1,9 +1,15 @@
 """Pure helpers for embedding workflows: chunking, mean-pooling, and a
-gzipped on-disk cache keyed by ``o:id``.
+generic gzipped on-disk JSON cache keyed by ``o:id``.
 
 Extracted from ``semantic_embedding.py`` to keep that script focused on
 orchestration. None of these helpers know about Gemini, datasets, or the
-script's CLI surface; they're plain utilities.
+script's CLI surface; they're plain utilities. The cache helpers store any
+JSON-serializable value — ``lemmatize_update_hf.py`` caches string pairs
+through them, the embedding scripts cache float vectors.
+
+Note on stored embeddings: vectors are cached and pushed to the Hub RAW,
+NOT L2-normalized. Consumers computing cosine similarity must normalize at
+read time (``related_articles.py`` does).
 """
 
 from __future__ import annotations
@@ -12,14 +18,25 @@ import gzip
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 
 logger = logging.getLogger(__name__)
 
 
-def load_cache(cache_file: Path) -> Dict[str, List[float]]:
-    """Load cached embeddings from a gzipped JSON file.
+def cache_fingerprint(model: str, dimensionality: int, task_type: str) -> str:
+    """Filesystem-safe slug identifying the embedding configuration.
+
+    Embedding resume caches MUST embed this in their filename: a cache
+    written at one (model, dim, task) must never be restored into a run
+    with different parameters — that silently mixes vector spaces.
+    """
+    safe_model = model.replace("/", "-")
+    return f"{safe_model}_{dimensionality}d_{task_type.lower()}"
+
+
+def load_cache(cache_file: Path) -> Dict[str, Any]:
+    """Load a gzipped JSON cache.
 
     Returns an empty dict if the file is missing or unreadable.
     """
@@ -35,7 +52,7 @@ def load_cache(cache_file: Path) -> Dict[str, List[float]]:
         return {}
 
 
-def save_cache(cache: Dict[str, List[float]], cache_file: Path) -> None:
+def save_cache(cache: Dict[str, Any], cache_file: Path) -> None:
     """Atomically write the cache to a gzipped JSON file.
 
     Creates the parent directory if needed; writes to a ``.tmp.gz`` sibling
@@ -94,20 +111,41 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
     return chunks
 
 
-def average_embeddings(embeddings: List[List[float]]) -> List[float]:
-    """Mean-pool a list of equal-dimension embedding vectors."""
+def average_embeddings(
+    embeddings: List[List[float]],
+    weights: Sequence[float] | None = None,
+) -> List[float]:
+    """Weighted mean-pool a list of equal-dimension embedding vectors.
+
+    ``weights`` should be the chunk lengths (in characters) so a short tail
+    chunk doesn't count as much as a full-size one; the overlap region is a
+    second-order effect once chunks are length-weighted. Falls back to a
+    plain mean when ``weights`` is omitted. The result is NOT L2-normalized.
+    """
     if len(embeddings) == 1:
-        return embeddings[0]
-    dim = len(embeddings[0])
-    averaged = [0.0] * dim
-    for emb in embeddings:
-        for j in range(dim):
-            averaged[j] += emb[j]
-    n = len(embeddings)
-    return [v / n for v in averaged]
+        return list(embeddings[0])
+
+    import numpy as np
+
+    mat = np.asarray(embeddings, dtype=np.float64)
+    if weights is None:
+        pooled = mat.mean(axis=0)
+    else:
+        w = np.asarray(weights, dtype=np.float64)
+        if len(w) != len(embeddings):
+            raise ValueError(
+                f"weights length {len(w)} != embeddings length {len(embeddings)}"
+            )
+        total = w.sum()
+        if total <= 0:
+            pooled = mat.mean(axis=0)
+        else:
+            pooled = (mat * w[:, None]).sum(axis=0) / total
+    return pooled.tolist()
 
 
 __all__ = [
+    "cache_fingerprint",
     "load_cache",
     "save_cache",
     "delete_cache",

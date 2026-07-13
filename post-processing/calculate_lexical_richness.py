@@ -29,7 +29,6 @@ Dependencies
 import argparse
 import logging
 import os
-import re
 import sys
 import uuid
 from collections import Counter
@@ -38,9 +37,12 @@ from typing import List, Dict, Any, Optional
 from datasets import load_dataset
 import textstat
 
-# Make ``post-processing/_common.py`` importable.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Make ``post-processing/_common.py`` and ``iwac_common`` importable.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _THIS_DIR)
+sys.path.insert(0, os.path.dirname(_THIS_DIR))
 from _common import choose_config, ensure_hf_token, get_available_configs, PRIVATE_REPO_ID  # noqa: E402
+from iwac_common.text_utils import tokenize_words  # noqa: E402
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -50,7 +52,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich.logging import RichHandler
-from rich.prompt import Prompt, IntPrompt
+from rich.prompt import Prompt
 from rich import box
 
 console = Console()
@@ -68,22 +70,28 @@ def calculate_mattr(text: str, window_size: int = 50) -> Optional[float]:
     """Compute Moving Average Type-Token Ratio (MATTR).
 
     Unlike raw TTR, MATTR is not biased by text length because it uses a
-    fixed-size sliding window. Falls back to regular TTR when the text has
-    fewer tokens than the window size.
+    fixed-size sliding window. Tokenization is French-aware
+    (``tokenize_words``): elided clitics are split off (``l'islam`` counts
+    one type, not two), so type counts are not inflated by ``l``/``d``/``qu``
+    fragments.
 
-    Returns None if the text is missing or has no tokens.
+    Texts with fewer tokens than ``window_size`` return None — a plain TTR
+    fallback would mix two incomparable metrics in the same column.
+
+    Returns None if the text is missing, has no tokens, or is too short
+    for MATTR.
     """
     if not text or not isinstance(text, str):
         return None
 
-    tokens = re.findall(r"\b\w+\b", text.lower())
+    tokens = tokenize_words(text)
 
     if not tokens:
         return None
 
     n = len(tokens)
-    if n <= window_size:
-        return len(set(tokens)) / n
+    if n < window_size:
+        return None  # too short for MATTR (no TTR fallback: incomparable metric)
 
     # Efficient sliding window using Counter
     window_counter = Counter(tokens[:window_size])
@@ -113,6 +121,10 @@ def calculate_readability(text: str) -> Optional[float]:
     if not text or not isinstance(text, str):
         return None
     try:
+        # With set_lang('fr'), textstat's flesch_reading_ease applies the
+        # French-calibrated constants (Kandel–Moles adaptation) — verified in
+        # textstat's source (get_lang_cfg(lang_root, "fre_base") etc.) — NOT
+        # the English Flesch formula.
         return textstat.flesch_reading_ease(text)
     except Exception:
         return None
@@ -159,7 +171,10 @@ def compute_metrics_batch(
         readability_col: Name of the readability column.
         update_mode: 'all' or 'missing'.
         window_size: MATTR window size.
-        error_counter: Mutable dict to accumulate error counts.
+        error_counter: Mutable dict to accumulate counts. 'richness_too_short'
+            counts non-empty texts shorter than the MATTR window (stored as
+            None by design, not an error); 'readability_failed' counts
+            readability computation failures.
 
     Returns:
         Batch with metrics added.
@@ -186,7 +201,9 @@ def compute_metrics_batch(
         if richness_needed:
             result = calculate_mattr(text_str, window_size)
             if result is None and has_content:
-                error_counter["richness_failed"] += 1
+                # Non-empty text without a MATTR value means it has fewer
+                # tokens than the window — too short for MATTR, not an error.
+                error_counter["richness_too_short"] += 1
             richness_results[i] = result
 
         if readability_needed:
@@ -397,7 +414,7 @@ def main():
     mode_desc = "all rows" if update_mode == "all" else "missing rows only"
     console.print(f"[blue]→[/blue] Processing {mode_desc}...")
 
-    error_counter: Dict[str, int] = {"richness_failed": 0, "readability_failed": 0}
+    error_counter: Dict[str, int] = {"richness_too_short": 0, "readability_failed": 0}
 
     with Progress(
         SpinnerColumn(),
@@ -433,11 +450,16 @@ def main():
 
     console.print("[green]✓[/green] Metrics computation complete.")
 
-    total_failures = error_counter["richness_failed"] + error_counter["readability_failed"]
+    too_short = error_counter["richness_too_short"]
+    total_failures = error_counter["readability_failed"]
+    if too_short > 0:
+        console.print(
+            f"[yellow]ℹ[/yellow] {too_short} texts too short for MATTR "
+            f"(< {window_size} tokens) — stored as None."
+        )
     if total_failures > 0:
         console.print(
-            f"[yellow]⚠[/yellow] Failures: {error_counter['richness_failed']} richness, "
-            f"{error_counter['readability_failed']} readability (stored as None)."
+            f"[yellow]⚠[/yellow] Failures: {total_failures} readability (stored as None)."
         )
 
     # --- Verify results ---
@@ -521,6 +543,8 @@ def main():
             f"MATTR window: [cyan]{window_size}[/cyan] tokens\n"
             f"Records: [cyan]{len(ds_processed)}[/cyan]"
         )
+        if too_short > 0:
+            summary += f"\n[yellow]Too short for MATTR: {too_short}[/yellow]"
         if total_failures > 0:
             summary += f"\n[yellow]Total failures: {total_failures}[/yellow]"
 

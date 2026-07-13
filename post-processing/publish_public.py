@@ -27,9 +27,14 @@ topic columns, AI sentiment (scores + justifications), descriptionAI,
 abstract, tableOfContents, lexical metrics, word counts, and the
 ``OCR_is_public`` flag itself.
 
-A long-text heuristic guards against NEW full-text columns slipping through:
-any unexpected string column with prose-length values aborts the push unless
-it is a known content column or allow-listed here.
+Two guards protect against NEW full-text columns slipping through:
+
+1. An explicit per-subset column allowlist (iwac_common/public_columns.json):
+   ANY column not listed there aborts the push. Approve reviewed columns with
+   --approve-columns (persisted to the JSON; commit the change).
+2. A prose-length heuristic as a second layer: an unexpected string/list
+   column with prose-length values aborts the push unless it is a known
+   content column or allow-listed here.
 
 Usage
 -----
@@ -57,7 +62,11 @@ import sys
 # Make ``post-processing/_common.py`` importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import ensure_hf_token, PRIVATE_REPO_ID, PUBLIC_REPO_ID  # noqa: E402
-from iwac_common.repos import CONTENT_COLUMNS  # noqa: E402
+from iwac_common.repos import (  # noqa: E402
+    CONTENT_COLUMNS,
+    PUBLIC_COLUMNS_FILE,
+    load_public_columns,
+)
 
 from dotenv import load_dotenv
 from pathlib import Path
@@ -65,6 +74,7 @@ from pathlib import Path
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
+import pandas as pd  # noqa: E402
 from datasets import load_dataset  # noqa: E402
 from huggingface_hub import HfApi  # noqa: E402
 from rich import box  # noqa: E402
@@ -102,26 +112,128 @@ SUSPECT_MEAN_CHARS = 3_000
 SUSPECT_MAX_CHARS = 30_000
 
 
+def _value_text_len(v) -> int:
+    """Character length of a value for the prose heuristic: strings count
+    directly; lists/tuples of strings count their joined length (a full text
+    stored as list[str] chunks must not evade the guard)."""
+    if isinstance(v, str):
+        return len(v)
+    if isinstance(v, (list, tuple)):
+        return sum(len(x) for x in v if isinstance(x, str))
+    return 0
+
+
 def find_suspect_columns(df, handled: set[str]) -> list[tuple[str, int, int]]:
-    """Return (column, mean_len, max_len) for prose-length string columns
-    that are not already handled (content columns, masked per-row) nor
-    allow-listed — i.e. NEW full-text columns that need classifying."""
+    """Return (column, mean_len, max_len) for prose-length columns that are
+    not already handled (content columns, masked per-row) nor allow-listed —
+    i.e. NEW full-text columns that need classifying.
+
+    Second defense layer behind the explicit column allowlist: scans object
+    AND pandas-StringDtype columns, and unwraps list values, so chunked or
+    typed text columns can't slip past on a technicality."""
+    from pandas.api.types import is_numeric_dtype, is_bool_dtype, is_datetime64_any_dtype
+
     suspects = []
     for col in df.columns:
         if col in PUBLIC_TEXT_ALLOWLIST or col in handled:
             continue
-        if df[col].dtype != object:
+        dtype = df[col].dtype
+        if is_numeric_dtype(dtype) or is_bool_dtype(dtype) or is_datetime64_any_dtype(dtype):
             continue
-        vals = df[col].dropna()
-        vals = vals[vals.map(lambda v: isinstance(v, str))]
-        vals = vals[vals.str.strip().ne("")]
-        if vals.empty:
+        lengths = df[col].dropna().map(_value_text_len)
+        lengths = lengths[lengths > 0]
+        if lengths.empty:
             continue
-        lengths = vals.str.len()
         mean_len, max_len = int(lengths.mean()), int(lengths.max())
         if mean_len > SUSPECT_MEAN_CHARS or max_len > SUSPECT_MAX_CHARS:
             suspects.append((col, mean_len, max_len))
     return suspects
+
+
+class MissingFlagError(RuntimeError):
+    """A subset has content columns but no ``OCR_is_public`` flag — masking
+    is impossible, so publishing must abort rather than leak."""
+
+
+def mask_content_columns(public_df, cfg: str) -> tuple[list[str], int, int]:
+    """Blank the content columns of ``public_df`` IN PLACE for every row
+    whose ``OCR_is_public`` flag is not truthy (null → private, conservative).
+
+    Returns ``(content_cols, kept, blanked)``. Raises
+    :class:`MissingFlagError` if content columns exist without the flag.
+    This is the privacy boundary — covered by tests/test_publish_public.py.
+    """
+    content_cols = [c for c in CONTENT_COLUMNS.get(cfg, []) if c in public_df.columns]
+    if not content_cols:
+        return [], 0, 0
+    if "OCR_is_public" not in public_df.columns:
+        raise MissingFlagError(
+            f"'{cfg}' has content columns {content_cols} but no 'OCR_is_public' "
+            f"flag; full text cannot be masked per row."
+        )
+    is_public = public_df["OCR_is_public"].map(lambda v: bool(v) if pd.notna(v) else False)
+    private_mask = ~is_public
+    for col in content_cols:
+        # Blank the full text (and its lemmas) only for private-content rows.
+        public_df.loc[private_mask, col] = ""
+    return content_cols, int(is_public.sum()), int(private_mask.sum())
+
+
+def check_column_allowlist(cfg: str, df, approve: set[str]) -> list[str]:
+    """Primary guard: every column must be explicitly allow-listed in
+    ``iwac_common/public_columns.json`` before it reaches the public repo.
+
+    Returns the list of columns newly approved this run (already persisted).
+    Aborts on any unknown column that was not passed via --approve-columns.
+    """
+    import json
+
+    allowlist = load_public_columns()
+    if cfg not in allowlist:
+        console.print(
+            f"[red]✗[/red] Subset [bold]{cfg}[/bold] has no entry in "
+            f"{PUBLIC_COLUMNS_FILE}. Add one (see the file's _readme). Aborting."
+        )
+        sys.exit(1)
+
+    unknown = [c for c in df.columns if c not in allowlist[cfg]]
+    if not unknown:
+        return []
+
+    to_approve = [c for c in unknown if c in approve]
+    still_unknown = [c for c in unknown if c not in approve]
+
+    if still_unknown:
+        console.print(
+            f"[red]✗[/red] [bold]{cfg}[/bold]: column(s) not in the public "
+            f"allowlist: [red]{', '.join(still_unknown)}[/red]"
+        )
+        for col, mean_len, max_len in find_suspect_columns(df[still_unknown], handled=set()):
+            console.print(
+                f"    [red]{col}[/red] looks like prose (mean {mean_len:,} chars, "
+                f"max {max_len:,}) — if it can hold private full text, add it to "
+                f"CONTENT_COLUMNS instead of the allowlist!"
+            )
+        console.print(
+            "    Review each column, then either re-run with "
+            "[cyan]--approve-columns col1,col2[/cyan] or edit "
+            f"{PUBLIC_COLUMNS_FILE} directly. Aborting — nothing pushed."
+        )
+        sys.exit(1)
+
+    # Persist the explicitly approved columns.
+    with open(PUBLIC_COLUMNS_FILE, encoding="utf-8") as f:
+        raw = json.load(f)
+    raw[cfg] = sorted(set(raw[cfg]) | set(to_approve))
+    with open(PUBLIC_COLUMNS_FILE, "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    console.print(
+        f"[yellow]⚠[/yellow] [bold]{cfg}[/bold]: approved new public column(s) "
+        f"{', '.join(to_approve)} (recorded in {os.path.basename(PUBLIC_COLUMNS_FILE)} "
+        f"— commit this change)."
+    )
+    return to_approve
 
 
 def main() -> None:
@@ -137,6 +249,13 @@ def main() -> None:
     )
     parser.add_argument("--max-shard-size", default="1GB")
     parser.add_argument("--dry-run", action="store_true", help="Report only; push nothing")
+    parser.add_argument(
+        "--approve-columns",
+        default="",
+        help="Comma-separated column names to add to the public allowlist "
+             "(iwac_common/public_columns.json) after review. Without this, any "
+             "column not already allow-listed aborts the push.",
+    )
     parser.add_argument(
         "--squash",
         action="store_true",
@@ -162,28 +281,25 @@ def main() -> None:
         title="[bold blue]Public Projection", border_style="blue",
     ))
 
+    approve = {c.strip() for c in args.approve_columns.split(",") if c.strip()}
+
     plans = []
     for cfg in configs:
         with console.status(f"[bold green]Loading '{cfg}' from {args.repo_private}...", spinner="dots"):
             ds = load_dataset(args.repo_private, name=cfg, split="train", token=token)
         public_df = ds.to_pandas()
 
-        content_cols = [c for c in CONTENT_COLUMNS.get(cfg, []) if c in public_df.columns]
-        kept, blanked = 0, 0
-        if content_cols:
-            if "OCR_is_public" not in public_df.columns:
-                console.print(
-                    f"[red]✗[/red] [bold]{cfg}[/bold] has content columns "
-                    f"{content_cols} but no 'OCR_is_public' flag. Re-run the upload "
-                    f"script (or the backfill) so full text can be masked per row. Aborting."
-                )
-                sys.exit(1)
-            is_public = public_df["OCR_is_public"].fillna(False).astype(bool)
-            private_mask = ~is_public
-            kept, blanked = int(is_public.sum()), int(private_mask.sum())
-            for col in content_cols:
-                # Blank the full text (and its lemmas) only for private-content rows.
-                public_df.loc[private_mask, col] = ""
+        # Primary guard: every column must be explicitly allow-listed.
+        check_column_allowlist(cfg, public_df, approve)
+
+        try:
+            content_cols, kept, blanked = mask_content_columns(public_df, cfg)
+        except MissingFlagError as exc:
+            console.print(
+                f"[red]✗[/red] {exc} Re-run the upload script (or the backfill) "
+                f"so full text can be masked per row. Aborting."
+            )
+            sys.exit(1)
 
         # Guard: the content columns are handled (masked); flag any OTHER
         # prose-length column that we have not classified.

@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -31,9 +30,8 @@ from rich import box
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
-from rich.prompt import IntPrompt, Prompt
+from rich.prompt import Prompt
 from rich.table import Table
-from tqdm import tqdm
 
 # Ensure package imports work when running this file directly
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -48,7 +46,6 @@ from lda_topic_modeling.constants import (  # type: ignore
     DOMAIN_STOPWORDS,
     LDA_GEO_STOPWORDS,
     LDA_GENERIC_STOPWORDS,
-    CUSTOM_COLLOCATIONS,
     DEFAULT_NUM_TOPICS,
     DEFAULT_PASSES,
     DEFAULT_ITERATIONS,
@@ -64,7 +61,6 @@ from lda_topic_modeling.constants import (  # type: ignore
 )
 from lda_topic_modeling.modeling import (  # type: ignore
     tokenize_documents,
-    apply_custom_collocations,
     build_dictionary,
     build_corpus,
     chunk_tokens,
@@ -187,7 +183,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 # ── Main ────────────────────────────────────────────────────────────
 
 
-def main() -> None:
+def main() -> int:
+    """Run the pipeline. Returns a process exit code (0 = success)."""
     configure_logging()
     logger = logging.getLogger(__name__)
 
@@ -249,7 +246,7 @@ def main() -> None:
         ds = load_dataset(repo_id, name=config_name, split="train", token=token)
     except Exception as e:
         logger.error(f"Dataset load error: {e}")
-        return
+        return 1
     logger.info(f"Loaded {len(ds)} rows.")
 
     # Language stats
@@ -260,13 +257,13 @@ def main() -> None:
         logger.info(f"{language}: {lang_count} | Other: {other_count} | Total: {len(ds)}")
         if lang_count == 0:
             logger.error(f"No '{language}' documents found.")
-            return
+            return 1
     else:
         logger.warning("No 'language' column — all texts will be processed.")
 
     if text_column not in ds.column_names:
         logger.error(f"Column '{text_column}' not found. Available: {ds.column_names}")
-        return
+        return 1
 
     # Check existing columns
     existing = [c for c in new_columns if c in ds.column_names]
@@ -277,10 +274,10 @@ def main() -> None:
                 confirm = input("Continue and overwrite? (y/N): ").strip().lower()
                 if confirm not in ("y", "yes", "o", "oui"):
                     logger.info("Cancelled.")
-                    return
+                    return 0
             except KeyboardInterrupt:
                 logger.info("\nCancelled.")
-                return
+                return 0
 
     # ── Build stopwords ─────────────────────────────────────────────
     stopwords = set(DOMAIN_STOPWORDS) | LDA_GEO_STOPWORDS | LDA_GENERIC_STOPWORDS
@@ -328,7 +325,7 @@ def main() -> None:
         valid = [(d, t) for d, t in zip(docs, tokenized) if t]
         if not valid:
             logger.error("No valid tokenized documents.")
-            return
+            return 1
         docs_valid = [d for d, _ in valid]
         tokenized_valid = [t for _, t in valid]
         logger.info(f"Valid tokenized docs: {len(tokenized_valid)}")
@@ -444,7 +441,7 @@ def main() -> None:
         # Load existing model
         if not model_dir.exists():
             logger.error(f"Model directory not found: {model_dir}")
-            return
+            return 1
         lda_model, dictionary, phraser = load_lda_model(model_dir, logger)
 
         # A chunk-trained model must predict with the same chunking and
@@ -542,7 +539,7 @@ def main() -> None:
         logger.info("Dataset saved successfully.")
     except Exception as e:
         logger.error(f"Push error: {e}")
-        return
+        return 1
 
     # ── Summary ─────────────────────────────────────────────────────
     table = Table(title="LDA Topic Modeling Summary", box=box.ROUNDED)
@@ -567,6 +564,7 @@ def main() -> None:
     console.print("[green]\u2713[/green] Done!")
     if mode == "fit":
         console.print(f"[blue]\u2192[/blue] Parameters: [cyan]{model_dir / 'training_parameters.json'}[/cyan]")
+    return 0
 
 
 def _display_optimization_results(results: list[dict], best_k: int) -> None:
@@ -617,4 +615,4 @@ def _display_coherence(metrics: dict) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

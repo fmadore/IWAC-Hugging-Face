@@ -41,6 +41,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "post-processing"))
 
 from _common import ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
+from iwac_common.text_utils import simple_tokenize  # noqa: E402
 from lda_topic_modeling.constants import (  # noqa: E402
     DOMAIN_STOPWORDS,
     LDA_GEO_STOPWORDS,
@@ -234,7 +235,9 @@ def main() -> None:
     country_tokens: dict[str, Counter] = defaultdict(Counter)
     decade_tokens: dict[str, Counter] = defaultdict(Counter)
     for _, row in text_rows.iterrows():
-        toks = [t for t in str(row["lemma_nostop"]).split() if len(t) >= 2 and t not in stopwords]
+        # simple_tokenize lowercases, so tokenization now matches the LDA preprocessing
+        # (previously keyness skipped lowercasing and case-split tokens LDA merges).
+        toks = simple_tokenize(row["lemma_nostop"], stopwords)
         if not toks:
             continue
         c = row["country"]
