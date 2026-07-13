@@ -1,5 +1,9 @@
 # IWAC Refactoring Roadmap
 
+> **Status:** the v1 roadmap below (Tiers 1–3 + post-roadmap pass) is **complete**.
+> The current plan is **[Roadmap v2](#roadmap-v2--july-2026)** at the end of this
+> file, driven by the findings in `CODE_AND_METHODS_AUDIT.md`.
+
 **Branch:** `claude/refactor-codebase-YP8F3`
 **Goal:** Reduce duplication, improve maintainability, preserve every existing function. No behavioral changes.
 **Estimated total reduction:** ~930 lines (~12%) across 6 upload scripts + 5 post-processing scripts.
@@ -228,3 +232,113 @@ re-raise, `ssl=False`, the references `ffill(axis=1)` merge smearing,
   articles/audiovisual/document.
 - **Packaging**: minimal `pyproject.toml`; `iwac_common` + `country_mapper`
   editable-installed (`pip install -e . --no-deps`); sys.path fallbacks kept.
+
+---
+
+# Roadmap v2 — July 2026
+
+**Branch:** `claude/repo-refactor-analysis-rjxdj8`
+**Driver:** `CODE_AND_METHODS_AUDIT.md` (full-repo audit after v1 completed).
+**Goals:** fix verified bugs, protect the live Hub data with pre-push guards,
+add the repo's first test suite + CI, finish the orchestration dedup v1 left
+behind, and raise the statistical/methodological bar of the DH analyses.
+
+Unlike v1, some tiers here are **deliberate behavioral changes** (better
+tokenization, statistical corrections, new columns). Each is flagged in the
+audit and in commit messages; data-affecting scripts must be re-run to take
+effect — pushing code changes never mutates the Hub by itself.
+
+## Tier A — Correctness fixes (audit §1)
+
+- [ ] **A1** `islamic-publications`: delete the empty-Omeka push-empty branch
+      (NameError at L215; would wipe the Hub config with a schema missing
+      `OCR_is_public`). Warn-and-exit like the other six scripts.
+- [ ] **A2** Embedding caches: fingerprint cache files with
+      `{model}-{dim}-{task}`; stop caching partially-embedded rows; make
+      `--update-mode all` actually recompute cached rows (text + images).
+- [ ] **A3** `_embedding_utils.average_embeddings`: length-weighted mean
+      (numpy), overlap-aware; document that stored vectors are not L2-normalized.
+- [ ] **A4** Shared tokenizer `iwac_common.text_utils.simple_tokenize` used by
+      LDA train, LDA predict, `topic_prevalence`, `keyness_bursts` (fixes the
+      keyness lowercase drift).
+- [ ] **A5** `publish_public.py`: explicit per-subset public-column allowlist in
+      `iwac_common/repos.py`; abort on any unknown column; harden the prose
+      guard (StringDtype, list[str], lower thresholds) as a second layer.
+- [ ] **A6** `hub_merge`: assert `o:id` uniqueness on both frames (fan-out guard).
+- [ ] **A7** Smaller: non-zero exit codes in `lda_topic_modeling.py`; loud
+      warning when the k-sweep's coherence all fails; fix
+      `tokenize_documents` return annotation; `load_from_cache_file=False` in
+      `calculate_word_count.py`; per-item media-fetch try/except in
+      articles/document/audiovisual/images; drop dead imports and the no-op
+      `fetch_media_data` override in `reference`.
+- [ ] **A8** `lemmatize_update_hf.py`: stopword check on surface form
+      (`token.is_stop`), whitespace-tolerant language filter, deterministic
+      bilingual-row rule (first listed language wins in both modes).
+- [ ] **A9** `sentiment_agreement.py`: pin κ weight matrix to the full 1–5
+      scale; document `.5` medians from two-rater consensus.
+- [ ] **A10** Lexical metrics: `None` instead of the TTR fallback below the
+      MATTR window; elision-aware French tokenizer shared by MATTR and
+      word-count; verify/document textstat's French Flesch constants.
+
+## Tier B — Pipeline safety rails (audit §2)
+
+- [ ] **B1** `OmekaApiClient.fetch_items`: reconcile fetched count against the
+      `Omeka-S-Total-Results` header; warn/abort on truncation.
+- [ ] **B2** `hub_merge`: row-count tripwire (abort if new < 95% of existing
+      unless `--force-shrink`) and schema-drop check.
+- [ ] **B3** `--no-cache` on all seven upload scripts.
+- [ ] **B4** `reference`: explicit `--stale-rows keep|drop` for Hub-only rows
+      surviving the outer merge (default keep = current behavior, loudly).
+
+## Tier C — Tests + CI (audit §3)
+
+- [ ] **C1** `tests/` with pytest: publish_public masking + allowlist guard
+      (the privacy boundary), hub_merge (fan-out, shrink, suffixes, dtypes),
+      simple_tokenize, dunning_g2, kleinberg_bursts, chunk_tokens,
+      average_embeddings, calculate_mattr, elision tokenizer.
+- [ ] **C2** GitHub Actions: install + import-smoke of every script + pytest.
+
+## Tier D — Upload-runner refactor + CLI unification (audit §3)
+
+- [ ] **D1** `iwac_common/upload_runner.py`: shared main() orchestration
+      (fetch → map loop → merge → validate → cast → push) parameterized by a
+      per-subset spec; migrate all 7 scripts (~650 duplicated lines removed);
+      Rich everywhere (retires the tqdm/plain-logging split in
+      audiovisual/index/images).
+- [ ] **D2** CLI: `--config` naming, `--update-mode missing|all` vocabulary
+      (aliases preserved), `--dry-run` everywhere, non-interactive
+      `calculate_lexical_richness.py`.
+- [ ] **D3** Post-processing dedup: shared column-metric runner
+      (lexical_richness + word_count + new metrics), shared Gemini retry
+      client for both embedding scripts, one config-picker, cache helpers out
+      of `_embedding_utils`.
+
+## Tier E — Methods improvements (audit §4)
+
+- [ ] **E1** LDA: multi-seed k-sweep (mean C_v ± sd, top-word Jaccard
+      stability), optional held-out perplexity split.
+- [ ] **E2** LDA: relevance-weighted labels (λ=0.6), `lda_model_name` column to
+      disambiguate per-language topic ids, full theta export
+      (`doc_topics.parquet`).
+- [ ] **E3** `topic_prevalence.py`: bootstrap CIs, n-weighted trend fit +
+      Mann–Kendall, Benjamini–Hochberg across topics, enforced min-docs on
+      year×country cells.
+- [ ] **E4** `keyness_bursts.py`: G² significance + BH correction + log-ratio
+      effect size; per-doc subject dedup; calendar-gap handling in bursts.
+- [ ] **E5** New `post-processing/calculate_ocr_quality.py`: dictionary
+      hit-rate + garble heuristics → per-row OCR quality score for weighting
+      downstream analyses.
+
+## Tier F — New analyses (audit §5)
+
+- [ ] **F1** `analyses/topic_sentiment.py`: LDA topics × 3-model sentiment
+      consensus × time × country.
+- [ ] **F2** Reprint clusters: union-find over high-cosine pairs in
+      `related_articles.py` (`--clusters`), cross-border circulation report.
+- [ ] **F3** `analyses/entity_networks.py`: subject co-occurrence networks via
+      the `index.Titre` authority join; edge lists + node metrics (Gephi-ready
+      CSV/GEXF).
+
+## Progress tracker
+
+Updated as tiers land; see git history on this branch for the commit per tier.
