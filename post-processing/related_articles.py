@@ -107,14 +107,22 @@ def topk_neighbors(matrix: np.ndarray, k: int, chunk: int = 2048) -> tuple[np.nd
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Top-k related items per row from existing Gemini embeddings."
+        description="Top-k related items per row from existing Gemini embeddings. "
+                    "Report-only by default (nothing is written); pass --push to add "
+                    "the output column and push it to the Hub."
     )
-    parser.add_argument("--repo", default=PRIVATE_REPO_ID)
-    parser.add_argument("--config", choices=list(CONFIG_SETTINGS), default="articles")
-    parser.add_argument("--source", choices=["hub", "csv"], default="hub")
-    parser.add_argument("--topk", type=int, default=10)
+    parser.add_argument("--repo", default=PRIVATE_REPO_ID,
+                        help="Repository ID on Hugging Face Hub (default: private full mirror).")
+    parser.add_argument("--config", choices=list(CONFIG_SETTINGS), default="articles",
+                        help="Dataset configuration (subset) to process (default: articles).")
+    parser.add_argument("--source", choices=["hub", "csv"], default="hub",
+                        help="hub = live dataset (default); csv = local data/ mirror")
+    parser.add_argument("--topk", type=int, default=10,
+                        help="Number of nearest neighbours per row (default: 10).")
     parser.add_argument("--column", default="related_articles", help="Output column name")
-    parser.add_argument("--push", action="store_true", help="Add the column and push to the Hub")
+    parser.add_argument("--push", action="store_true",
+                        help="Write mode: add the output column and push to the Hub "
+                             "(without this flag the script only reports; nothing is written).")
     parser.add_argument("--max-shard-size", default="1GB")
     args = parser.parse_args()
 

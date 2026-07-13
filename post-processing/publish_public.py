@@ -45,7 +45,7 @@ Usage
     python post-processing/publish_public.py
 
     # Publish selected subsets non-interactively
-    python post-processing/publish_public.py --configs articles,references -y
+    python post-processing/publish_public.py --config articles,references -y
 
     # One-time: squash the public repo's git history so previously public
     # OCR/lemma parquet files disappear from old revisions. DESTRUCTIVE to
@@ -243,10 +243,13 @@ def main() -> None:
     parser.add_argument("--repo-private", default=PRIVATE_REPO_ID)
     parser.add_argument("--repo-public", default=PUBLIC_REPO_ID)
     parser.add_argument(
-        "--configs",
+        "--config",
+        dest="config",
         default=",".join(ALL_CONFIGS),
         help=f"Comma-separated subsets to publish (default: {','.join(ALL_CONFIGS)})",
     )
+    # Deprecated alias (pre-2026-07 invocations used --configs); hidden from --help.
+    parser.add_argument("--configs", dest="config", help=argparse.SUPPRESS)
     parser.add_argument("--max-shard-size", default="1GB")
     parser.add_argument("--dry-run", action="store_true", help="Report only; push nothing")
     parser.add_argument(
@@ -265,7 +268,10 @@ def main() -> None:
     parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts")
     args = parser.parse_args()
 
-    configs = [c.strip() for c in args.configs.split(",") if c.strip()]
+    if any(a == "--configs" or a.startswith("--configs=") for a in sys.argv[1:]):
+        console.print("[yellow]⚠[/yellow] --configs is deprecated; use --config.")
+
+    configs = [c.strip() for c in args.config.split(",") if c.strip()]
     unknown = [c for c in configs if c not in ALL_CONFIGS]
     if unknown:
         console.print(f"[red]✗[/red] Unknown config(s): {unknown}. Valid: {ALL_CONFIGS}")

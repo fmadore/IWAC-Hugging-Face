@@ -221,14 +221,19 @@ def majority(votes: List[str]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Inter-model sentiment agreement (Gemini/ChatGPT/Mistral) + consensus columns."
+        description="Inter-model sentiment agreement (Gemini/ChatGPT/Mistral) + consensus columns. "
+                    "Report-only by default (nothing is written); pass --push to add the "
+                    "consensus/disagreement columns and push them to the Hub."
     )
-    parser.add_argument("--repo", default=PRIVATE_REPO_ID)
-    parser.add_argument("--config", default="articles", help="Subset with sentiment columns (articles)")
+    parser.add_argument("--repo", default=PRIVATE_REPO_ID,
+                        help="Repository ID on Hugging Face Hub (default: private full mirror).")
+    parser.add_argument("--config", default="articles",
+                        help="Dataset configuration (subset) with sentiment columns (default: articles).")
     parser.add_argument("--source", choices=["hub", "csv"], default="hub",
                         help="hub = live dataset (default); csv = local data/ mirror")
     parser.add_argument("--push", action="store_true",
-                        help="Add consensus/disagreement columns and push to the Hub")
+                        help="Write mode: add consensus/disagreement columns and push to the Hub "
+                             "(without this flag the script only reports; nothing is written).")
     parser.add_argument("--max-shard-size", default="1GB")
     args = parser.parse_args()
 

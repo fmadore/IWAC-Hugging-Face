@@ -10,13 +10,25 @@ Two classic corpus-DH analyses over the `articles` subset:
    with the same stopword sets as the LDA pipeline (geographic + generic
    noise removed, Islamic/domain terms kept, per the DH guidelines).
 
+   Statistical control: G² conflates effect size and sample size (a tiny
+   rate difference on a huge corpus yields a huge G²), so G² is used only
+   for the *significance test* — per-token p = chi2.sf(G², df=1), then
+   Benjamini–Hochberg correction within each slice's tested token family
+   (q_value). Only tokens with q < 0.05 are reported, *ranked by the
+   log-ratio effect size* (log2 of relative rates, Haldane–Anscombe +0.5
+   smoothing), capped at ``--top-n``.
+
 2. **Burst detection (Kleinberg 2-state automaton)** — periods when a
    ``subject`` term (controlled vocabulary, joins to the index subset)
    appears far above its corpus base rate: coverage spikes around events.
+   Subjects are deduplicated per document (a document listing the same
+   subject twice counts once), and the year axis is a contiguous calendar
+   range (missing years zero-filled), so burst intervals can span truly
+   empty years and log(T) reflects the real calendar span.
 
 Outputs (analyses/output/):
-- keyness_country.csv    country, rank, token, g2, count, rate_ratio
-- keyness_decade.csv     decade, rank, token, g2, count, rate_ratio
+- keyness_country.csv    country, rank, token, log_ratio, g2, p_value, q_value, count, rate_ratio
+- keyness_decade.csv     decade, rank, token, log_ratio, g2, p_value, q_value, count, rate_ratio
 - subject_bursts.csv     subject, start, end, weight, mentions_in_burst, total
 - keyness_bursts_summary.json
 
@@ -36,6 +48,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "post-processing"))
@@ -55,6 +68,36 @@ from rich.table import Table
 
 console = Console()
 OUTPUT_DIR = REPO_ROOT / "analyses" / "output"
+
+# FDR threshold for the keyness report (Benjamini–Hochberg q-values).
+ALPHA = 0.05
+
+
+# ---------------------------------------------------------------------------
+# Shared statistics helpers
+# ---------------------------------------------------------------------------
+
+
+def bh_adjust(pvals) -> np.ndarray:
+    """Benjamini–Hochberg step-up adjusted p-values (q-values).
+
+    Returns an array aligned with the input. NaN p-values are ignored
+    (returned as NaN) and do not count toward the number of tests m.
+    """
+    p = np.asarray(pvals, dtype=float)
+    q = np.full(p.shape, np.nan)
+    finite = np.isfinite(p)
+    m = int(finite.sum())
+    if m == 0:
+        return q
+    pf = p[finite]
+    order = np.argsort(pf, kind="mergesort")
+    ranked = pf[order] * m / np.arange(1, m + 1)
+    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+    out = np.empty(m)
+    out[order] = np.clip(ranked, 0.0, 1.0)
+    q[finite] = out
+    return q
 
 
 # ---------------------------------------------------------------------------
@@ -78,12 +121,37 @@ def dunning_g2(a: int, b: int, total_a: int, total_b: int) -> float:
     return g2 if (a / total_a) > ((b / total_b) if total_b else 0) else -g2
 
 
+def log_ratio(a: int, b: int, total_a: int, total_b: int) -> float:
+    """Log2 ratio of relative rates with Haldane–Anscombe +0.5 smoothing.
+
+    Effect size for keyness (Hardie's Log Ratio): +1 means the token is twice
+    as frequent (per token) in corpus A as in corpus B. Antisymmetric:
+    ``log_ratio(a, b, ta, tb) == -log_ratio(b, a, tb, ta)``. The +0.5 on both
+    counts keeps zero counts finite.
+    """
+    if total_a <= 0 or total_b <= 0:
+        return float("nan")
+    return math.log2(((a + 0.5) / total_a) / ((b + 0.5) / total_b))
+
+
+KEYNESS_COLUMNS = ["slice", "rank", "token", "log_ratio", "g2",
+                   "p_value", "q_value", "count", "rate_ratio"]
+
+
 def keyness_for_slices(
     slice_tokens: dict[str, Counter],
     top_n: int,
     min_count: int,
+    alpha: float = ALPHA,
 ) -> pd.DataFrame:
-    """Top-N overrepresented tokens per slice vs. all other slices pooled."""
+    """Significant overrepresented tokens per slice vs. all other slices pooled.
+
+    G² grows with sample size as well as with effect strength, so it is used
+    only as the *test statistic*: p = chi2.sf(G², df=1), BH-corrected within
+    each slice's tested token family (all tokens with count >= min_count).
+    Tokens with q < alpha are then *ranked by log_ratio* (effect size) and
+    capped at top_n.
+    """
     totals = {s: sum(c.values()) for s, c in slice_tokens.items()}
     grand: Counter = Counter()
     for c in slice_tokens.values():
@@ -94,23 +162,42 @@ def keyness_for_slices(
     for s, counter in slice_tokens.items():
         total_a = totals[s]
         total_b = grand_total - total_a
-        scored = []
+        if total_a == 0 or total_b == 0:
+            continue
+        # Tested family: every token meeting min_count (over- AND under-
+        # represented) — the BH denominator must cover all tests performed.
+        tested = []
         for tok, a in counter.items():
             if a < min_count:
                 continue
             b = grand[tok] - a
-            g2 = dunning_g2(a, b, total_a, total_b)
-            if g2 > 0:
-                rate_a = a / total_a
-                rate_b = (b / total_b) if total_b else 0.0
-                ratio = rate_a / rate_b if rate_b else float("inf")
-                scored.append((tok, g2, a, ratio))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        for rank, (tok, g2, a, ratio) in enumerate(scored[:top_n], 1):
-            rows.append({"slice": s, "rank": rank, "token": tok,
-                         "g2": round(g2, 2), "count": a,
-                         "rate_ratio": round(ratio, 2) if math.isfinite(ratio) else None})
-    return pd.DataFrame(rows)
+            tested.append((tok, a, b, dunning_g2(a, b, total_a, total_b)))
+        if not tested:
+            continue
+        # dunning_g2 is signed (negative = underrepresented); the chi2 test
+        # statistic is the unsigned value.
+        pvals = stats.chi2.sf(np.abs([g for _, _, _, g in tested]), df=1)
+        qvals = bh_adjust(pvals)
+        scored = []
+        for (tok, a, b, g2), p, q in zip(tested, pvals, qvals):
+            if g2 <= 0 or q >= alpha:
+                continue  # report only significant overrepresentation
+            rate_a = a / total_a
+            rate_b = (b / total_b) if total_b else 0.0
+            ratio = rate_a / rate_b if rate_b else float("inf")
+            scored.append({
+                "slice": s, "token": tok,
+                "log_ratio": round(log_ratio(a, b, total_a, total_b), 3),
+                "g2": round(g2, 2),
+                "p_value": float(p), "q_value": float(q),
+                "count": a,
+                "rate_ratio": round(ratio, 2) if math.isfinite(ratio) else None,
+            })
+        scored.sort(key=lambda x: x["log_ratio"], reverse=True)
+        for rank, item in enumerate(scored[:top_n], 1):
+            rows.append({"rank": rank, **item})
+    frame = pd.DataFrame(rows, columns=KEYNESS_COLUMNS if not rows else None)
+    return frame[KEYNESS_COLUMNS] if rows else frame
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +214,12 @@ def kleinberg_bursts(
     Two states: base rate p0 = R/D and burst rate p1 = s*p0. Entering the
     burst state costs gamma*ln(T); staying or leaving is free. Returns the
     maximal state-1 intervals with their total weight (cost saved vs. state 0).
+
+    ``years`` must be a *contiguous calendar range* (the caller zero-fills
+    missing years) so that T = ln-cost horizon equals the true calendar span
+    and intervals never treat non-consecutive years as adjacent. Years with
+    d[t] = 0 are handled: sigma() emits zero cost for either state, so burst
+    intervals can legitimately span truly empty years.
     """
     T = len(r)
     R, D = float(r.sum()), float(d.sum())
@@ -186,6 +279,26 @@ def kleinberg_bursts(
         else:
             t += 1
     return bursts
+
+
+def unique_subjects(raw) -> set[str]:
+    """Deduplicated subject set for one document's pipe-separated field.
+
+    A document listing the same subject twice must count once toward the
+    per-year mention count (r[t] counts *documents*, not repetitions).
+    """
+    return {s.strip() for s in str(raw).split("|") if s.strip()}
+
+
+def contiguous_year_index(observed_years) -> np.ndarray:
+    """Contiguous calendar range min..max over the observed years.
+
+    Calendar gaps (years with zero documents) become explicit d[t] = 0
+    entries instead of silently collapsing, so Kleinberg's log(T) and the
+    interval bookkeeping see the real calendar span.
+    """
+    ys = np.asarray(list(observed_years), dtype=int)
+    return np.arange(int(ys.min()), int(ys.max()) + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -253,21 +366,24 @@ def main() -> None:
     # ---------------- Bursts ----------------
     subj_rows = df[valid_year & df["subject"].notna()]
     per_year_docs = subj_rows.groupby(subj_rows["year"].astype(int)).size()
-    year_index = np.array(sorted(per_year_docs.index))
-    d_arr = per_year_docs.reindex(year_index).to_numpy(dtype=float)
+    # Contiguous calendar range: zero-fill missing years so gaps don't
+    # collapse (log(T) and burst intervals see the true calendar span).
+    year_index = contiguous_year_index(per_year_docs.index)
+    d_arr = per_year_docs.reindex(year_index, fill_value=0).to_numpy(dtype=float)
+    n_gap_years = int((d_arr == 0).sum())
 
     subject_year: dict[str, Counter] = defaultdict(Counter)
     for _, row in subj_rows.iterrows():
         y = int(row["year"])
-        for s_term in str(row["subject"]).split("|"):
-            s_term = s_term.strip()
-            if s_term:
-                subject_year[s_term][y] += 1
+        # Dedup per document: the same subject listed twice counts once.
+        for s_term in unique_subjects(row["subject"]):
+            subject_year[s_term][y] += 1
 
     console.print(
         f"[blue]→[/blue] Burst detection: {len(subject_year):,} subjects, "
         f"{year_index.min()}–{year_index.max()} "
-        f"(threshold: ≥{args.min_subject_total} total mentions)"
+        f"({n_gap_years} empty calendar years zero-filled; "
+        f"threshold: ≥{args.min_subject_total} total mentions)"
     )
 
     burst_rows = []
@@ -295,31 +411,41 @@ def main() -> None:
             "decades": sorted(decade_tokens),
             "stopword_count": len(stopwords),
             "top_n": args.top_n,
+            "alpha": ALPHA,
+            "note": ("p = chi2.sf(G², df=1), Benjamini–Hochberg within each "
+                     "slice's tested token family; only q < alpha reported, "
+                     "ranked by log_ratio effect size (G² conflates effect "
+                     "and sample size)."),
         },
         "bursts": {
             "subjects_tested": sum(1 for c in subject_year.values() if sum(c.values()) >= args.min_subject_total),
             "bursts_found": int(len(bursts_df)),
             "s": args.burst_s, "gamma": args.burst_gamma,
+            "year_range": [int(year_index.min()), int(year_index.max())],
+            "empty_years_zero_filled": n_gap_years,
+            "note": ("Subjects deduplicated per document; calendar gaps "
+                     "zero-filled, so burst intervals can span truly empty "
+                     "years."),
         },
     }
     with open(OUTPUT_DIR / "keyness_bursts_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     # ---------------- Report ----------------
-    kc = Table(title="Distinctive vocabulary per country (top 8 by G²)", box=box.ROUNDED)
+    kc = Table(title=f"Distinctive vocabulary per country (top 8 by log-ratio, q<{ALPHA})", box=box.ROUNDED)
     kc.add_column("Country", style="cyan")
     kc.add_column("Keywords", style="green")
     for country in sorted(country_tokens):
         top = keyness_country[keyness_country["slice"] == country].head(8)["token"]
-        kc.add_row(country, ", ".join(top))
+        kc.add_row(country, ", ".join(top) if len(top) else "[dim]none significant[/dim]")
     console.print(kc)
 
-    kd = Table(title="Distinctive vocabulary per decade (top 8 by G²)", box=box.ROUNDED)
+    kd = Table(title=f"Distinctive vocabulary per decade (top 8 by log-ratio, q<{ALPHA})", box=box.ROUNDED)
     kd.add_column("Decade", style="cyan")
     kd.add_column("Keywords", style="green")
     for decade in sorted(decade_tokens):
         top = keyness_decade[keyness_decade["slice"] == decade].head(8)["token"]
-        kd.add_row(decade, ", ".join(top))
+        kd.add_row(decade, ", ".join(top) if len(top) else "[dim]none significant[/dim]")
     console.print(kd)
 
     if not bursts_df.empty:

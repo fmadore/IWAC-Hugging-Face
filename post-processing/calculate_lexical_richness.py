@@ -13,9 +13,12 @@ The user is prompted to choose the dataset configuration. Column names:
 Usage
 -----
     python post-processing/calculate_lexical_richness.py [--repo USER/DATASET]
+        [--config SUBSET] [--update-mode missing|all] [--dry-run] [-y]
 
-Example:
-    python post-processing/calculate_lexical_richness.py --repo fmadore/islam-west-africa-collection
+Examples:
+    python post-processing/calculate_lexical_richness.py          # fully interactive
+    python post-processing/calculate_lexical_richness.py --config articles --update-mode missing   # headless
+    python post-processing/calculate_lexical_richness.py --config articles -y --dry-run
 
 Environment Variables
 ---------------------
@@ -30,18 +33,26 @@ import argparse
 import logging
 import os
 import sys
-import uuid
 from collections import Counter
 from typing import List, Dict, Any, Optional
 
-from datasets import load_dataset
 import textstat
 
 # Make ``post-processing/_common.py`` and ``iwac_common`` importable.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _THIS_DIR)
 sys.path.insert(0, os.path.dirname(_THIS_DIR))
-from _common import choose_config, ensure_hf_token, get_available_configs, PRIVATE_REPO_ID  # noqa: E402
+from _common import (  # noqa: E402
+    PRIVATE_REPO_ID,
+    choose_update_mode,
+    ensure_hf_token,
+    load_hub_dataset,
+    map_with_progress,
+    print_dry_run_panel,
+    push_dataset,
+    reorder_columns_after,
+    resolve_config,
+)
 from iwac_common.text_utils import tokenize_words  # noqa: E402
 
 # Disable symlinks warning from huggingface_hub
@@ -50,9 +61,7 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich.logging import RichHandler
-from rich.prompt import Prompt
 from rich import box
 
 console = Console()
@@ -63,7 +72,6 @@ logging.basicConfig(
     datefmt="[%X]",
     handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)]
 )
-logger = logging.getLogger(__name__)
 
 
 def calculate_mattr(text: str, window_size: int = 50) -> Optional[float]:
@@ -128,28 +136,6 @@ def calculate_readability(text: str) -> Optional[float]:
         return textstat.flesch_reading_ease(text)
     except Exception:
         return None
-
-
-def choose_update_mode() -> str:
-    """Prompt the user to choose the update mode."""
-    console.print("\n[bold]Update Mode:[/bold]")
-    table = Table(box=box.SIMPLE)
-    table.add_column("#", style="cyan", justify="center")
-    table.add_column("Mode", style="green")
-    table.add_column("Description", style="white")
-
-    table.add_row("1", "missing", "Compute only rows without values (recommended)")
-    table.add_row("2", "all", "Recalculate all values (may take longer)")
-
-    console.print(table)
-
-    while True:
-        try:
-            choice = Prompt.ask("Choose update mode", choices=["1", "2"], default="1")
-            return "missing" if choice == "1" else "all"
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Operation cancelled.[/yellow]")
-            raise SystemExit(0)
 
 
 def compute_metrics_batch(
@@ -318,9 +304,27 @@ def main():
         help="Window size for MATTR computation (default: 50 tokens)."
     )
     parser.add_argument(
+        "--config",
+        default=None,
+        help="Dataset configuration/subset to process (skips the interactive picker)."
+    )
+    parser.add_argument(
+        "--update-mode",
+        choices=["missing", "all"],
+        default=None,
+        help="'missing' computes only rows without values; 'all' recalculates "
+             "everything (skips the interactive prompt)."
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Compute metrics but do not push to Hub."
+    )
+    parser.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        help="Skip confirmations/prompts by accepting defaults (update mode: "
+             "missing). Combine with --config for a fully non-interactive run."
     )
 
     args = parser.parse_args()
@@ -339,16 +343,19 @@ def main():
     token = ensure_hf_token(console=console)
     console.print("[green]✓[/green] Authenticated successfully.")
 
-    # --- Configuration selection ---
+    # --- Configuration selection (CLI flag or interactive picker) ---
     console.print("\n[bold cyan]Step 2:[/bold cyan] Selecting configuration...")
-    with console.status("[bold green]Fetching available configurations...", spinner="dots"):
-        available_configs = get_available_configs(repo_id, token=token)
-
-    config_name_choice = choose_config(available_configs, console=console)
+    config_name_choice = resolve_config(repo_id, token=token, cli_config=args.config, console=console)
     console.print(f"[green]✓[/green] Selected configuration: [cyan]{config_name_choice}[/cyan]")
 
-    # --- Update mode selection ---
-    update_mode = choose_update_mode()
+    # --- Update mode selection (CLI flag, --yes default, or interactive) ---
+    if args.update_mode:
+        update_mode = args.update_mode
+    elif args.yes:
+        update_mode = "missing"
+        console.print("[green]→[/green] Update mode defaulted to 'missing' via --yes.")
+    else:
+        update_mode = choose_update_mode(console=console)
     console.print(f"[green]✓[/green] Update mode: [cyan]{update_mode}[/cyan]")
 
     # --- Display configuration ---
@@ -357,14 +364,9 @@ def main():
 
     # --- Load dataset ---
     console.print(f"\n[bold cyan]Step 3:[/bold cyan] Loading dataset...")
-    try:
-        with console.status(f"[bold green]Loading '{repo_id}' (config: {config_name_choice})...", spinner="dots"):
-            ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token)
-    except Exception as e:
-        console.print(f"[red]✗[/red] Failed to load dataset: {e}")
+    ds = load_hub_dataset(repo_id, config_name_choice, token=token, console=console)
+    if ds is None:
         return
-
-    console.print(f"[green]✓[/green] Dataset loaded: [cyan]{len(ds)}[/cyan] rows")
 
     # --- Column checks ---
     if text_column_name not in ds.column_names:

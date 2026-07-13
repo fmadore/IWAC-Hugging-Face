@@ -62,9 +62,13 @@ from _embedding_utils import (  # noqa: E402
     load_cache,
     save_cache,
 )
+from _gemini_client import (  # noqa: E402
+    call_with_retry,
+    restore_from_cache,
+    set_embedding_column,
+)
 from google import genai
 from google.genai import types
-import pyarrow as pa
 
 # Load .env from project root
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -100,8 +104,8 @@ CHUNK_SIZE = 28_000
 CHUNK_OVERLAP = 2_000
 DEFAULT_DIMENSIONALITY = 768
 DEFAULT_BATCH_SIZE = 20
-MAX_RETRIES = 6
-BASE_RETRY_DELAY = 5  # seconds
+# Retry ladder (MAX_RETRIES / BASE_RETRY_DELAY) is shared with the image
+# embedding script and lives in _gemini_client.call_with_retry.
 CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache_embeddings"
 CHECKPOINT_EVERY = 5  # save cache every N API batches
 
@@ -195,31 +199,19 @@ def embed_texts_with_retry(
     task_type: str,
     dimensionality: int,
 ) -> List[List[float]]:
-    """Call Gemini embed_content with exponential backoff for rate limiting."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = client.models.embed_content(
-                model=MODEL_NAME,
-                contents=texts,
-                config=types.EmbedContentConfig(
-                    task_type=task_type,
-                    output_dimensionality=dimensionality,
-                ),
-            )
-            return [emb.values for emb in response.embeddings]
-        except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                wait = BASE_RETRY_DELAY * (2 ** attempt)
-                logger.warning(f"Rate limited (attempt {attempt + 1}/{MAX_RETRIES}), waiting {wait}s...")
-                time.sleep(wait)
-            elif attempt < MAX_RETRIES - 1:
-                wait = BASE_RETRY_DELAY * (2 ** attempt)
-                logger.warning(f"API error (attempt {attempt + 1}/{MAX_RETRIES}): {e}. Retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError(f"Failed after {MAX_RETRIES} retries")
+    """Call Gemini embed_content with the shared 429/backoff retry ladder."""
+    def _call() -> List[List[float]]:
+        response = client.models.embed_content(
+            model=MODEL_NAME,
+            contents=texts,
+            config=types.EmbedContentConfig(
+                task_type=task_type,
+                output_dimensionality=dimensionality,
+            ),
+        )
+        return [emb.values for emb in response.embeddings]
+
+    return call_with_retry(_call)
 
 
 def display_config_panel(
@@ -546,12 +538,7 @@ def main():
     # Build the full embeddings list, pre-filling from cache
     # Normalize None to [] for consistent PyArrow typing
     all_embeddings: List[Any] = [emb if emb is not None else [] for emb in existing_embeddings]
-    cache_hits = 0
-    for i, oid in enumerate(row_ids):
-        oid_str = str(oid)
-        if oid_str in cache:
-            all_embeddings[i] = cache[oid_str]
-            cache_hits += 1
+    cache_hits = restore_from_cache(all_embeddings, row_ids, cache)
 
     if cache_hits > 0:
         console.print(f"[green]✓[/green] Restored [cyan]{cache_hits}[/cyan] embeddings from cache")
@@ -687,21 +674,9 @@ def main():
     # --- Update the dataset ---
     console.print(f"\n[bold cyan]Step 6:[/bold cyan] Updating dataset...")
 
-    # Build column directly to avoid PyArrow type inference issues with sparse embeddings.
-    emb_col_data = []
-    for emb in all_embeddings:
-        if is_empty_embedding(emb):
-            emb_col_data.append(None)
-        else:
-            emb_col_data.append(emb)
-
-    # Create a typed PyArrow array so nulls and float lists coexist
-    pa_array = pa.array(emb_col_data, type=pa.list_(pa.float64()))
-
-    if embedding_column in ds.column_names:
-        ds_processed = ds.remove_columns([embedding_column]).add_column(embedding_column, pa_array)
-    else:
-        ds_processed = ds.add_column(embedding_column, pa_array)
+    # Build the column as a typed PyArrow array (nulls + float lists coexist)
+    # to avoid type-inference issues with sparse embeddings.
+    ds_processed = set_embedding_column(ds, embedding_column, all_embeddings)
 
     # --- Verify results ---
     console.print("\n[bold]Sample embeddings (first 3 non-empty):[/bold]")

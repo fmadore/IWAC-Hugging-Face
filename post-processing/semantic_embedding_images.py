@@ -67,10 +67,14 @@ from _embedding_utils import (  # noqa: E402
     load_cache,
     save_cache,
 )
+from _gemini_client import (  # noqa: E402
+    call_with_retry,
+    restore_from_cache,
+    set_embedding_column,
+)
 from google import genai  # noqa: E402
 from google.genai import types  # noqa: E402
 from PIL import Image  # noqa: E402
-import pyarrow as pa  # noqa: E402
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -107,8 +111,8 @@ DEFAULT_MAX_SIDE = 1024              # downscale longest side before embedding
 # returns one vector each.
 IMAGE_BATCH_LIMIT = 6
 DEFAULT_BATCH_SIZE = 6
-MAX_RETRIES = 6
-BASE_RETRY_DELAY = 5  # seconds
+# Retry ladder (MAX_RETRIES / BASE_RETRY_DELAY) is shared with the text
+# embedding script and lives in _gemini_client.call_with_retry.
 CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache_embeddings"
 # Resume cache stem; the full filename embeds cache_fingerprint(model, dim,
 # task) so a cache written at one embedding configuration is never restored
@@ -145,7 +149,7 @@ def embed_images_with_retry(
     images: List[bytes],
     dimensionality: int,
 ) -> List[List[float]]:
-    """Embed a batch of images (one vector each) with exponential backoff.
+    """Embed a batch of images (one vector each) with the shared retry ladder.
 
     ``gemini-embedding-2`` is natively multimodal; task type is folded into
     the model rather than passed as a parameter, so we only set
@@ -156,27 +160,16 @@ def embed_images_with_retry(
         types.Content(parts=[types.Part.from_bytes(data=img, mime_type="image/jpeg")])
         for img in images
     ]
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = client.models.embed_content(
-                model=MODEL_NAME,
-                contents=contents,
-                config=types.EmbedContentConfig(output_dimensionality=dimensionality),
-            )
-            return [emb.values for emb in response.embeddings]
-        except Exception as e:  # noqa: BLE001
-            error_str = str(e)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                wait = BASE_RETRY_DELAY * (2 ** attempt)
-                logger.warning(f"Rate limited (attempt {attempt + 1}/{MAX_RETRIES}), waiting {wait}s...")
-                time.sleep(wait)
-            elif attempt < MAX_RETRIES - 1:
-                wait = BASE_RETRY_DELAY * (2 ** attempt)
-                logger.warning(f"API error (attempt {attempt + 1}/{MAX_RETRIES}): {e}. Retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError(f"Failed after {MAX_RETRIES} retries")
+
+    def _call() -> List[List[float]]:
+        response = client.models.embed_content(
+            model=MODEL_NAME,
+            contents=contents,
+            config=types.EmbedContentConfig(output_dimensionality=dimensionality),
+        )
+        return [emb.values for emb in response.embeddings]
+
+    return call_with_retry(_call)
 
 
 def display_config_panel(
@@ -318,11 +311,7 @@ def main() -> None:
     cache = load_cache(cache_file)
     if cache:
         console.print(f"[green]✓[/green] Resuming with [cyan]{len(cache)}[/cyan] cached embeddings")
-    restored = 0
-    for i, oid in enumerate(row_ids):
-        if str(oid) in cache:
-            all_embeddings[i] = cache[str(oid)]
-            restored += 1
+    restored = restore_from_cache(all_embeddings, row_ids, cache)
     if restored:
         console.print(f"[green]✓[/green] Restored [cyan]{restored}[/cyan] embeddings from cache")
 
@@ -403,12 +392,7 @@ def main() -> None:
 
     # --- Step 6: Update dataset ---
     console.print(f"\n[bold cyan]Step 6:[/bold cyan] Updating dataset...")
-    emb_col_data = [None if is_empty_embedding(e) else e for e in all_embeddings]
-    pa_array = pa.array(emb_col_data, type=pa.list_(pa.float64()))
-    if EMBEDDING_COLUMN in ds.column_names:
-        ds_out = ds.remove_columns([EMBEDDING_COLUMN]).add_column(EMBEDDING_COLUMN, pa_array)
-    else:
-        ds_out = ds.add_column(EMBEDDING_COLUMN, pa_array)
+    ds_out = set_embedding_column(ds, EMBEDDING_COLUMN, all_embeddings)
 
     # Place the embedding column right after the image URL column.
     cols = list(ds_out.column_names)

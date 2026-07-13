@@ -13,7 +13,8 @@
     "thumbnail", "title", "author", "newspaper", "country", "pub_date",
     "descriptionAI", "subject", "spatial", "language", "nb_pages", "URL",
     "source", "OCR", "OCR_is_public", "embedding_OCR", "nb_mots",
-    "Richesse_Lexicale_OCR", "Lisibilite_OCR", "lemma_text", "lemma_nostop",
+    "ocr_quality", "Richesse_Lexicale_OCR", "Lisibilite_OCR", "lemma_text",
+    "lemma_nostop",
     "lda_topic_id", "lda_topic_prob", "lda_topic_label", "lda_topic_topk",
     "gemini_centralite_islam_musulmans", "gemini_centralite_justification",
     "gemini_polarite", "gemini_polarite_justification",
@@ -33,13 +34,14 @@
     "thumbnail", "title", "creator", "publisher", "country", "pub_date",
     "descriptionAI", "volume", "issue", "is_part_of", "extent", "medium",
     "subject", "spatial", "language", "source", "OCR", "nb_mots",
-    "OCR_is_public"
+    "ocr_quality", "OCR_is_public"
   ],
   "documents": [
     "o:id", "identifier", "added_date", "iwac_url", "iiif_manifest", "PDF",
     "thumbnail", "title", "author", "contributor", "country", "pub_date",
     "descriptionAI", "abstract", "subject", "spatial", "language", "type",
-    "nb_pages", "source", "rights", "OCR", "nb_mots", "OCR_is_public"
+    "nb_pages", "source", "rights", "OCR", "nb_mots", "ocr_quality",
+    "OCR_is_public"
   ],
   "images": [
     "o:id", "identifier", "added_date", "iwac_url", "iiif_manifest",
@@ -59,7 +61,7 @@
     "thumbnail", "title", "author", "newspaper", "country", "pub_date",
     "issue", "tableOfContents", "embedding_tableOfContents", "subject",
     "spatial", "language", "nb_pages", "URL", "source", "OCR", "nb_mots",
-    "lemma_text", "lemma_nostop", "OCR_is_public"
+    "ocr_quality", "lemma_text", "lemma_nostop", "OCR_is_public"
   ],
   "references": [
     "o:id", "iwac_url", "identifier", "added_date", "o:resource_class",
@@ -67,7 +69,8 @@
     "book_title", "chapter", "volume", "issue", "abstract", "edition",
     "nb_pages", "page_start", "page_end", "extent", "is_part_of",
     "provenance", "subject", "spatial", "language", "doi", "URL", "OCR",
-    "OCR_is_public", "nb_mots", "country", "embedding_OCR", "lda_topic_id",
+    "OCR_is_public", "nb_mots", "ocr_quality", "country", "embedding_OCR",
+    "lda_topic_id",
     "lda_topic_prob", "lda_topic_label", "lda_topic_topk", "lemma_text",
     "lemma_nostop"
   ]

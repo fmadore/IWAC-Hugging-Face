@@ -11,14 +11,36 @@ computes the *full* topic distribution for every French article, and
 aggregates mean topic probability per year and per year x country.
 
 Outputs (written to analyses/output/):
-- topic_prevalence_year.csv          year, topic_id, label, prevalence, n_docs
-- topic_prevalence_year_country.csv  + country
+- topic_prevalence_year.csv          year, topic_id, label, prevalence,
+                                     ci_low, ci_high, n_docs
+- topic_prevalence_year_country.csv  + country (cells with < --min-docs-cell
+                                     docs are dropped)
 - topic_labels.csv                   topic_id, label, top_words
-- topic_prevalence_summary.json      trends (rising/falling topics, peaks)
+- topic_prevalence_summary.json      trends (slope, Mann–Kendall p, BH q, peaks)
+
+Statistics
+----------
+- Trend slope: *n-weighted* least squares (weights = per-year doc counts) on
+  the years passing ``--min-docs-year``; reported in percentage points per
+  decade.
+- Trend test: Mann–Kendall (normal approximation with tie correction,
+  two-sided p) on the same year window, with Benjamini–Hochberg correction
+  across all topics → ``q_value`` / ``significant`` (q < 0.05). The console
+  rising/declining tables only rank topics with q < 0.05.
+- ``mean_prevalence`` is doc-weighted over the *same* solid-year window used
+  for the slope (no window inconsistency).
+- ``peak_year`` is taken on a 3-year centered rolling mean of the per-year
+  prevalence (min_periods=1 at the edges) to damp single-year noise; note the
+  smoothing runs over the *ordered sequence of solid years*, which may skip
+  thin years excluded by ``--min-docs-year``.
+- Per-year confidence bands: percentile bootstrap (``--bootstrap N``, default
+  200, 0 disables) resampling documents with replacement *within each year*
+  → ``ci_low`` / ``ci_high`` (2.5/97.5 percentiles).
 
 Usage
 -----
     python analyses/topic_prevalence.py [--source hub|csv] [--min-docs-year 20]
+                                        [--bootstrap 200] [--min-docs-cell 10]
 """
 from __future__ import annotations
 

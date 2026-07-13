@@ -259,6 +259,28 @@ DEFAULT_SWEEP_ITERATIONS = 200
 # (lda_topic_topk): "id:prob|id:prob|..." sorted by descending probability.
 DEFAULT_TOPIC_TOPK = 3
 
+# LDAvis-style relevance weighting for topic LABELS (Sievert & Shirley 2014):
+#   relevance(w, k) = λ·log p(w|k) + (1−λ)·log(p(w|k) / p(w))
+# λ=1.0 reproduces pure top-probability ranking; λ=0.6 (the LDAvis-recommended
+# value) down-weights corpus-common words so labels are more distinctive.
+# Pass lambda_relevance=None to get_topic_label for the old pure-probability
+# behavior (--no-relevance-labels on the CLI).
+DEFAULT_LAMBDA_RELEVANCE = 0.6
+
+# Multi-seed k-sweep stability (--stability-seeds): 1 = single seed
+# (exact legacy behavior). N>1 trains N reduced models per candidate k
+# (seeds 42, 43, ...), selects k by MEAN C_v, and reports the sd plus a
+# topic-stability score (mean best-match Jaccard of top-10 topic words
+# between seed pairs).
+DEFAULT_STABILITY_SEEDS = 1
+STABILITY_TOPN_WORDS = 10   # top words per topic compared for the Jaccard score
+
+# Held-out evaluation (--holdout): fraction of (chunked) training docs set
+# aside with seed 42 during the k-sweep; sweep models train on the remainder
+# and report held-out log-perplexity. 0.0 = off. The FINAL model always
+# retrains on ALL documents.
+DEFAULT_HOLDOUT_FRACTION = 0.0
+
 # ── Per-config presets ─────────────────────────────────────────────
 # Recommended settings per subset, applied automatically when the
 # corresponding CLI flag is NOT given, so a plain
