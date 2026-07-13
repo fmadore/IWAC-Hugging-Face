@@ -52,6 +52,7 @@ from scipy import stats
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "post-processing"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # analyses/ for _stats
 
 from _common import ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
 from iwac_common.text_utils import simple_tokenize  # noqa: E402
@@ -78,26 +79,9 @@ ALPHA = 0.05
 # ---------------------------------------------------------------------------
 
 
-def bh_adjust(pvals) -> np.ndarray:
-    """Benjamini–Hochberg step-up adjusted p-values (q-values).
-
-    Returns an array aligned with the input. NaN p-values are ignored
-    (returned as NaN) and do not count toward the number of tests m.
-    """
-    p = np.asarray(pvals, dtype=float)
-    q = np.full(p.shape, np.nan)
-    finite = np.isfinite(p)
-    m = int(finite.sum())
-    if m == 0:
-        return q
-    pf = p[finite]
-    order = np.argsort(pf, kind="mergesort")
-    ranked = pf[order] * m / np.arange(1, m + 1)
-    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
-    out = np.empty(m)
-    out[order] = np.clip(ranked, 0.0, 1.0)
-    q[finite] = out
-    return q
+# bh_adjust lives in analyses/_stats.py (shared with topic_prevalence.py);
+# re-exported here so existing references keep working.
+from _stats import bh_adjust  # noqa: E402,F401
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +270,10 @@ def unique_subjects(raw) -> set[str]:
 
     A document listing the same subject twice must count once toward the
     per-year mention count (r[t] counts *documents*, not repetitions).
+    Missing/NaN fields yield the empty set.
     """
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return set()
     return {s.strip() for s in str(raw).split("|") if s.strip()}
 
 
