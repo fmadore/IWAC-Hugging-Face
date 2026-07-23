@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -31,9 +30,8 @@ from rich import box
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
-from rich.prompt import IntPrompt, Prompt
+from rich.prompt import Prompt
 from rich.table import Table
-from tqdm import tqdm
 
 # Ensure package imports work when running this file directly
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -48,7 +46,6 @@ from lda_topic_modeling.constants import (  # type: ignore
     DOMAIN_STOPWORDS,
     LDA_GEO_STOPWORDS,
     LDA_GENERIC_STOPWORDS,
-    CUSTOM_COLLOCATIONS,
     DEFAULT_NUM_TOPICS,
     DEFAULT_PASSES,
     DEFAULT_ITERATIONS,
@@ -61,10 +58,12 @@ from lda_topic_modeling.constants import (  # type: ignore
     DEFAULT_SWEEP_PASSES,
     DEFAULT_SWEEP_ITERATIONS,
     DEFAULT_TOPIC_TOPK,
+    DEFAULT_LAMBDA_RELEVANCE,
+    DEFAULT_STABILITY_SEEDS,
+    DEFAULT_HOLDOUT_FRACTION,
 )
 from lda_topic_modeling.modeling import (  # type: ignore
     tokenize_documents,
-    apply_custom_collocations,
     build_dictionary,
     build_corpus,
     chunk_tokens,
@@ -73,6 +72,7 @@ from lda_topic_modeling.modeling import (  # type: ignore
     load_lda_model,
     predict_batch,
     compute_coherence,
+    compute_corpus_word_probs,
     save_model_parameters,
     get_topic_label,
     find_optimal_topics,
@@ -180,14 +180,75 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SWEEP_ITERATIONS,
         help="Optimisation: iterations per sweep model (reduced; final model retrains at --iterations)",
     )
+    p.add_argument(
+        "--stability-seeds",
+        type=int,
+        default=DEFAULT_STABILITY_SEEDS,
+        help="Optimisation: models per k (seeds 42..42+N-1); select by mean C_v and "
+             "report top-word Jaccard stability. 1 = legacy single-seed sweep",
+    )
+    p.add_argument(
+        "--holdout",
+        type=float,
+        default=DEFAULT_HOLDOUT_FRACTION,
+        help="Optimisation: fraction of docs held out to report per-k held-out "
+             "log-perplexity (the winning k retrains on ALL docs). 0 = off",
+    )
+    p.add_argument(
+        "--no-relevance-labels",
+        action="store_true",
+        help="Use pure top-probability topic labels instead of LDAvis-style "
+             "relevance-weighted labels (λ=%.2f)" % DEFAULT_LAMBDA_RELEVANCE,
+    )
+    p.add_argument(
+        "--no-theta-export",
+        action="store_true",
+        help="Skip writing the full document-topic matrix to "
+             "<model_dir>/doc_topics.parquet during predict",
+    )
     p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts")
     return p
+
+
+def _export_theta(ds, theta_col, model_dir, model_name, num_topics, language, logger):
+    """Write the full document-topic matrix (theta) for rows this pass
+    computed to ``<model_dir>/doc_topics.parquet`` so downstream analyses read
+    exact distributions without re-running inference. One float column per
+    topic (topic_0..topic_{k-1}), plus o:id and lda_model_name."""
+    import pandas as pd
+
+    ids = ds["o:id"] if "o:id" in ds.column_names else list(range(len(ds)))
+    thetas = ds[theta_col]
+    rows = []
+    for oid, theta in zip(ids, thetas):
+        if theta is None:
+            continue
+        row = {"o:id": str(oid), "lda_model_name": model_name}
+        for k in range(num_topics):
+            row[f"topic_{k}"] = float(theta[k]) if k < len(theta) else 0.0
+        rows.append(row)
+    if not rows:
+        logger.warning("No document-topic distributions to export (no rows computed this pass).")
+        return
+    out_path = model_dir / "doc_topics.parquet"
+    df = pd.DataFrame(rows)
+    # Compose with an existing export from another language pass, if present.
+    if out_path.exists():
+        try:
+            prev = pd.read_parquet(out_path)
+            prev = prev[~prev["o:id"].isin(set(df["o:id"]))]
+            df = pd.concat([prev, df], ignore_index=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not merge with existing {out_path.name}: {e}")
+    df.to_parquet(out_path, index=False)
+    logger.info(f"Exported document-topic matrix: {out_path} ({len(rows)} docs this pass)")
 
 
 # ── Main ────────────────────────────────────────────────────────────
 
 
-def main() -> None:
+def main() -> int:
+    """Run the pipeline. Returns a process exit code (0 = success)."""
     configure_logging()
     logger = logging.getLogger(__name__)
 
@@ -199,7 +260,10 @@ def main() -> None:
     topic_prob_col = "lda_topic_prob"
     topic_label_col = "lda_topic_label"
     topic_topk_col = "lda_topic_topk"
-    new_columns = [topic_id_col, topic_prob_col, topic_label_col, topic_topk_col]
+    model_name_col = "lda_model_name"  # disambiguates FR vs EN per-language models
+    new_columns = [topic_id_col, topic_prob_col, topic_label_col, topic_topk_col, model_name_col]
+    # LDAvis-style relevance weight for labels (None = legacy pure-probability).
+    lambda_relevance = None if args.no_relevance_labels else DEFAULT_LAMBDA_RELEVANCE
 
     # ── Auth ────────────────────────────────────────────────────────
     token = ensure_hf_token(console=console)
@@ -249,7 +313,7 @@ def main() -> None:
         ds = load_dataset(repo_id, name=config_name, split="train", token=token)
     except Exception as e:
         logger.error(f"Dataset load error: {e}")
-        return
+        return 1
     logger.info(f"Loaded {len(ds)} rows.")
 
     # Language stats
@@ -260,13 +324,13 @@ def main() -> None:
         logger.info(f"{language}: {lang_count} | Other: {other_count} | Total: {len(ds)}")
         if lang_count == 0:
             logger.error(f"No '{language}' documents found.")
-            return
+            return 1
     else:
         logger.warning("No 'language' column — all texts will be processed.")
 
     if text_column not in ds.column_names:
         logger.error(f"Column '{text_column}' not found. Available: {ds.column_names}")
-        return
+        return 1
 
     # Check existing columns
     existing = [c for c in new_columns if c in ds.column_names]
@@ -277,10 +341,10 @@ def main() -> None:
                 confirm = input("Continue and overwrite? (y/N): ").strip().lower()
                 if confirm not in ("y", "yes", "o", "oui"):
                     logger.info("Cancelled.")
-                    return
+                    return 0
             except KeyboardInterrupt:
                 logger.info("\nCancelled.")
-                return
+                return 0
 
     # ── Build stopwords ─────────────────────────────────────────────
     stopwords = set(DOMAIN_STOPWORDS) | LDA_GEO_STOPWORDS | LDA_GENERIC_STOPWORDS
@@ -328,7 +392,7 @@ def main() -> None:
         valid = [(d, t) for d, t in zip(docs, tokenized) if t]
         if not valid:
             logger.error("No valid tokenized documents.")
-            return
+            return 1
         docs_valid = [d for d, _ in valid]
         tokenized_valid = [t for _, t in valid]
         logger.info(f"Valid tokenized docs: {len(tokenized_valid)}")
@@ -353,6 +417,21 @@ def main() -> None:
         dictionary = build_dictionary(tokenized_valid, no_below=args.no_below, no_above=args.no_above)
         logger.info(f"Dictionary: {len(dictionary)} terms")
         corpus = build_corpus(dictionary, tokenized_valid)
+        # Corpus-wide word probabilities p(w) for relevance-weighted labels.
+        word_probs = compute_corpus_word_probs(dictionary, corpus)
+
+        # Optionally hold out a fraction of docs for held-out perplexity.
+        holdout_corpus = None
+        if args.holdout and args.holdout > 0.0:
+            rng = np.random.default_rng(42)
+            n = len(corpus)
+            n_hold = max(1, int(round(n * args.holdout)))
+            hold_idx = set(rng.choice(n, size=n_hold, replace=False).tolist())
+            holdout_corpus = [corpus[i] for i in range(n) if i in hold_idx]
+            logger.info(
+                f"Held-out evaluation: {len(holdout_corpus)}/{n} docs "
+                f"({args.holdout:.0%}); the winning k retrains on ALL docs."
+            )
 
         # Optimise num_topics if requested (DH best practice)
         num_topics = args.num_topics if args.num_topics is not None else DEFAULT_NUM_TOPICS
@@ -360,8 +439,8 @@ def main() -> None:
         if optimize_topics:
             logger.info(
                 "Running topic-number optimisation "
-                f"(sweep models at passes={args.sweep_passes}, iterations={args.sweep_iterations}; "
-                "the winning k retrains at full settings)..."
+                f"(sweep models at passes={args.sweep_passes}, iterations={args.sweep_iterations}, "
+                f"seeds={args.stability_seeds}; the winning k retrains at full settings)..."
             )
             best_k, optimization_results = find_optimal_topics(
                 corpus,
@@ -373,6 +452,8 @@ def main() -> None:
                 sweep_passes=args.sweep_passes,
                 sweep_iterations=args.sweep_iterations,
                 chunksize=args.chunksize,
+                n_seeds=args.stability_seeds,
+                holdout_corpus=holdout_corpus,
                 logger=logger,
             )
             _display_optimization_results(optimization_results, best_k)
@@ -391,13 +472,18 @@ def main() -> None:
             logger=logger,
         )
 
-        # Log top topics
+        # Log top topics (relevance-weighted labels unless disabled)
         logger.info("Top topics:")
         for tid in range(min(10, lda_model.num_topics)):
-            label = get_topic_label(lda_model, tid, top_n=args.topic_label_words)
+            label = get_topic_label(
+                lda_model, tid, top_n=args.topic_label_words,
+                lambda_relevance=lambda_relevance, word_probs=word_probs,
+            )
             logger.info(f"  Topic {tid}: {label}")
 
-        # Save model (including phrasers for prediction)
+        # Save model (including phrasers for prediction). The dictionary's
+        # collection frequencies (cfs) persist with it, so predict mode
+        # recovers p(w) for relevance labels without the training corpus.
         save_lda_model(lda_model, dictionary, model_dir, logger, phraser=phraser)
 
         # Coherence
@@ -439,13 +525,28 @@ def main() -> None:
             extra_info=extra_info,
             logger=logger,
             alpha="asymmetric" if args.workers and args.workers > 1 else "auto",
+            lambda_relevance=lambda_relevance,
+            evaluation={
+                "sweep_n_seeds": args.stability_seeds,
+                "holdout_fraction": args.holdout,
+            },
         )
+        word_probs_for_predict = word_probs
     else:
         # Load existing model
         if not model_dir.exists():
             logger.error(f"Model directory not found: {model_dir}")
-            return
+            return 1
         lda_model, dictionary, phraser = load_lda_model(model_dir, logger)
+        # Recover p(w) from the dictionary's persisted collection frequencies
+        # so predict labels match fit labels without the training corpus.
+        word_probs_for_predict = compute_corpus_word_probs(dictionary)
+        if word_probs_for_predict is None and lambda_relevance is not None:
+            logger.warning(
+                "Dictionary has no collection frequencies; falling back to "
+                "pure top-probability labels for this run."
+            )
+            lambda_relevance = None
 
         # A chunk-trained model must predict with the same chunking and
         # language filter. The params file reflects how THIS model was
@@ -468,6 +569,7 @@ def main() -> None:
     # ── Predict on full dataset ─────────────────────────────────────
     logger.info("Predicting topics for all documents...")
 
+    theta_col = None if args.no_theta_export else "_lda_theta"
     ds_processed = ds.map(
         lambda batch: predict_batch(
             lda_model,
@@ -483,6 +585,11 @@ def main() -> None:
             topk=args.topic_topk,
             chunk_words=chunk_words,
             language=language,
+            model_name_col=model_name_col,
+            model_name=model_dir.name,
+            theta_col=theta_col,
+            lambda_relevance=lambda_relevance,
+            word_probs=word_probs_for_predict,
         ),
         batched=True,
         batch_size=args.batch_size,
@@ -490,6 +597,14 @@ def main() -> None:
     )
 
     logger.info("Prediction complete.")
+
+    # ── Export full document-topic matrix (theta) ───────────────────
+    if theta_col is not None and theta_col in ds_processed.column_names:
+        _export_theta(
+            ds_processed, theta_col, model_dir, model_dir.name,
+            lda_model.num_topics, language, logger,
+        )
+        ds_processed = ds_processed.remove_columns([theta_col])
 
     # ── Statistics ──────────────────────────────────────────────────
     topic_ids = ds_processed[topic_id_col]
@@ -511,7 +626,10 @@ def main() -> None:
         counts = Counter(valid_ids)
         logger.info("Top 10 most frequent topics:")
         for tid, count in counts.most_common(10):
-            label = get_topic_label(lda_model, tid, top_n=args.topic_label_words)
+            label = get_topic_label(
+                lda_model, tid, top_n=args.topic_label_words,
+                lambda_relevance=lambda_relevance, word_probs=word_probs_for_predict,
+            )
             logger.info(f"  Topic {tid}: {label} ({count} docs)")
 
     # ── Reorder columns ────────────────────────────────────────────
@@ -542,7 +660,7 @@ def main() -> None:
         logger.info("Dataset saved successfully.")
     except Exception as e:
         logger.error(f"Push error: {e}")
-        return
+        return 1
 
     # ── Summary ─────────────────────────────────────────────────────
     table = Table(title="LDA Topic Modeling Summary", box=box.ROUNDED)
@@ -567,6 +685,7 @@ def main() -> None:
     console.print("[green]\u2713[/green] Done!")
     if mode == "fit":
         console.print(f"[blue]\u2192[/blue] Parameters: [cyan]{model_dir / 'training_parameters.json'}[/cyan]")
+    return 0
 
 
 def _display_optimization_results(results: list[dict], best_k: int) -> None:
@@ -617,4 +736,4 @@ def _display_coherence(metrics: dict) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

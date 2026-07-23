@@ -33,45 +33,23 @@ Variables d'environnement
 
 import os
 import sys
-import asyncio
-import logging
 from typing import Dict, Any
 
 # Add parent directory to path for iwac_common import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import pandas as pd
-from tqdm import tqdm
 from dotenv import load_dotenv
-from datasets import Dataset
-from huggingface_hub import login, utils as hf_utils
-from iwac_common.omeka_client import (
-    Config,
-    OmekaApiClient,
-    conn_manager,
-    fetch_iiif_thumbnail_url,
-)
-from iwac_common.field_mappers import (
-    extract_added_date,
-    get_value,
-)
-from iwac_common.hub_merge import merge_with_hub_dataset, resolve_hf_token
-from iwac_common.repos import PRIVATE_REPO_ID
-
-# Disable symlinks warning from huggingface_hub
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-
-# ---------------------------------------------------------------------------
-# Configuration & journalisation
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+from iwac_common.omeka_client import OmekaApiClient, conn_manager, fetch_iiif_thumbnail_url
+from iwac_common.field_mappers import extract_added_date, get_value
+from iwac_common.upload_runner import UploadSpec, run_upload
 
 load_dotenv()
+
+
+# Orchestration + CLI + Rich console/logging live in
+# iwac_common.upload_runner. The `images` subset has no OCR/full-text
+# columns; the merge preserves the computed `embedding_image` from
+# post-processing/semantic_embedding_images.py.
 
 # Photographs (bibo:Image). The "Photograph" resource template's default class
 # (33) is unused; every photograph item is filed under class 58.
@@ -190,91 +168,21 @@ async def map_image_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
     }
 
 
-# ---------------------------------------------------------------------------
-# Pipeline principale : fetch → map → dataset → push
-# ---------------------------------------------------------------------------
-
-async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
-    api = OmekaApiClient(cfg, use_cache=True)
-
-    # 1. Fetch current Omeka items and map them
-    logger.info("Fetching photograph items from Omeka API...")
-    omeka_items_raw = await api.fetch_items(IMAGE_RESOURCE_CLASS_ID)
-
-    if not omeka_items_raw:
-        logger.warning("No items returned from Omeka API. Exiting.")
-        return
-
-    logger.info(f"Fetched {len(omeka_items_raw)} items from Omeka.")
-    omeka_records_list = []
-
-    for it in tqdm(omeka_items_raw, desc="Mapping Omeka photographs"):
-        try:
-            record = await map_image_item(it, api)
-            omeka_records_list.append(record)
-        except Exception as e:
-            logger.error(f"Error mapping item {it.get('o:id', 'Unknown ID')}: {e}", exc_info=True)
-
-    if not omeka_records_list:
-        logger.error("No records were successfully mapped. Exiting.")
-        return
-
-    new_omeka_df = pd.DataFrame(omeka_records_list)
-    if 'o:id' not in new_omeka_df.columns or new_omeka_df['o:id'].isnull().any():
-        logger.error("Critical: 'o:id' column is missing or contains null values in new Omeka data after mapping. Cannot proceed.")
-        return
-    new_omeka_df['o:id'] = new_omeka_df['o:id'].astype(str)
-
-    # 2-3. Load existing Hub dataset and merge to preserve computed columns
-    #      (notably embedding_image from semantic_embedding_images.py).
-    token_to_use = resolve_hf_token()
-    final_df = merge_with_hub_dataset(
-        new_omeka_df,
-        repo,
-        config_name="images",
-        token=token_to_use,
-    )
-
-    # 4. Conversion to Dataset and Push
-    if not final_df.empty:
-        logger.info(f"Preparing to push {len(final_df)} records to the Hub. Columns: {final_df.columns.tolist()}")
-
-        if 'o:id' not in final_df.columns or final_df['o:id'].isnull().any():
-            logger.error("Critical error: 'o:id' is missing or null in the final DataFrame before push. Aborting push.")
-            await conn_manager.close()
-            return
-
-        ds = Dataset.from_pandas(final_df, preserve_index=False)
-        logger.info("Dataset preview (first 5 rows):")
-        logger.info(ds.to_pandas().head())
-
-        if os.getenv("HF_TOKEN") is None and not hf_utils.is_notebook():
-            login()
-
-        try:
-            logger.info(f"Pushing dataset to {repo} with config 'images'...")
-            ds.push_to_hub(repo, max_shard_size=shard_size, config_name="images", token=token_to_use)
-            logger.info(f"Dataset published/updated on {repo} with config 'images'")
-        except Exception as e:
-            logger.error(f"Failed to push dataset to Hub: {e}")
-            logger.error("Details of the exception:", exc_info=True)
-
-    else:
-        logger.info("Final dataset is empty. No push operation will be performed.")
-
-    await conn_manager.close()
 
 
 # ---------------------------------------------------------------------------
-# Exécution CLI
+# Spec + entry point (shared pipeline in iwac_common.upload_runner)
 # ---------------------------------------------------------------------------
+
+SPEC = UploadSpec(
+    config_name="images",
+    resource_class_ids=(58,),  # bibo:Image — curator field photographs
+    map_item=map_image_item,
+    title="🖼️ IWAC Images Upload",
+    cache_dir=".cache_omk_images",
+    description="Publie les photographies IWAC sur le Hub HF",
+)
+
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Publie les photographies IWAC sur le Hub HF")
-    parser.add_argument("--repo", default=PRIVATE_REPO_ID, help="Repository Hugging Face où publier (défaut: miroir privé complet)")
-    parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
-    args = parser.parse_args()
-
-    asyncio.run(build_and_push(Config(CACHE_DIR=".cache_omk_images"), repo=args.repo, shard_size=args.max_shard_size))
+    sys.exit(run_upload(SPEC))

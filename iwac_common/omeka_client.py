@@ -176,6 +176,12 @@ def async_retry(
 # ---------------------------------------------------------------------------
 
 
+class TruncatedFetchError(RuntimeError):
+    """The paginated fetch returned fewer items than the API's
+    ``Omeka-S-Total-Results`` header reports — a partial response or a stale
+    cache. Aborting protects the Hub dataset from a silent mass-delete."""
+
+
 class OmekaApiClient:
     """Minimal async client for the Omeka S REST API.
 
@@ -227,8 +233,40 @@ class OmekaApiClient:
             {"resource_class_id": rcid, "page": page, "per_page": per},
         )
 
-    async def fetch_items(self, rcid: int) -> List[Dict[str, Any]]:
-        """Fetch every item with the given resource_class_id, paginated."""
+    @async_retry()
+    async def fetch_total_results(self, rcid: int) -> Optional[int]:
+        """Read the ``Omeka-S-Total-Results`` header for a resource class.
+
+        Deliberately bypasses the cache (the JSON cache stores bodies, not
+        headers) — one cheap per_page=1 request per class.
+        """
+        params = {
+            "resource_class_id": rcid,
+            "page": 1,
+            "per_page": 1,
+            "key_identity": self.cfg.API_KEY_IDENTITY,
+            "key_credential": self.cfg.API_KEY_CREDENTIAL,
+        }
+        sess = await conn_manager.get()
+        async with sess.get(f"{self.cfg.API_URL}/items", params=params) as resp:
+            resp.raise_for_status()
+            total = resp.headers.get("Omeka-S-Total-Results")
+            return int(total) if total is not None else None
+
+    async def fetch_items(
+        self, rcid: int, *, verify_total: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Fetch every item with the given resource_class_id, paginated.
+
+        With ``verify_total`` (default), the fetched count is reconciled
+        against the API's ``Omeka-S-Total-Results`` header: pagination stops
+        on the first short page, so a transient short-but-200 response would
+        otherwise truncate the fetch silently — and a truncated fetch flowing
+        into the Hub merge deletes rows. A shortfall raises
+        :class:`TruncatedFetchError`; note a stale local cache (item added on
+        Omeka within the cache TTL) triggers the same signal — re-run with
+        the cache disabled.
+        """
         first = await self.fetch_items_page(rcid, 1)
         items = list(first)
         per = 100
@@ -254,6 +292,31 @@ class OmekaApiClient:
                     if len(batch) < per:
                         break
                     page += 1
+
+        if verify_total:
+            expected: Optional[int] = None
+            try:
+                expected = await self.fetch_total_results(rcid)
+            except Exception as exc:  # noqa: BLE001
+                self.console.print(
+                    f"[yellow]⚠[/yellow] Could not read Omeka-S-Total-Results "
+                    f"for class {rcid} ({exc}); skipping count reconciliation."
+                )
+            if expected is not None and len(items) < expected:
+                raise TruncatedFetchError(
+                    f"Fetched {len(items)} items for class {rcid} but the API "
+                    f"reports {expected}. Either a page response was truncated "
+                    f"mid-run, or the local cache is stale (items added on Omeka "
+                    f"since it was written). Re-run — with --no-cache if it "
+                    f"persists — instead of pushing a shrunken dataset."
+                )
+            if expected is not None and len(items) > expected:
+                self.console.print(
+                    f"[yellow]⚠[/yellow] Fetched {len(items)} items for class "
+                    f"{rcid} but the API reports {expected} (items deleted "
+                    f"mid-run or stale cache pages?)."
+                )
+
         self.console.print(
             f"[green]✓[/green] {len(items)} items retrieved for class {rcid}"
         )
@@ -321,6 +384,7 @@ __all__ = [
     "conn_manager",
     "async_retry",
     "OmekaApiClient",
+    "TruncatedFetchError",
     "IIIF_BASE_URL",
     "fetch_iiif_thumbnail_url",
 ]

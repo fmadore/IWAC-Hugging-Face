@@ -19,6 +19,14 @@ from tqdm import tqdm
 
 import unicodedata
 
+try:
+    from iwac_common.text_utils import simple_tokenize
+except ImportError:  # venv without the editable install
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from iwac_common.text_utils import simple_tokenize
+
 from .constants import (
     DOMAIN_STOPWORDS,
     LABEL_ONLY_STOPWORDS,
@@ -39,6 +47,7 @@ from .constants import (
     DEFAULT_SWEEP_PASSES,
     DEFAULT_SWEEP_ITERATIONS,
     DEFAULT_TOPIC_TOPK,
+    STABILITY_TOPN_WORDS,
 )
 
 # Combined stopword set for label filtering (module-level to avoid
@@ -76,15 +85,20 @@ def tokenize_documents(
     phrase_min_count: int = 20,
     phrase_threshold: float = 10.0,
     custom_collocations: List[Tuple[str, ...]] | None = None,
-) -> List[List[str]]:
+) -> Tuple[List[List[str]], Tuple[Phraser, Phraser] | None]:
     """Tokenize documents for LDA.
 
     Since ``lemma_nostop`` is already lemmatized and partially cleaned,
-    we only need to split on whitespace and apply minimal filtering.
+    we only need to split on whitespace and apply minimal filtering
+    (via the shared :func:`simple_tokenize`).
 
     When *detect_phrases* is True, gensim ``Phrases`` is used to join
     frequent collocations (e.g. "côte" + "ivoire" → "côte_ivoire",
     "burkina" + "faso" → "burkina_faso").
+
+    Returns ``(tokenized_docs, phraser)`` where *phraser* is the
+    ``(bigram_phraser, trigram_phraser)`` pair when phrase detection ran,
+    else None.
     """
     if stopwords is None:
         stopwords = set()
@@ -93,12 +107,7 @@ def tokenize_documents(
         if not doc or not str(doc).strip():
             tokenized.append([])
             continue
-        tokens = [
-            t
-            for t in str(doc).lower().split()
-            if len(t) >= min_token_length and t not in stopwords
-        ]
-        tokenized.append(tokens)
+        tokenized.append(simple_tokenize(doc, stopwords, min_token_length))
 
     phraser = None
     if detect_phrases and tokenized:
@@ -340,14 +349,77 @@ def _is_subsumed_by_ngram(token_norm: str, selected_norms: List[str]) -> bool:
     return False
 
 
-def get_topic_label(model: LdaModel, topic_id: int, top_n: int = 6) -> str:
+def compute_corpus_word_probs(
+    dictionary: Dictionary,
+    corpus: List[List[Tuple[int, int]]] | None = None,
+) -> np.ndarray | None:
+    """Corpus-wide word probability p(w) over the dictionary vocabulary.
+
+    Counted once from the bag-of-words *corpus* when given; otherwise from
+    ``dictionary.cfs`` (collection frequencies persisted with the trained
+    dictionary — available at predict time without the training corpus).
+    Returns None when no counts are available (relevance re-ranking then
+    falls back to pure top-probability labels).
+    """
+    probs = np.zeros(len(dictionary), dtype=np.float64)
+    if corpus is not None:
+        for doc in corpus:
+            for tid, cnt in doc:
+                probs[int(tid)] += cnt
+    else:
+        for tid, cnt in dictionary.cfs.items():
+            if 0 <= int(tid) < len(probs):
+                probs[int(tid)] = cnt
+    total = probs.sum()
+    if total <= 0:
+        return None
+    return probs / total
+
+
+def get_topic_label(
+    model: LdaModel,
+    topic_id: int,
+    top_n: int = 6,
+    lambda_relevance: float | None = None,
+    word_probs: np.ndarray | None = None,
+) -> str:
     """Return a human-readable label for a topic.
 
     Applies stopword removal and substring-aware deduplication so that
     e.g. "Cote", "Ivoire", "Cote Ivoire" collapse to just "Cote Ivoire".
+
+    When *lambda_relevance* and *word_probs* (from
+    :func:`compute_corpus_word_probs`) are given, candidate words are
+    re-ranked by LDAvis-style relevance (Sievert & Shirley 2014)::
+
+        relevance(w, k) = λ·log p(w|k) + (1−λ)·log(p(w|k) / p(w))
+
+    so corpus-common words no longer dominate several labels. Re-ranking
+    is restricted to the topic's top words by probability (a standard
+    practical guard against surfacing ultra-rare noise words), then the
+    existing stopword / dedup / ngram-preference logic applies unchanged.
+    ``lambda_relevance=None`` (the default) is the escape hatch: pure
+    top-probability candidates, exactly the old behavior.
     """
-    # Fetch more candidates than needed so we can filter and still fill top_n slots
-    raw_words = model.show_topic(int(topic_id), topn=top_n * 3)
+    n_candidates = top_n * 3
+    if (
+        lambda_relevance is not None
+        and word_probs is not None
+        and len(word_probs) == model.num_terms
+    ):
+        eps = 1e-12
+        topic_dist = model.get_topics()[int(topic_id)].astype(np.float64)
+        # Candidate pool: the topic's own top words by p(w|k), so relevance
+        # re-ranks plausible words instead of dredging the whole vocabulary.
+        pool = np.argsort(topic_dist)[::-1][: max(50, top_n * 8)]
+        p_wk = topic_dist[pool] + eps
+        p_w = word_probs[pool] + eps
+        relevance = lambda_relevance * np.log(p_wk) + (1.0 - lambda_relevance) * np.log(p_wk / p_w)
+        order = pool[np.argsort(relevance)[::-1]][:n_candidates]
+        raw_words = [(model.id2word[int(i)], float(topic_dist[int(i)])) for i in order]
+    else:
+        # Fetch more candidates than needed so we can filter and still fill top_n slots
+        raw_words = model.show_topic(int(topic_id), topn=n_candidates)
 
     seen_norms: set[str] = set()
     candidates: List[Tuple[str, str]] = []  # (original, normalized)
@@ -385,7 +457,10 @@ def predict_document(
     minimum_probability: float = DEFAULT_MINIMUM_PROBABILITY,
     topk: int = DEFAULT_TOPIC_TOPK,
     chunk_words: int | None = None,
-) -> Tuple[int | None, float | None, str | None, str | None]:
+    lambda_relevance: float | None = None,
+    word_probs: np.ndarray | None = None,
+    return_distribution: bool = False,
+) -> Tuple[Any, ...]:
     """Predict topics for a single tokenized document.
 
     Returns (topic_id, probability, label, topk_str) — the dominant topic
@@ -393,13 +468,21 @@ def predict_document(
     (descending probability, entries below *minimum_probability* dropped).
     Returns (None, None, None, None) for empty docs.
 
+    With *return_distribution* set, a fifth element is appended: the full
+    document-topic distribution as a list of ``num_topics`` floats (theta),
+    or None for empty docs.
+
+    *lambda_relevance* / *word_probs* are forwarded to
+    :func:`get_topic_label` for relevance-weighted labels.
+
     With *chunk_words* set (models trained on chunks), the document is
     split into chunks, each chunk is inferred separately, and the
     distributions are averaged weighted by chunk length — so a book and
     an article both yield one comparable document-level mixture.
     """
+    empty = (None, None, None, None, None) if return_distribution else (None, None, None, None)
     if not tokens:
-        return None, None, None, None
+        return empty
 
     if chunk_words:
         dist = np.zeros(model.num_topics)
@@ -412,26 +495,35 @@ def predict_document(
                 dist[int(tid)] += float(prob) * len(chunk)
             total_weight += len(chunk)
         if total_weight == 0:
-            return None, None, None, None
+            return empty
         dist /= total_weight
         ranked = [(int(tid), float(dist[tid])) for tid in np.argsort(dist)[::-1]]
     else:
         bow = dictionary.doc2bow(tokens)
         if not bow:
-            return None, None, None, None
+            return empty
         topic_distribution = model.get_document_topics(bow, minimum_probability=0.0)
         if not topic_distribution:
-            return None, None, None, None
+            return empty
+        dist = np.zeros(model.num_topics)
+        for tid, prob in topic_distribution:
+            dist[int(tid)] = float(prob)
         ranked = sorted(topic_distribution, key=lambda x: x[1], reverse=True)
 
     best_topic_id, best_prob = ranked[0]
-    label = get_topic_label(model, best_topic_id)
+    label = get_topic_label(
+        model, best_topic_id,
+        lambda_relevance=lambda_relevance, word_probs=word_probs,
+    )
     topk_str = "|".join(
         f"{int(tid)}:{prob:.4f}"
         for tid, prob in ranked[:topk]
         if prob >= minimum_probability
     )
-    return int(best_topic_id), float(best_prob), label, topk_str or None
+    result = (int(best_topic_id), float(best_prob), label, topk_str or None)
+    if return_distribution:
+        return result + ([float(p) for p in dist],)
+    return result
 
 
 def apply_phraser(tokens: List[str], phraser: Tuple[Phraser, Phraser] | None) -> List[str]:
@@ -459,6 +551,11 @@ def predict_batch(
     topk: int = DEFAULT_TOPIC_TOPK,
     chunk_words: int | None = None,
     language: str = "Français",
+    model_name_col: str | None = None,
+    model_name: str | None = None,
+    theta_col: str | None = None,
+    lambda_relevance: float | None = None,
+    word_probs: np.ndarray | None = None,
 ) -> Dict[str, List[Any]]:
     """Predict topics for a HuggingFace dataset batch (batched map function).
 
@@ -469,6 +566,19 @@ def predict_batch(
     the French ones. When *topic_topk_col* is set, a compact top-k
     distribution string (``"id:prob|id:prob|..."``) is stored alongside
     the dominant topic.
+
+    When *model_name_col* is set, *model_name* (the model directory's
+    basename) is written for every row this pass computes, so FR/EN models
+    sharing the lda_* columns stay disambiguated; skipped rows keep their
+    existing value (same preserve pattern as the topic columns).
+
+    When *theta_col* is set, the full document-topic distribution (list of
+    ``num_topics`` floats) is stored for computed rows (None elsewhere) —
+    the caller extracts it into ``doc_topics.parquet`` and drops the
+    column before pushing.
+
+    *lambda_relevance* / *word_probs* enable relevance-weighted labels
+    (see :func:`get_topic_label`); both default to the legacy behavior.
     """
     texts = batch[text_col]
     languages = batch.get("language", [None] * len(texts))
@@ -481,6 +591,9 @@ def predict_batch(
     probabilities: List[float | None] = _existing(topic_prob_col)
     labels: List[str | None] = _existing(topic_label_col)
     topks: List[str | None] = _existing(topic_topk_col)
+    model_names: List[str | None] = _existing(model_name_col)
+    # Theta is per-pass output, never merged from existing data.
+    thetas: List[List[float] | None] = [None] * len(texts)
 
     sw = stopwords or set()
 
@@ -491,26 +604,30 @@ def predict_batch(
         if not text or not str(text).strip():
             continue
 
-        tokens = [
-            t
-            for t in str(text).lower().split()
-            if len(t) >= min_token_length and t not in sw
-        ]
+        tokens = simple_tokenize(text, sw, min_token_length)
         tokens = apply_phraser(tokens, phraser)
         tokens = apply_custom_collocations(tokens, CUSTOM_COLLOCATIONS)
-        tid, prob, label, topk_str = predict_document(
-            model, dictionary, tokens, topk=topk, chunk_words=chunk_words
+        tid, prob, label, topk_str, theta = predict_document(
+            model, dictionary, tokens, topk=topk, chunk_words=chunk_words,
+            lambda_relevance=lambda_relevance, word_probs=word_probs,
+            return_distribution=True,
         )
         topics[i] = tid
         probabilities[i] = prob
         labels[i] = label
         topks[i] = topk_str
+        model_names[i] = model_name
+        thetas[i] = theta
 
     batch[topic_id_col] = topics
     batch[topic_prob_col] = probabilities
     batch[topic_label_col] = labels
     if topic_topk_col is not None:
         batch[topic_topk_col] = topks
+    if model_name_col is not None:
+        batch[model_name_col] = model_names
+    if theta_col is not None:
+        batch[theta_col] = thetas
     return batch
 
 
@@ -575,8 +692,17 @@ def save_model_parameters(
     extra_info: Dict[str, Any] | None = None,
     logger: logging.Logger | None = None,
     alpha: str = "auto",
+    lambda_relevance: float | None = None,
+    evaluation: Dict[str, Any] | None = None,
 ) -> Path:
-    """Save training parameters to JSON for reproducibility."""
+    """Save training parameters to JSON for reproducibility.
+
+    *lambda_relevance* records the LDAvis-style label re-ranking weight
+    (None = pure top-probability labels). *evaluation* records sweep
+    robustness settings (``sweep_n_seeds``, ``holdout_fraction``) under a
+    top-level ``evaluation`` key; the per-k sweep values live in
+    ``extra.topic_optimization.results``.
+    """
     params: Dict[str, Any] = {
         "metadata": {
             "created_at": datetime.now().isoformat(),
@@ -591,6 +717,7 @@ def save_model_parameters(
             "alpha": alpha,
             "eta": "auto",
             "random_state": DEFAULT_RANDOM_STATE,
+            "label_lambda_relevance": lambda_relevance,
         },
         "dictionary_filter": {
             "no_below": no_below,
@@ -602,6 +729,8 @@ def save_model_parameters(
         },
     }
 
+    if evaluation:
+        params["evaluation"] = evaluation
     if coherence_metrics:
         params["coherence_metrics"] = coherence_metrics
     if extra_info:
@@ -617,6 +746,59 @@ def save_model_parameters(
     return params_path
 
 
+def topic_stability_jaccard(
+    models: List[LdaModel],
+    topn: int = STABILITY_TOPN_WORDS,
+) -> float | None:
+    """Topic-stability score across seed models: mean best-match Jaccard.
+
+    For each pair of models, every topic is represented by the set of its
+    top-*topn* words and topics are aligned by GREEDY best-match: the
+    highest-Jaccard (topic_a, topic_b) pair is matched first, both topics
+    are removed, and matching repeats until one model's topics run out
+    (a full Hungarian assignment is unnecessary at this granularity).
+    The pair's score is the mean Jaccard of the matched topics; the
+    returned score is the mean over all model pairs. 1.0 = seeds recover
+    identical topics; ~0 = seeds disagree completely. Returns None with
+    fewer than two models.
+    """
+    if len(models) < 2:
+        return None
+
+    top_words = [
+        [set(w for w, _ in m.show_topic(t, topn=topn)) for t in range(m.num_topics)]
+        for m in models
+    ]
+
+    pair_scores: List[float] = []
+    for i in range(len(models)):
+        for j in range(i + 1, len(models)):
+            a_tops, b_tops = top_words[i], top_words[j]
+            overlaps = []
+            for ai, a in enumerate(a_tops):
+                for bi, b in enumerate(b_tops):
+                    union = a | b
+                    jac = len(a & b) / len(union) if union else 0.0
+                    overlaps.append((jac, ai, bi))
+            # Deterministic greedy alignment: best Jaccard first, ties by index
+            overlaps.sort(key=lambda o: (-o[0], o[1], o[2]))
+            used_a: set[int] = set()
+            used_b: set[int] = set()
+            matched: List[float] = []
+            n_match = min(len(a_tops), len(b_tops))
+            for jac, ai, bi in overlaps:
+                if ai in used_a or bi in used_b:
+                    continue
+                used_a.add(ai)
+                used_b.add(bi)
+                matched.append(jac)
+                if len(matched) >= n_match:
+                    break
+            pair_scores.append(float(np.mean(matched)) if matched else 0.0)
+
+    return float(np.mean(pair_scores))
+
+
 def find_optimal_topics(
     corpus: List[List[Tuple[int, int]]],
     dictionary: Dictionary,
@@ -628,6 +810,8 @@ def find_optimal_topics(
     sweep_iterations: int = DEFAULT_SWEEP_ITERATIONS,
     chunksize: int = DEFAULT_CHUNKSIZE,
     random_state: int = DEFAULT_RANDOM_STATE,
+    n_seeds: int = 1,
+    holdout_corpus: List[List[Tuple[int, int]]] | None = None,
     logger: logging.Logger | None = None,
 ) -> Tuple[int, List[Dict[str, Any]]]:
     """Sweep a range of topic counts and return the k with highest C_v.
@@ -639,18 +823,35 @@ def find_optimal_topics(
     *sweep_iterations*) — enough for a stable *relative* C_v ranking; the
     caller retrains the winning k at full production settings afterwards.
 
+    With *n_seeds* > 1, each candidate k trains n_seeds reduced models
+    (random_state, random_state+1, ...), the winning k is picked by MEAN
+    C_v instead of a single noisy draw, and each k additionally reports
+    the C_v standard deviation (sample sd) plus a topic-stability score
+    (see :func:`topic_stability_jaccard`). n_seeds=1 is the exact legacy
+    behavior. Secondary metrics (NPMI, U_Mass) are computed on the
+    first-seed model only, to keep the sweep cost linear in n_seeds.
+
+    With *holdout_corpus* set (bow docs unseen during training), each k
+    also reports held-out ``log_perplexity`` (gensim's per-word likelihood
+    bound; higher, i.e. less negative, is better), averaged over seeds.
+
     Returns:
-        best_k: the number of topics with the highest C_v score.
-        results: list of dicts with keys ``k``, ``c_v``, ``c_npmi``, ``u_mass``
-                 for every tested value, so users can inspect the full curve.
+        best_k: the number of topics with the highest (mean) C_v score.
+        results: list of dicts with keys ``k``, ``c_v`` (mean over seeds),
+                 ``c_v_sd``, ``c_v_per_seed``, ``stability_jaccard``,
+                 ``holdout_log_perplexity``, ``c_npmi``, ``u_mass`` for
+                 every tested value, so users can inspect the full curve.
     """
     log = logger or logging.getLogger(__name__)
+    n_seeds = max(1, int(n_seeds))
 
     candidates = list(range(topic_range_start, topic_range_end + 1, topic_range_step))
+    seeds = [random_state + s for s in range(n_seeds)]
     log.info(
         f"Optimising num_topics: testing {candidates} "
-        f"({len(candidates)} models to train at sweep settings: "
+        f"({len(candidates)} k values x {n_seeds} seed(s) {seeds} at sweep settings: "
         f"passes={sweep_passes}, iterations={sweep_iterations})"
+        + (f"; held-out eval on {len(holdout_corpus)} docs" if holdout_corpus else "")
     )
 
     results: List[Dict[str, Any]] = []
@@ -658,52 +859,90 @@ def find_optimal_topics(
     best_cv = -1.0
 
     for k in tqdm(candidates, desc="Topic optimisation"):
-        log.info(f"Training LDA with k={k}...")
-        model = LdaModel(
-            corpus=corpus,
-            id2word=dictionary,
-            num_topics=k,
-            passes=sweep_passes,
-            iterations=sweep_iterations,
-            chunksize=chunksize,
-            random_state=random_state,
-            alpha="auto",
-            eta="auto",
-            per_word_topics=True,
-        )
+        seed_models: List[LdaModel] = []
+        cv_per_seed: List[float | None] = []
+        perplexities: List[float] = []
+
+        for seed in seeds:
+            log.info(f"Training LDA with k={k} (seed={seed})...")
+            model = LdaModel(
+                corpus=corpus,
+                id2word=dictionary,
+                num_topics=k,
+                passes=sweep_passes,
+                iterations=sweep_iterations,
+                chunksize=chunksize,
+                random_state=seed,
+                alpha="auto",
+                eta="auto",
+                per_word_topics=True,
+            )
+            seed_models.append(model)
+
+            # C_v (primary criterion), per seed
+            try:
+                cm_cv = CoherenceModel(
+                    model=model, texts=tokenized_docs,
+                    dictionary=dictionary, coherence="c_v",
+                )
+                cv = float(cm_cv.get_coherence())
+                cv_per_seed.append(cv)
+                log.info(f"  k={k} seed={seed}  C_v={cv:.4f}")
+            except Exception as e:
+                log.warning(f"  k={k} seed={seed}  C_v failed: {e}")
+                cv_per_seed.append(None)
+
+            # Held-out log-perplexity (per-word bound; higher = better)
+            if holdout_corpus:
+                try:
+                    perplexities.append(float(model.log_perplexity(holdout_corpus)))
+                except Exception as e:
+                    log.warning(f"  k={k} seed={seed}  log_perplexity failed: {e}")
 
         entry: Dict[str, Any] = {"k": k}
 
-        # C_v (primary criterion)
-        try:
-            cm_cv = CoherenceModel(
-                model=model, texts=tokenized_docs,
-                dictionary=dictionary, coherence="c_v",
-            )
-            cv = cm_cv.get_coherence()
-            entry["c_v"] = float(cv)
-            log.info(f"  k={k}  C_v={cv:.4f}")
-            if cv > best_cv:
-                best_cv = cv
+        cv_valid = [c for c in cv_per_seed if c is not None]
+        if cv_valid:
+            mean_cv = float(np.mean(cv_valid))
+            entry["c_v"] = mean_cv
+            entry["c_v_sd"] = float(np.std(cv_valid, ddof=1)) if len(cv_valid) > 1 else None
+            if mean_cv > best_cv:
+                best_cv = mean_cv
                 best_k = k
-        except Exception as e:
-            log.warning(f"  k={k}  C_v failed: {e}")
+        else:
             entry["c_v"] = None
+            entry["c_v_sd"] = None
+        entry["c_v_per_seed"] = cv_per_seed if n_seeds > 1 else None
 
-        # NPMI (secondary)
+        # Topic stability across seeds (None when n_seeds == 1)
+        entry["stability_jaccard"] = topic_stability_jaccard(seed_models)
+
+        entry["holdout_log_perplexity"] = (
+            float(np.mean(perplexities)) if perplexities else None
+        )
+
+        if n_seeds > 1 and entry["c_v"] is not None:
+            log.info(
+                f"  k={k}  mean C_v={entry['c_v']:.4f}"
+                + (f" (sd={entry['c_v_sd']:.4f})" if entry["c_v_sd"] is not None else "")
+                + (f"  stability={entry['stability_jaccard']:.3f}"
+                   if entry["stability_jaccard"] is not None else "")
+            )
+
+        # Secondary metrics on the first-seed model only (cost control)
+        first_model = seed_models[0]
         try:
             cm_npmi = CoherenceModel(
-                model=model, texts=tokenized_docs,
+                model=first_model, texts=tokenized_docs,
                 dictionary=dictionary, coherence="c_npmi",
             )
             entry["c_npmi"] = float(cm_npmi.get_coherence())
         except Exception:
             entry["c_npmi"] = None
 
-        # U_Mass (secondary)
         try:
             cm_umass = CoherenceModel(
-                model=model, corpus=corpus,
+                model=first_model, corpus=corpus,
                 dictionary=dictionary, coherence="u_mass",
             )
             entry["u_mass"] = float(cm_umass.get_coherence())
@@ -712,5 +951,12 @@ def find_optimal_topics(
 
         results.append(entry)
 
-    log.info(f"Best num_topics by C_v: {best_k} (C_v={best_cv:.4f})")
+    if all(r.get("c_v") is None for r in results):
+        log.error(
+            "Every C_v coherence computation failed — model selection did not run; "
+            f"returning k={best_k} (the smallest candidate), NOT a data-driven choice."
+        )
+    else:
+        label = "mean C_v" if n_seeds > 1 else "C_v"
+        log.info(f"Best num_topics by {label}: {best_k} ({label}={best_cv:.4f})")
     return best_k, results

@@ -40,4 +40,26 @@ CONTENT_COLUMNS = {
 # Back-compat alias (older docs/scripts referenced PRIVATE_COLUMNS).
 PRIVATE_COLUMNS = CONTENT_COLUMNS
 
-__all__ = ["PUBLIC_REPO_ID", "PRIVATE_REPO_ID", "CONTENT_COLUMNS", "PRIVATE_COLUMNS"]
+# Path of the per-subset public-column allowlist consumed by
+# publish_public.py (see the "_readme" key inside the file).
+PUBLIC_COLUMNS_FILE = os.path.join(os.path.dirname(__file__), "public_columns.json")
+
+
+def load_public_columns() -> dict:
+    """Return the per-subset allowlist of publishable columns as
+    ``{subset: set(columns)}`` (the ``_readme`` key is dropped)."""
+    import json
+
+    with open(PUBLIC_COLUMNS_FILE, encoding="utf-8") as f:
+        data = json.load(f)
+    return {k: set(v) for k, v in data.items() if not k.startswith("_")}
+
+
+__all__ = [
+    "PUBLIC_REPO_ID",
+    "PRIVATE_REPO_ID",
+    "CONTENT_COLUMNS",
+    "PRIVATE_COLUMNS",
+    "PUBLIC_COLUMNS_FILE",
+    "load_public_columns",
+]

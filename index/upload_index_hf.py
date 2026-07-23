@@ -24,7 +24,6 @@ Variables d'environnement
 
 import os
 import sys
-import asyncio
 import logging
 from typing import Dict, Any, List, Optional
 from collections import defaultdict, Counter
@@ -33,40 +32,23 @@ from collections import defaultdict, Counter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
-from tqdm import tqdm
 from dotenv import load_dotenv
-from datasets import Dataset, load_dataset
-from huggingface_hub import login, get_token, utils as hf_utils
-import huggingface_hub
-from iwac_common.omeka_client import (
-    Config,
-    OmekaApiClient,
-    conn_manager,
-    fetch_iiif_thumbnail_url,
-)
+from datasets import load_dataset
+from rich.console import Console
+from iwac_common.omeka_client import OmekaApiClient, conn_manager, fetch_iiif_thumbnail_url
 from iwac_common.field_mappers import extract_added_date, get_value
-from iwac_common.hub_merge import merge_with_hub_dataset, resolve_hf_token
-from iwac_common.repos import PRIVATE_REPO_ID
+from iwac_common.upload_runner import UploadSpec, run_upload
 
-# Disable symlinks warning from huggingface_hub
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-
-# ---------------------------------------------------------------------------
-# Configuration & journalisation
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("upload")
+console = Console()
 
 load_dotenv()
 
 
-# Config, Cache, ConnectionManager, async_retry and OmekaApiClient now live
-# in iwac_common.omeka_client. The shared client uses a Rich progress bar
-# during pagination; the previous tqdm-based progress is no longer needed.
+# Orchestration + CLI + Rich console/logging live in
+# iwac_common.upload_runner. Index keeps a `post_map` hook for its
+# cross-subset frequency statistics (computed from the articles /
+# publications / references subsets before merging).
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +254,7 @@ def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.Dat
     return result
 
 
-async def load_reference_datasets(token: Optional[str] = None, repo: str = PRIVATE_REPO_ID) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+async def load_reference_datasets(token: Optional[str], repo: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Charge les datasets articles, publications et references depuis Hugging Face Hub"""
     articles_df = pd.DataFrame()
     publications_df = pd.DataFrame()
@@ -305,128 +287,50 @@ async def load_reference_datasets(token: Optional[str] = None, repo: str = PRIVA
     return articles_df, publications_df, references_df
 
 
+
+
 # ---------------------------------------------------------------------------
-# Pipeline principale : fetch → map → calculate stats → dataset → push
+# Spec + entry point (shared pipeline in iwac_common.upload_runner)
 # ---------------------------------------------------------------------------
 
-async def build_and_push(cfg: Config, repo: str, shard_size: str = "1GB"):
-    api = OmekaApiClient(cfg, use_cache=True)
-
-    # 1. Charger les datasets de référence pour calculer les statistiques
-    token_to_use = resolve_hf_token()
-    
-    articles_df, publications_df, references_df = await load_reference_datasets(token_to_use, repo=repo)
-    
-    # 2. Calculer les statistiques de fréquence
+async def _attach_frequency_stats(
+    new_df: pd.DataFrame, api: OmekaApiClient, repo: str, token: Optional[str]
+) -> pd.DataFrame:
+    """post_map hook: enrich index rows with corpus-wide term frequency
+    statistics (occurrences + first/last year + countries) computed from the
+    articles, publications and references subsets, joined on the index Titre
+    (controlled vocabulary). Runs after mapping, before the Hub merge."""
+    articles_df, publications_df, references_df = await load_reference_datasets(token, repo)
     frequency_stats = calculate_frequency_stats(articles_df, publications_df, references_df)
 
-    # 3. Fetch current Omeka index items and map them
-    logger.info("Fetching index items from Omeka API...")
-    
-    # Récupérer tous les types d'items d'index
-    omeka_items_raw = []
-    resource_class_ids = [9, 94, 96, 54, 244]  # Lieux, Personnes, Organisations, Événements, Sujets/Notices
-    
-    for rcid in resource_class_ids:
-        logger.info(f"Fetching items for resource class {rcid}...")
-        try:
-            items = await api.fetch_items(rcid)
-            omeka_items_raw.extend(items)
-            logger.info(f"Fetched {len(items)} items for resource class {rcid}")
-        except Exception as e:
-            logger.error(f"Error fetching items for resource class {rcid}: {e}")
-            continue
-
-    if not omeka_items_raw:
-        logger.warning("No index items returned from Omeka API. Exiting.")
-        return
-
-    logger.info(f"Fetched {len(omeka_items_raw)} index items from Omeka.")
-    omeka_records_list = []
-    
-    for it in tqdm(omeka_items_raw, desc="Mapping Omeka index items"):
-        try:
-            record = await map_index_item(it, api)
-            omeka_records_list.append(record)
-        except Exception as e:
-            logger.error(f"Error mapping index item {it.get('o:id', 'Unknown ID')}: {e}", exc_info=True)
-    
-    if not omeka_records_list:
-        logger.error("No index records were successfully mapped. Exiting.")
-        return
-        
-    new_omeka_df = pd.DataFrame(omeka_records_list)
-    
-    # 4. Ajouter les statistiques de fréquence
-    logger.info("Adding frequency statistics to index records...")
-    
-    # Créer des colonnes pour les statistiques
-    new_omeka_df['frequency'] = 0
-    new_omeka_df['first_occurrence'] = ''
-    new_omeka_df['last_occurrence'] = ''
-    new_omeka_df['countries'] = None
-    
-    # Mapper les statistiques basées sur le titre
-    for idx, row in new_omeka_df.iterrows():
-        titre = row.get('Titre', '')
+    console.print("[blue]→[/blue] Attaching frequency statistics to index records...")
+    new_df["frequency"] = 0
+    new_df["first_occurrence"] = ""
+    new_df["last_occurrence"] = ""
+    new_df["countries"] = None
+    for idx, row in new_df.iterrows():
+        titre = row.get("Titre", "")
         if titre in frequency_stats:
             stats = frequency_stats[titre]
-            new_omeka_df.at[idx, 'frequency'] = stats['frequency']
-            new_omeka_df.at[idx, 'first_occurrence'] = stats['first_occurrence']
-            new_omeka_df.at[idx, 'last_occurrence'] = stats['last_occurrence']
-            new_omeka_df.at[idx, 'countries'] = stats['countries']
+            new_df.at[idx, "frequency"] = stats["frequency"]
+            new_df.at[idx, "first_occurrence"] = stats["first_occurrence"]
+            new_df.at[idx, "last_occurrence"] = stats["last_occurrence"]
+            new_df.at[idx, "countries"] = stats["countries"]
         else:
-            new_omeka_df.at[idx, 'countries'] = ''
-
-    # 5-6. Load existing Hub dataset and merge to preserve computed columns.
-    final_df = merge_with_hub_dataset(
-        new_omeka_df,
-        repo,
-        config_name="index",
-        token=token_to_use,
-    )
-
-    # 7. Conversion to Dataset and Push
-    if not final_df.empty:
-        logger.info(f"Preparing to push {len(final_df)} index records to the Hub.")
-        
-        # Final check for o:id integrity
-        if 'o:id' not in final_df.columns or final_df['o:id'].isnull().any():
-            logger.error("Critical error: 'o:id' is missing or null in the final DataFrame before push. Aborting push.")
-            await conn_manager.close()
-            return
-
-        ds = Dataset.from_pandas(final_df, preserve_index=False)
-        logger.info("Index dataset preview (first 5 rows):")
-        logger.info(ds.to_pandas().head())
-
-        if os.getenv("HF_TOKEN") is None and not hf_utils.is_notebook():
-            login()
-        
-        try:
-            logger.info(f"Pushing index dataset to {repo} with config 'index'...")
-            ds.push_to_hub(repo, max_shard_size=shard_size, config_name="index", token=token_to_use)
-            logger.info(f"Index dataset published/updated on {repo} with config 'index'")
-        except Exception as e:
-            logger.error(f"Failed to push index dataset to Hub: {e}")
-            logger.error("Details of the exception:", exc_info=True)
-
-    else:
-        logger.info("Final index dataset is empty. No push operation will be performed.")
-
-    await conn_manager.close()
+            new_df.at[idx, "countries"] = ""
+    return new_df
 
 
-# ---------------------------------------------------------------------------
-# Exécution CLI
-# ---------------------------------------------------------------------------
+SPEC = UploadSpec(
+    config_name="index",
+    resource_class_ids=(9, 94, 96, 54, 244),  # Lieux, Personnes, Organisations, Événements, Sujets/Notices
+    map_item=map_index_item,
+    title="🗂️ IWAC Index Upload",
+    cache_dir=".cache_omk_index",
+    description="Publie l'index IWAC sur le Hub HF",
+    post_map=_attach_frequency_stats,
+)
+
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Publie l'index IWAC sur le Hub HF")
-    parser.add_argument("--repo", default=PRIVATE_REPO_ID, help="Nom du repo HF (défaut: miroir privé complet)")
-    parser.add_argument("--max-shard-size", default="1GB", help="Taille max d'un shard Parquet (ex. 500MB, 1GB)")
-    args = parser.parse_args()
-
-    asyncio.run(build_and_push(Config(CACHE_DIR=".cache_omk_index"), repo=args.repo, shard_size=args.max_shard_size))
+    sys.exit(run_upload(SPEC))

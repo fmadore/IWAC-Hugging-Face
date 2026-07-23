@@ -34,8 +34,8 @@ import argparse
 import asyncio
 import logging
 import os
-import re
 import sys
+import uuid
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -55,6 +55,7 @@ sys.path.insert(0, _THIS_DIR)
 sys.path.insert(0, os.path.dirname(_THIS_DIR))
 from _common import ensure_hf_token, PRIVATE_REPO_ID  # noqa: E402
 from iwac_common.omeka_client import Config, OmekaApiClient, conn_manager  # noqa: E402
+from iwac_common.text_utils import tokenize_words  # noqa: E402
 
 load_dotenv()
 
@@ -144,32 +145,35 @@ def configure_logging() -> None:
 def count_words(text: str | None) -> int:
     """
     Compte le nombre de mots dans une chaîne de caractères.
-    
-    Utilise une expression régulière pour identifier les mots composés de
-    caractères alphanumériques, en ignorant la ponctuation et les espaces multiples.
-    
+
+    Utilise le tokenizer partagé ``iwac_common.text_utils.tokenize_words``
+    (sensible à l'élision française) : les clitiques élidés ne comptent plus
+    comme des mots séparés — « l'islam » = 1 mot (avant : 2).
+
     Args:
         text: Texte à analyser (peut être None)
-        
+
     Returns:
         Nombre de mots trouvés (0 si le texte est None ou vide)
     """
     if not text:
         return 0
-    # Utilise une expression régulière pour mieux gérer les séparateurs multiples
-    # et la ponctuation simple attachée aux mots.
-    words = re.findall(r"\b\w+\b", str(text).lower())
-    return len(words)
+    return len(tokenize_words(str(text)))
 
-def add_word_count_batch(batch: dict[str, list], text_col: str, count_col: str) -> dict[str, list]:
+def add_word_count_batch(
+    batch: dict[str, list], text_col: str, count_col: str, update_mode: str = "all"
+) -> dict[str, list]:
     """
     Applique le comptage de mots à un batch d'exemples.
-    
+
     Args:
         batch: Dictionnaire contenant les colonnes du batch
         text_col: Nom de la colonne contenant le texte à analyser
         count_col: Nom de la colonne où stocker les comptes de mots
-        
+        update_mode: "all" recalcule chaque ligne; "missing" ne calcule que les
+            lignes dont ``count_col`` est absent/nul (les valeurs existantes
+            sont conservées).
+
     Returns:
         Le batch avec la colonne de comptage ajoutée ou mise à jour
     """
@@ -177,12 +181,20 @@ def add_word_count_batch(batch: dict[str, list], text_col: str, count_col: str) 
         # Si la colonne de texte n'est pas dans ce batch (peut arriver avec des datasets hétérogènes)
         # ou si le batch est vide, retourner le batch tel quel ou avec une colonne de comptes vide.
         if count_col not in batch:
-            batch[count_col] = [0] * len(batch.get(next(iter(batch)), []))  # Crée une colonne de zéros
+            # Garde-fou: next(iter(batch)) lèverait StopIteration sur un batch vide.
+            first_col = next(iter(batch), None)
+            batch[count_col] = [0] * (len(batch[first_col]) if first_col is not None else 0)
         return batch
 
     texts_in_batch: list = batch[text_col]
-    word_counts = [count_words(text) for text in texts_in_batch]
-    batch[count_col] = word_counts
+    existing = batch.get(count_col) if update_mode == "missing" else None
+    if existing is not None:
+        batch[count_col] = [
+            existing[i] if existing[i] is not None else count_words(text)
+            for i, text in enumerate(texts_in_batch)
+        ]
+    else:
+        batch[count_col] = [count_words(text) for text in texts_in_batch]
     return batch
 
 def main() -> None:
@@ -216,6 +228,18 @@ def main() -> None:
         "-y", "--yes",
         action="store_true",
         help="Recalculer sans confirmation quand 'nb_mots' existe déjà",
+    )
+    parser.add_argument(
+        "--update-mode",
+        choices=["missing", "all"],
+        default="all",
+        help="'all' recalcule tout (défaut, comportement historique); "
+             "'missing' ne calcule que les lignes sans 'nb_mots'",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Calcule et affiche un aperçu, mais ne pousse rien vers le Hub",
     )
     args = parser.parse_args()
 
@@ -288,11 +312,11 @@ def main() -> None:
         console.print("[red]✗[/red] La colonne [bold]o:id[/bold] est requise pour les références mais n'existe pas.")
         return
 
-    if count_column_name in ds.column_names:
+    if count_column_name in ds.column_names and args.update_mode == "all":
         # Ask user if they want to recalculate existing word counts
         console.print(f"\n[yellow]⚠[/yellow] La colonne [bold]{count_column_name}[/bold] existe déjà.")
-        if args.yes:
-            console.print("[green]→[/green] Recalcul confirmé via --yes.")
+        if args.yes or args.dry_run:
+            console.print("[green]→[/green] Recalcul confirmé (--yes/--dry-run).")
         else:
             try:
                 recalculate = Confirm.ask("Voulez-vous recalculer les comptes de mots existants?", default=False)
@@ -331,7 +355,12 @@ def main() -> None:
                 fn_kwargs={
                     "text_col": text_column_fixed,
                     "count_col": count_column_name,
+                    "update_mode": args.update_mode,
                 },
+                # Ne jamais resservir un cache .map() périmé lors des re-runs
+                # (même pattern que calculate_lexical_richness.py).
+                load_from_cache_file=False,
+                new_fingerprint=str(uuid.uuid4()),
             )
         
         console.print(f"[green]✓[/green] Comptage des mots terminé")
@@ -361,6 +390,14 @@ def main() -> None:
             console.print(f"[dim]Nouvel ordre: {', '.join(ds_processed.column_names[:5])}{'...' if len(ds_processed.column_names) > 5 else ''}[/dim]")
         except ValueError:
             console.print(f"[yellow]⚠[/yellow] La colonne de référence [bold]{text_column_fixed}[/bold] n'a pas été trouvée. Le dataset sera poussé sans réorganisation.")
+
+    # --- Dry-run: on s'arrête avant le push ---
+    if args.dry_run:
+        console.print(Panel(
+            "[yellow]Dry run — aucun push effectué.[/yellow]",
+            border_style="yellow",
+        ))
+        return
 
     # --- Push du dataset mis à jour vers le Hub ---
     console.print(f"\n[blue]→[/blue] Push du dataset mis à jour vers [bold]{repo_id}[/bold] (config: [bold]{config_name_choice}[/bold])...")

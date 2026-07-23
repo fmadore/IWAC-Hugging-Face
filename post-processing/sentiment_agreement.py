@@ -23,7 +23,9 @@ Metrics reported per dimension:
 Columns added with --push:
 - consensus_polarite            majority label (>= 2 models), else ""
 - consensus_centralite          majority label (>= 2 models), else ""
-- consensus_subjectivite_score  median of available scores (float)
+- consensus_subjectivite_score  median of available scores (float; with
+                                exactly two raters the median is their mean,
+                                so .5 values appear by design)
 - sentiment_disagreement        pipe-joined dimensions in dispute
                                 (polarite/centralite: no majority;
                                  subjectivite: score range >= 2)
@@ -78,6 +80,10 @@ CENTRALITY_ORDER = {
     "Très central": 5,
 }
 
+# Full ordinal scale for subjectivité (numeric 1-5); polarité/centralité get
+# theirs from the *_ORDER mappings. Used to anchor weighted-kappa weights.
+SUBJECTIVITY_SCALE = [1, 2, 3, 4, 5]
+
 # (dimension key, column template, label→ordinal map or None for numeric)
 DIMENSIONS = [
     ("polarite", "{m}_polarite", POLARITY_ORDER),
@@ -93,13 +99,30 @@ OUTPUT_DIR = REPO_ROOT / "analyses" / "output"
 # ---------------------------------------------------------------------------
 
 
-def cohen_kappa(a: np.ndarray, b: np.ndarray, weighted: bool = False) -> Optional[float]:
-    """Cohen's kappa on aligned integer ratings; quadratic weights if weighted."""
+def cohen_kappa(
+    a: np.ndarray,
+    b: np.ndarray,
+    weighted: bool = False,
+    scale: Optional[List[int]] = None,
+) -> Optional[float]:
+    """Cohen's kappa on aligned integer ratings; quadratic weights if weighted.
+
+    ``scale`` is the dimension's full ordered category set (e.g. 1..5).
+    When given, the quadratic weight matrix is anchored to the theoretical
+    scale min/max instead of the (max-min)² of the OBSERVED categories —
+    the correct formulation when comparing kappa across pairs/dimensions
+    where a pair may never use an extreme category. Note: because distances
+    are computed from the true category VALUES and kappa is 1 - do/de, the
+    normalizing constant cancels, so the numeric result matches the
+    observed-anchored version (to float precision); passing the scale makes
+    the anchoring explicit and robust to future weight-scheme changes.
+    Unweighted kappa is unaffected: unused categories have zero marginals.
+    """
     mask = ~(np.isnan(a) | np.isnan(b))
     a, b = a[mask].astype(int), b[mask].astype(int)
     if len(a) == 0:
         return None
-    cats = sorted(set(a) | set(b))
+    cats = sorted(scale) if scale is not None else sorted(set(a) | set(b))
     if len(cats) == 1:
         return 1.0  # both raters constant and identical
     idx = {c: i for i, c in enumerate(cats)}
@@ -198,14 +221,19 @@ def majority(votes: List[str]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Inter-model sentiment agreement (Gemini/ChatGPT/Mistral) + consensus columns."
+        description="Inter-model sentiment agreement (Gemini/ChatGPT/Mistral) + consensus columns. "
+                    "Report-only by default (nothing is written); pass --push to add the "
+                    "consensus/disagreement columns and push them to the Hub."
     )
-    parser.add_argument("--repo", default=PRIVATE_REPO_ID)
-    parser.add_argument("--config", default="articles", help="Subset with sentiment columns (articles)")
+    parser.add_argument("--repo", default=PRIVATE_REPO_ID,
+                        help="Repository ID on Hugging Face Hub (default: private full mirror).")
+    parser.add_argument("--config", default="articles",
+                        help="Dataset configuration (subset) with sentiment columns (default: articles).")
     parser.add_argument("--source", choices=["hub", "csv"], default="hub",
                         help="hub = live dataset (default); csv = local data/ mirror")
     parser.add_argument("--push", action="store_true",
-                        help="Add consensus/disagreement columns and push to the Hub")
+                        help="Write mode: add consensus/disagreement columns and push to the Hub "
+                             "(without this flag the script only reports; nothing is written).")
     parser.add_argument("--max-shard-size", default="1GB")
     args = parser.parse_args()
 
@@ -249,6 +277,10 @@ def main() -> None:
         n_any2 = int((ordinal.notna().sum(axis=1) >= 2).sum())
 
         # --- metrics ---
+        # Anchor kappa weights to the dimension's full theoretical scale
+        # (not just observed categories), so values are comparable across
+        # pairs/dimensions.
+        full_scale = sorted(mapping.values()) if mapping is not None else SUBJECTIVITY_SCALE
         pair_metrics = {}
         for m1, m2 in combinations(MODELS, 2):
             a, b = ordinal[m1].to_numpy(), ordinal[m2].to_numpy()
@@ -257,8 +289,8 @@ def main() -> None:
             pair_metrics[f"{m1}-{m2}"] = {
                 "n": int(both.sum()),
                 "exact_agreement": exact,
-                "kappa": cohen_kappa(a, b, weighted=False),
-                "kappa_weighted_quadratic": cohen_kappa(a, b, weighted=True),
+                "kappa": cohen_kappa(a, b, weighted=False, scale=full_scale),
+                "kappa_weighted_quadratic": cohen_kappa(a, b, weighted=True, scale=full_scale),
             }
 
         units = [row[~np.isnan(row)].tolist() for row in ordinal.to_numpy()]
@@ -285,6 +317,9 @@ def main() -> None:
                 consensus_frame[f"consensus_{dim_key}"] == ""
             )
         else:
+            # Median of the available scores. With exactly two raters the
+            # median is the mean of the two values, so half-point scores
+            # (e.g. 2.5, 3.5) appear by design — they are not an error.
             consensus_frame["consensus_subjectivite_score"] = ordinal.median(axis=1, skipna=True)
             spread = ordinal.max(axis=1) - ordinal.min(axis=1)
             disagreement_flags[dim_key] = (ordinal.notna().sum(axis=1) >= 2) & (spread >= 2)
