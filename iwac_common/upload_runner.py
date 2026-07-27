@@ -56,7 +56,14 @@ from .hub_merge import (
     merge_with_hub_dataset,
     resolve_hf_token,
 )
-from .omeka_client import Config, OmekaApiClient, TruncatedFetchError, conn_manager
+from .omeka_client import (
+    Config,
+    MediaFetchGuardError,
+    OmekaApiClient,
+    TruncatedFetchError,
+    conn_manager,
+    media_stats,
+)
 from .repos import PRIVATE_REPO_ID
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
@@ -123,6 +130,7 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
     cfg = Config(CACHE_DIR=spec.cache_dir)
     _display_config_panel(console, spec, cfg, args)
     api = OmekaApiClient(cfg, use_cache=not args.no_cache, console=console)
+    media_stats.reset()
 
     try:
         # 1. Fetch. A failed or truncated class fetch aborts the whole run:
@@ -172,6 +180,13 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
         if not records:
             console.print("[bold red]✗ Error:[/bold red] No records were successfully mapped.")
             return 1
+
+        # Mass media-lookup failure blanks PDF/thumbnail for every item while
+        # leaving the row count intact, so no other rail catches it. Check
+        # before the merge — there is nothing to salvage downstream.
+        media_summary = media_stats.check(allow_failures=args.allow_media_failures)
+        if media_summary:
+            console.print(f"[yellow]⚠[/yellow] {media_summary} — media URLs for those items are empty.")
 
         new_df = pd.DataFrame(records)
         if "o:id" not in new_df.columns or new_df["o:id"].isnull().any():
@@ -269,6 +284,13 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
             border_style="red",
         ))
         return 1
+    except MediaFetchGuardError as exc:
+        console.print(Panel(
+            f"[bold red]✗ Mass media-lookup failure[/bold red]\n\n{exc}",
+            title="Aborted — Hub data protected",
+            border_style="red",
+        ))
+        return 1
     except (ShrinkGuardError, DuplicateIdError) as exc:
         console.print(Panel(
             f"[bold red]✗ {type(exc).__name__}[/bold red]\n\n{exc}",
@@ -304,6 +326,13 @@ def build_parser(spec: UploadSpec) -> argparse.ArgumentParser:
         "--force-shrink", action="store_true",
         help="Allow pushing a dataset markedly smaller than the one on the Hub "
              "(normally aborted: a truncated fetch would silently delete rows)",
+    )
+    parser.add_argument(
+        "--allow-media-failures", action="store_true",
+        help="Allow pushing when most per-item media lookups failed (normally "
+             "aborted: PDF/thumbnail would be blanked over good Hub values). "
+             "Use only when the media really are gone, not when the host is "
+             "unreachable",
     )
     if spec.supports_stale_rows:
         parser.add_argument(

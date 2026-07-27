@@ -182,6 +182,86 @@ class TruncatedFetchError(RuntimeError):
     cache. Aborting protects the Hub dataset from a silent mass-delete."""
 
 
+class MediaFetchGuardError(RuntimeError):
+    """Too large a share of per-item media lookups failed.
+
+    Media sub-fetches degrade gracefully by design: one unreachable manifest
+    yields an empty ``PDF``/``thumbnail`` for that item rather than killing
+    the run. Under a *network-wide* failure that same tolerance turns
+    catastrophic — every lookup fails, every media URL comes back empty, and
+    because those columns exist in the fresh frame the merge overwrites the
+    Hub's good values with blanks. Row counts are unchanged, so neither the
+    shrink tripwire nor the total-count reconciliation notices.
+
+    Observed 2026-07-27: a VPN made islam.zmo.de unreachable mid-run and
+    1,501 publications were on course to lose every PDF URL."""
+
+
+class MediaFetchStats:
+    """Counts per-item media lookups so a run can abort on mass failure.
+
+    Both degradation paths report here: :meth:`OmekaApiClient.fetch_media_data`
+    (which raises, and is caught by each subset's mapper) and
+    :func:`fetch_iiif_thumbnail_url` (which swallows everything and returns
+    ``""``). Absences are never counted — an item with no primary media makes
+    no attempt — so the rate measures failure, not sparsity.
+    """
+
+    #: Abort above this share of failed attempts.
+    MAX_FAILURE_RATE = 0.20
+    #: Below this many attempts the rate is too noisy to judge.
+    MIN_ATTEMPTS = 20
+
+    def __init__(self) -> None:
+        self.attempted = 0
+        self.failed = 0
+
+    def reset(self) -> None:
+        self.attempted = 0
+        self.failed = 0
+
+    def record_attempt(self) -> None:
+        self.attempted += 1
+
+    def record_failure(self) -> None:
+        self.failed += 1
+
+    @property
+    def failure_rate(self) -> float:
+        return self.failed / self.attempted if self.attempted else 0.0
+
+    def check(self, *, allow_failures: bool = False) -> Optional[str]:
+        """Raise :class:`MediaFetchGuardError` on mass failure.
+
+        Returns a human-readable summary when failures occurred but stayed
+        under the threshold, else ``None``. With ``allow_failures`` the
+        breach is reported and downgraded to that summary.
+        """
+        if not self.failed:
+            return None
+        summary = (
+            f"{self.failed:,}/{self.attempted:,} media lookups failed "
+            f"({self.failure_rate:.0%})"
+        )
+        breached = (
+            self.attempted >= self.MIN_ATTEMPTS
+            and self.failure_rate > self.MAX_FAILURE_RATE
+        )
+        if breached and not allow_failures:
+            raise MediaFetchGuardError(
+                f"{summary} — above the {self.MAX_FAILURE_RATE:.0%} threshold. "
+                "PDF/thumbnail URLs would be pushed empty, overwriting good "
+                "values on the Hub. Check connectivity to the Omeka host (a "
+                "VPN or DNS change is the usual cause) and re-run. Use "
+                "--allow-media-failures only if the media really are gone."
+            )
+        return summary
+
+
+#: Process-wide media-lookup counters; ``upload_runner`` resets per run.
+media_stats = MediaFetchStats()
+
+
 class OmekaApiClient:
     """Minimal async client for the Omeka S REST API.
 
@@ -323,7 +403,15 @@ class OmekaApiClient:
         return items
 
     async def fetch_media_data(self, media_id: str) -> Any:
-        return await self.request(f"media/{media_id}", {})
+        # Counted here rather than in the callers: every subset script wraps
+        # this in its own try/except, so this is the one place that sees all
+        # attempts and all failures (see MediaFetchStats).
+        media_stats.record_attempt()
+        try:
+            return await self.request(f"media/{media_id}", {})
+        except Exception:
+            media_stats.record_failure()
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +433,7 @@ async def fetch_iiif_thumbnail_url(
     """
     manifest_url = f"{IIIF_BASE_URL}/{omeka_id}/manifest"
     thumbnail_url = ""
+    media_stats.record_attempt()
     try:
         # Shorter timeout: this request runs once per item.
         async with session.get(manifest_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -364,13 +453,19 @@ async def fetch_iiif_thumbnail_url(
                 logger.warning(
                     f"IIIF manifest request for {omeka_id} returned status {resp.status}. URL: {manifest_url}"
                 )
+    # Only transport-level errors count as failures. A 200 carrying no
+    # thumbnail, or a 404 for an item with no manifest, is a genuine absence
+    # and must not inflate the failure rate.
     except asyncio.TimeoutError:
+        media_stats.record_failure()
         logger.warning(f"Timeout fetching IIIF manifest for {omeka_id}. URL: {manifest_url}")
     except aiohttp.ClientError as e_client:
+        media_stats.record_failure()
         logger.warning(
             f"Client error fetching IIIF manifest for {omeka_id}: {e_client}. URL: {manifest_url}"
         )
     except Exception as e_general:
+        media_stats.record_failure()
         logger.error(
             f"Unexpected error fetching IIIF manifest for {omeka_id}: {e_general}. URL: {manifest_url}"
         )

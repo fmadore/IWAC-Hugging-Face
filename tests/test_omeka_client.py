@@ -54,3 +54,60 @@ class TestFetchReconciliation:
         client = StubClient(pages, total=999)
         items = asyncio.run(client.fetch_items(36, verify_total=False))
         assert len(items) == 10
+
+
+class TestMediaFetchGuard:
+    """Mass media-lookup failure blanks PDF/thumbnail while leaving row counts
+    intact, so neither the shrink tripwire nor the total-count reconciliation
+    sees it. This guard is the only thing standing between a network outage
+    and a wiped media column."""
+
+    def _stats(self, attempted, failed):
+        from iwac_common.omeka_client import MediaFetchStats
+
+        s = MediaFetchStats()
+        s.attempted, s.failed = attempted, failed
+        return s
+
+    def test_no_failures_is_silent(self):
+        assert self._stats(500, 0).check() is None
+
+    def test_total_outage_aborts(self):
+        from iwac_common.omeka_client import MediaFetchGuardError
+
+        with pytest.raises(MediaFetchGuardError):
+            self._stats(1501, 1501).check()
+
+    def test_a_few_bad_manifests_pass(self):
+        """5/500 is ordinary attrition, not an outage — must not abort."""
+        assert "5/500" in self._stats(500, 5).check().replace(",", "")
+
+    def test_small_subset_never_trips(self):
+        """Below MIN_ATTEMPTS the rate is too noisy: 3/3 on a tiny subset
+        must report but not abort, or `documents` (26 rows) would be
+        unrunnable whenever a couple of manifests are missing."""
+        assert self._stats(3, 3).check() is not None
+
+    def test_threshold_boundary(self):
+        from iwac_common.omeka_client import MediaFetchGuardError, MediaFetchStats
+
+        n = MediaFetchStats.MIN_ATTEMPTS * 10
+        at_limit = int(n * MediaFetchStats.MAX_FAILURE_RATE)
+        self._stats(n, at_limit).check()          # exactly at threshold: allowed
+        with pytest.raises(MediaFetchGuardError):
+            self._stats(n, at_limit + 1).check()  # one over: aborts
+
+    def test_override_downgrades_to_warning(self):
+        summary = self._stats(1501, 1501).check(allow_failures=True)
+        assert summary and "100%" in summary
+
+    def test_absences_are_not_failures(self):
+        """An item with no primary media makes no attempt, so sparse media
+        coverage must never look like failure."""
+        from iwac_common.omeka_client import MediaFetchStats
+
+        s = MediaFetchStats()
+        for _ in range(50):
+            s.record_attempt()          # only items that HAVE media
+        assert s.failure_rate == 0.0
+        assert s.check() is None
