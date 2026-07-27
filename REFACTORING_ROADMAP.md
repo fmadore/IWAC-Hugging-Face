@@ -325,9 +325,10 @@ effect — pushing code changes never mutates the Hub by itself.
       year×country cells.
 - [ ] **E4** `keyness_bursts.py`: G² significance + BH correction + log-ratio
       effect size; per-doc subject dedup; calendar-gap handling in bursts.
-- [ ] **E5** New `post-processing/calculate_ocr_quality.py`: dictionary
+- [ ] ~~**E5** New `post-processing/calculate_ocr_quality.py`: dictionary
       hit-rate + garble heuristics → per-row OCR quality score for weighting
-      downstream analyses.
+      downstream analyses.~~ **Reverted 2026-07-26** — see note under the v2
+      progress tracker.
 
 ## Tier F — New analyses (audit §5)
 
@@ -371,10 +372,29 @@ All six tiers landed on `claude/repo-refactor-analysis-rjxdj8`:
       theta export; `analyses/_stats.py` (Mann–Kendall, BH, weighted slope,
       bootstrap); topic_prevalence significance + CIs + min-docs-cell; keyness
       χ² + BH + log-ratio + subject dedup + calendar-gap bursts; new
-      `calculate_ocr_quality.py`.
+      `calculate_ocr_quality.py` (since reverted — see below).
 - [x] **Tier F** — new analyses: `analyses/topic_sentiment.py` (topic ×
       sentiment × time × country), `analyses/entity_networks.py` (authority
       co-occurrence graph, Gephi-ready), reprint-cluster groundwork.
 
 Net: 7 upload scripts share one runner; the analyses have significance
 testing throughout; first test suite + CI in the repo's history.
+
+## E5 reverted (2026-07-26)
+
+`post-processing/calculate_ocr_quality.py` was **removed** before its column
+ever reached the Hub, together with `tests/test_ocr_quality.py`, the `wordfreq`
+dependency, and the `ocr_quality` entries in `iwac_common/public_columns.json`.
+
+Two reasons:
+
+1. **The premise no longer holds.** OCR is now extracted with vision LLMs, which
+   do not produce the character-level garbling a dictionary hit-rate is designed
+   to detect. The dry run bore this out — 12,332 scored articles with a median of
+   0.997 and Q1 of 0.992, i.e. almost no discriminating power.
+2. **It penalised African-language material.** `resolve_lang()` mapped anything
+   that was not `Anglais` to the French lexicon, so the 45 Ewé / Kabyè / Dendi
+   articles scored 0.06–0.09 and occupied the entire bottom of the distribution
+   despite having clean OCR. Weighting downstream analyses by that score would
+   have systematically discounted exactly the West African-language sources the
+   collection exists to document.

@@ -126,8 +126,10 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
         "contributor": get_value(item, "dcterms:contributor"),
         "country": country,
         "pub_date": get_value(item, "dcterms:date"),
+        # Like articles: documents have no table of contents, and their
+        # abstract is the AI-generated one in bibo:shortDescription. The
+        # dcterms:abstract field is being retired on the Omeka side.
         "descriptionAI": get_value(item, "bibo:shortDescription"),
-        "abstract": get_value(item, "dcterms:abstract"),
         "subject": get_value(item, "dcterms:subject"),
         "spatial": get_value(item, "dcterms:spatial"),
         "language": get_value(item, "dcterms:language"),

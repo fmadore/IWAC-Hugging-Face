@@ -20,8 +20,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest
+          pip install -r requirements.txt pytest pyflakes
           pip install -e . --no-deps
+
+      # The import smoke test only imports each module, so a name used inside
+      # main() but never imported (a dropped `from rich.progress import ...`,
+      # say) passes it and crashes at runtime. pyflakes catches exactly that.
+      - name: Lint for undefined names
+        run: pyflakes $(git ls-files '*.py') | grep -i "undefined name" && exit 1 || exit 0
 
       - name: Run tests (unit + import smoke)
         run: pytest tests/ -v --tb=short

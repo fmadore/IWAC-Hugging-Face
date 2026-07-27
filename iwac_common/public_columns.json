@@ -32,7 +32,6 @@
     "OCR_is_public",
     "embedding_OCR",
     "nb_mots",
-    "ocr_quality",
     "Richesse_Lexicale_OCR",
     "Lisibilite_OCR",
     "lemma_text",
@@ -91,7 +90,6 @@
     "source",
     "OCR",
     "nb_mots",
-    "ocr_quality",
     "OCR_is_public"
   ],
   "documents": [
@@ -108,7 +106,6 @@
     "country",
     "pub_date",
     "descriptionAI",
-    "abstract",
     "subject",
     "spatial",
     "language",
@@ -118,7 +115,6 @@
     "rights",
     "OCR",
     "nb_mots",
-    "ocr_quality",
     "OCR_is_public"
   ],
   "images": [
@@ -192,7 +188,6 @@
     "source",
     "OCR",
     "nb_mots",
-    "ocr_quality",
     "lemma_text",
     "lemma_nostop",
     "OCR_is_public"
@@ -230,7 +225,6 @@
     "OCR",
     "OCR_is_public",
     "nb_mots",
-    "ocr_quality",
     "country",
     "embedding_OCR",
     "lda_topic_id",

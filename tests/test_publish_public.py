@@ -114,11 +114,11 @@ class TestColumnAllowlist:
 
     def test_approved_column_persisted(self, monkeypatch, tmp_path):
         f = self._patch_allowlist(monkeypatch, tmp_path, {"articles": ["o:id"]})
-        df = pd.DataFrame({"o:id": ["1"], "ocr_quality": [0.9]})
-        approved = pp.check_column_allowlist("articles", df, approve={"ocr_quality"})
-        assert approved == ["ocr_quality"]
+        df = pd.DataFrame({"o:id": ["1"], "new_metric": [0.9]})
+        approved = pp.check_column_allowlist("articles", df, approve={"new_metric"})
+        assert approved == ["new_metric"]
         on_disk = json.loads(f.read_text(encoding="utf-8"))
-        assert "ocr_quality" in on_disk["articles"]
+        assert "new_metric" in on_disk["articles"]
 
     def test_partial_approval_still_aborts(self, monkeypatch, tmp_path):
         self._patch_allowlist(monkeypatch, tmp_path, {"articles": ["o:id"]})

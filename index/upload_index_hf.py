@@ -237,7 +237,7 @@ def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.Dat
         logger.info(f"Calculating frequency stats from {name} dataset...")
         if df.empty:
             continue
-        for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Processing {name}"):
+        for _, row in df.iterrows():
             _accumulate_term_stats(term_stats, row, fields)
 
     # Convertir les sets en chaînes séparées par |

@@ -33,6 +33,7 @@ import argparse
 import logging
 import os
 import sys
+import uuid
 from collections import Counter
 from typing import List, Dict, Any, Optional
 
@@ -62,6 +63,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.logging import RichHandler
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich import box
 
 console = Console()
@@ -72,6 +74,8 @@ logging.basicConfig(
     datefmt="[%X]",
     handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)]
 )
+
+logger = logging.getLogger("lexical_richness")
 
 
 def calculate_mattr(text: str, window_size: int = 50) -> Optional[float]:

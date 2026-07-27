@@ -28,6 +28,7 @@ Variables d'environnement
 import os
 import sys
 import re
+import logging
 import pandas as pd
 from typing import Dict, Any, List
 
@@ -41,6 +42,10 @@ from iwac_common.field_mappers import extract_added_date, get_value, is_content_
 from iwac_common.upload_runner import UploadSpec, run_upload
 
 load_dotenv()
+
+# Rich logging itself is configured by iwac_common.upload_runner; this is the
+# named logger the field-mapping warnings below write to.
+logger = logging.getLogger("upload")
 
 
 # Orchestration (fetch of all 9 reference classes → map loop → outer merge →
