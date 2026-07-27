@@ -34,12 +34,23 @@ if a content subset lacks `OCR_is_public`, and aborts on any column missing from
 the per-subset allowlist in `iwac_common/public_columns.json`. If a new column is
 legitimate, add it to the allowlist deliberately — never silence the guard.
 
+The uploads have their own rails, and the same rule applies: an abort is
+information, not an obstacle. `hub_merge` refuses a frame under 95% of the Hub's
+row count (`--force-shrink`), `fetch_items` raises on a short read against the
+`Omeka-S-Total-Results` header, and a mass media-lookup failure aborts
+(`--allow-media-failures`). That last one exists because the others guard row
+*count*: when the Omeka host is unreachable, every media sub-fetch fails,
+`PDF`/`thumbnail` come back empty, and the merge overwrites good Hub URLs with
+blanks while the row count stays identical. If it fires, fix connectivity —
+overriding it is almost never right.
+
 ## Non-obvious gotchas
 
 **Code changes never move data.** Editing a computation does nothing to the Hub
-until you re-run the script that owns that column, usually with
-`--update-mode all` (`--mode all` for `lemmatize_update_hf.py`). A method change
-without a re-run leaves the old values in place, silently.
+until you re-run the script that owns that column, with `--update-mode all` —
+uniform across every script since the Tier D CLI unification, `lemmatize`
+included (its `--mode all|empty` still works but is the legacy alias). A method
+change without a re-run leaves the old values in place, silently.
 
 **Pushes to one repo must be sequential.** `push_to_hub` rewrites the whole
 config and the shared README metadata. Two scripts pushing concurrently — even to
@@ -56,10 +67,13 @@ alive across an upload. `reference/` merges `how="outer"` — the others use
 rarely-taken branch. CI runs `pyflakes` for exactly that reason; a refactor that
 drops an import will otherwise pass tests and crash at runtime.
 
-**Caches:** Omeka responses in `.cache_omk*` (gzipped JSON, 24h TTL); lemma and
-embedding resume caches are deleted on a successful push, so a leftover cache
-file means a previous run was interrupted — check it predates no relevant code
-change before resuming.
+**Caches:** Omeka responses in `.cache_omk*` (gzipped JSON, 24h TTL). Lemma and
+embedding resume caches are deleted on a successful push, so a leftover file
+means an interrupted run. Both are fingerprinted by the config that produced
+them (spaCy model + `LEMMA_LOGIC_VERSION`; embedding model + dim + task), so a
+cache from a different configuration is ignored rather than silently mixed in —
+no manual date-checking needed. Bump `LEMMA_LOGIC_VERSION` whenever the
+lemmatisation output changes for identical input.
 
 ## Running things
 
