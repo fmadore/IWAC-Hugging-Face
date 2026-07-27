@@ -103,6 +103,27 @@ SPACY_MAX_CHUNK_CHARS = 100_000
 CACHE_DIR = Path(__file__).resolve().parent / ".cache_lemmas"
 CHECKPOINT_EVERY = 100
 
+# Bump whenever the lemmatisation OUTPUT changes for the same input text —
+# normalize(), the stop-word rule, or the chunking. This invalidates stale
+# resume caches by name. Currently 1 = the post-2026-07 logic, where the
+# stop-word check runs on the surface form (token.is_stop) rather than the
+# lemma.
+LEMMA_LOGIC_VERSION = 1
+
+
+def cache_fingerprint(spacy_model: str, model_version: str) -> str:
+    """Filesystem-safe slug identifying the lemmatisation configuration.
+
+    Lemma resume caches MUST embed this in their filename. The cache is
+    normally deleted after a successful push, so it only survives an
+    interrupted run — but that is exactly the case that bites: if the
+    spaCy model or the lemmatisation logic changes before the re-run, the
+    leftover rows would be restored as if freshly computed, silently mixing
+    two versions of the column. Mirrors ``_embedding_utils.cache_fingerprint``.
+    """
+    safe_model = spacy_model.replace("/", "-")
+    return f"{safe_model}-{model_version}_v{LEMMA_LOGIC_VERSION}"
+
 
 def normalize(text: str) -> str:
     if not text:  # None or empty string (e.g. blank OCR rows) → nothing to lemmatise
@@ -410,9 +431,22 @@ def main():
     # restart, and the cache is deleted only after a successful push.
     # ------------------------------------------------------------------
     # Per-language cache files: a crashed English pass must not feed its
-    # rows into a resumed French pass (and vice versa).
+    # rows into a resumed French pass (and vice versa). The fingerprint adds
+    # the spaCy model + logic version, so a cache left behind by an
+    # interrupted run is ignored once either of those changes.
     cache_suffix = f"_{language_filter}" if language_filter else ""
-    cache_file = CACHE_DIR / f"{config_name}{cache_suffix}.json.gz"
+    fingerprint = cache_fingerprint(spacy_model, nlp.meta.get("version", "unknown"))
+    cache_file = CACHE_DIR / f"{config_name}{cache_suffix}_{fingerprint}.json.gz"
+
+    # An un-fingerprinted cache is from before this scheme and cannot be
+    # trusted; say so rather than leaving it to rot silently.
+    legacy = CACHE_DIR / f"{config_name}{cache_suffix}.json.gz"
+    if legacy.exists():
+        console.print(
+            f"[yellow]⚠[/yellow] Ignoring legacy resume cache [dim]{legacy.name}[/dim] "
+            "(written before lemma caches were fingerprinted — its rows may predate "
+            "the current model or logic). Delete it once you no longer need it."
+        )
     console.print(f"[blue]→[/blue] Applying lemmatisation – this can take a while…")
     result = lemmatise_dataset(
         ds,
