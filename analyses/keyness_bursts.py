@@ -58,6 +58,7 @@ from _common import ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # n
 from iwac_common.text_utils import simple_tokenize  # noqa: E402
 from lda_topic_modeling.constants import (  # noqa: E402
     DOMAIN_STOPWORDS,
+    FRAGMENT_STOPWORDS,
     LDA_GEO_STOPWORDS,
     LDA_GENERIC_STOPWORDS,
 )
@@ -325,7 +326,12 @@ def main() -> None:
     df = df.assign(year=years)
     valid_year = df["year"].between(args.year_min, args.year_max)
 
-    stopwords = set(DOMAIN_STOPWORDS) | LDA_GEO_STOPWORDS | LDA_GENERIC_STOPWORDS
+    # Keyness runs no phrase detection, so the fragments that the LDA
+    # pipeline filters post-phrase can go straight into the stopword set.
+    stopwords = (
+        set(DOMAIN_STOPWORDS) | FRAGMENT_STOPWORDS
+        | LDA_GEO_STOPWORDS | LDA_GENERIC_STOPWORDS
+    )
 
     # ---------------- Keyness ----------------
     is_french = df["language"].isna() | (df["language"] == "Français")

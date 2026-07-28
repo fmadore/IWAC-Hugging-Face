@@ -614,12 +614,31 @@ def main() -> int:
     skipped = sum(1 for t in topic_ids if t is None)
     logger.info(f"With topics ({language} + preserved): {processed} | Without: {skipped} | Total: {len(topic_ids)}")
 
-    valid_ids = [t for t in topic_ids if t is not None]
+    # Topic-level stats must cover only the rows THIS run predicted. Rows in
+    # another language keep the ids written by that language's model, and
+    # those do not index into this one: with references at 24 French topics
+    # and 16 English ones, a French id of 18 reaching get_topic_label below
+    # raised IndexError and killed the run just short of the push. The
+    # predicate mirrors predict_batch, which also predicts rows with no
+    # language value.
+    row_languages = (
+        ds_processed["language"]
+        if "language" in ds_processed.column_names
+        else [None] * len(topic_ids)
+    )
+    own_rows = [
+        i for i, lg in enumerate(row_languages) if lg is None or lg == language
+    ]
+
+    valid_ids = [topic_ids[i] for i in own_rows if topic_ids[i] is not None]
     if valid_ids:
         unique_topics = set(valid_ids)
         logger.info(f"Unique topics assigned: {len(unique_topics)}")
 
-        valid_probs_list = [p for p in topic_probs if p is not None and p > 0]
+        valid_probs_list = [
+            topic_probs[i] for i in own_rows
+            if topic_probs[i] is not None and topic_probs[i] > 0
+        ]
         if valid_probs_list:
             logger.info(f"Mean probability: {np.mean(valid_probs_list):.3f}")
 

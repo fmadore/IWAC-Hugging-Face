@@ -57,6 +57,30 @@ config and the shared README metadata. Two scripts pushing concurrently — even
 different subsets — will clobber each other's columns via lost update. Finish one
 before starting the next.
 
+**LDA stopwords come in tiers, and the tier decides the outcome.** Which set a
+word goes in matters more than whether it is in one at all:
+
+- `DOMAIN_STOPWORDS` — stripped *before* gensim's phrase detection, so nothing
+  here can ever appear inside a compound. Right for digitisation noise
+  (`camscanner`) and for citation apparatus whose whole family you want gone:
+  `paris` alone anchored 32 compounds (`paris_cnrs`, `afrique_noir_paris`).
+  Wrong for a fragment like `al`, which is junk alone but carries 82 compounds
+  (`al_qadr`, `al_qaïda`, `al_azhar`, `dar_al_hadith`) — the religious events,
+  organisations and titles the collection exists to study.
+- `FRAGMENT_STOPWORDS` — filtered one pass *after* phrasing, so `al`/`el`/`page`
+  vanish alone and survive in `al_azhar`, `el_hadj`, `page_facebook`.
+- `JUNK_COMPOUND_STOPWORDS` — the mirror case: whole phrases that are apparatus
+  though each part is legitimate (`university_press` goes, `university_medina`
+  stays). Never put a bare word here; it would veto nothing but itself.
+- `ARTIFACT_LABEL_STOPWORDS` — vetoes a label word-by-word, so compounds from
+  models trained before a fix stop surfacing pending a re-fit.
+
+Adding a modeling stopword only takes effect on `--mode fit`; `--mode predict`
+refreshes labels alone. Before adding one, check what it costs: a token absent
+from the `articles` (press) dictionary but present in `references` is citation
+apparatus, which is how `oxford`/`indiana`/`press` were cleared and why
+`berlin` and `licence` were not.
+
 **Uploads merge rather than overwrite.** Each upload fetches from Omeka, loads
 the existing Hub rows, identifies columns present only on the Hub (the computed
 ones), and merges them back on `o:id`. That is what keeps embeddings and topics

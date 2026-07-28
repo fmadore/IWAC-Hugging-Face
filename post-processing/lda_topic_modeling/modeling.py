@@ -28,7 +28,10 @@ except ImportError:  # venv without the editable install
     from iwac_common.text_utils import simple_tokenize
 
 from .constants import (
+    ARTIFACT_LABEL_STOPWORDS,
     DOMAIN_STOPWORDS,
+    FRAGMENT_STOPWORDS,
+    POST_PHRASE_STOPWORDS,
     LABEL_ONLY_STOPWORDS,
     LDA_GEO_STOPWORDS,
     LDA_GENERIC_STOPWORDS,
@@ -54,7 +57,7 @@ from .constants import (
 # rebuilding on every call).  Includes both accented and unaccented
 # forms so the accent-stripped w_norm always finds a match.
 _ALL_LABEL_STOPWORDS = (
-    LABEL_ONLY_STOPWORDS | DOMAIN_STOPWORDS
+    LABEL_ONLY_STOPWORDS | DOMAIN_STOPWORDS | FRAGMENT_STOPWORDS
     | LDA_GEO_STOPWORDS | LDA_GENERIC_STOPWORDS
 )
 
@@ -85,6 +88,7 @@ def tokenize_documents(
     phrase_min_count: int = 20,
     phrase_threshold: float = 10.0,
     custom_collocations: List[Tuple[str, ...]] | None = None,
+    fragment_stopwords: set[str] | None = None,
 ) -> Tuple[List[List[str]], Tuple[Phraser, Phraser] | None]:
     """Tokenize documents for LDA.
 
@@ -93,8 +97,13 @@ def tokenize_documents(
     (via the shared :func:`simple_tokenize`).
 
     When *detect_phrases* is True, gensim ``Phrases`` is used to join
-    frequent collocations (e.g. "côte" + "ivoire" → "côte_ivoire",
-    "burkina" + "faso" → "burkina_faso").
+    frequent collocations (e.g. "el" + "hadj" → "el_hadj", "nuit" +
+    "destin" → "nuit_destin").
+
+    *fragment_stopwords* (default :data:`FRAGMENT_STOPWORDS`) are dropped
+    only once phrase detection and custom collocations have run, so a
+    fragment survives inside its compounds and disappears everywhere else.
+    Pass an empty set to disable.
 
     Returns ``(tokenized_docs, phraser)`` where *phraser* is the
     ``(bigram_phraser, trigram_phraser)`` pair when phrase detection ran,
@@ -126,7 +135,25 @@ def tokenize_documents(
     if collocations:
         tokenized = [apply_custom_collocations(doc, collocations) for doc in tokenized]
 
+    fragments = POST_PHRASE_STOPWORDS if fragment_stopwords is None else fragment_stopwords
+    if fragments:
+        tokenized = [drop_fragments(doc, fragments) for doc in tokenized]
+
     return tokenized, phraser
+
+
+def drop_fragments(tokens: List[str], fragments: set[str] | None = None) -> List[str]:
+    """Drop bare fragments and junk compounds, keeping everything else.
+
+    Runs after phrase detection, so ``["al", "al_azhar"]`` → ``["al_azhar"]``
+    while ``"university_press"`` goes and ``"university_medina"`` stays.
+    Matching is on the whole token — ``al_azhar`` is never split — so only an
+    exact listed token is removed.
+    """
+    frags = POST_PHRASE_STOPWORDS if fragments is None else fragments
+    if not frags or not tokens:
+        return tokens
+    return [t for t in tokens if t not in frags]
 
 
 def apply_custom_collocations(
@@ -324,13 +351,43 @@ def load_lda_model(
 
 
 def _normalize_token(token: str) -> str:
-    """Lowercase and strip accents for robust matching."""
+    """Lowercase, strip accents, and treat ``_`` as a word separator.
+
+    Phrase tokens arrive underscore-joined (``fête_tabaski``). Normalising
+    the underscore to a space is what lets the ngram-preference and
+    subsumption logic in :func:`get_topic_label` recognise them as
+    multi-word — while it kept the underscore, every phrase counted as a
+    unigram and labels wasted slots on redundant pairs like
+    "fête - tabaski - … - fête_tabaski".
+    """
     if not token:
         return ""
-    t = token.lower()
+    t = token.lower().replace("_", " ")
     t = unicodedata.normalize("NFKD", t)
     t = "".join(ch for ch in t if not unicodedata.combining(ch))
-    return "".join(ch for ch in t if ch.isalnum() or ch in {" ", "-", "_"}).strip()
+    t = "".join(ch for ch in t if ch.isalnum() or ch in {" ", "-"})
+    return " ".join(t.split())
+
+
+# Stopwords normalised the same way, so underscore-joined entries
+# ("op_cit", "côte_ivoire") and accented ones still match.
+_ALL_LABEL_STOPWORDS_NORM = {
+    n for n in (_normalize_token(w) for w in _ALL_LABEL_STOPWORDS) if n
+}
+
+_ARTIFACT_LABEL_STOPWORDS_NORM = {
+    n for n in (_normalize_token(w) for w in ARTIFACT_LABEL_STOPWORDS) if n
+}
+
+
+def _contains_artifact(token_norm: str) -> bool:
+    """True when any word of a (possibly compound) label candidate is junk.
+
+    Whole-token matching is deliberate everywhere else — this is the one
+    place a component-wise test is right, because a compound built around
+    a digitisation artefact is junk however many real words it swallowed.
+    """
+    return any(part in _ARTIFACT_LABEL_STOPWORDS_NORM for part in token_norm.split())
 
 
 def _is_subsumed_by_ngram(token_norm: str, selected_norms: List[str]) -> bool:
@@ -427,7 +484,7 @@ def get_topic_label(
         w_norm = _normalize_token(word)
         if not w_norm:
             continue
-        if w_norm in _ALL_LABEL_STOPWORDS:
+        if w_norm in _ALL_LABEL_STOPWORDS_NORM or _contains_artifact(w_norm):
             continue
         if w_norm in seen_norms:
             continue
@@ -536,6 +593,29 @@ def apply_phraser(tokens: List[str], phraser: Tuple[Phraser, Phraser] | None) ->
     return list(tokens)
 
 
+def tokenize_for_prediction(
+    text: str,
+    stopwords: set[str] | None,
+    phraser: Tuple[Phraser, Phraser] | None,
+    min_token_length: int = 2,
+    custom_collocations: List[Tuple[str, ...]] | None = None,
+    fragment_stopwords: set[str] | None = None,
+) -> List[str]:
+    """Reproduce training-time tokenization for a single document.
+
+    The inference-side mirror of :func:`tokenize_documents`: same stopword
+    pass, same phrasers, same collocations, same post-phrase fragment
+    filter. Every caller that scores documents against a trained model must
+    go through here — training and prediction drifting apart silently
+    mis-assigns topics.
+    """
+    tokens = simple_tokenize(text, stopwords or set(), min_token_length)
+    tokens = apply_phraser(tokens, phraser)
+    collocations = custom_collocations if custom_collocations is not None else CUSTOM_COLLOCATIONS
+    tokens = apply_custom_collocations(tokens, collocations)
+    return drop_fragments(tokens, fragment_stopwords)
+
+
 def predict_batch(
     model: LdaModel,
     dictionary: Dictionary,
@@ -604,9 +684,7 @@ def predict_batch(
         if not text or not str(text).strip():
             continue
 
-        tokens = simple_tokenize(text, sw, min_token_length)
-        tokens = apply_phraser(tokens, phraser)
-        tokens = apply_custom_collocations(tokens, CUSTOM_COLLOCATIONS)
+        tokens = tokenize_for_prediction(text, sw, phraser, min_token_length)
         tid, prob, label, topk_str, theta = predict_document(
             model, dictionary, tokens, topk=topk, chunk_words=chunk_words,
             lambda_relevance=lambda_relevance, word_probs=word_probs,
@@ -688,6 +766,7 @@ def save_model_parameters(
     no_below: int,
     no_above: float,
     stopwords_used: List[str],
+    fragment_stopwords: List[str] | None = None,
     coherence_metrics: Dict[str, Any] | None = None,
     extra_info: Dict[str, Any] | None = None,
     logger: logging.Logger | None = None,
@@ -726,6 +805,11 @@ def save_model_parameters(
         "stopwords": {
             "count": len(stopwords_used),
             "words": sorted(stopwords_used),
+            # Removed after phrase detection: bare fragments whose compounds
+            # must survive, plus whole compounds that are apparatus.
+            "fragments": sorted(
+                POST_PHRASE_STOPWORDS if fragment_stopwords is None else fragment_stopwords
+            ),
         },
     }
 

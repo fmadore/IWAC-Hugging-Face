@@ -32,6 +32,23 @@ DOMAIN_STOPWORDS = {
     # OCR artifacts
     "lp", "bf", "wa", "adj", "octet", "sem", "at",
 
+    # Digitisation watermark. "Scanned by CamScanner" is stamped in the page
+    # footer of 16 reference documents (2,220 occurrences in the raw OCR),
+    # and phrase detection glued it onto whatever preceded it —
+    # "mémoire_maîtrise_scanned_camscanner", "op_cit_scanned_camscanner",
+    # "scanned_camscanner_organisation_pionnier". Stripping it here, BEFORE
+    # phrase detection, is what frees the real words it swallowed.
+    # ("scan"/"scanner" are deliberately absent: they never occur as OCR
+    # noise, and French "scanner" is a legitimate medical term.)
+    "camscanner", "scanned",
+
+    # Corrupted PDF text layer, not Arabic-language content. Three reference
+    # items (o:id 5315, 12709 — the same title twice — and 15722) carry
+    # thousands of repetitions of an injected Arabic anti-virus notice
+    # ("كورونا تصيب الفايروسات"; 4,730 hits in a single document), enough to
+    # hijack an entire topic. The items themselves need re-OCR in Omeka.
+    "فايروسات", "الفايروسات", "كورونا", "تصيب",
+
     # Generic French functional words that hurt clustering (no topical signal)
     "ensuite", "puis", "donc", "aussi", "toujours", "encore", "bien",
     "tout", "tres", "très", "avoir", "etre", "être", "plus", "entre",
@@ -39,7 +56,7 @@ DOMAIN_STOPWORDS = {
     "selon", "ainsi", "car", "vers", "depuis", "pendant", "contre",
     "sans", "chez", "comme",
     "aller", "falloir", "vouloir", "savoir", "voir", "celer",
-    "el",  # fragment from "El Hadj"
+    # "el" / "al" live in FRAGMENT_STOPWORDS below — see the note there.
 
     # ENGLISH stopwords (critical for filtering non-French documents)
     "the", "of", "to", "and", "in", "for", "is", "on", "that", "by",
@@ -49,15 +66,115 @@ DOMAIN_STOPWORDS = {
     # quote French sources, and the English spaCy stopword list keeps these —
     # without them the EN reference model grows French-residue junk topics).
     # Harmless for the French pipeline: spaCy fr already strips them.
-    # Deliberately NOT included (French content homographs): vol (theft),
-    # est (East), son (sound).
+    # "est" is safe despite the French "East" homograph: it survives in no
+    # French dictionary (spaCy fr lemmatises the verb to "être"), only in the
+    # English references model. Still deliberately NOT included: vol (theft),
+    # son (sound).
     "la", "le", "les", "des", "du", "de", "un", "une", "et", "ou",
     "au", "aux", "dans", "sur", "par", "pour", "que", "qui",
     "sont", "ce", "cette", "ces", "sa", "ses", "leur", "leurs",
-    "de_la", "de_l", "à", "a_la",
+    "de_la", "de_l", "à", "a_la", "en", "ne", "est",
+
+    # GERMAN function words: the references corpus quotes German colonial
+    # and missionary sources, and neither the French nor the English spaCy
+    # stopword list strips them.
+    "und", "der", "von", "das", "die",
 
     # Bibliographic apparatus abbreviations (reference lists, citations)
-    "ed", "eds", "éd", "dir", "pp", "cit", "op_cit", "ibid",
+    "ed", "eds", "éd", "dir", "pp", "cit", "op_cit", "ibid", "idem", "fig",
+
+    # Publishers and places of publication — footnote apparatus, never a
+    # topic. Stripping them here, pre-phrase, is what dissolves the whole
+    # citation family: "paris" alone anchors 32 compounds in the French
+    # references model (paris_armand_colin, paris_cnrs, afrique_noir_paris),
+    # and "london_hurst" is another publisher. "new"/"york" are listed
+    # separately because matching happens before phrase detection, when
+    # "new_york" does not yet exist as a token.
+    #
+    # The university-press cities below occur ONLY in the references
+    # subsets, never in the press articles — the signature of apparatus
+    # rather than content. Berlin, Londres and Genève are deliberately
+    # absent for the opposite reason: they appear in the articles corpus as
+    # real news subjects, and the Berlin Conference is part of the history
+    # this collection studies.
+    "karthala", "harmattan", "brill", "routledge",
+    "paris", "london", "new", "york",
+    "oxford", "cambridge", "leiden", "princeton", "stanford",
+    "edinburgh", "chicago", "bloomington", "boulder",
+
+    # University-press imprints. "press" is the head of every one of the 11
+    # press compounds in the two references models (clarendon_press,
+    # ohio_university_press, university_california_press …) and not one is
+    # about the news media; it costs the French pipeline nothing, which says
+    # "presse"/"média", and the English keeps "medium"/"media". The
+    # institution names beside it occur ONLY in the references subsets.
+    # "university" is deliberately absent — it carries real institutions
+    # (university_abomey_calavi, university_medina, university_campus).
+    "press", "indiana", "ohio", "evanston", "berkeley", "clarendon",
+    "northwestern", "wisconsin", "california", "uk",
+
+    # Rights notice stamped into the digitised documents ("licence accordée
+    # Frédérick Madore") plus the curator's name in citations of his own
+    # work — apparatus in both roles. Removing just these two names
+    # dissolves the whole family (licence_accorder_frédérick_madore at 240
+    # occurrences, page_/cité_licence_accorder_frédérick, frédérick_madore,
+    # madore_frédérick) while sparing "licence", a real French word, and
+    # "accorder", which anchors allah_accorder and dieu_accorder.
+    "frédérick", "frederick", "madore",
+
+    # Markup / URL residue surviving OCR and HTML extraction ("&amp;" → amp)
+    "amp", "http", "https", "www", "url", "com", "pdf", "doi", "isbn",
+}
+
+# ── Fragment stopwords (removed AFTER phrase detection) ────────────
+# Tokens that are noise on their own but carry meaning inside a compound.
+# Removing them with DOMAIN_STOPWORDS would strip them before gensim's
+# Phrases runs, so the compound could never form: a pre-phrase "al" costs
+# 82 domain compounds across the three models — al_qadr (Laylat al-Qadr),
+# al_qaïda / al_qaeda, al_azhar, al_hajj, al_houda, dar_al_hadith,
+# abd_al_wahhab, aïd_al_fitr — exactly the religious events, organisations
+# and titles this collection exists to study. Filtering them one pass later
+# keeps every compound and drops only the orphaned fragment.
+#
+# Also included in the label stopwords below, so labels regenerated from an
+# already-trained model lose the bare fragment without a full re-fit.
+FRAGMENT_STOPWORDS = {
+    "al",    # Arabic definite article: al-Azhar, Aïd al-Fitr, al-Qaïda
+    "el",    # same, Maghrebi spelling — keeps the title "El Hadj" intact
+    "page",  # "suite page 4" apparatus; keeps page_facebook
+}
+
+# ── Junk compounds (also removed AFTER phrase detection) ───────────
+# The mirror case of FRAGMENT_STOPWORDS: whole phrases that are apparatus
+# even though each part is a legitimate word on its own. They cannot be
+# handled pre-phrase without collateral damage — removing "licence" or
+# "accorder" would cost a real French noun and allah_accorder/dieu_accorder.
+# This is a safety net rather than the primary defence: the pre-phrase
+# stopwords above should stop most of these forming at all, but phrase
+# detection can re-join what is left behind once a name is stripped out of
+# the middle of a string.
+JUNK_COMPOUND_STOPWORDS = {
+    "licence_accorder",           # residue of the rights notice
+    "university_press",
+    "indiana_university_press",
+}
+
+# What the post-phrase pass actually filters.
+POST_PHRASE_STOPWORDS = FRAGMENT_STOPWORDS | JUNK_COMPOUND_STOPWORDS
+
+# ── Artefact tokens rejected anywhere inside a label ───────────────
+# The sets above match a label candidate as a whole, which is what you want
+# almost everywhere — "al" must not veto "al_azhar". These tokens are the
+# exception: they are pure digitisation damage, so a label is wrong the
+# moment one appears in it, compound included. The distinction matters for
+# models trained BEFORE these entered DOMAIN_STOPWORDS, whose dictionaries
+# still hold "scanned_camscanner_organisation_pionnier" and friends — a
+# re-fit removes them at the root, this keeps labels clean until then.
+ARTIFACT_LABEL_STOPWORDS = {
+    "camscanner", "scanned",
+    "فايروسات", "الفايروسات", "كورونا", "تصيب",
+    "amp",
+    "frédérick", "frederick", "madore",  # rights notice / curator citation
 }
 
 # ── Label-only stopwords ───────────────────────────────────────────

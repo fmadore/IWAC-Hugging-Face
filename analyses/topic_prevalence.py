@@ -66,18 +66,15 @@ from _stats import (  # noqa: E402
     mann_kendall,
     weighted_least_squares_slope,
 )
-from iwac_common.text_utils import simple_tokenize  # noqa: E402
 from lda_topic_modeling.constants import (  # noqa: E402
     DOMAIN_STOPWORDS,
     LDA_GEO_STOPWORDS,
     LDA_GENERIC_STOPWORDS,
-    CUSTOM_COLLOCATIONS,
 )
 from lda_topic_modeling.modeling import (  # noqa: E402
-    apply_custom_collocations,
-    apply_phraser,
     get_topic_label,
     load_lda_model,
+    tokenize_for_prediction,
 )
 
 from rich import box
@@ -90,13 +87,6 @@ from rich.table import Table
 
 console = Console()
 OUTPUT_DIR = REPO_ROOT / "analyses" / "output"
-
-
-def tokenize_like_training(text: str, stopwords: set, phraser) -> list[str]:
-    """Reproduce the prediction-time tokenization of the LDA pipeline."""
-    tokens = simple_tokenize(text, stopwords)
-    tokens = apply_phraser(tokens, phraser)
-    return apply_custom_collocations(tokens, CUSTOM_COLLOCATIONS)
 
 
 def main() -> None:
@@ -160,7 +150,7 @@ def main() -> None:
     ) as progress:
         task = progress.add_task("[cyan]Computing topic distributions", total=len(idx))
         for i in idx:
-            tokens = tokenize_like_training(df.at[i, "lemma_nostop"], stopwords, phraser)
+            tokens = tokenize_for_prediction(df.at[i, "lemma_nostop"], stopwords, phraser)
             bow = dictionary.doc2bow(tokens)
             if bow:
                 vec = np.zeros(n_topics)
