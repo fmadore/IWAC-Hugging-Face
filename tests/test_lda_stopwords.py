@@ -109,6 +109,22 @@ class TestJunkCompounds:
     def test_post_phrase_set_is_the_union(self):
         assert POST_PHRASE_STOPWORDS == FRAGMENT_STOPWORDS | JUNK_COMPOUND_STOPWORDS
 
+    def test_journal_title_dropped_but_its_words_survive(self):
+        # "religion", "journal" and "africa" are core vocabulary, so the
+        # title can only be caught whole.
+        assert drop_fragments(
+            ["journal_religion_africa", "religion", "journal_officiel", "africa"]
+        ) == ["religion", "journal_officiel", "africa"]
+        for word in ("religion", "journal", "africa"):
+            assert word not in DOMAIN_STOPWORDS
+
+    def test_cited_scholars_dissolve_their_coauthor_strings(self):
+        # Removing gomez/perez is what kills leblanc_/savadogo_gomez_perez,
+        # so those everyday West African surnames stay out of the set.
+        assert {"muriel", "gomez", "perez", "hanretta", "weiss"} <= DOMAIN_STOPWORDS
+        for surname in ("leblanc", "savadogo", "souza"):
+            assert surname not in DOMAIN_STOPWORDS
+
     def test_junk_compounds_are_compounds(self):
         # A bare word here would silently veto every compound built on it;
         # that job belongs to DOMAIN_STOPWORDS.

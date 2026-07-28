@@ -74,6 +74,7 @@ DOMAIN_STOPWORDS = {
     "au", "aux", "dans", "sur", "par", "pour", "que", "qui",
     "sont", "ce", "cette", "ces", "sa", "ses", "leur", "leurs",
     "de_la", "de_l", "à", "a_la", "en", "ne", "est",
+    "il", "elle", "ils", "pas", "nous",
 
     # GERMAN function words: the references corpus quotes German colonial
     # and missionary sources, and neither the French nor the English spaCy
@@ -122,6 +123,19 @@ DOMAIN_STOPWORDS = {
     # "accorder", which anchors allah_accorder and dieu_accorder.
     "frédérick", "frederick", "madore",
 
+    # Cited scholars. A bibliography names its authors far more often than
+    # the text discusses them, so they crowd into labels as though they were
+    # subjects. All of these are references-only — none appears in the
+    # articles dictionary. Removing the given name and surname dissolves the
+    # co-author strings too (leblanc_gomez_perez, savadogo_gomez_perez), so
+    # "leblanc" and "savadogo" need not be listed and are better left out:
+    # Savadogo is an everyday Burkinabè surname. For the same reason "souza"
+    # is absent — it IS in the press corpus, naming the Afro-Brazilian
+    # families of Ouidah (francisco_félix_souza, famille_souza).
+    "muriel", "gomez", "perez", "sean", "hanretta", "weiss", "caleb",
+    "playbook",  # from the report title weiss_aqim_imperial_playbook;
+                 # "aqim" stays, it is a real organisation
+
     # Markup / URL residue surviving OCR and HTML extraction ("&amp;" → amp)
     "amp", "http", "https", "www", "url", "com", "pdf", "doi", "isbn",
 }
@@ -157,6 +171,24 @@ JUNK_COMPOUND_STOPWORDS = {
     "licence_accorder",           # residue of the rights notice
     "university_press",
     "indiana_university_press",
+
+    # Academic journal titles. Every part of these is core vocabulary —
+    # "religion" alone runs to 5,957 occurrences in the articles corpus,
+    # "journal" is the ordinary French word for a newspaper — so they can
+    # only be caught whole, after phrasing. The whole family is listed
+    # rather than one title: strip a single one and its siblings simply
+    # take its place in the labels.
+    "journal_religion_africa",
+    "journal_africaniste",
+    "journal_african",
+    "journal_african_history",
+    "africa_journal",
+    "canadian_journal",
+    "canadian_journal_african_studies",
+    "canadian_journal_african_revue",
+    "war_journal",                # Long War Journal, a source on jihadism
+    # NOT listed: journal_officiel (the government gazette — a primary
+    # source in this collection, not apparatus).
 }
 
 # What the post-phrase pass actually filters.
@@ -174,7 +206,10 @@ ARTIFACT_LABEL_STOPWORDS = {
     "camscanner", "scanned",
     "فايروسات", "الفايروسات", "كورونا", "تصيب",
     "amp",
-    "frédérick", "frederick", "madore",  # rights notice / curator citation
+    # Bibliographic apparatus: the rights notice, and cited scholars whose
+    # names are named by the bibliography, not discussed by the text.
+    "frédérick", "frederick", "madore",
+    "gomez", "perez", "hanretta", "weiss",
 }
 
 # ── Label-only stopwords ───────────────────────────────────────────
