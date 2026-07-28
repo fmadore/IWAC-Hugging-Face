@@ -287,6 +287,11 @@ def main() -> int:
     # ── Resolve settings: explicit CLI > params file (predict) > preset > defaults
     preset = CONFIG_PRESETS.get(config_name, {})
     language: str = args.language or preset.get("language", "Français")
+    # One config can serve several languages from separate models, so fold
+    # this language's overrides in before anything else reads the preset —
+    # notably model_path, which otherwise defaults to the other language's
+    # model and overwrites it.
+    preset = {**preset, **preset.get("language_overrides", {}).get(language, {})}
     model_dir = Path(args.model_path or preset.get("model_path", "lda_model"))
     chunk_words: int | None = (
         args.chunk_words if args.chunk_words is not None else preset.get("chunk_words")
@@ -303,7 +308,11 @@ def main() -> int:
         logger.info(
             f"Preset '{config_name}': language={language}, model_path={model_dir}, "
             f"chunk_words={chunk_words}"
-            + (f", k-sweep {range_start}-{range_end} step {range_step}" if optimize_topics else "")
+            + (
+                f", k-sweep {range_start}-{range_end} step {range_step}"
+                if optimize_topics
+                else f", k={preset.get('num_topics', DEFAULT_NUM_TOPICS)} (pinned)"
+            )
             + " (explicit CLI flags override)"
         )
 
@@ -434,7 +443,11 @@ def main() -> int:
             )
 
         # Optimise num_topics if requested (DH best practice)
-        num_topics = args.num_topics if args.num_topics is not None else DEFAULT_NUM_TOPICS
+        num_topics = (
+            args.num_topics
+            if args.num_topics is not None
+            else preset.get("num_topics", DEFAULT_NUM_TOPICS)
+        )
         optimization_results = None
         if optimize_topics:
             logger.info(

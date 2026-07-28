@@ -148,6 +148,17 @@ correctly-transcribed African-language sources as garbage is worse than no metri
 **Topic modeling:** ~30 topics for ~12K documents; prioritise C_v coherence
 (≥ 0.5 is good); domain collocations are forced in `constants.py`.
 
+**C_v cannot choose k on the small subsets — do not let it.** On `references`
+a 3-seed sweep put every k from 12 to 32 within 0.014 mean C_v while a single
+k varied by up to 0.035 across seeds, so the ranking is pure noise: four
+successive re-fits picked 24, 16, 24 and 32, each time with a confident-looking
+"best k". k is therefore pinned in `CONFIG_PRESETS` (`num_topics`, per language
+via `language_overrides`) rather than swept, because k defines what
+`lda_topic_id` means and an auto-sweep renumbers every topic on each re-fit.
+Judge k by the multi-seed *stability* score (mean best-match Jaccard between
+seeds, `--stability-seeds`) and by documents-per-topic; it falls systematically
+as k rises where C_v does not. Re-check only if a corpus grows substantially.
+
 **Reproducibility:** fixed seed 42, parameters saved to `training_parameters.json`,
 coherence metrics recorded. Report-only analyses write to `analyses/output/`
 (gitignored) and never add Hub columns.

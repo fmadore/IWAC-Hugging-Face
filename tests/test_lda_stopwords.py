@@ -9,6 +9,7 @@ on a fragment survives. Get the order backwards and you either keep
 
 from lda_topic_modeling.constants import (
     ARTIFACT_LABEL_STOPWORDS,
+    CONFIG_PRESETS,
     DOMAIN_STOPWORDS,
     FRAGMENT_STOPWORDS,
     JUNK_COMPOUND_STOPWORDS,
@@ -152,3 +153,41 @@ class TestLabelNormalisation:
         # A component-wise veto is blunt: anything in here kills every
         # compound containing it, so it must hold only digitisation damage.
         assert ARTIFACT_LABEL_STOPWORDS.isdisjoint(FRAGMENT_STOPWORDS)
+
+
+class TestConfigPresets:
+    """Preset resolution for the per-language references models.
+
+    k is part of what lda_topic_id means, and model_path decides which model
+    a fit overwrites, so both must resolve correctly per language.
+    """
+
+    def _resolve(self, config: str, language: str | None = None) -> dict:
+        # Mirrors the resolution in lda_topic_modeling.main().
+        preset = CONFIG_PRESETS.get(config, {})
+        lang = language or preset.get("language", "Français")
+        return {**preset, **preset.get("language_overrides", {}).get(lang, {})}
+
+    def test_french_and_english_resolve_to_different_models(self):
+        fr = self._resolve("references")
+        en = self._resolve("references", "Anglais")
+        assert fr["model_path"] == "lda_model_references"
+        assert en["model_path"] == "lda_model_references_en"
+
+    def test_k_is_pinned_per_language(self):
+        assert self._resolve("references")["num_topics"] == 16
+        assert self._resolve("references", "Anglais")["num_topics"] == 8
+
+    def test_references_no_longer_sweeps_k_by_default(self):
+        # C_v cannot separate k on this corpus, and an auto-sweep renumbers
+        # every topic on each re-fit.
+        for lang in (None, "Anglais"):
+            assert not self._resolve("references", lang).get("optimize_topics", False)
+
+    def test_articles_k_does_not_ride_on_the_global_default(self):
+        assert CONFIG_PRESETS["articles"]["num_topics"] == 30
+
+    def test_overrides_do_not_mutate_the_base_preset(self):
+        self._resolve("references", "Anglais")
+        assert CONFIG_PRESETS["references"]["model_path"] == "lda_model_references"
+        assert CONFIG_PRESETS["references"]["num_topics"] == 16

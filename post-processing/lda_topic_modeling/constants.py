@@ -436,17 +436,27 @@ DEFAULT_HOLDOUT_FRACTION = 0.0
 # ── Per-config presets ─────────────────────────────────────────────
 # Recommended settings per subset, applied automatically when the
 # corresponding CLI flag is NOT given, so a plain
-#   lda_topic_modeling.py --config publications --mode fit -y
+#   lda_topic_modeling.py --config references --mode fit -y
 # runs the recommended recipe. Resolution order:
 #   explicit CLI > training_parameters.json (predict mode) > preset > defaults.
-# "optimize_topics" only kicks in when --num-topics is not given.
+#
+# "num_topics" pins k. That matters more than it looks: k is baked into the
+# meaning of the lda_topic_id column, so a preset that re-derives it lets an
+# ordinary re-fit silently renumber every topic in the dataset.
+# "optimize_topics" re-derives it on every fit and only kicks in when
+# --num-topics is not given; --optimize-topics still forces a sweep.
+#
+# "language_overrides" lets one config serve several languages from separate
+# models, keyed by the resolved language and merged over the base preset.
+# Without it the English references pass had to carry --model-path by hand,
+# and forgetting it overwrote the French model.
 CONFIG_PRESETS: dict[str, dict] = {
     "articles": {
-        # Whole-document model (press articles are short); k=30 chosen
-        # by an earlier sweep — no auto-optimize to protect the existing
-        # column semantics on re-predict runs.
+        # Whole-document model (press articles are short). k pinned, not
+        # swept, to protect the existing column semantics on re-fit.
         "model_path": "lda_model",
         "language": "Français",
+        "num_topics": 30,
     },
     "publications": {
         # Full periodical issues are long: chunked training/prediction.
@@ -457,12 +467,30 @@ CONFIG_PRESETS: dict[str, dict] = {
         "optimize_topics": True,
     },
     "references": {
-        # Scholarly texts (French model; run the English pass with
-        # --language Anglais --model-path lda_model_references_en).
+        # Scholarly texts, one model per language.
+        #
+        # k is pinned rather than swept because on corpora this small C_v
+        # cannot choose it. A 3-seed sweep put every k from 12 to 32 inside
+        # 0.014 mean C_v while a single k varied by up to 0.035 across seeds
+        # — the ranking is noise, and four successive re-fits duly picked
+        # 24, 16, 24 and 32. What does vary systematically is topic
+        # stability (mean best-match Jaccard between seeds), which falls as
+        # k rises: 0.395 at k=8 against 0.274 at k=16 in the English model.
+        # These values trade that stability off against granularity, giving
+        # both models ~16 labelled documents per topic (280/16 and 123/8).
+        # Re-check with --optimize-topics --stability-seeds 3 if the corpus
+        # grows substantially; judge by stability, not by C_v.
         "model_path": "lda_model_references",
         "chunk_words": 1000,
         "language": "Français",
-        "topic_range": (8, 24, 4),
-        "optimize_topics": True,
+        "num_topics": 16,
+        "topic_range": (12, 32, 4),
+        "language_overrides": {
+            "Anglais": {
+                "model_path": "lda_model_references_en",
+                "num_topics": 8,
+                "topic_range": (8, 24, 4),
+            },
+        },
     },
 }
