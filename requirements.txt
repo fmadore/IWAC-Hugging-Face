@@ -13,6 +13,11 @@ spacy<4
 textstat
 google-genai
 pillow<12  # semantic_embedding_images.py (image downscaling before embedding)
+# calculate_hijri_dates.py — Umm al-Qura conversion. The same converter (and so
+# the same buckets) as IwacVisualizations' generate_on_this_day.py; ICU/Intl
+# disagrees with it on 75% of the collection's pre-2000 dates, which is why the
+# lunar date is computed once in the pipeline rather than in each consumer.
+hijridate
 # Topic modeling (LDA)
 gensim<5
 numpy<2.4

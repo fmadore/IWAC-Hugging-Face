@@ -52,6 +52,19 @@ uniform across every script since the Tier D CLI unification, `lemmatize`
 included (its `--mode all|empty` still works but is the legacy alias). A method
 change without a re-run leaves the old values in place, silently.
 
+**The Hijri converter is a compatibility contract, not an implementation
+detail.** `calculate_hijri_dates.py` uses `hijridate` (Umm al-Qura) because
+IwacVisualizations' `generate_on_this_day.py` does, and measured on the live
+`articles` subset the ICU tables behind a browser's or Node's `Intl` disagree
+with it on **75 % of pre-2000 dates** (2,365 of 3,152) and on none from 2000 on.
+That is the reason the lunar date is a stored column rather than something each
+consumer derives: the website's day buckets, the MCP server's lunar tools and
+any notebook now agree by construction. Swapping the converter would silently
+re-file thousands of 1960s–90s items. Only 0.86 % of articles change lunar
+*month*, so month-level aggregates are robust either way — day-level ones are
+not. Not computed for `references`: an academic imprint date has no meaningful
+lunar reading.
+
 **Pushes to one repo must be sequential.** `push_to_hub` rewrites the whole
 config and the shared README metadata. Two scripts pushing concurrently — even to
 different subsets — will clobber each other's columns via lost update. Finish one
