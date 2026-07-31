@@ -32,23 +32,30 @@ class TestTopicSentimentHelpers:
         assert ts.slug("Très négatif") == "tres_negatif"
         assert ts.slug("Plutôt Objectif") == "plutot_objectif"
 
+    # Column names come from the live panel (iwac_common.sentiment_panel), so
+    # these stay correct when the panel is rotated or resized. Votes are built
+    # from the panel size rather than hardcoded, because the majority threshold
+    # is now "> half the voters" rather than a fixed 2.
     def test_consensus_label_majority(self):
-        df = pd.DataFrame({
-            "gemini_polarite": ["Négatif", "Positif"],
-            "chatgpt_polarite": ["Négatif", "Neutre"],
-            "mistral_polarite": ["Positif", "Neutre"],
-        })
-        out = ts.consensus_label_series(df, ts.POLARITY_COLS)
-        assert out.iloc[0] == "Négatif"   # 2/3
-        assert out.iloc[1] == "Neutre"    # 2/3
+        cols = ts.POLARITY_COLS
+        n_majority = len(cols) // 2 + 1
+        votes = ["Négatif"] * n_majority + ["Positif"] * (len(cols) - n_majority)
+        df = pd.DataFrame([votes], columns=cols)
+        assert ts.consensus_label_series(df, cols).iloc[0] == "Négatif"
 
     def test_consensus_label_no_majority(self):
-        df = pd.DataFrame({
-            "gemini_polarite": ["Négatif"],
-            "chatgpt_polarite": ["Positif"],
-            "mistral_polarite": ["Neutre"],
-        })
-        assert ts.consensus_label_series(df, ts.POLARITY_COLS).iloc[0] == ""
+        cols = ts.POLARITY_COLS
+        # Spread votes across distinct labels so no label clears half.
+        labels = list(ts.POLARITY_ORDER)
+        votes = [labels[i % len(labels)] for i in range(len(cols))]
+        df = pd.DataFrame([votes], columns=cols)
+        assert ts.consensus_label_series(df, cols).iloc[0] == ""
+
+    def test_consensus_label_needs_two_voters(self):
+        cols = ts.POLARITY_COLS
+        votes = ["Négatif"] + [None] * (len(cols) - 1)
+        df = pd.DataFrame([votes], columns=cols)
+        assert ts.consensus_label_series(df, cols).iloc[0] == ""
 
     def test_polarity_ordinal_maps(self):
         s = ts.polarity_ordinal(pd.Series(list(ts.POLARITY_ORDER)))

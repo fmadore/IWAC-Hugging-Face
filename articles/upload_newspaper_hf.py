@@ -39,6 +39,12 @@ from iwac_common.field_mappers import (
     is_content_public,
     to_int_or_none,
 )
+from iwac_common.sentiment_panel import (
+    DIMENSION_FIELDS,
+    LEGACY_VENDOR_COLUMNS,
+    active_models,
+    prefixes,
+)
 from iwac_common.upload_runner import UploadSpec, run_upload
 
 load_dotenv()
@@ -154,25 +160,22 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
     }
 
 
-# (gemini, chatgpt, mistral) × (centralite, polarite, subjectivite) sentiment
-# fields. Mistral stores ``subjectivite_score`` as a resource:item rather than
-# a numeric @value, so it goes through ``_get_subjectivity_score``.
-_SENTIMENT_MODELS = (
-    ("gemini", "iwac:gemini"),
-    ("chatgpt", "iwac:chatgpt"),
-    ("mistral", "iwac:mistral"),
-)
-
-
 def _sentiment_columns(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Read the panel's sentiment values off an Omeka item.
+
+    Only ``active_models()`` are read: a frozen model's Omeka properties no
+    longer exist, and its Hub columns survive because ``hub_merge`` preserves
+    columns this mapper does not produce.
+    """
     cols: Dict[str, Any] = {}
-    for prefix, omeka_prefix in _SENTIMENT_MODELS:
-        cols[f"{prefix}_centralite_islam_musulmans"] = get_value(item, f"{omeka_prefix}Centralite")
-        cols[f"{prefix}_centralite_justification"] = get_value(item, f"{omeka_prefix}CentraliteJustification")
-        cols[f"{prefix}_polarite"] = get_value(item, f"{omeka_prefix}Polarite")
-        cols[f"{prefix}_polarite_justification"] = get_value(item, f"{omeka_prefix}PolariteJustification")
-        cols[f"{prefix}_subjectivite_score"] = _get_subjectivity_score(item, f"{omeka_prefix}SubjectiviteScore")
-        cols[f"{prefix}_subjectivite_justification"] = get_value(item, f"{omeka_prefix}SubjectiviteJustification")
+    for model in active_models():
+        for suffix, omeka_suffix in DIMENSION_FIELDS:
+            prop = model.omeka_property(omeka_suffix)
+            # subjectivite_score is a resource:item link, not a numeric literal.
+            if suffix == "subjectivite_score":
+                cols[model.column(suffix)] = _get_subjectivity_score(item, prop)
+            else:
+                cols[model.column(suffix)] = get_value(item, prop)
     return cols
 
 
@@ -181,8 +184,12 @@ def _sentiment_columns(item: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _sentiment_columns_last(final_df: pd.DataFrame) -> pd.DataFrame:
-    """Keep the AI sentiment block as the trailing columns."""
-    sentiment_prefixes = ("gemini_", "chatgpt_", "mistral_")
+    """Keep the AI sentiment block as the trailing columns.
+
+    Uses the full panel, not just the active models, so frozen columns stay
+    grouped with the live ones instead of drifting into the metadata block.
+    """
+    sentiment_prefixes = tuple(f"{p}_" for p in prefixes())
     sentiment_cols = [c for c in final_df.columns if c.startswith(sentiment_prefixes)]
     other_cols = [c for c in final_df.columns if not c.startswith(sentiment_prefixes)]
     return final_df[other_cols + sentiment_cols]
@@ -197,10 +204,9 @@ SPEC = UploadSpec(
     description="Publie les articles de journaux IWAC sur le Hub HF",
     int_columns=(
         "nb_pages",
-        "gemini_subjectivite_score",
-        "chatgpt_subjectivite_score",
-        "mistral_subjectivite_score",
+        *(f"{p}_subjectivite_score" for p in prefixes()),
     ),
+    columns_to_exclude=LEGACY_VENDOR_COLUMNS,
     post_merge=_sentiment_columns_last,
 )
 

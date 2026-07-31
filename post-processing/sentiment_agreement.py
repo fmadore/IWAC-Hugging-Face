@@ -3,9 +3,11 @@
 sentiment_agreement.py
 ======================
 
-Inter-model agreement analysis for the three AI sentiment annotators
-(Gemini, ChatGPT, Mistral) on the `articles` subset, plus optional
-consensus columns pushed back to the Hub.
+Inter-model agreement analysis for the AI sentiment annotator panel on the
+`articles` subset, plus optional consensus columns pushed back to the Hub.
+
+The panel is defined once in ``iwac_common.sentiment_panel``; this script
+adapts to its size, so adding or retiring a model needs no edit here.
 
 The three dimensions are ordinal 5-point scales:
 
@@ -17,12 +19,13 @@ The three dimensions are ordinal 5-point scales:
 
 Metrics reported per dimension:
 - Pairwise Cohen's kappa (unweighted + quadratic-weighted)
-- Krippendorff's alpha (nominal + interval), 3 raters, missing-tolerant
-- Exact agreement rates (all three / pairwise)
+- Krippendorff's alpha (nominal + interval), N raters, missing-tolerant
+- Exact agreement rates (unanimous / pairwise)
 
 Columns added with --push:
-- consensus_polarite            majority label (>= 2 models), else ""
-- consensus_centralite          majority label (>= 2 models), else ""
+- consensus_polarite            strict-majority label (> half the models that
+                                voted, min 2 voters), else ""
+- consensus_centralite          strict-majority label, same rule
 - consensus_subjectivite_score  median of available scores (float; with
                                 exactly two raters the median is their mean,
                                 so .5 values appear by design)
@@ -55,6 +58,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import REPO_ROOT, ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
+from iwac_common.sentiment_panel import PANEL  # noqa: E402
 
 from rich import box
 from rich.console import Console
@@ -63,7 +67,13 @@ from rich.table import Table
 
 console = Console()
 
-MODELS = ["gemini", "chatgpt", "mistral"]
+#: Column prefixes of the annotator panel, in report order. Model-keyed, so a
+#: rotation shows up here as a new prefix rather than a silent change of what
+#: an existing one means. ``topic_sentiment`` imports this list.
+MODELS = [m.prefix for m in PANEL]
+
+#: prefix -> human-readable model name, for report headers.
+MODEL_LABELS = {m.prefix: m.label for m in PANEL}
 
 POLARITY_ORDER = {
     "Très négatif": 1,
@@ -207,11 +217,19 @@ def label_votes(row: pd.Series, cols: List[str]) -> List[str]:
 
 
 def majority(votes: List[str]) -> str:
-    """Label shared by >= 2 voters, else ''."""
-    if not votes:
+    """Label held by a strict majority of the models that actually voted, else ''.
+
+    The threshold is derived from the number of votes cast, not hardcoded: with
+    three raters it is the historical ">= 2", but on a five- or six-model panel
+    a hardcoded 2 would call 2-of-6 a consensus. Ties therefore return '' and
+    the row is flagged in ``sentiment_disagreement``.
+    """
+    if len(votes) < 2:
+        # A lone surviving rater is not a consensus (matches the pre-2026-07
+        # ">= 2" rule, which also rejected the single-vote case).
         return ""
     label, count = Counter(votes).most_common(1)[0]
-    return label if count >= 2 else ""
+    return label if count > len(votes) / 2 else ""
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +239,7 @@ def majority(votes: List[str]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Inter-model sentiment agreement (Gemini/ChatGPT/Mistral) + consensus columns. "
+        description="Inter-model sentiment agreement across the annotator panel + consensus columns. "
                     "Report-only by default (nothing is written); pass --push to add the "
                     "consensus/disagreement columns and push them to the Hub."
     )
@@ -239,7 +257,7 @@ def main() -> None:
 
     console.print(Panel.fit(
         "[bold cyan]AI Sentiment Inter-Model Agreement[/bold cyan]\n"
-        f"[dim]{' vs '.join(m.capitalize() for m in MODELS)} — "
+        f"[dim]{' vs '.join(MODEL_LABELS[m] for m in MODELS)} — "
         f"{args.repo} ({args.config})[/dim]",
         border_style="cyan",
     ))

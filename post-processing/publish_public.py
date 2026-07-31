@@ -67,6 +67,7 @@ from iwac_common.repos import (  # noqa: E402
     PUBLIC_COLUMNS_FILE,
     load_public_columns,
 )
+from iwac_common.sentiment_panel import all_justification_columns  # noqa: E402
 
 from dotenv import load_dotenv
 from pathlib import Path
@@ -95,15 +96,10 @@ PUBLIC_TEXT_ALLOWLIST = {
     "abstract",
     "Description",
     "lda_topic_label",
-    "gemini_centralite_justification",
-    "gemini_polarite_justification",
-    "gemini_subjectivite_justification",
-    "chatgpt_centralite_justification",
-    "chatgpt_polarite_justification",
-    "chatgpt_subjectivite_justification",
-    "mistral_centralite_justification",
-    "mistral_polarite_justification",
-    "mistral_subjectivite_justification",
+    # Sentiment justifications, for every panel member including frozen ones.
+    # Derived rather than listed so rotating the panel cannot leave a new
+    # model's justifications tripping the prose guard.
+    *all_justification_columns(),
 }
 
 # Heuristic thresholds for "this looks like full text": mean length of

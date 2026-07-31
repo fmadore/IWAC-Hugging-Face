@@ -64,6 +64,64 @@ class TestComputedColumnPreservation:
         assert out.loc[out["o:id"] == "4", "embedding_OCR"].isna().all()
 
 
+class TestSentimentColumnRename:
+    """The 2026-07 vendor→model rename of the sentiment columns.
+
+    The rename only works because the mapper emits the NEW names while the OLD
+    ones are passed as ``columns_to_exclude``. Without the exclusion the merge
+    would preserve the old names as Hub-only columns and the dataset would carry
+    both sets; with it, the rename happens in place.
+    """
+
+    # Names come from the live panel, so a future rotation cannot leave this
+    # test asserting against a column prefix that no longer exists.
+    LEGACY_COL = "gemini_polarite"
+
+    @staticmethod
+    def _current_col():
+        from iwac_common.sentiment_panel import PANEL
+
+        return PANEL[0].column("polarite")
+
+    def _hub_with_legacy(self):
+        df = _existing()
+        df[self.LEGACY_COL] = ["Neutre"] * 4
+        df["embedding_OCR"] = [[0.1] * 3] * 4
+        return df
+
+    def _new_with_renamed(self):
+        df = _new()
+        df[self._current_col()] = ["Neutre"] * 4
+        return df
+
+    def test_legacy_column_dropped_when_excluded(self, hub):
+        hub(self._hub_with_legacy())
+        out = merge_with_hub_dataset(
+            self._new_with_renamed(), "repo", "articles",
+            columns_to_exclude=[self.LEGACY_COL],
+        )
+        assert self.LEGACY_COL not in out.columns
+        assert self._current_col() in out.columns
+        # Genuinely computed columns are still preserved.
+        assert "embedding_OCR" in out.columns
+
+    def test_without_exclusion_both_names_survive(self, hub):
+        """Guards the failure mode: forgetting columns_to_exclude duplicates."""
+        hub(self._hub_with_legacy())
+        out = merge_with_hub_dataset(self._new_with_renamed(), "repo", "articles")
+        assert self.LEGACY_COL in out.columns
+        assert self._current_col() in out.columns
+
+    def test_panel_columns_match_uploader_spec(self):
+        """The uploader's exclusion list must be exactly the pre-rename names."""
+        from iwac_common.sentiment_panel import LEGACY_VENDOR_COLUMNS, all_columns
+
+        assert len(LEGACY_VENDOR_COLUMNS) == 18
+        # No overlap: an old name that is also a new name would be dropped and
+        # re-added in the same merge, which is not a rename.
+        assert not set(LEGACY_VENDOR_COLUMNS) & set(all_columns())
+
+
 class TestShrinkGuard:
     def test_truncated_fetch_raises(self, hub):
         hub(_existing(100))

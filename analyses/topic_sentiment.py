@@ -6,7 +6,8 @@ topic_sentiment.py
 Which LDA topics attract which AI sentiment — overall, by country, and
 over time — on the `articles` subset.
 
-Per-row sentiment is the 3-model consensus (Gemini / ChatGPT / Mistral),
+Per-row sentiment is the consensus of the annotator panel defined in
+``iwac_common.sentiment_panel``,
 mirroring ``post-processing/sentiment_agreement.py``:
 
 - polarité / centralité : majority label (>= 2 identical votes), else no
@@ -86,10 +87,12 @@ def slug(label: str) -> str:
 
 
 def consensus_label_series(df: pd.DataFrame, cols: List[str]) -> pd.Series:
-    """Majority label (>= 2 identical votes) per row across model columns.
+    """Strict-majority label per row across model columns.
 
-    Non-empty strings (including 'Non applicable') count as votes,
-    mirroring sentiment_agreement.py. Returns '' when there is no majority.
+    Non-empty strings (including 'Non applicable') count as votes, mirroring
+    sentiment_agreement.py — whose ``majority`` this delegates to, so the
+    threshold scales with the panel size. Returns '' when no label is held by
+    more than half the models that voted.
     """
     present = [c for c in cols if c in df.columns]
 
@@ -209,7 +212,7 @@ def resolve_consensus(df: pd.DataFrame) -> pd.DataFrame:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Topic x sentiment analysis (consensus of Gemini/ChatGPT/Mistral). Report-only."
+        description="Topic x sentiment analysis (consensus of the annotator panel). Report-only."
     )
     parser.add_argument("--repo", default=PRIVATE_REPO_ID)
     parser.add_argument("--config", default="articles",
