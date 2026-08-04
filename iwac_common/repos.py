@@ -32,8 +32,11 @@ PRIVATE_REPO_ID = os.getenv("IWAC_HF_PRIVATE_REPO", "fmadore/islam-west-africa-c
 CONTENT_COLUMNS = {
     "articles": ["OCR", "lemma_text", "lemma_nostop"],
     "publications": ["OCR", "lemma_text", "lemma_nostop"],
-    "documents": ["OCR"],
+    "documents": ["OCR", "lemma_text", "lemma_nostop"],
     "references": ["OCR", "lemma_text", "lemma_nostop"],
+    # audiovisual has no lemmas on purpose: only 5 of 47 rows carry a
+    # transcription and 3 of those are Haoussa/Arabe, which a French spaCy
+    # pipeline would lemmatise into noise.
     "audiovisual": ["OCR"],
 }
 

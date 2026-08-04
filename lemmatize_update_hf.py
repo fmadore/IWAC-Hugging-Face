@@ -310,7 +310,11 @@ def lemmatise_dataset(
 
 # Subsets that carry an OCR text column worth lemmatising. Passing --config
 # with another subset still works; this list only drives the interactive menu.
-LEMMATIZABLE_SUBSETS = ["articles", "publications", "references"]
+#
+# 'audiovisual' is deliberately absent: only 5 of its 47 rows carry a
+# transcription and 3 of those are Haoussa/Arabe, so a French pipeline would
+# lemmatise mostly noise for the sake of two French rows.
+LEMMATIZABLE_SUBSETS = ["articles", "publications", "references", "documents"]
 
 # Default spaCy model per --language label (CPU-friendly large models).
 LANGUAGE_MODEL_DEFAULTS = {

@@ -124,6 +124,8 @@
     "rights",
     "OCR",
     "nb_mots",
+    "lemma_text",
+    "lemma_nostop",
     "OCR_is_public"
   ],
   "images": [
