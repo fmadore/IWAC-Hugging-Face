@@ -55,11 +55,11 @@ That last clause is the reason this has its own section. Flipping the public
 dataset private is the emergency lever if a leak is ever found; minting removes
 it permanently. So the order is fixed:
 
-1. Run `post-processing/verify_public_masking.py` against the live public repo.
-   It reads every content subset and fails if any row flagged
-   `OCR_is_public = false` still carries `OCR` / `lemma_text` / `lemma_nostop`.
-   The `publish_public.py` guards check what gets *written*; this checks what is
-   already *there*.
+1. Check the published projection first: load each content subset from the
+   public repo and confirm no row flagged `OCR_is_public = false` still carries
+   `OCR` / `lemma_text` / `lemma_nostop`. The `publish_public.py` guards cover
+   what gets *written* and say nothing about what is already *there*. Verified
+   clean on 2026-08-05: 14,797 rows, 5,914 source-private, none leaking.
 2. Only then mint, and only on `fmadore/islam-west-africa-collection`.
 
 **Mint at deliberate release points, not on every pipeline push.** The Hub has
