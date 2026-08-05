@@ -1,18 +1,20 @@
 # Major-version caps protect against silent breaks on upgrades.
 # Lower bounds intentionally absent to keep existing installs working.
+# Caps last raised 2026-08-05, after a clean-venv install of the newest release
+# of every entry below passed the full suite (201 tests) on Python 3.12.
 aiohttp<4
 aiofiles
 python-dotenv<2
-rich<14
+rich<16
 tqdm<5
-pandas<3
+pandas<4
 pyarrow
-datasets<5
-huggingface_hub[hf_xet]<1
+datasets<6
+huggingface_hub[hf_xet]<2
 spacy<4
 textstat
 google-genai
-pillow<12  # semantic_embedding_images.py (image downscaling before embedding)
+pillow<13  # semantic_embedding_images.py (image downscaling before embedding)
 # calculate_hijri_dates.py — Umm al-Qura conversion. The same converter (and so
 # the same buckets) as IwacVisualizations' generate_on_this_day.py; ICU/Intl
 # disagrees with it on 75% of the collection's pre-2000 dates, which is why the
@@ -20,4 +22,8 @@ pillow<12  # semantic_embedding_images.py (image downscaling before embedding)
 hijridate
 # Topic modeling (LDA)
 gensim<5
-numpy<2.4
+# numpy keeps a MINOR cap where everything else here gets a major one: gensim and
+# scipy bind to its C ABI and have broken on numpy minor releases before. 2.5.x
+# is the line the suite was verified against — raise it deliberately, after a
+# test run, not reflexively. Note that numpy 2.5 requires Python >= 3.12.
+numpy<2.6
