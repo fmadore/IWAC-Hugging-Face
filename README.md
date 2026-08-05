@@ -2,11 +2,12 @@
 
 Python pipeline that mirrors the [Islam West Africa Collection](https://islam.zmo.de/s/westafrica/) (IWAC) from its Omeka S archive into versioned [Hugging Face](https://huggingface.co/datasets/fmadore/islam-west-africa-collection) datasets.
 
-[![Islam West Africa Collection](https://img.shields.io/badge/Collection-IWAC-blue)](https://islam.zmo.de/s/westafrica/)
-[![Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset-yellow)](https://huggingface.co/datasets/fmadore/islam-west-africa-collection)
-[![Dataset DOI](https://img.shields.io/badge/DOI-10.57967%2Fhf%2F9857-blue)](https://doi.org/10.57967/hf/9857)
-[![Software DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21805704.svg)](https://doi.org/10.5281/zenodo.21805704)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Collection: IWAC](https://img.shields.io/badge/Collection-IWAC-1f6feb?style=flat-square)](https://islam.zmo.de/s/westafrica/)
+[![Hugging Face dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset-ffd21e?style=flat-square&labelColor=555)](https://huggingface.co/datasets/fmadore/islam-west-africa-collection)
+[![License: MIT](https://img.shields.io/badge/License-MIT-3fb950?style=flat-square)](LICENSE)
+
+[![Dataset DOI](https://img.shields.io/badge/Dataset%20DOI-10.57967%2Fhf%2F9857-0a7bbb?style=flat-square)](https://doi.org/10.57967/hf/9857)
+[![Software DOI](https://img.shields.io/badge/Software%20DOI-10.5281%2Fzenodo.21805704-0a7bbb?style=flat-square)](https://doi.org/10.5281/zenodo.21805704)
 
 ## Context
 
