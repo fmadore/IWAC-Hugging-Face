@@ -1,0 +1,179 @@
+# IWAC Hugging Face Pipeline
+
+Python pipeline that mirrors the [Islam West Africa Collection](https://islam.zmo.de/s/westafrica/) (IWAC) from its Omeka S archive into versioned [Hugging Face](https://huggingface.co/datasets/fmadore/islam-west-africa-collection) datasets.
+
+[![Islam West Africa Collection](https://img.shields.io/badge/Collection-IWAC-blue)](https://islam.zmo.de/s/westafrica/)
+[![Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset-yellow)](https://huggingface.co/datasets/fmadore/islam-west-africa-collection)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+## Context
+
+The [Islam West Africa Collection](https://islam.zmo.de/s/westafrica/) is an open-access digital database documenting Islam and Muslim communities in Benin, Burkina Faso, Côte d'Ivoire, Niger, Nigeria, and Togo since the 1960s. Created by [Frédérick Madore](https://www.frederickmadore.com/) and hosted at the Leibniz-Zentrum Moderner Orient (ZMO) in Berlin, it holds over 14,500 items curated in [Omeka S](https://omeka.org/s/).
+
+Omeka S is built for curation and public access, not for analysis. This pipeline turns the archive into something a researcher can actually compute over: it reads the Omeka S REST API, flattens each resource class into a tabular subset, enriches it with columns that do not exist in the source — semantic embeddings, lemmatised text, topic assignments, lexical metrics, Islamic-calendar dates, a multi-model sentiment panel — and publishes the result as a Hugging Face dataset that can be loaded in one line.
+
+It is the data layer behind the collection's [visualisations](https://github.com/fmadore/IwacVisualizations) and its MCP server, and a companion to [iwac-ai-pipelines](https://github.com/fmadore/iwac-ai-pipelines), which handles the LLM-assisted curation happening upstream inside Omeka S.
+
+## The two-repo split
+
+Much of the collection's full text is **private on the Omeka S source** — rights-restricted newspaper scans, for instance — while a large share is public. The dataset is therefore split across two Hub repos:
+
+| Repo | Visibility | Role |
+|------|-----------|------|
+| [`fmadore/islam-west-africa-collection-full`](https://huggingface.co/datasets/fmadore/islam-west-africa-collection-full) | Private | Complete superset, full text for all rows. The canonical target of **every** upload and post-processing script. |
+| [`fmadore/islam-west-africa-collection`](https://huggingface.co/datasets/fmadore/islam-west-africa-collection) | Public | The citable projection. Written **only** by `post-processing/publish_public.py`. |
+
+The projection **masks full text per row rather than stripping it wholesale**. `OCR`, `lemma_text`, and `lemma_nostop` survive wherever `OCR_is_public` is true — a flag derived from the per-value `is_public` attribute on Omeka's `bibo:content` field. Roughly 61% of articles, 89% of publications, 25 of 26 documents, and 7 of 867 references keep their text in public. Everything that cannot reconstruct the source — embeddings, topics, sentiment and its justifications, `descriptionAI`, lexical metrics — is always projected.
+
+Because a leak here would be unrecoverable, `publish_public.py` aborts rather than guessing: if a content subset lacks `OCR_is_public`, or if any column is absent from the per-subset allowlist in [`iwac_common/public_columns.json`](iwac_common/public_columns.json). Adding a legitimately new column means editing that allowlist deliberately.
+
+The uploads carry equivalent rails. `hub_merge` refuses a frame under 95% of the Hub's current row count; `fetch_items` raises on a short read against the `Omeka-S-Total-Results` header; and a mass media-lookup failure aborts, because the other guards check row *count* and an unreachable host would otherwise overwrite good URLs with blanks while the row count held steady.
+
+## Dataset subsets
+
+Seven subsets, each mapped from an Omeka S resource class:
+
+| Subset | Contents |
+|--------|----------|
+| `articles` | Newspaper articles — the analytical core of the collection |
+| `publications` | Islamic periodicals and their issues |
+| `documents` | Archival and institutional documents |
+| `references` | Scholarly references (books, chapters, journal articles) |
+| `index` | Authority records: persons, places, organisations, events |
+| `audiovisual` | Audio and video records with transcriptions where available |
+| `images` | Fieldwork photographs |
+
+Content subsets join to `index` authority records, which is what makes entity-level analysis possible across the corpus.
+
+```python
+from datasets import load_dataset
+
+articles = load_dataset("fmadore/islam-west-africa-collection", name="articles", split="train")
+```
+
+## What the pipeline computes
+
+| Stage | Script | Output |
+|-------|--------|--------|
+| Semantic embeddings | `post-processing/semantic_embedding.py` | Gemini embeddings over full text, chunked and averaged for long documents |
+| Image embeddings | `post-processing/semantic_embedding_images.py` | Embeddings over downscaled images |
+| Lemmatisation | `lemmatize_update_hf.py` | spaCy lemmas, with and without stopwords, per language |
+| Topic modeling | `post-processing/lda_topic_modeling/` | LDA topic id, probability, label, and top-k terms |
+| Lexical metrics | `post-processing/calculate_lexical_richness.py`, `calculate_word_count.py` | Word count, lexical richness, readability |
+| Islamic calendar | `post-processing/calculate_hijri_dates.py` | Hijri year, month, and day (Umm al-Qura) |
+| Sentiment panel | `iwac_common/sentiment_panel.py` | Centrality, polarity, and subjectivity of Islam/Muslim representation, plus justifications, from three models |
+| Related items | `post-processing/related_articles.py` | Nearest neighbours by embedding |
+| Model agreement | `post-processing/sentiment_agreement.py` | Inter-model agreement across the sentiment panel |
+
+The sentiment panel runs `gemini-3-flash-preview`, `gpt-5-mini`, and `ministral-14b-2512`, each writing columns keyed by its exact model id so that no two generations of a model can collide in the same column.
+
+## Repository layout
+
+```
+articles/  audiovisual/  document/  images/       Upload scripts, one per subset:
+index/     islamic-publications/  reference/      Omeka S -> Hugging Face
+
+iwac_common/        Shared infrastructure: Omeka client, Hub merge, field
+                    mappers, upload runner, sentiment panel, repo config
+post-processing/    Computed columns + publish_public.py
+analyses/           Report-only analyses; write to analyses/output/, never
+                    add Hub columns
+tests/              Unit tests and import smoke tests (run in CI)
+data/               fetch_datasets.py — local CSV mirrors for offline work
+```
+
+## Installation
+
+Requires **Python >= 3.10** (CI runs 3.11). Development is CPU-only throughout; the pipeline deliberately prefers CPU-viable models such as spaCy's `*_lg` pipelines over transformer equivalents.
+
+```bash
+git clone https://github.com/fmadore/IWAC-Hugging-Face.git
+cd IWAC-Hugging-Face
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\pip install -e . --no-deps
+cp .env.example .env
+```
+
+The editable install makes `iwac_common` and `country_mapper` importable from any working directory; the scripts keep `sys.path` fallbacks so they still run in an uninstalled venv.
+
+The lemmatisation step additionally needs spaCy models:
+
+```bash
+.venv\Scripts\python -m spacy download fr_core_news_lg
+.venv\Scripts\python -m spacy download en_core_web_lg
+```
+
+## Configuration
+
+Copy `.env.example` to `.env` and fill in `OMEKA_BASE_URL`, `OMEKA_KEY_IDENTITY`, `OMEKA_KEY_CREDENTIAL`, `HF_TOKEN`, and — for the embedding scripts — `GOOGLE_API_KEY`.
+
+Set `IWAC_HF_PRIVATE_REPO` and `IWAC_HF_PUBLIC_REPO` to redirect the pipeline at a scratch dataset. Do this before running anything that writes to the Hub for the first time.
+
+## Usage
+
+```bash
+.venv\Scripts\python script_name.py
+```
+
+The flow runs in three stages, in order:
+
+```bash
+# 1. Upload — fetch from Omeka S, merge into the private repo
+.venv\Scripts\python articles/upload_newspaper_hf.py
+
+# 2. Post-process — compute derived columns on the private repo
+.venv\Scripts\python post-processing/calculate_word_count.py --update-mode empty
+
+# 3. Publish — project the private repo into the public one
+.venv\Scripts\python post-processing/publish_public.py
+```
+
+Two properties of this flow are easy to get wrong:
+
+**Pushes to one repo must be sequential.** `push_to_hub` rewrites the whole dataset config and the shared README metadata, so two scripts pushing concurrently will clobber each other's columns through a lost update — even when they target different subsets. Finish one before starting the next.
+
+**Uploads merge rather than overwrite.** Each upload fetches from Omeka, loads the existing Hub rows, identifies columns that exist only on the Hub, and merges them back on `o:id`. That is what keeps embeddings and topics alive across a re-upload rather than blanking them.
+
+Post-processing scripts share a `--update-mode` flag: `empty` fills only missing values (the cheap default for incremental runs), `all` recomputes every row. **Changing a computation does nothing to published data until you re-run its script with `--update-mode all`** — a method change without a re-run silently leaves the old values in place.
+
+## Reproducibility
+
+Topic models use a fixed seed (42), write their parameters to `training_parameters.json`, and record coherence metrics alongside the model. Omeka responses are cached in `.cache_omk*` for 24 hours. Lemma and embedding resume caches are fingerprinted by the configuration that produced them — spaCy model plus `LEMMA_LOGIC_VERSION`, embedding model plus dimension and task — so a cache written under a different configuration is ignored rather than silently mixed in. These caches are deleted on a successful push, which means a leftover cache file is a reliable signal of an interrupted run.
+
+CI runs the test suite on every push, plus `pyflakes` specifically for undefined names: the import smoke tests only import each module, so a name used inside `main()` but never imported would otherwise pass tests and fail at runtime.
+
+## Limitations and caveats
+
+**The public dataset is not a complete corpus.** Full text is masked per row by the access status of the source item, so any analysis run against the public repo covers a subset of the material — one that is not random, since access status correlates with publisher and period. Results computed on the public projection can differ from the same analysis on the private mirror. Derived columns (embeddings, topics, sentiment, metrics) are complete for all rows either way, because they were computed before masking.
+
+**LLM sentiment is non-deterministic and opaque.** The same text sent twice may score differently, and the models' reasoning cannot be traced. This is why sentiment runs as a three-model panel with a published agreement measure and per-model justification columns, rather than as a single score presented as ground truth. Treat disagreement as information about the item, not as noise to be averaged away.
+
+**Metrics keyed to a French or English lexicon mis-score the collection's own material.** Readability and lexical-richness measures have no valid reading for the Ewé, Kabiyè, and Dendi items. Those are scored null rather than low: a metric that ranks correctly transcribed African-language sources as garbage is worse than no metric.
+
+**The number of topics is pinned, not swept.** On the smaller subsets, C_v coherence cannot choose *k* — a three-seed sweep on `references` placed every *k* from 12 to 32 within 0.014 mean C_v while a single *k* varied by up to 0.035 across seeds, so successive re-fits each produced a confident-looking but different "best k". Because *k* defines what `lda_topic_id` means, an auto-sweep would renumber every topic on each re-fit. *k* is therefore fixed per language in `CONFIG_PRESETS` and judged by multi-seed stability and documents-per-topic instead.
+
+**The Hijri converter is a compatibility contract.** `calculate_hijri_dates.py` uses `hijridate` (Umm al-Qura) because the collection's visualisation pipeline does. Measured on the live `articles` subset, the ICU tables behind a browser's or Node's `Intl` disagree with it on 75% of pre-2000 dates and none from 2000 onward. Storing the lunar date as a column rather than deriving it per consumer is what keeps the website, the MCP server, and any notebook in agreement. Day-level lunar aggregates are sensitive to this choice; month-level ones are robust, as only 0.86% of articles shift lunar month.
+
+**Topic-model stopwords are a scholarly choice, not cleanup.** Islamic organisations, religious events, figures, and titles are the object of study and must survive into topic labels. The stopword tiers in `lda_topic_modeling/constants.py` are ordered so that a fragment like `al` is filtered when it stands alone but preserved inside `al_azhar` or `dar_al_hadith`. Adding a stopword changes what the models mean and only takes effect on a re-fit.
+
+## Related repositories
+
+- [iwac-ai-pipelines](https://github.com/fmadore/iwac-ai-pipelines) — LLM-assisted curation upstream in Omeka S: OCR, HTR, NER, summarisation, transcription
+- [IwacVisualizations](https://github.com/fmadore/IwacVisualizations) — visualisations built on this dataset
+
+## Citation
+
+The pipeline and the data it produces are separate objects, and which one you cite depends on what your work relies on:
+
+- **This pipeline** — the code in this repository. Cite via [`CITATION.cff`](CITATION.cff).
+- **The dataset** — cite the Hugging Face DOI shown on the [dataset page](https://huggingface.co/datasets/fmadore/islam-west-africa-collection). Hugging Face assigns a new DOI per revision, so cite the one matching the revision you loaded.
+- **The collection itself** — the underlying archive:
+
+> Madore, Frédérick. *Islam West Africa Collection*. Leibniz-Zentrum Moderner Orient. https://islam.zmo.de/s/westafrica/
+
+## License
+
+[MIT](LICENSE) © 2025-2026 Frédérick Madore
+
+The license covers the pipeline code in this repository. The collection's underlying materials carry their own rights, which vary by item and are recorded in the Omeka S source.

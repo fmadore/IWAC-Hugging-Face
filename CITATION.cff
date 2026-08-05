@@ -1,0 +1,55 @@
+cff-version: 1.2.0
+message: >-
+  If you use this pipeline or the datasets it produces in your research,
+  please cite the repository as below.
+title: "IWAC Hugging Face Pipeline"
+version: 0.1.0
+date-released: 2026-08-05
+abstract: >-
+  Python pipeline that mirrors the Islam West Africa Collection (IWAC) from an
+  Omeka S archive into versioned Hugging Face datasets. It maps seven subsets
+  (articles, audiovisual, documents, images, index, publications, references)
+  from the Omeka S REST API, enriches them with computed columns — semantic
+  embeddings, spaCy lemmas, LDA topics, lexical metrics, Islamic-calendar dates
+  and a multi-model sentiment panel — and projects the result into a public
+  dataset in which full text is masked per row according to the access status
+  of the source item. Built for the Islam West Africa Collection and adaptable
+  to other Omeka S collections published as research datasets.
+type: software
+keywords:
+  - digital humanities
+  - Islam West Africa
+  - Omeka S
+  - Hugging Face
+  - research data management
+  - topic modeling
+  - semantic embeddings
+  - sentiment analysis
+  - corpus linguistics
+  - African studies
+license: MIT
+repository-code: https://github.com/fmadore/IWAC-Hugging-Face
+url: https://huggingface.co/datasets/fmadore/islam-west-africa-collection
+authors:
+  - family-names: Madore
+    given-names: Frédérick
+    orcid: https://orcid.org/0000-0003-0959-2092
+    affiliation: University of Bayreuth
+# DOIs — two different objects, two different registries:
+#
+#   * This repository is the CODE. Archive it on Zenodo via the GitHub
+#     integration (it only sees public repos) and add the CONCEPT DOI below —
+#     the one that always resolves to the newest version, which is what a
+#     citation should point at. Mirrors iwac-ai-pipelines (10.5281/zenodo.21804210).
+#
+#   * The DATASET is cited separately with a Hugging Face DOI, minted from the
+#     dataset's Settings page and issued through DataCite. Mint it on the
+#     PUBLIC repo only. Do NOT mint one on islam-west-africa-collection-full:
+#     a DOI locks deletion, renaming and visibility changes behind a support
+#     request, and it would not resolve for anyone without access anyway.
+#     Note that HF assigns a new DOI per revision and marks the previous one
+#     outdated; it has no version-independent concept DOI.
+#
+# identifiers:
+#   - type: doi
+#     value: 10.5281/zenodo.XXXXXXXX   # Zenodo concept DOI (this pipeline)
