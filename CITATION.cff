@@ -29,7 +29,9 @@ keywords:
   - African studies
 license: MIT
 repository-code: https://github.com/fmadore/IWAC-Hugging-Face
-url: https://huggingface.co/datasets/fmadore/islam-west-africa-collection
+# Landing page for the project as a whole. The dataset has its own URL and DOI
+# under `references` below; this field describes the software.
+url: https://islam.zmo.de/s/westafrica/
 authors:
   - family-names: Madore
     given-names: Frédérick
@@ -53,3 +55,21 @@ authors:
 # identifiers:
 #   - type: doi
 #     value: 10.5281/zenodo.XXXXXXXX   # Zenodo concept DOI (this pipeline)
+#
+# The dataset this pipeline produces is a distinct work with its own DOI, so it
+# belongs under `references` rather than `identifiers` — the latter would claim
+# the dataset's DOI identifies this source code, which it does not.
+references:
+  - type: data
+    title: "Islam West Africa Collection (IWAC)"
+    doi: 10.57967/hf/9857
+    url: https://huggingface.co/datasets/fmadore/islam-west-africa-collection
+    year: 2025
+    publisher:
+      name: Leibniz-Zentrum Moderner Orient (ZMO)
+    license: CC-BY-NC-SA-4.0
+    authors:
+      - family-names: Madore
+        given-names: Frédérick
+        orcid: https://orcid.org/0000-0003-0959-2092
+        affiliation: University of Bayreuth

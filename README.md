@@ -4,6 +4,7 @@ Python pipeline that mirrors the [Islam West Africa Collection](https://islam.zm
 
 [![Islam West Africa Collection](https://img.shields.io/badge/Collection-IWAC-blue)](https://islam.zmo.de/s/westafrica/)
 [![Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset-yellow)](https://huggingface.co/datasets/fmadore/islam-west-africa-collection)
+[![Dataset DOI](https://img.shields.io/badge/DOI-10.57967%2Fhf%2F9857-blue)](https://doi.org/10.57967/hf/9857)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## Context
@@ -167,7 +168,7 @@ CI runs the test suite on every push, plus `pyflakes` specifically for undefined
 The pipeline and the data it produces are separate objects, and which one you cite depends on what your work relies on:
 
 - **This pipeline** — the code in this repository. Cite via [`CITATION.cff`](CITATION.cff).
-- **The dataset** — cite the Hugging Face DOI shown on the [dataset page](https://huggingface.co/datasets/fmadore/islam-west-africa-collection). Hugging Face assigns a new DOI per revision, so cite the one matching the revision you loaded.
+- **The dataset** — cite [`10.57967/hf/9857`](https://doi.org/10.57967/hf/9857). Hugging Face assigns a new DOI per revision and marks the previous one outdated, so check the [dataset page](https://huggingface.co/datasets/fmadore/islam-west-africa-collection) for the DOI matching the revision you loaded.
 - **The collection itself** — the underlying archive:
 
 > Madore, Frédérick. *Islam West Africa Collection*. Leibniz-Zentrum Moderner Orient. https://islam.zmo.de/s/westafrica/
