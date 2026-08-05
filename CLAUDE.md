@@ -44,6 +44,34 @@ row count (`--force-shrink`), `fetch_items` raises on a short read against the
 blanks while the row count stays identical. If it fires, fix connectivity —
 overriding it is almost never right.
 
+## DOIs: mint at release points, never on every update
+
+The dataset DOI is minted on the Hub, from the **public** repo's settings, and
+**never** on `-full`. Hugging Face states the action plainly: it *cannot be
+undone*, and the repo can no longer be deleted, renamed, transferred, or made
+private.
+
+That last clause is the reason this has its own section. Flipping the public
+dataset private is the emergency lever if a leak is ever found; minting removes
+it permanently. So the order is fixed:
+
+1. Run `post-processing/verify_public_masking.py` against the live public repo.
+   It reads every content subset and fails if any row flagged
+   `OCR_is_public = false` still carries `OCR` / `lemma_text` / `lemma_nostop`.
+   The `publish_public.py` guards check what gets *written*; this checks what is
+   already *there*.
+2. Only then mint, and only on `fmadore/islam-west-africa-collection`.
+
+**Mint at deliberate release points, not on every pipeline push.** The Hub has
+no concept DOI: each "Generate new DOI" supersedes the last and marks it
+outdated, so a DOI per update produces a trail of stale identifiers and citations
+that resolve to a superseded revision. Pick a state worth citing — a completed
+enrichment pass, not an incremental column refresh — and mint that.
+
+The **code** DOI is a separate object: Zenodo, on the GitHub repo, whose concept
+DOI always resolves to the newest version. That is what the commented block in
+`CITATION.cff` is reserved for. The dataset DOI belongs on the dataset card.
+
 ## Non-obvious gotchas
 
 **Code changes never move data.** Editing a computation does nothing to the Hub
