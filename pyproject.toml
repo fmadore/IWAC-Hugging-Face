@@ -15,7 +15,11 @@ build-backend = "setuptools.build_meta"
 name = "iwac-hugging-face"
 version = "0.1.0"
 description = "Pipeline scripts for the Islam West Africa Collection dataset on Hugging Face Hub"
-requires-python = ">=3.10"
+# 3.12 is the real floor, not a preference: the pinned numpy line (2.5, capped
+# in requirements.txt) requires >= 3.12. Declaring >= 3.10 while shipping a
+# dependency set that cannot install there is a promise the pipeline cannot
+# keep. CI runs 3.12 for the same reason.
+requires-python = ">=3.12"
 
 [tool.setuptools]
 packages = ["iwac_common"]
