@@ -5,6 +5,7 @@ Python pipeline that mirrors the [Islam West Africa Collection](https://islam.zm
 [![Islam West Africa Collection](https://img.shields.io/badge/Collection-IWAC-blue)](https://islam.zmo.de/s/westafrica/)
 [![Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset-yellow)](https://huggingface.co/datasets/fmadore/islam-west-africa-collection)
 [![Dataset DOI](https://img.shields.io/badge/DOI-10.57967%2Fhf%2F9857-blue)](https://doi.org/10.57967/hf/9857)
+[![Software DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21805704.svg)](https://doi.org/10.5281/zenodo.21805704)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## Context
@@ -167,7 +168,7 @@ CI runs the test suite on every push, plus `pyflakes` specifically for undefined
 
 The pipeline and the data it produces are separate objects, and which one you cite depends on what your work relies on:
 
-- **This pipeline** — the code in this repository. Cite via [`CITATION.cff`](CITATION.cff).
+- **This pipeline** — the code in this repository. Cite [`10.5281/zenodo.21805704`](https://doi.org/10.5281/zenodo.21805704), the concept DOI, which always resolves to the newest release. Metadata comes from [`CITATION.cff`](CITATION.cff).
 - **The dataset** — cite [`10.57967/hf/9857`](https://doi.org/10.57967/hf/9857). Hugging Face assigns a new DOI per revision and marks the previous one outdated, so check the [dataset page](https://huggingface.co/datasets/fmadore/islam-west-africa-collection) for the DOI matching the revision you loaded.
 - **The collection itself** — the underlying archive:
 

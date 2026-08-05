@@ -37,25 +37,14 @@ authors:
     given-names: Frédérick
     orcid: https://orcid.org/0000-0003-0959-2092
     affiliation: University of Bayreuth
-# DOIs — two different objects, two different registries:
-#
-#   * This repository is the CODE. Archive it on Zenodo via the GitHub
-#     integration (it only sees public repos) and add the CONCEPT DOI below —
-#     the one that always resolves to the newest version, which is what a
-#     citation should point at. Mirrors iwac-ai-pipelines (10.5281/zenodo.21804210).
-#
-#   * The DATASET is cited separately with a Hugging Face DOI, minted from the
-#     dataset's Settings page and issued through DataCite. Mint it on the
-#     PUBLIC repo only. Do NOT mint one on islam-west-africa-collection-full:
-#     a DOI locks deletion, renaming and visibility changes behind a support
-#     request, and it would not resolve for anyone without access anyway.
-#     Note that HF assigns a new DOI per revision and marks the previous one
-#     outdated; it has no version-independent concept DOI.
-#
-# identifiers:
-#   - type: doi
-#     value: 10.5281/zenodo.XXXXXXXX   # Zenodo concept DOI (this pipeline)
-#
+# Zenodo mints two DOIs per archived release. The CONCEPT DOI below is
+# version-independent and always resolves to the newest release, which is what a
+# citation should point at; the v1.0.0 snapshot alone is 10.5281/zenodo.21805705.
+# Zenodo builds the record's metadata from this file, so correct it here first
+# and let the next release carry it through.
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.21805704
 # The dataset this pipeline produces is a distinct work with its own DOI, so it
 # belongs under `references` rather than `identifiers` — the latter would claim
 # the dataset's DOI identifies this source code, which it does not.
