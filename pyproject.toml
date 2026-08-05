@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "iwac-hugging-face"
-version = "0.1.0"
+version = "1.0.0"
 description = "Pipeline scripts for the Islam West Africa Collection dataset on Hugging Face Hub"
 # 3.12 is the real floor, not a preference: the pinned numpy line (2.5, capped
 # in requirements.txt) requires >= 3.12. Declaring >= 3.10 while shipping a
