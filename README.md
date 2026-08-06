@@ -64,11 +64,22 @@ articles = load_dataset("fmadore/islam-west-africa-collection", name="articles",
 | Topic modeling | `post-processing/lda_topic_modeling/` | LDA topic id, probability, label, and top-k terms |
 | Lexical metrics | `post-processing/calculate_lexical_richness.py`, `calculate_word_count.py` | Word count, lexical richness, readability |
 | Islamic calendar | `post-processing/calculate_hijri_dates.py` | Hijri year, month, and day (Umm al-Qura) |
-| Sentiment panel | `iwac_common/sentiment_panel.py` | Centrality, polarity, and subjectivity of Islam/Muslim representation, plus justifications, from three models |
+| Sentiment panel | `iwac_common/sentiment_panel.py` | Centrality, polarity, and subjectivity of Islam/Muslim representation, plus justifications, from a panel of models |
 | Related items | `post-processing/related_articles.py` | Nearest neighbours by embedding |
 | Model agreement | `post-processing/sentiment_agreement.py` | Inter-model agreement across the sentiment panel |
 
-The sentiment panel runs `gemini-3-flash-preview`, `gpt-5-mini`, and `ministral-14b-2512`, each writing columns keyed by its exact model id so that no two generations of a model can collide in the same column.
+The sentiment panel writes columns keyed by the exact model id, so that no two generations of a model can collide in the same column. Two generations now sit side by side on the Hub, the live one first:
+
+| Generation | Models | Campaign | Subjectivité | Status |
+|---|---|---|---|---|
+| 2 | `gpt-5.6-luna`, `mistral-small-2603`, `deepseek-v4-flash-0731` | 2026-08 | label (`string`) | Live — use this panel |
+| 1 | `gemini-3-flash-preview`, `gpt-5-mini`, `ministral-14b-2512` | 2026-01/02 | integer 1–5 (`float64`) | Frozen. The Omeka properties were deleted in 2026-08; the 18 columns remain on the Hub as historical data |
+
+Column order follows that table: `PANEL` in `iwac_common/sentiment_panel.py` is ordered newest-generation-first, and the uploader's `post_merge` hook sorts the sentiment block by it, so the current panel precedes its history rather than trailing it.
+
+A generation boundary is a change of instrument, not a version bump: generation 2 ran a rewritten prompt (fingerprint `d14ace9ac192`) and asked for subjectivité as a label rather than a number, so `{model}_subjectivite_score` is a string in generation 2 and a float in generation 1. Comparisons across the boundary confound the models with the prompt rewrite; `sentiment_agreement.py` therefore takes `--generation` and defaults to the newest. `SUBJECTIVITE_ORDER` maps a label to its 1–5 rank when one scale is needed for both.
+
+Generation 1 survives on the Hub through the merge, not through a copy: the uploader stops emitting a frozen model's columns and `hub_merge` preserves every Hub column the fresh frame does not carry. Emitting those columns empty would overwrite the values without changing the row count, so no guard would fire — which is why `tests/test_sentiment_panel.py` covers that pair directly.
 
 ## Repository layout
 
@@ -150,7 +161,7 @@ CI runs the test suite on every push, plus `pyflakes` specifically for undefined
 
 **The public dataset is not a complete corpus.** Full text is masked per row by the access status of the source item, so any analysis run against the public repo covers a subset of the material — one that is not random, since access status correlates with publisher and period. Results computed on the public projection can differ from the same analysis on the private mirror. Derived columns (embeddings, topics, sentiment, metrics) are complete for all rows either way, because they were computed before masking.
 
-**LLM sentiment is non-deterministic and opaque.** The same text sent twice may score differently, and the models' reasoning cannot be traced. This is why sentiment runs as a three-model panel with a published agreement measure and per-model justification columns, rather than as a single score presented as ground truth. Treat disagreement as information about the item, not as noise to be averaged away.
+**LLM sentiment is non-deterministic and opaque.** The same text sent twice may score differently — measurably so: re-annotating 1,485 articles with `deepseek-v4-flash-0731`, which the vendor runs at temperature 1.0, returned a different centrality for 19 of them. A re-run is a fresh reading, not a correction, and the models' reasoning cannot be traced. This is why sentiment runs as a model panel with a published agreement measure and per-model justification columns, rather than as a single score presented as ground truth. Treat disagreement as information about the item, not as noise to be averaged away.
 
 **Metrics keyed to a French or English lexicon mis-score the collection's own material.** Readability and lexical-richness measures have no valid reading for the Ewé, Kabiyè, and Dendi items. Those are scored null rather than low: a metric that ranks correctly transcribed African-language sources as garbage is worse than no metric.
 

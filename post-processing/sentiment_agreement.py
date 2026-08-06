@@ -9,6 +9,13 @@ Inter-model agreement analysis for the AI sentiment annotator panel on the
 The panel is defined once in ``iwac_common.sentiment_panel``; this script
 adapts to its size, so adding or retiring a model needs no edit here.
 
+**One generation at a time, and the newest by default.** Generation 2 ran a
+rewritten prompt and asked for subjectivité as a label; generation 1 ran the
+2026-01 prompt and asked for an integer. A κ computed across that boundary
+measures the prompt rewrite as much as it measures the models, so ``--generation``
+selects a coherent panel and defaults to the newest. ``--generation all`` exists
+for the deliberate cross-generation comparison and says so in the report.
+
 The three dimensions are ordinal 5-point scales:
 
 - polarité      : Très négatif < Négatif < Neutre < Positif < Très positif
@@ -58,7 +65,12 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import REPO_ROOT, ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
-from iwac_common.sentiment_panel import PANEL  # noqa: E402
+from iwac_common.sentiment_panel import (  # noqa: E402
+    PANEL,
+    SUBJECTIVITE_ORDER,
+    generation as panel_generation,
+    latest_generation,
+)
 
 from rich import box
 from rich.console import Console
@@ -67,13 +79,25 @@ from rich.table import Table
 
 console = Console()
 
-#: Column prefixes of the annotator panel, in report order. Model-keyed, so a
-#: rotation shows up here as a new prefix rather than a silent change of what
-#: an existing one means. ``topic_sentiment`` imports this list.
-MODELS = [m.prefix for m in PANEL]
+#: Column prefixes of the *current* annotator generation, in report order.
+#: Model-keyed, so a rotation shows up here as a new prefix rather than a silent
+#: change of what an existing one means. ``topic_sentiment`` imports this list,
+#: which is why it is the newest generation rather than the whole panel: an
+#: analysis wants one coherent set of raters, not every model that ever ran.
+MODELS = [m.prefix for m in latest_generation()]
 
-#: prefix -> human-readable model name, for report headers.
+#: prefix -> human-readable model name, for report headers. Whole panel, so a
+#: ``--generation 1`` run still finds its labels.
 MODEL_LABELS = {m.prefix: m.label for m in PANEL}
+
+
+def models_for(gen: Optional[int]) -> List[str]:
+    """Column prefixes for one generation, or the whole panel when ``gen`` is None."""
+    members = PANEL if gen is None else panel_generation(gen)
+    if not members:
+        raise SystemExit(f"No panel member has generation={gen}.")
+    return [m.prefix for m in members]
+
 
 POLARITY_ORDER = {
     "Très négatif": 1,
@@ -206,6 +230,19 @@ def to_ordinal(series: pd.Series, mapping: Optional[Dict[str, int]]) -> pd.Serie
     return s.map(mapping).astype(float)
 
 
+def subjectivite_ordinal(series: pd.Series) -> pd.Series:
+    """Subjectivité on the 1-5 scale, from either of its two representations.
+
+    Generation 1 stores the integer the model returned, generation 2 the label,
+    and the two generations sit in identically named columns of different type.
+    The union is unambiguous — a label never parses as a number and a number is
+    not in :data:`SUBJECTIVITE_ORDER` — so no caller has to know which it holds.
+    """
+    numeric = pd.to_numeric(series, errors="coerce")
+    labels = to_ordinal(series, SUBJECTIVITE_ORDER)
+    return numeric.where(numeric.notna(), labels)
+
+
 def label_votes(row: pd.Series, cols: List[str]) -> List[str]:
     """Non-empty label votes for a row (keeps 'Non applicable' as a real vote)."""
     votes = []
@@ -252,17 +289,30 @@ def main() -> None:
     parser.add_argument("--push", action="store_true",
                         help="Write mode: add consensus/disagreement columns and push to the Hub "
                              "(without this flag the script only reports; nothing is written).")
+    parser.add_argument(
+        "--generation",
+        choices=[*sorted({str(m.generation) for m in PANEL}), "all"],
+        default=str(max(m.generation for m in PANEL)),
+        help="Annotator generation to compare (default: the newest). Generations "
+             "ran different prompts and different subjectivité scales, so 'all' "
+             "measures the rewrite as well as the models.",
+    )
     parser.add_argument("--max-shard-size", default="1GB")
     args = parser.parse_args()
 
+    gen = None if args.generation == "all" else int(args.generation)
+    models = models_for(gen)
+
     console.print(Panel.fit(
         "[bold cyan]AI Sentiment Inter-Model Agreement[/bold cyan]\n"
-        f"[dim]{' vs '.join(MODEL_LABELS[m] for m in MODELS)} — "
-        f"{args.repo} ({args.config})[/dim]",
+        f"[dim]{' vs '.join(MODEL_LABELS[m] for m in models)} — "
+        f"{args.repo} ({args.config})[/dim]"
+        + ("\n[yellow]⚠ cross-generation run: differences confound model with "
+           "prompt rewrite[/yellow]" if gen is None else ""),
         border_style="cyan",
     ))
 
-    sentiment_cols = [tpl.format(m=m) for _, tpl, _ in DIMENSIONS for m in MODELS]
+    sentiment_cols = [tpl.format(m=m) for _, tpl, _ in DIMENSIONS for m in models]
     needed = ["o:id"] + sentiment_cols
 
     token = ensure_hf_token(console=console) if (args.source == "hub" or args.push) else None
@@ -281,7 +331,12 @@ def main() -> None:
         "config": args.config,
         "source": args.source,
         "n_rows": int(len(df)),
-        "models": MODELS,
+        "generation": args.generation,
+        "models": models,
+        "prompt_fingerprints": {
+            m.prefix: (m.prompt_fingerprint or "pre-fingerprint (commit 84bf993)")
+            for m in PANEL if m.prefix in models
+        },
         "dimensions": {},
     }
 
@@ -289,8 +344,13 @@ def main() -> None:
     disagreement_flags: Dict[str, pd.Series] = {}
 
     for dim_key, tpl, mapping in DIMENSIONS:
-        cols = [tpl.format(m=m) for m in MODELS]
-        ordinal = pd.DataFrame({m: to_ordinal(df[c], mapping) for m, c in zip(MODELS, cols)})
+        cols = [tpl.format(m=m) for m in models]
+        # Subjectivité is the one dimension whose column type varies by
+        # generation (integer vs label), so it gets the union converter.
+        convert = subjectivite_ordinal if dim_key == "subjectivite" else (
+            lambda s, _map=mapping: to_ordinal(s, _map)
+        )
+        ordinal = pd.DataFrame({m: convert(df[c]) for m, c in zip(models, cols)})
         n_full = int(ordinal.notna().all(axis=1).sum())
         n_any2 = int((ordinal.notna().sum(axis=1) >= 2).sum())
 
@@ -300,7 +360,7 @@ def main() -> None:
         # pairs/dimensions.
         full_scale = sorted(mapping.values()) if mapping is not None else SUBJECTIVITY_SCALE
         pair_metrics = {}
-        for m1, m2 in combinations(MODELS, 2):
+        for m1, m2 in combinations(models, 2):
             a, b = ordinal[m1].to_numpy(), ordinal[m2].to_numpy()
             both = ~(np.isnan(a) | np.isnan(b))
             exact = float(np.mean(a[both] == b[both])) if both.any() else None
@@ -318,10 +378,11 @@ def main() -> None:
         full_rows = ordinal.dropna()
         all3 = float((full_rows.nunique(axis=1) == 1).mean()) if len(full_rows) else None
 
+        # Keys say "all", not "all_3": the panel is no longer fixed at three.
         report["dimensions"][dim_key] = {
-            "n_rated_by_all_3": n_full,
+            "n_rated_by_all": n_full,
             "n_rated_by_2plus": n_any2,
-            "exact_agreement_all_3": all3,
+            "exact_agreement_all": all3,
             "krippendorff_alpha_interval": alpha_interval,
             "krippendorff_alpha_nominal": alpha_nominal,
             "pairwise": pair_metrics,
@@ -346,9 +407,9 @@ def main() -> None:
         table = Table(title=f"Dimension: {dim_key}", box=box.ROUNDED)
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="green", justify="right")
-        table.add_row("Rows rated by all 3", f"{n_full:,}")
+        table.add_row(f"Rows rated by all {len(models)}", f"{n_full:,}")
         if all3 is not None:
-            table.add_row("Exact agreement (all 3)", f"{all3:.1%}")
+            table.add_row(f"Exact agreement (all {len(models)})", f"{all3:.1%}")
         if alpha_interval is not None:
             table.add_row("Krippendorff α (interval)", f"{alpha_interval:.3f}")
         if alpha_nominal is not None:

@@ -79,9 +79,11 @@ class TestSentimentColumnRename:
 
     @staticmethod
     def _current_col():
-        from iwac_common.sentiment_panel import PANEL
+        # An *active* member: a frozen one's columns are deliberately absent from
+        # the mapper's output, so it could not stand in for a renamed column.
+        from iwac_common.sentiment_panel import active_models
 
-        return PANEL[0].column("polarite")
+        return active_models()[0].column("polarite")
 
     def _hub_with_legacy(self):
         df = _existing()

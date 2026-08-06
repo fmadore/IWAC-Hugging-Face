@@ -56,6 +56,7 @@ from sentiment_agreement import (  # noqa: E402
     MODELS,
     POLARITY_ORDER,
     majority,
+    subjectivite_ordinal,
     to_ordinal,
 )
 
@@ -104,9 +105,14 @@ def consensus_label_series(df: pd.DataFrame, cols: List[str]) -> pd.Series:
 
 
 def consensus_score_series(df: pd.DataFrame, cols: List[str]) -> pd.Series:
-    """Median of the available numeric scores per row (NaN when none)."""
+    """Median of the available subjectivité scores per row (NaN when none).
+
+    Goes through ``subjectivite_ordinal`` rather than ``pd.to_numeric``: since
+    generation 2 the column holds a label, and a plain numeric coercion would
+    turn every value into NaN and silently report "no data" instead of failing.
+    """
     present = [c for c in cols if c in df.columns]
-    scores = pd.DataFrame({c: pd.to_numeric(df[c], errors="coerce") for c in present})
+    scores = pd.DataFrame({c: subjectivite_ordinal(df[c]) for c in present})
     return scores.median(axis=1, skipna=True)
 
 
@@ -186,7 +192,7 @@ def resolve_consensus(df: pd.DataFrame) -> pd.DataFrame:
         console.print("[yellow]ℹ[/yellow] Using existing [cyan]consensus_centralite[/cyan] column from the dataset.")
     elif sum(c in df.columns for c in CENTRALITY_COLS) >= 2:
         cent = consensus_label_series(df, CENTRALITY_COLS)
-        console.print("[blue]→[/blue] Computed centrality consensus inline (majority of 3 model votes).")
+        console.print(f"[blue]→[/blue] Computed centrality consensus inline (majority of {len(MODELS)} model votes).")
     else:
         abort("Need consensus_centralite or >= 2 of "
               f"{', '.join(CENTRALITY_COLS)} — none available.")
@@ -198,7 +204,7 @@ def resolve_consensus(df: pd.DataFrame) -> pd.DataFrame:
         out["subj_score"] = pd.to_numeric(df["consensus_subjectivite_score"], errors="coerce")
     elif sum(c in df.columns for c in SUBJECTIVITY_COLS) >= 2:
         out["subj_score"] = consensus_score_series(df, SUBJECTIVITY_COLS)
-        console.print("[blue]→[/blue] Computed subjectivity consensus inline (median of 3 model scores).")
+        console.print(f"[blue]→[/blue] Computed subjectivity consensus inline (median of {len(MODELS)} model scores).")
     else:
         abort("Need consensus_subjectivite_score or >= 2 of "
               f"{', '.join(SUBJECTIVITY_COLS)} — none available.")

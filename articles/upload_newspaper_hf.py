@@ -42,7 +42,11 @@ from iwac_common.field_mappers import (
 from iwac_common.sentiment_panel import (
     DIMENSION_FIELDS,
     LEGACY_VENDOR_COLUMNS,
+    SUBJECTIVITE_ORDER,
+    SUBJECTIVITE_SUFFIX,
     active_models,
+    all_columns,
+    numeric_subjectivite_columns,
     prefixes,
 )
 from iwac_common.upload_runner import UploadSpec, run_upload
@@ -59,35 +63,36 @@ load_dotenv()
 # Fonctions d'aide pour mapper les champs Omeka → plat
 # ---------------------------------------------------------------------------
 
-# Mapping for subjectivity score labels (Mistral uses resource:item instead of numeric)
-SUBJECTIVITY_LABEL_TO_SCORE = {
-    "Très objectif": 1,
-    "Plutôt objectif": 2,
-    "Mixte": 3,
-    "Plutôt subjectif": 4,
-    "Très subjectif": 5,
-    "Non applicable": None,
-}
+
+def _get_subjectivity_label(item: Dict[str, Any], field: str) -> str:
+    """Subjectivité as the label Omeka stores, or ``""`` when unscored.
+
+    Generation 2 asks the model for a label rather than the integer 1-5, so this
+    is the value as given. ``""`` (not None) for the unscored rows, matching the
+    convention every other string column in this subset follows — a model that
+    called an article ``Non abordé`` legitimately declines to score it, and so
+    does one that simply omitted the field.
+    """
+    return get_value(item, field).strip()
 
 
 def _get_subjectivity_score(item: Dict[str, Any], field: str) -> Optional[int]:
-    """Extract subjectivity score, handling both numeric:integer and resource:item types."""
-    if field not in item or item[field] is None:
+    """Subjectivité as the 1-5 ordinal, for models asked for a number.
+
+    Both generations store the value as a ``resource:item`` link to one of the
+    five labelled items (78043-78047), so the label is read first and ranked; the
+    ``int()`` fallback covers a numeric literal, which no live property uses.
+    Unreachable while every active model is generation 2 — kept because it is the
+    other half of ``SentimentModel.subjectivite_is_label`` and the reader for the
+    frozen generation-1 columns' semantics.
+    """
+    label = _get_subjectivity_label(item, field)
+    if label in SUBJECTIVITE_ORDER:
+        return SUBJECTIVITE_ORDER[label]
+    try:
+        return int(label)
+    except (TypeError, ValueError):
         return None
-    val = item[field]
-    if isinstance(val, list) and val:
-        val = val[0]
-    if isinstance(val, dict):
-        at_value = val.get("@value")
-        if at_value is not None:
-            try:
-                return int(at_value)
-            except (ValueError, TypeError):
-                pass
-        display_title = val.get("display_title", "")
-        if display_title in SUBJECTIVITY_LABEL_TO_SCORE:
-            return SUBJECTIVITY_LABEL_TO_SCORE[display_title]
-    return None
 
 
 async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
@@ -165,15 +170,23 @@ def _sentiment_columns(item: Dict[str, Any]) -> Dict[str, Any]:
 
     Only ``active_models()`` are read: a frozen model's Omeka properties no
     longer exist, and its Hub columns survive because ``hub_merge`` preserves
-    columns this mapper does not produce.
+    columns this mapper does not produce. That is the whole mechanism keeping
+    generation 1 on the Hub after its deletion from the archive — so this loop
+    growing quiet about a model is intentional, not a regression.
     """
     cols: Dict[str, Any] = {}
     for model in active_models():
         for suffix, omeka_suffix in DIMENSION_FIELDS:
             prop = model.omeka_property(omeka_suffix)
-            # subjectivite_score is a resource:item link, not a numeric literal.
-            if suffix == "subjectivite_score":
-                cols[model.column(suffix)] = _get_subjectivity_score(item, prop)
+            if suffix == SUBJECTIVITE_SUFFIX:
+                # Same Omeka storage (a link to a labelled item) either way;
+                # the generation decides whether the column keeps the label or
+                # its 1-5 rank.
+                cols[model.column(suffix)] = (
+                    _get_subjectivity_label(item, prop)
+                    if model.subjectivite_is_label
+                    else _get_subjectivity_score(item, prop)
+                )
             else:
                 cols[model.column(suffix)] = get_value(item, prop)
     return cols
@@ -184,14 +197,25 @@ def _sentiment_columns(item: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _sentiment_columns_last(final_df: pd.DataFrame) -> pd.DataFrame:
-    """Keep the AI sentiment block as the trailing columns.
+    """Keep the AI sentiment block as the trailing columns, in panel order.
 
     Uses the full panel, not just the active models, so frozen columns stay
     grouped with the live ones instead of drifting into the metadata block.
+    Ordering follows ``PANEL`` rather than whatever order the merge happened to
+    produce, which puts the **live** generation first and the frozen one after
+    it: a reader meets the current panel before its history, and the order stays
+    stable across runs instead of tracking which columns the merge preserved.
     """
     sentiment_prefixes = tuple(f"{p}_" for p in prefixes())
-    sentiment_cols = [c for c in final_df.columns if c.startswith(sentiment_prefixes)]
-    other_cols = [c for c in final_df.columns if not c.startswith(sentiment_prefixes)]
+    present = set(final_df.columns)
+    sentiment_cols = [c for c in all_columns() if c in present]
+    # Anything sentiment-prefixed but off-panel (a member retired mid-rotation)
+    # trails the block rather than vanishing from the frame.
+    sentiment_cols += [
+        c for c in final_df.columns
+        if c.startswith(sentiment_prefixes) and c not in sentiment_cols
+    ]
+    other_cols = [c for c in final_df.columns if c not in set(sentiment_cols)]
     return final_df[other_cols + sentiment_cols]
 
 
@@ -204,7 +228,9 @@ SPEC = UploadSpec(
     description="Publie les articles de journaux IWAC sur le Hub HF",
     int_columns=(
         "nb_pages",
-        *(f"{p}_subjectivite_score" for p in prefixes()),
+        # Generation-1 subjectivité only: those columns hold the 1-5 integer.
+        # Casting a generation-2 label column to Int64 would blank it entirely.
+        *numeric_subjectivite_columns(),
     ),
     columns_to_exclude=LEGACY_VENDOR_COLUMNS,
     post_merge=_sentiment_columns_last,
