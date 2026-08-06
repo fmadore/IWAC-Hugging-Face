@@ -50,6 +50,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
+from .card_sync import CardSchemaError, sync_card_features
 from .hub_merge import (
     DuplicateIdError,
     ShrinkGuardError,
@@ -259,6 +260,16 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
                     config_name=spec.config_name,
                     token=token,
                 )
+            # push_to_hub updates the card's byte sizes but not its feature list,
+            # so a schema change leaves the subset unloadable (CastError). Check
+            # and repair before declaring success — see iwac_common/card_sync.py.
+            sync_card_features(
+                args.repo,
+                spec.config_name,
+                token=token,
+                console=console,
+                expected_columns=list(final_df.columns),
+            )
             console.print(Panel(
                 f"[bold green]✓ Dataset successfully published![/bold green]\n\n"
                 f"Repository: [cyan]{args.repo}[/cyan]\n"
@@ -268,6 +279,21 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
                 border_style="green",
             ))
             return 0
+        except CardSchemaError as exc:
+            # The push itself worked; saying "failed to push" would send someone
+            # looking in the wrong place.
+            console.print(Panel(
+                f"[bold red]✗ Data pushed, but the card is out of step[/bold red]\n\n"
+                f"{exc}\n\n"
+                f"The rows ARE on the Hub — the declared schema is not, so "
+                f"load_dataset('{args.repo}', name='{spec.config_name}') raises "
+                f"CastError until the card's dataset_info is corrected. Do not "
+                f"re-run the upload to fix it; fix the card.",
+                title="Card schema mismatch",
+                border_style="red",
+            ))
+            logger.error("Details of the exception:", exc_info=True)
+            return 1
         except Exception as exc:  # noqa: BLE001
             console.print(Panel(
                 f"[bold red]✗ Failed to push dataset[/bold red]\n\n{exc}",

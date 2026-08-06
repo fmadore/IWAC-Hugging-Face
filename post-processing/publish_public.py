@@ -36,6 +36,14 @@ Two guards protect against NEW full-text columns slipping through:
    column with prose-length values aborts the push unless it is a known
    content column or allow-listed here.
 
+Both run BEFORE the push. A third check runs after it: ``sync_card_features``
+(iwac_common/card_sync.py) verifies that the dataset card declares the schema
+that was actually pushed, because ``push_to_hub`` refreshes the card's byte sizes
+but not its feature list — which on 2026-08-06 left this very dataset raising
+``CastError`` on ``load_dataset``. It repairs the card rather than aborting: the
+push has already landed by then, so stopping would leave the citable dataset
+broken.
+
 Usage
 -----
     # Preview what would change, push nothing
@@ -62,6 +70,7 @@ import sys
 # Make ``post-processing/_common.py`` importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import ensure_hf_token, PRIVATE_REPO_ID, PUBLIC_REPO_ID  # noqa: E402
+from iwac_common.card_sync import CardSchemaError, sync_card_features  # noqa: E402
 from iwac_common.repos import (  # noqa: E402
     CONTENT_COLUMNS,
     PUBLIC_COLUMNS_FILE,
@@ -368,6 +377,26 @@ def main() -> None:
         console.print(f"[green]✓[/green] {cfg}: {len(public_df):,} rows, "
                       f"{len(public_df.columns)} cols pushed"
                       + (f" — OCR kept for {kept:,}, blanked {blanked:,}" if content_cols else ""))
+
+        # push_to_hub refreshes the card's byte sizes but not its feature list, so
+        # a schema change leaves this subset raising CastError on load. That is
+        # worse here than on the private mirror: this is the citable dataset.
+        try:
+            sync_card_features(
+                args.repo_public, cfg, token=token, console=console,
+                expected_columns=list(public_df.columns),
+            )
+        except CardSchemaError as exc:
+            console.print(Panel(
+                f"[bold red]✗ '{cfg}' pushed, but the card is out of step[/bold red]\n\n"
+                f"{exc}\n\n"
+                f"The rows ARE public — the declared schema is not, so "
+                f"load_dataset('{args.repo_public}', name='{cfg}') raises CastError "
+                f"until the card's dataset_info is corrected. Fix the card; do not "
+                f"re-run the projection.",
+                title="Card schema mismatch", border_style="red",
+            ))
+            sys.exit(1)
 
     if args.squash:
         console.print(Panel(

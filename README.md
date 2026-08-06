@@ -32,6 +32,8 @@ Because a leak here would be unrecoverable, `publish_public.py` aborts rather th
 
 The uploads carry equivalent rails. `hub_merge` refuses a frame under 95% of the Hub's current row count; `fetch_items` raises on a short read against the `Omeka-S-Total-Results` header; and a mass media-lookup failure aborts, because the other guards check row *count* and an unreachable host would otherwise overwrite good URLs with blanks while the row count held steady.
 
+One rail runs *after* the push instead of before it. `push_to_hub` refreshes a config's byte sizes in the dataset card but not its feature list, so any push that adds or drops a column leaves the card declaring the old schema — and `load_dataset` then raises `CastError: column names don't match`, making the subset unloadable for every consumer, this pipeline's own next run included. It happened twice on 2026-08-06, to the private mirror and then to the public citable dataset. [`iwac_common/card_sync.py`](iwac_common/card_sync.py) therefore checks the card against the parquet after every push and **repairs** it, since by that point aborting would only leave the dataset broken; it raises only if the mismatch survives the rewrite. Both writers to the Hub call it, and `tests/test_card_sync.py` asserts they still do.
+
 ## Dataset subsets
 
 Seven subsets, each mapped from an Omeka S resource class:
