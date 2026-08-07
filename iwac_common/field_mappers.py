@@ -35,6 +35,67 @@ def get_value(item: Dict[str, Any], field: str) -> str:
     return str(val)
 
 
+def get_value_by_language(
+    item: Dict[str, Any],
+    field: str,
+    language: str,
+    *,
+    untagged_matches: bool = False,
+    fallback: bool = False,
+) -> str:
+    """Extract ONE ``@language``-tagged literal from an Omeka property.
+
+    The language-aware counterpart to :func:`get_value`, which pipe-joins every
+    value it finds. That join is wrong for a property carrying one literal per
+    language — ``bibo:shortDescription`` since the summariser went bilingual —
+    because it produces ``"résumé|summary"``, a single string whose two halves
+    can only be recovered by splitting on a delimiter the prose is allowed to
+    contain, in an order Omeka never promised to keep stable.
+
+    Only the *first* match is returned; a second literal in the same language
+    is a data error upstream, so it is logged rather than silently joined back
+    into the shape this function exists to avoid.
+
+    Args:
+        language: the ``@language`` tag to select, e.g. ``"fr"``.
+        untagged_matches: also accept values carrying **no** ``@language``.
+            Set on the French slot: every summary written before the pipeline
+            went bilingual is an untagged French literal, and without this they
+            would all read as missing.
+        fallback: if nothing matched, return the first value that has any
+            ``@value`` at all. Right for a descriptive field of unpredictable
+            language (``index``'s ``Description``); wrong for a per-language
+            column, where it would file French prose under English.
+    """
+    if field not in item or item[field] is None:
+        return ""
+    val = item[field]
+    if isinstance(val, dict):
+        val = [val]
+    if not isinstance(val, list):
+        return str(val)
+
+    matches = [
+        v for v in val
+        if isinstance(v, dict) and v.get("@value")
+        and (v.get("@language") == language
+             or (untagged_matches and not v.get("@language")))
+    ]
+    if matches:
+        if len(matches) > 1:
+            logger.warning(
+                "Item %s has %d '%s' values for %s; keeping the first",
+                item.get("o:id"), len(matches), language, field,
+            )
+        return str(matches[0].get("@value", ""))
+
+    if fallback:
+        for v in val:
+            if isinstance(v, dict) and v.get("@value"):
+                return str(v.get("@value", ""))
+    return ""
+
+
 def is_content_public(item: Dict[str, Any], field: str = "bibo:content") -> bool:
     """True iff ``field``'s full text is publicly visible on Omeka.
 
@@ -116,6 +177,7 @@ def extract_added_date(item: Dict[str, Any]) -> str:
 
 __all__ = [
     "get_value",
+    "get_value_by_language",
     "is_content_public",
     "get_media_ids",
     "to_int_or_none",

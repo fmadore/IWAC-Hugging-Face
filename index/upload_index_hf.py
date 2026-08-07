@@ -36,7 +36,11 @@ from dotenv import load_dotenv
 from datasets import load_dataset
 from rich.console import Console
 from iwac_common.omeka_client import OmekaApiClient, conn_manager, fetch_iiif_thumbnail_url
-from iwac_common.field_mappers import extract_added_date, get_value
+from iwac_common.field_mappers import (
+    extract_added_date,
+    get_value,
+    get_value_by_language,
+)
 from iwac_common.upload_runner import UploadSpec, run_upload
 
 logger = logging.getLogger("upload")
@@ -65,25 +69,6 @@ def _get_value_only(item: Dict[str, Any], field: str) -> str:
         parts = [str(v.get("@value", "")) for v in val if isinstance(v, dict) and v.get("@value")]
         return "|".join(filter(None, parts))
     if isinstance(val, dict):
-        return val.get("@value", "")
-    return str(val)
-
-
-def _get_value_with_lang(item: Dict[str, Any], field: str, preferred_lang: str = "fr") -> str:
-    """Extrait une valeur en privilégiant une langue spécifique"""
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        # Chercher d'abord la langue préférée
-        for v in val:
-            if isinstance(v, dict) and v.get("@language") == preferred_lang:
-                return v.get("@value", "")
-        # Sinon prendre la première valeur disponible
-        for v in val:
-            if isinstance(v, dict) and v.get("@value"):
-                return v.get("@value", "")
-    elif isinstance(val, dict):
         return val.get("@value", "")
     return str(val)
 
@@ -169,7 +154,13 @@ async def map_index_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
         "Titre": item.get("o:title", ""),
         "Titre alternatif": get_value(item, "dcterms:alternative"),
         "Type": _get_resource_class_type(item),
-        "Description": _get_value_with_lang(item, "dcterms:description", "fr"),
+        # fallback=True: an authority record's description is of unpredictable
+        # language, so any value beats none. untagged_matches stays off to
+        # preserve the exact precedence the local helper had before it moved
+        # into iwac_common (tagged 'fr' wins, then first value of any kind).
+        "Description": get_value_by_language(
+            item, "dcterms:description", "fr", fallback=True
+        ),
         "Date création": get_value(item, "dcterms:created"),
         "date": get_value(item, "dcterms:date"),
         "Relation": _get_display_title(item, "dcterms:relation"),

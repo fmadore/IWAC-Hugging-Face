@@ -139,3 +139,20 @@ class TestLiveAllowlistFile:
             for c in cols:
                 assert c in allow[cfg], f"{c} missing from allowlist[{cfg}]"
             assert "OCR_is_public" in allow[cfg]
+
+    def test_bilingual_summary_columns_are_paired(self):
+        """`descriptionAI_en` must be allow-listed wherever `descriptionAI` is.
+
+        The mappers emit the two together, so a subset that lists only the
+        French half would abort publish_public.py on the first bilingual push —
+        after the private mirror had already taken the column.
+        """
+        from iwac_common.repos import load_public_columns
+
+        allow = load_public_columns()
+        for cfg, cols in allow.items():
+            if cfg.startswith("_") or "descriptionAI" not in cols:
+                continue
+            assert "descriptionAI_en" in cols, (
+                f"allowlist[{cfg}] has descriptionAI but not descriptionAI_en"
+            )

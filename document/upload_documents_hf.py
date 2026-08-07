@@ -43,6 +43,7 @@ from iwac_common.omeka_client import (
 from iwac_common.field_mappers import (
     extract_added_date,
     get_value,
+    get_value_by_language,
     is_content_public,
     to_int_or_none,
 )
@@ -129,7 +130,13 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
         # Like articles: documents have no table of contents, and their
         # abstract is the AI-generated one in bibo:shortDescription. The
         # dcterms:abstract field is being retired on the Omeka side.
-        "descriptionAI": get_value(item, "bibo:shortDescription"),
+        # One column per language — see the note in upload_newspaper_hf.py.
+        "descriptionAI": get_value_by_language(
+            item, "bibo:shortDescription", "fr", untagged_matches=True
+        ),
+        "descriptionAI_en": get_value_by_language(
+            item, "bibo:shortDescription", "en"
+        ),
         "subject": get_value(item, "dcterms:subject"),
         "spatial": get_value(item, "dcterms:spatial"),
         "language": get_value(item, "dcterms:language"),

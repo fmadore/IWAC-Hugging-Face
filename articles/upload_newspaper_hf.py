@@ -36,6 +36,7 @@ from iwac_common.omeka_client import OmekaApiClient, conn_manager, fetch_iiif_th
 from iwac_common.field_mappers import (
     extract_added_date,
     get_value,
+    get_value_by_language,
     is_content_public,
     to_int_or_none,
 )
@@ -150,7 +151,17 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
         "newspaper": newspaper_name,
         "country": country, # Added country field
         "pub_date": get_value(item, "dcterms:date"),
-        "descriptionAI": get_value(item, "bibo:shortDescription"),
+        # One column per language, NOT get_value(): the summariser writes an
+        # `fr` and an `en` literal on the same property, and pipe-joining them
+        # yields a string splittable only on a delimiter the prose may contain,
+        # in an order Omeka does not guarantee. Untagged legacy values are
+        # French. See iwac_common/field_mappers.get_value_by_language.
+        "descriptionAI": get_value_by_language(
+            item, "bibo:shortDescription", "fr", untagged_matches=True
+        ),
+        "descriptionAI_en": get_value_by_language(
+            item, "bibo:shortDescription", "en"
+        ),
         "subject": get_value(item, "dcterms:subject"),
         "spatial": get_value(item, "dcterms:spatial"),
         "language": get_value(item, "dcterms:language"),

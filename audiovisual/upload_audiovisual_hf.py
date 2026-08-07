@@ -46,6 +46,7 @@ from iwac_common.omeka_client import (
 from iwac_common.field_mappers import (
     extract_added_date,
     get_value,
+    get_value_by_language,
     is_content_public,
 )
 from iwac_common.upload_runner import UploadSpec, run_upload
@@ -151,7 +152,15 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
         "publisher": publisher,
         "country": country,
         "pub_date": get_value(item, "dcterms:date"),
-        "descriptionAI": get_value(item, "bibo:shortDescription"),
+        # Empty for all 47 rows today, but kept the same shape as articles and
+        # documents so populating it later (iwac-mcp-server TODO) is a data
+        # change rather than a schema change. See upload_newspaper_hf.py.
+        "descriptionAI": get_value_by_language(
+            item, "bibo:shortDescription", "fr", untagged_matches=True
+        ),
+        "descriptionAI_en": get_value_by_language(
+            item, "bibo:shortDescription", "en"
+        ),
         "volume": _get_at_value(item, "bibo:volume"),
         "issue": _get_at_value(item, "bibo:issue"),
         "is_part_of": _get_at_value(item, "dcterms:isPartOf"),

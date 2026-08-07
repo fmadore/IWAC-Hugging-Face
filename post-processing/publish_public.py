@@ -102,6 +102,7 @@ ALL_CONFIGS = ["articles", "publications", "index", "references", "audiovisual",
 PUBLIC_TEXT_ALLOWLIST = {
     "tableOfContents",
     "descriptionAI",
+    "descriptionAI_en",
     "abstract",
     "Description",
     "lda_topic_label",
