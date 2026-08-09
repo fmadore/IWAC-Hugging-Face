@@ -36,7 +36,11 @@ jobs:
       - name: Reject undefined names
         shell: bash
         run: |
-          python -m pyflakes $(git ls-files '*.py') | tee pyflakes.log
+          # Pyflakes exits non-zero for every diagnostic, including warnings
+          # outside this focused gate. Capture its report first, then fail only
+          # for the undefined-name errors this step is intended to reject.
+          python -m pyflakes $(git ls-files '*.py') > pyflakes.log || true
+          cat pyflakes.log
           if grep -qi "undefined name" pyflakes.log; then
             exit 1
           fi
