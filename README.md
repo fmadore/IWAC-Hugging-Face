@@ -4,6 +4,7 @@ Python pipeline that mirrors the [Islam West Africa Collection](https://islam.zm
 
 [![Collection: IWAC](https://img.shields.io/badge/Collection-IWAC-1f6feb?style=flat-square)](https://islam.zmo.de/s/westafrica/)
 [![Hugging Face dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset-ffd21e?style=flat-square&labelColor=555)](https://huggingface.co/datasets/fmadore/islam-west-africa-collection)
+[![CI](https://github.com/fmadore/IWAC-Hugging-Face/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/fmadore/IWAC-Hugging-Face/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-3fb950?style=flat-square)](LICENSE)
 
 [![Dataset DOI](https://img.shields.io/badge/Dataset%20DOI-10.57967%2Fhf%2F9857-0a7bbb?style=flat-square)](https://doi.org/10.57967/hf/9857)
@@ -103,16 +104,39 @@ data/               fetch_datasets.py — local CSV mirrors for offline work
 
 Requires **Python >= 3.12**. CI tests Python 3.12 on Linux and Windows and Python 3.13 on Linux. Development is CPU-only throughout; the pipeline deliberately prefers CPU-viable models such as spaCy's `*_lg` pipelines over transformer equivalents.
 
+Windows PowerShell:
+
+```powershell
+git clone https://github.com/fmadore/IWAC-Hugging-Face.git
+Set-Location IWAC-Hugging-Face
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m pip install -e . --no-deps
+Copy-Item .env.example .env
+```
+
+Linux or macOS:
+
 ```bash
 git clone https://github.com/fmadore/IWAC-Hugging-Face.git
 cd IWAC-Hugging-Face
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\pip install -e . --no-deps
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m pip install -e . --no-deps
 cp .env.example .env
 ```
 
-For development, install `requirements-dev.txt` instead; it includes pytest, coverage, and the undefined-name check. The editable install also exposes `iwac-upload`, `iwac-mirror`, and `iwac-publish-public` from the checkout.
+For development, install `requirements-dev.txt` instead; it includes the runtime dependencies, pytest, coverage, and the undefined-name check:
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pip install -e . --no-deps
+python -m pytest
+```
+
+The editable install exposes `iwac-upload`, `iwac-mirror`, and `iwac-publish-public` from the checkout.
 
 The lemmatisation step additionally needs spaCy models:
 
@@ -130,6 +154,14 @@ Set `IWAC_HF_PRIVATE_REPO` and `IWAC_HF_PUBLIC_REPO` to redirect the pipeline at
 ## Usage
 
 The original script paths remain supported. The installed commands give the common operations one discoverable surface:
+
+```bash
+iwac-upload --help
+iwac-mirror --help
+iwac-publish-public --help
+```
+
+`iwac-upload` accepts `articles`, `publications`, `index`, `references`, `audiovisual`, `documents`, or `images` as its subset argument.
 
 The flow runs in three stages, in order:
 
