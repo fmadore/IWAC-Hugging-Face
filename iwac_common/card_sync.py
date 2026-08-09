@@ -34,7 +34,7 @@ import pyarrow.parquet as pq
 from huggingface_hub import DatasetCard, HfApi, HfFileSystem
 from rich.console import Console
 
-from .hub_merge import resolve_hf_token
+from .hub import resolve_hf_token
 
 
 class CardSchemaError(RuntimeError):

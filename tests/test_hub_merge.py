@@ -4,6 +4,7 @@ import pytest
 import iwac_common.hub_merge as hub_merge
 from iwac_common.hub_merge import (
     DuplicateIdError,
+    HubBaselineUnavailableError,
     ShrinkGuardError,
     merge_with_hub_dataset,
 )
@@ -62,6 +63,54 @@ class TestComputedColumnPreservation:
         hub(_existing(3))
         out = merge_with_hub_dataset(_new(4), "repo", "articles")
         assert out.loc[out["o:id"] == "4", "embedding_OCR"].isna().all()
+
+    def test_failed_media_field_keeps_existing_value(self, hub):
+        existing = _existing()
+        existing["thumbnail"] = [f"old-{i}" for i in range(4)]
+        fresh = _new()
+        fresh["thumbnail"] = ["", "new-2", "new-3", "new-4"]
+        hub(existing)
+        out = merge_with_hub_dataset(
+            fresh,
+            "repo",
+            "articles",
+            preserve_fields_by_id={"1": {"thumbnail"}},
+        )
+        assert out.loc[out["o:id"] == "1", "thumbnail"].item() == "old-0"
+        assert out.loc[out["o:id"] == "2", "thumbnail"].item() == "new-2"
+
+    def test_failed_mapper_row_does_not_blank_other_computed_values(self, hub):
+        existing = _existing(2)
+        fresh = _new(1)
+        hub(existing)
+        out = merge_with_hub_dataset(
+            fresh,
+            "repo",
+            "articles",
+            preserve_existing_ids=["2"],
+        ).sort_values("o:id")
+        assert out["title"].tolist() == ["T1", "t2"]
+        assert out["embedding_OCR"].notna().all()
+
+
+class TestFailClosedBaseline:
+    def test_load_error_is_not_treated_as_first_run(self, monkeypatch):
+        def fail(*args, **kwargs):
+            raise OSError("offline")
+
+        monkeypatch.setattr(hub_merge, "load_dataset", fail)
+        with pytest.raises(HubBaselineUnavailableError, match="Refusing to assume"):
+            merge_with_hub_dataset(_new(), "repo", "articles")
+
+    def test_explicit_initialize_requires_absent_config(self, monkeypatch):
+        monkeypatch.setattr(
+            hub_merge, "load_dataset", lambda *a, **k: (_ for _ in ()).throw(OSError("404"))
+        )
+        monkeypatch.setattr(hub_merge, "get_repo_configs", lambda *a, **k: set())
+        out = merge_with_hub_dataset(
+            _new(), "repo", "articles", allow_initialize=True
+        )
+        assert list(out["o:id"]) == ["1", "2", "3", "4"]
 
 
 class TestSentimentColumnRename:

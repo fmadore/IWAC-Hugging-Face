@@ -22,5 +22,21 @@ description = "Pipeline scripts for the Islam West Africa Collection dataset on 
 requires-python = ">=3.12"
 
 [tool.setuptools]
-packages = ["iwac_common"]
+packages = ["iwac_common", "iwac_pipeline"]
 py-modules = ["country_mapper"]
+
+[project.scripts]
+iwac-upload = "iwac_pipeline.cli:upload_main"
+iwac-mirror = "iwac_pipeline.cli:mirror_main"
+iwac-publish-public = "iwac_pipeline.cli:publish_public_main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["iwac_common"]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
+skip_covered = true

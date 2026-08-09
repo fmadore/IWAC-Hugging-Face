@@ -39,7 +39,15 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import REPO_ROOT, ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
+from _common import (  # noqa: E402
+    PRIVATE_REPO_ID,
+    REPO_ROOT,
+    add_columns_by_id,
+    ensure_hf_token,
+    load_hub_dataset,
+    load_subset_dataframe,
+    push_dataset,
+)
 
 from rich import box
 from rich.console import Console
@@ -105,7 +113,7 @@ def topk_neighbors(matrix: np.ndarray, k: int, chunk: int = 2048) -> tuple[np.nd
     return nn_idx, nn_sim
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Top-k related items per row from existing Gemini embeddings. "
                     "Report-only by default (nothing is written); pass --push to add "
@@ -125,6 +133,8 @@ def main() -> None:
                              "(without this flag the script only reports; nothing is written).")
     parser.add_argument("--max-shard-size", default="1GB")
     args = parser.parse_args()
+    if args.topk < 1:
+        parser.error("--topk must be at least 1")
 
     emb_col, context_cols = CONFIG_SETTINGS[args.config]
 
@@ -139,15 +149,16 @@ def main() -> None:
         args.repo, args.config, token=token, source=args.source,
         columns=["o:id", emb_col] + context_cols, console=console,
     )
+    source_revision = df.attrs.get("iwac_source_revision")
     if emb_col not in df.columns:
         console.print(f"[red]✗[/red] Embedding column '{emb_col}' not found.")
-        return
+        return 1
 
     with console.status("[bold green]Parsing embeddings...", spinner="dots"):
         matrix, positions = parse_embeddings(df[emb_col])
     if len(positions) < 2:
         console.print("[red]✗[/red] Fewer than 2 rows with embeddings; nothing to do.")
-        return
+        return 1
     console.print(
         f"[green]✓[/green] {len(positions):,} rows with embeddings "
         f"(dim={matrix.shape[1]}); {len(df) - len(positions):,} without"
@@ -210,19 +221,22 @@ def main() -> None:
     if not args.push:
         console.print("[yellow]ℹ[/yellow] Report-only run. Use [bold]--push[/bold] to add "
                       f"'{args.column}' to the Hub dataset.")
-        return
+        return 0
     if args.source != "hub":
         console.print("[red]✗[/red] --push requires --source hub (row alignment must match live data).")
-        return
-
-    from datasets import load_dataset
+        return 1
 
     console.print("\n[bold cyan]Pushing related-articles column to the Hub...[/bold cyan]")
-    ds = load_dataset(args.repo, name=args.config, split="train", token=token)
-    if args.column in ds.column_names:
-        ds = ds.remove_columns([args.column])
-    ds = ds.add_column(args.column, related)
-    ds.push_to_hub(
+    ds = load_hub_dataset(
+        args.repo,
+        args.config,
+        token=token,
+        console=console,
+        revision=source_revision,
+    )
+    ds = add_columns_by_id(ds, out_frame)
+    if push_dataset(
+        ds,
         repo_id=args.repo,
         config_name=args.config,
         token=token,
@@ -230,9 +244,13 @@ def main() -> None:
         commit_message=(
             f"Add '{args.column}' (top-{args.topk} cosine neighbors from {emb_col})"
         ),
-    )
-    console.print("[green]✓[/green] Pushed.")
+        console=console,
+        expected_revision=source_revision,
+    ):
+        console.print("[green]✓[/green] Pushed.")
+        return 0
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

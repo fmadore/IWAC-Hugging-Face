@@ -278,7 +278,7 @@ def display_existing_stats(
     return richness_missing, readability_missing
 
 
-def main():
+def main() -> int:
     textstat.set_lang('fr')
 
     parser = argparse.ArgumentParser(
@@ -369,14 +369,13 @@ def main():
     # --- Load dataset ---
     console.print(f"\n[bold cyan]Step 3:[/bold cyan] Loading dataset...")
     ds = load_hub_dataset(repo_id, config_name_choice, token=token, console=console)
-    if ds is None:
-        return
+    source_revision = getattr(ds, "_iwac_source_revision", None)
 
     # --- Column checks ---
     if text_column_name not in ds.column_names:
         console.print(f"[red]✗[/red] Source column '{text_column_name}' not found in dataset.")
         console.print(f"[yellow]ℹ[/yellow] Available columns: {', '.join(ds.column_names)}")
-        return
+        return 1
 
     has_richness = richness_column_name in ds.column_names
     has_readability = readability_column_name in ds.column_names
@@ -412,7 +411,7 @@ def main():
                 title="Nothing to do",
                 border_style="green"
             ))
-            return
+            return 0
 
     # --- Compute metrics ---
     console.print(f"\n[bold cyan]Step 5:[/bold cyan] Computing lexical metrics...")
@@ -519,25 +518,25 @@ def main():
             title="Dry Run Complete",
             border_style="yellow"
         ))
-        return
+        return 0
 
     console.print(f"\n[bold cyan]Step 6:[/bold cyan] Pushing to Hugging Face Hub...")
 
-    try:
-        commit_message = (
-            f"Add/update '{richness_column_name}' (MATTR, window={window_size}) and "
-            f"'{readability_column_name}' (Flesch) from '{text_column_name}' "
-            f"(config: {config_name_choice}, mode: {update_mode})"
-        )
-
-        with console.status("[bold green]Pushing dataset to Hub...", spinner="dots"):
-            ds_processed.push_to_hub(
-                repo_id=repo_id,
-                config_name=config_name_choice,
-                commit_message=commit_message,
-                token=token,
-                max_shard_size=max_shard_size,
-            )
+    commit_message = (
+        f"Add/update '{richness_column_name}' (MATTR, window={window_size}) and "
+        f"'{readability_column_name}' (Flesch) from '{text_column_name}' "
+        f"(config: {config_name_choice}, mode: {update_mode})"
+    )
+    if push_dataset(
+        ds_processed,
+        repo_id=repo_id,
+        config_name=config_name_choice,
+        commit_message=commit_message,
+        token=token,
+        max_shard_size=max_shard_size,
+        console=console,
+        expected_revision=source_revision,
+    ):
 
         action = "updated" if (has_richness or has_readability) else "created"
         summary = (
@@ -555,15 +554,9 @@ def main():
             summary += f"\n[yellow]Total failures: {total_failures}[/yellow]"
 
         console.print(Panel(summary, title="Upload Complete", border_style="green"))
-
-    except Exception as e:
-        console.print(Panel(
-            f"[bold red]Failed to push dataset[/bold red]\n\n{e}",
-            title="Error",
-            border_style="red"
-        ))
-        logger.error("Push error details:", exc_info=True)
+        return 0
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -40,6 +40,7 @@ from dotenv import load_dotenv
 from iwac_common.omeka_client import OmekaApiClient, conn_manager
 from iwac_common.field_mappers import extract_added_date, get_value, is_content_public
 from iwac_common.upload_runner import UploadSpec, run_upload
+from iwac_common.schema import SUBSETS
 
 load_dotenv()
 
@@ -58,7 +59,7 @@ logger = logging.getLogger("upload")
 # aborts the whole run on any class fetch failure or truncation — safer than
 # the old continue-on-error, which could silently drop a class (and, via the
 # outer merge, hide it as blank-Omeka rows).
-RESOURCE_CLASSES = [35, 43, 88, 40, 82, 178, 52, 77, 305]
+RESOURCE_CLASSES = SUBSETS["references"].resource_class_ids
 
 # Resource class mapping
 RESOURCE_CLASS_MAPPING = {

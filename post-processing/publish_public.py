@@ -70,13 +70,22 @@ import sys
 # Make ``post-processing/_common.py`` importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import ensure_hf_token, PRIVATE_REPO_ID, PUBLIC_REPO_ID  # noqa: E402
-from iwac_common.card_sync import CardSchemaError, sync_card_features  # noqa: E402
+from iwac_common.hub import (  # noqa: E402
+    ConcurrentHubWriteError,
+    HubBaselineUnavailableError,
+    HubWriteError,
+    HubWriteLockedError,
+    get_repo_revision,
+    hub_write_lock,
+    push_dataset_verified,
+)
 from iwac_common.repos import (  # noqa: E402
     CONTENT_COLUMNS,
     PUBLIC_COLUMNS_FILE,
     load_public_columns,
 )
 from iwac_common.sentiment_panel import all_justification_columns  # noqa: E402
+from iwac_common.schema import ALL_CONFIGS  # noqa: E402
 
 from dotenv import load_dotenv
 from pathlib import Path
@@ -94,8 +103,6 @@ from rich.prompt import Confirm  # noqa: E402
 from rich.table import Table  # noqa: E402
 
 console = Console()
-
-ALL_CONFIGS = ["articles", "publications", "index", "references", "audiovisual", "documents", "images"]
 
 # Long-text columns that are legitimately public (shown on the public Omeka
 # pages or derived commentary, not the protected full text).
@@ -161,9 +168,14 @@ class MissingFlagError(RuntimeError):
     is impossible, so publishing must abort rather than leak."""
 
 
+class InvalidFlagError(RuntimeError):
+    """``OCR_is_public`` contains a non-boolean value and is untrustworthy."""
+
+
 def mask_content_columns(public_df, cfg: str) -> tuple[list[str], int, int]:
     """Blank the content columns of ``public_df`` IN PLACE for every row
-    whose ``OCR_is_public`` flag is not truthy (null → private, conservative).
+    whose ``OCR_is_public`` flag is false (null → private, conservative).
+    Non-boolean values are rejected rather than interpreted by truthiness.
 
     Returns ``(content_cols, kept, blanked)``. Raises
     :class:`MissingFlagError` if content columns exist without the flag.
@@ -177,7 +189,19 @@ def mask_content_columns(public_df, cfg: str) -> tuple[list[str], int, int]:
             f"'{cfg}' has content columns {content_cols} but no 'OCR_is_public' "
             f"flag; full text cannot be masked per row."
         )
-    is_public = public_df["OCR_is_public"].map(lambda v: bool(v) if pd.notna(v) else False)
+    import numpy as np
+
+    def strict_flag(value) -> bool:
+        if pd.isna(value):
+            return False
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        raise InvalidFlagError(
+            f"'{cfg}' has non-boolean OCR_is_public value {value!r} "
+            f"({type(value).__name__}); refusing a truthiness-based rights decision."
+        )
+
+    is_public = public_df["OCR_is_public"].map(strict_flag)
     private_mask = ~is_public
     for col in content_cols:
         # Blank the full text (and its lemmas) only for private-content rows.
@@ -189,11 +213,10 @@ def check_column_allowlist(cfg: str, df, approve: set[str]) -> list[str]:
     """Primary guard: every column must be explicitly allow-listed in
     ``iwac_common/public_columns.json`` before it reaches the public repo.
 
-    Returns the list of columns newly approved this run (already persisted).
+    Returns the list of columns newly approved for this run. Persistence is
+    deferred until after dry-run/confirmation so previews never edit files.
     Aborts on any unknown column that was not passed via --approve-columns.
     """
-    import json
-
     allowlist = load_public_columns()
     if cfg not in allowlist:
         console.print(
@@ -227,19 +250,31 @@ def check_column_allowlist(cfg: str, df, approve: set[str]) -> list[str]:
         )
         sys.exit(1)
 
-    # Persist the explicitly approved columns.
+    console.print(
+        f"[yellow]⚠[/yellow] [bold]{cfg}[/bold]: reviewed new public column(s) "
+        f"{', '.join(to_approve)}; they will be recorded only if publishing proceeds."
+    )
+    return to_approve
+
+
+def persist_public_column_approvals(approved_by_config: dict[str, list[str]]) -> None:
+    """Persist reviewed allowlist additions after preview/confirmation."""
+    import json
+
+    if not any(approved_by_config.values()):
+        return
     with open(PUBLIC_COLUMNS_FILE, encoding="utf-8") as f:
         raw = json.load(f)
-    raw[cfg] = sorted(set(raw[cfg]) | set(to_approve))
+    for cfg, columns in approved_by_config.items():
+        if columns:
+            raw[cfg] = sorted(set(raw[cfg]) | set(columns))
     with open(PUBLIC_COLUMNS_FILE, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)
         f.write("\n")
     console.print(
-        f"[yellow]⚠[/yellow] [bold]{cfg}[/bold]: approved new public column(s) "
-        f"{', '.join(to_approve)} (recorded in {os.path.basename(PUBLIC_COLUMNS_FILE)} "
-        f"— commit this change)."
+        f"[yellow]⚠[/yellow] Recorded reviewed public columns in "
+        f"{os.path.basename(PUBLIC_COLUMNS_FILE)} — commit this change."
     )
-    return to_approve
 
 
 def main() -> None:
@@ -295,18 +330,26 @@ def main() -> None:
 
     approve = {c.strip() for c in args.approve_columns.split(",") if c.strip()}
 
+    source_revision = get_repo_revision(args.repo_private, token=token)
     plans = []
+    approved_by_config: dict[str, list[str]] = {}
     for cfg in configs:
         with console.status(f"[bold green]Loading '{cfg}' from {args.repo_private}...", spinner="dots"):
-            ds = load_dataset(args.repo_private, name=cfg, split="train", token=token)
+            ds = load_dataset(
+                args.repo_private,
+                name=cfg,
+                split="train",
+                token=token,
+                revision=source_revision,
+            )
         public_df = ds.to_pandas()
 
         # Primary guard: every column must be explicitly allow-listed.
-        check_column_allowlist(cfg, public_df, approve)
+        approved_by_config[cfg] = check_column_allowlist(cfg, public_df, approve)
 
         try:
             content_cols, kept, blanked = mask_content_columns(public_df, cfg)
-        except MissingFlagError as exc:
+        except (MissingFlagError, InvalidFlagError) as exc:
             console.print(
                 f"[red]✗[/red] {exc} Re-run the upload script (or the backfill) "
                 f"so full text can be masked per row. Aborting."
@@ -352,52 +395,78 @@ def main() -> None:
         console.print("[yellow]Cancelled.[/yellow]")
         return
 
+    current_source_revision = get_repo_revision(args.repo_private, token=token)
+    if current_source_revision != source_revision:
+        console.print(
+            f"[red]✗[/red] The private source changed from {source_revision} to "
+            f"{current_source_revision} while the projection was prepared. "
+            "Reload and rebuild it; nothing was pushed."
+        )
+        sys.exit(1)
+
+    persist_public_column_approvals(approved_by_config)
+
     import numpy as np
     from datasets import Dataset
 
-    for cfg, content_cols, kept, blanked, public_df in plans:
-        # to_pandas returns embeddings as np.ndarray; from_pandas infers list
-        # types more reliably from plain Python lists (nulls stay null).
-        for col in public_df.columns:
-            if col.startswith("embedding"):
-                public_df[col] = public_df[col].map(
-                    lambda v: v.tolist() if isinstance(v, np.ndarray) else v
+    try:
+        # One lock spans the complete projection, preventing two local runs
+        # from interleaving different subset revisions.
+        with hub_write_lock(args.repo_public):
+            target_revision = get_repo_revision(args.repo_public, token=token)
+            for cfg, content_cols, kept, blanked, public_df in plans:
+                # to_pandas returns embeddings as np.ndarray; from_pandas infers
+                # list types more reliably from plain Python lists.
+                for col in public_df.columns:
+                    if col.startswith("embedding"):
+                        public_df[col] = public_df[col].map(
+                            lambda v: v.tolist() if isinstance(v, np.ndarray) else v
+                        )
+                with console.status(
+                    f"[bold green]Pushing '{cfg}' to {args.repo_public}...",
+                    spinner="dots",
+                ):
+                    pub_ds = Dataset.from_pandas(public_df, preserve_index=False)
+                    result = push_dataset_verified(
+                        pub_ds,
+                        repo_id=args.repo_public,
+                        config_name=cfg,
+                        token=token,
+                        max_shard_size=args.max_shard_size,
+                        commit_message=(
+                            f"Public projection of '{cfg}' from private mirror"
+                            + (
+                                f" ({blanked:,} private-content rows masked)"
+                                if content_cols else ""
+                            )
+                        ),
+                        expected_revision=target_revision,
+                        expected_columns=list(public_df.columns),
+                        expected_ids=public_df["o:id"].tolist(),
+                        console=console,
+                        acquire_lock=False,
+                    )
+                    target_revision = result.after_revision
+                console.print(
+                    f"[green]✓[/green] {cfg}: {len(public_df):,} rows, "
+                    f"{len(public_df.columns)} cols pushed"
+                    + (
+                        f" — OCR kept for {kept:,}, blanked {blanked:,}"
+                        if content_cols else ""
+                    )
                 )
-        with console.status(f"[bold green]Pushing '{cfg}' to {args.repo_public}...", spinner="dots"):
-            pub_ds = Dataset.from_pandas(public_df, preserve_index=False)
-            pub_ds.push_to_hub(
-                args.repo_public,
-                config_name=cfg,
-                token=token,
-                max_shard_size=args.max_shard_size,
-                commit_message=(
-                    f"Public projection of '{cfg}' from private mirror"
-                    + (f" ({blanked:,} private-content rows masked)" if content_cols else "")
-                ),
-            )
-        console.print(f"[green]✓[/green] {cfg}: {len(public_df):,} rows, "
-                      f"{len(public_df.columns)} cols pushed"
-                      + (f" — OCR kept for {kept:,}, blanked {blanked:,}" if content_cols else ""))
-
-        # push_to_hub refreshes the card's byte sizes but not its feature list, so
-        # a schema change leaves this subset raising CastError on load. That is
-        # worse here than on the private mirror: this is the citable dataset.
-        try:
-            sync_card_features(
-                args.repo_public, cfg, token=token, console=console,
-                expected_columns=list(public_df.columns),
-            )
-        except CardSchemaError as exc:
-            console.print(Panel(
-                f"[bold red]✗ '{cfg}' pushed, but the card is out of step[/bold red]\n\n"
-                f"{exc}\n\n"
-                f"The rows ARE public — the declared schema is not, so "
-                f"load_dataset('{args.repo_public}', name='{cfg}') raises CastError "
-                f"until the card's dataset_info is corrected. Fix the card; do not "
-                f"re-run the projection.",
-                title="Card schema mismatch", border_style="red",
-            ))
-            sys.exit(1)
+    except (
+        HubBaselineUnavailableError,
+        ConcurrentHubWriteError,
+        HubWriteError,
+        HubWriteLockedError,
+    ) as exc:
+        console.print(Panel(
+            f"[bold red]Public projection stopped[/bold red]\n\n{exc}",
+            title="Hub safety guard",
+            border_style="red",
+        ))
+        sys.exit(1)
 
     if args.squash:
         console.print(Panel(

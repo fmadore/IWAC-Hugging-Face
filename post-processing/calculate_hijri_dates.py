@@ -258,7 +258,7 @@ def report(df: pd.DataFrame, config_name: str) -> None:
     console.print(dist)
 
 
-def main() -> None:
+def main() -> int:
     configure_logging()
     console.print(
         Panel.fit(
@@ -290,7 +290,7 @@ def main() -> None:
             "for these columns.\n[yellow]ℹ[/yellow] pip install hijridate  "
             "(also listed in requirements.txt)"
         )
-        return
+        return 1
 
     token = ensure_hf_token(console=console)
     config_name = resolve_config(
@@ -299,12 +299,11 @@ def main() -> None:
     console.print(f"[green]→[/green] Subset: [bold]{config_name}[/bold]")
 
     ds = load_hub_dataset(args.repo, config_name, token=token, console=console)
-    if ds is None:
-        return
+    source_revision = getattr(ds, "_iwac_source_revision", None)
 
     if SOURCE_COLUMN not in ds.column_names:
         console.print(f"[red]✗[/red] '{SOURCE_COLUMN}' is missing from this subset — nothing to convert.")
-        return
+        return 1
 
     already = [c for c in HIJRI_COLUMNS if c in ds.column_names]
     if already and args.update_mode == "all" and not (args.yes or args.dry_run):
@@ -312,10 +311,10 @@ def main() -> None:
         try:
             if not Confirm.ask("Recompute them?", default=False):
                 console.print("[yellow]ℹ[/yellow] Cancelled; existing values kept.")
-                return
+                return 0
         except KeyboardInterrupt:
             console.print("\n[yellow]⚠[/yellow] Cancelled.")
-            return
+            return 0
 
     ds = map_with_progress(
         ds,
@@ -344,7 +343,7 @@ def main() -> None:
             extra=f"[dim]Columns: {', '.join(HIJRI_COLUMNS)}[/dim]",
             console=console,
         )
-        return
+        return 0
 
     ok = push_dataset(
         ds,
@@ -356,6 +355,7 @@ def main() -> None:
             f"converted from {SOURCE_COLUMN} with hijridate (Umm al-Qura) — config: {config_name}"
         ),
         console=console,
+        expected_revision=source_revision,
     )
     if ok:
         console.print(
@@ -368,7 +368,9 @@ def main() -> None:
                 border_style="green",
             )
         )
+        return 0
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

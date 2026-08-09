@@ -25,7 +25,6 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
-from datasets import load_dataset
 from rich import box
 from rich.console import Console
 from rich.logging import RichHandler
@@ -39,7 +38,14 @@ PARENT_DIR = CURRENT_DIR.parent
 if str(PARENT_DIR) not in sys.path:
     sys.path.insert(0, str(PARENT_DIR))
 
-from _common import choose_config, ensure_hf_token, get_available_configs, PRIVATE_REPO_ID  # type: ignore  # noqa: E402
+from _common import (  # type: ignore  # noqa: E402
+    PRIVATE_REPO_ID,
+    choose_config,
+    ensure_hf_token,
+    get_available_configs,
+    load_hub_dataset,
+    push_dataset,
+)
 
 from lda_topic_modeling.constants import (  # type: ignore
     CONFIG_PRESETS,
@@ -318,11 +324,8 @@ def main() -> int:
 
     # ── Load dataset ────────────────────────────────────────────────
     logger.info(f"Loading dataset '{repo_id}' config '{config_name}'...")
-    try:
-        ds = load_dataset(repo_id, name=config_name, split="train", token=token)
-    except Exception as e:
-        logger.error(f"Dataset load error: {e}")
-        return 1
+    ds = load_hub_dataset(repo_id, config_name, token=token, console=console)
+    source_revision = getattr(ds, "_iwac_source_revision", None)
     logger.info(f"Loaded {len(ds)} rows.")
 
     # Language stats
@@ -681,17 +684,18 @@ def main() -> int:
 
     # ── Push to Hub ─────────────────────────────────────────────────
     logger.info("Pushing dataset to Hub...")
-    try:
-        ds_processed.push_to_hub(
-            repo_id=repo_id,
-            config_name=config_name,
-            commit_message=f"Add LDA topic modeling columns ({', '.join(new_columns)})",
-            token=token,
-            max_shard_size=args.max_shard_size,
-        )
+    if push_dataset(
+        ds_processed,
+        repo_id=repo_id,
+        config_name=config_name,
+        commit_message=f"Add LDA topic modeling columns ({', '.join(new_columns)})",
+        token=token,
+        max_shard_size=args.max_shard_size,
+        console=console,
+        expected_revision=source_revision,
+    ):
         logger.info("Dataset saved successfully.")
-    except Exception as e:
-        logger.error(f"Push error: {e}")
+    else:
         return 1
 
     # ── Summary ─────────────────────────────────────────────────────

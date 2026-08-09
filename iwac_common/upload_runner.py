@@ -29,13 +29,12 @@ import argparse
 import asyncio
 import logging
 import os
-import sys
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional, Sequence
 
 import pandas as pd
 from datasets import Dataset
-from huggingface_hub import login, utils as hf_utils
+from huggingface_hub import login
 from rich import box
 from rich.console import Console
 from rich.logging import RichHandler
@@ -50,12 +49,18 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from .card_sync import CardSchemaError, sync_card_features
+from .hub import (
+    ConcurrentHubWriteError,
+    HubBaselineUnavailableError,
+    HubWriteError,
+    HubWriteLockedError,
+    push_dataset_verified,
+    resolve_hf_token,
+)
 from .hub_merge import (
     DuplicateIdError,
     ShrinkGuardError,
     merge_with_hub_dataset,
-    resolve_hf_token,
 )
 from .omeka_client import (
     Config,
@@ -66,8 +71,13 @@ from .omeka_client import (
     media_stats,
 )
 from .repos import PRIVATE_REPO_ID
+from .schema import DataContractError, validate_frame
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+
+class MappingGuardError(RuntimeError):
+    """One or more Omeka items could not be mapped safely."""
 
 
 @dataclass
@@ -150,8 +160,20 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
         console.print(f"[green]✓[/green] Fetched {len(items)} items from Omeka.")
 
         # 2. Map.
-        records = []
-        failures = 0
+        records_by_position: list[Optional[Dict[str, Any]]] = [None] * len(items)
+        mapping_errors: list[tuple[str, str]] = []
+        semaphore = asyncio.Semaphore(args.map_concurrency)
+
+        async def map_one(position: int, item: Dict[str, Any]):
+            async with semaphore:
+                try:
+                    record = await spec.map_item(item, api)
+                    if record is None:
+                        raise ValueError("mapper returned None")
+                    return position, record, None
+                except Exception as exc:  # noqa: BLE001
+                    return position, None, exc
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[bold blue]{task.description}"),
@@ -164,20 +186,38 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
             task = progress.add_task(
                 f"[cyan]Mapping {spec.config_name}", total=len(items)
             )
-            for it in items:
-                try:
-                    record = await spec.map_item(it, api)
-                    if record is not None:
-                        records.append(record)
-                except Exception as exc:  # noqa: BLE001
-                    failures += 1
+            tasks = [
+                asyncio.create_task(map_one(position, item))
+                for position, item in enumerate(items)
+            ]
+            for completed in asyncio.as_completed(tasks):
+                position, record, exc = await completed
+                if exc is None:
+                    records_by_position[position] = record
+                else:
+                    item_id = str(items[position].get("o:id", "Unknown ID"))
+                    mapping_errors.append((item_id, str(exc)))
                     logger.error(
-                        f"Error mapping item {it.get('o:id', 'Unknown ID')}: {exc}",
-                        exc_info=True,
+                        "Error mapping item %s: %s", item_id, exc,
+                        exc_info=(type(exc), exc, exc.__traceback__),
                     )
                 progress.update(task, advance=1)
-        if failures:
-            console.print(f"[yellow]⚠[/yellow] {failures} item(s) failed to map (see log above).")
+        if mapping_errors and not args.allow_map_failures:
+            sample = "; ".join(
+                f"{item_id}: {message}" for item_id, message in mapping_errors[:5]
+            )
+            raise MappingGuardError(
+                f"{len(mapping_errors)} item(s) failed to map ({sample}). "
+                "The run fails closed so those rows are not deleted. Re-run after "
+                "fixing the cause, or use --allow-map-failures to preserve their "
+                "existing Hub rows explicitly."
+            )
+        if mapping_errors:
+            console.print(
+                f"[yellow]⚠[/yellow] {len(mapping_errors)} mapper failure(s) explicitly "
+                "allowed; their complete existing Hub rows will be retained."
+            )
+        records = [record for record in records_by_position if record is not None]
         if not records:
             console.print("[bold red]✗ Error:[/bold red] No records were successfully mapped.")
             return 1
@@ -187,7 +227,10 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
         # before the merge — there is nothing to salvage downstream.
         media_summary = media_stats.check(allow_failures=args.allow_media_failures)
         if media_summary:
-            console.print(f"[yellow]⚠[/yellow] {media_summary} — media URLs for those items are empty.")
+            console.print(
+                f"[yellow]⚠[/yellow] {media_summary} — existing Hub values for "
+                "the affected media fields will be preserved."
+            )
 
         new_df = pd.DataFrame(records)
         if "o:id" not in new_df.columns or new_df["o:id"].isnull().any():
@@ -196,12 +239,26 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
         new_df["o:id"] = new_df["o:id"].astype(str)
 
         token = resolve_hf_token()
+        if token is None:
+            console.print("[yellow]⚠[/yellow] No HF token found; starting login before reading the baseline.")
+            try:
+                login()
+            except Exception as exc:  # noqa: BLE001
+                raise HubBaselineUnavailableError(
+                    f"Hugging Face login failed: {exc}"
+                ) from exc
+            token = resolve_hf_token()
+        if token is None:
+            raise HubBaselineUnavailableError(
+                "No Hugging Face token is available after login; refusing to read or write."
+            )
         if spec.post_map is not None:
             new_df = await spec.post_map(new_df, api, args.repo, token)
 
         # 3. Merge with the Hub (preserves computed columns; safety rails
         # raise instead of silently shrinking or fanning out).
         console.print("\n[bold cyan]Step 2:[/bold cyan] Merging with existing Hub dataset...")
+        revision: dict[str, str] = {}
         final_df = merge_with_hub_dataset(
             new_df,
             args.repo,
@@ -213,6 +270,16 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
             console=console,
             allow_shrink=args.force_shrink,
             stale_rows=getattr(args, "stale_rows", "keep"),
+            allow_initialize=args.initialize,
+            preserve_existing_ids=(
+                [item_id for item_id, _ in mapping_errors]
+                if args.allow_map_failures else ()
+            ),
+            preserve_fields_by_id=(
+                media_stats.failed_fields_by_item
+                if args.allow_media_failures else None
+            ),
+            revision_out=revision,
         )
 
         if spec.post_merge is not None:
@@ -229,6 +296,11 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
             return 0
         if final_df["o:id"].isnull().any():
             console.print("[bold red]✗ Critical:[/bold red] 'o:id' null after merge. Aborting push.")
+            return 1
+        try:
+            validate_frame(final_df, spec.config_name)
+        except DataContractError as exc:
+            console.print(f"[bold red]✗ Data contract:[/bold red] {exc}")
             return 1
 
         summary = Table(title="Dataset Summary", box=box.ROUNDED)
@@ -250,26 +322,20 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
             return 0
 
         ds = Dataset.from_pandas(final_df, preserve_index=False)
-        if os.getenv("HF_TOKEN") is None and not hf_utils.is_notebook():
-            login()
         try:
             with console.status("[bold green]Pushing dataset to Hugging Face Hub...", spinner="dots"):
-                ds.push_to_hub(
-                    args.repo,
-                    max_shard_size=args.max_shard_size,
+                push_dataset_verified(
+                    ds,
+                    repo_id=args.repo,
                     config_name=spec.config_name,
                     token=token,
+                    commit_message=f"Refresh '{spec.config_name}' from the IWAC Omeka source",
+                    max_shard_size=args.max_shard_size,
+                    console=console,
+                    expected_revision=revision.get("revision"),
+                    expected_columns=list(final_df.columns),
+                    expected_ids=final_df["o:id"].tolist(),
                 )
-            # push_to_hub updates the card's byte sizes but not its feature list,
-            # so a schema change leaves the subset unloadable (CastError). Check
-            # and repair before declaring success — see iwac_common/card_sync.py.
-            sync_card_features(
-                args.repo,
-                spec.config_name,
-                token=token,
-                console=console,
-                expected_columns=list(final_df.columns),
-            )
             console.print(Panel(
                 f"[bold green]✓ Dataset successfully published![/bold green]\n\n"
                 f"Repository: [cyan]{args.repo}[/cyan]\n"
@@ -279,21 +345,6 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
                 border_style="green",
             ))
             return 0
-        except CardSchemaError as exc:
-            # The push itself worked; saying "failed to push" would send someone
-            # looking in the wrong place.
-            console.print(Panel(
-                f"[bold red]✗ Data pushed, but the card is out of step[/bold red]\n\n"
-                f"{exc}\n\n"
-                f"The rows ARE on the Hub — the declared schema is not, so "
-                f"load_dataset('{args.repo}', name='{spec.config_name}') raises "
-                f"CastError until the card's dataset_info is corrected. Do not "
-                f"re-run the upload to fix it; fix the card.",
-                title="Card schema mismatch",
-                border_style="red",
-            ))
-            logger.error("Details of the exception:", exc_info=True)
-            return 1
         except Exception as exc:  # noqa: BLE001
             console.print(Panel(
                 f"[bold red]✗ Failed to push dataset[/bold red]\n\n{exc}",
@@ -317,12 +368,39 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
             border_style="red",
         ))
         return 1
+    except MappingGuardError as exc:
+        console.print(Panel(
+            f"[bold red]✗ Mapper failure[/bold red]\n\n{exc}",
+            title="Aborted — Hub rows protected",
+            border_style="red",
+        ))
+        return 1
+    except (
+        HubBaselineUnavailableError,
+        ConcurrentHubWriteError,
+        HubWriteError,
+        HubWriteLockedError,
+    ) as exc:
+        console.print(Panel(
+            f"[bold red]✗ Hub safety guard[/bold red]\n\n{exc}",
+            title="Aborted — Hub data protected",
+            border_style="red",
+        ))
+        return 1
     except (ShrinkGuardError, DuplicateIdError) as exc:
         console.print(Panel(
             f"[bold red]✗ {type(exc).__name__}[/bold red]\n\n{exc}",
             title="Aborted — Hub data protected",
             border_style="red",
         ))
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        console.print(Panel(
+            f"[bold red]✗ Unexpected pipeline failure[/bold red]\n\n{exc}",
+            title="Aborted — Hub left untouched",
+            border_style="red",
+        ))
+        logger.error("Unexpected upload failure:", exc_info=True)
         return 1
     finally:
         await conn_manager.close()
@@ -355,10 +433,24 @@ def build_parser(spec: UploadSpec) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--allow-media-failures", action="store_true",
-        help="Allow pushing when most per-item media lookups failed (normally "
-             "aborted: PDF/thumbnail would be blanked over good Hub values). "
+        help="Allow pushing when any per-item media lookup failed (normally "
+             "aborted; existing media values for failed items are preserved). "
              "Use only when the media really are gone, not when the host is "
              "unreachable",
+    )
+    parser.add_argument(
+        "--allow-map-failures", action="store_true",
+        help="Continue after mapper errors while retaining those items' complete "
+             "existing Hub rows. The default is to abort on any mapper error.",
+    )
+    parser.add_argument(
+        "--map-concurrency", type=int, default=8,
+        help="Maximum concurrent Omeka item mappers (default: 8)",
+    )
+    parser.add_argument(
+        "--initialize", action="store_true",
+        help="Allow creation of a deliberately new Hub config. Existing configs "
+             "still fail closed on every read/auth/network error.",
     )
     if spec.supports_stale_rows:
         parser.add_argument(
@@ -373,6 +465,9 @@ def run_upload(spec: UploadSpec, argv: Optional[Sequence[str]] = None) -> int:
     """Parse the CLI and run the upload; returns a process exit code."""
     console, logger = _setup_console_logging()
     args = build_parser(spec).parse_args(argv)
+    if args.map_concurrency < 1:
+        console.print("[red]--map-concurrency must be at least 1.[/red]")
+        return 2
     try:
         return asyncio.run(_run(spec, args, console, logger))
     except KeyboardInterrupt:

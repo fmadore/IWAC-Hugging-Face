@@ -44,6 +44,7 @@ from iwac_common.omeka_client import (
     OmekaApiClient,
     conn_manager,
     fetch_iiif_thumbnail_url,
+    fetch_primary_media_url,
 )
 from iwac_common.field_mappers import (
     extract_added_date,
@@ -52,6 +53,7 @@ from iwac_common.field_mappers import (
     to_int_or_none,
 )
 from iwac_common.upload_runner import UploadSpec, run_upload
+from iwac_common.schema import SUBSETS
 
 logger = logging.getLogger(__name__)
 
@@ -74,16 +76,9 @@ load_dotenv(dotenv_path=dotenv_path)
 async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item Omeka (publication islamique) en dict plat pour HF datasets."""
 
-    primary_url = ""
-    if item.get("o:primary_media"):
-        try:
-            media_id_url = item["o:primary_media"]["@id"]
-            media_id = media_id_url.split("/")[-1]
-            media_data = await api.fetch_media_data(media_id)
-            primary_url = media_data.get("o:original_url", "")
-        except Exception as e:
-            logger.error(f"Error fetching primary media for item {item.get('o:id')}: {e}")
-            primary_url = ""
+    primary_url = await fetch_primary_media_url(
+        item, api, affected_fields=("PDF",)
+    )
 
 
     publisher_name = get_value(item, "dcterms:publisher") # Changed newspaper_name to publisher_name for clarity
@@ -157,7 +152,7 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
 
 SPEC = UploadSpec(
     config_name="publications",
-    resource_class_ids=(60,),  # bibo:Issue — Islamic publications
+    resource_class_ids=SUBSETS["publications"].resource_class_ids,
     map_item=map_islamic_publication_item,
     title="📚 IWAC Islamic Publications Upload",
     cache_dir=".cache_omk",  # intentionally shared with articles (cache keys include class id)

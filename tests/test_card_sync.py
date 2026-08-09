@@ -213,22 +213,34 @@ class TestFailureModes:
             sync_card_features("repo", "articles")
 
 
-class TestWiredIntoBothPushers:
-    """Both writers to the Hub must call the guard, or the hazard returns."""
+class TestWiredIntoSingleWriter:
+    """All scripts delegate to the one gateway that owns card repair."""
 
-    def test_upload_runner_calls_it(self):
+    def test_verified_writer_calls_guard(self):
         import inspect
 
-        import iwac_common.upload_runner as runner
+        import iwac_common.hub as hub
 
-        src = inspect.getsource(runner)
+        src = inspect.getsource(hub.push_dataset_verified)
         assert "sync_card_features(" in src
         assert "CardSchemaError" in src
 
-    def test_publish_public_calls_it(self):
+    def test_no_script_bypasses_verified_writer(self):
         from pathlib import Path
 
-        src = (Path(__file__).resolve().parent.parent
-               / "post-processing" / "publish_public.py").read_text(encoding="utf-8")
-        assert "sync_card_features(" in src
-        assert "CardSchemaError" in src
+        root = Path(__file__).resolve().parent.parent
+        offenders = []
+        code_dirs = [
+            "iwac_common", "articles", "audiovisual", "document", "images",
+            "index", "islamic-publications", "reference", "post-processing",
+            "analyses", "data",
+        ]
+        candidates = list(root.glob("*.py"))
+        for directory in code_dirs:
+            candidates.extend((root / directory).rglob("*.py"))
+        for path in candidates:
+            if path == root / "iwac_common" / "hub.py":
+                continue
+            if ".push_to_hub(" in path.read_text(encoding="utf-8"):
+                offenders.append(str(path.relative_to(root)))
+        assert offenders == []

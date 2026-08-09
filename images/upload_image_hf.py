@@ -39,9 +39,15 @@ from typing import Dict, Any
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
-from iwac_common.omeka_client import OmekaApiClient, conn_manager, fetch_iiif_thumbnail_url
+from iwac_common.omeka_client import (
+    OmekaApiClient,
+    conn_manager,
+    fetch_iiif_thumbnail_url,
+    fetch_primary_media_url,
+)
 from iwac_common.field_mappers import extract_added_date, get_value
 from iwac_common.upload_runner import UploadSpec, run_upload
+from iwac_common.schema import SUBSETS
 
 load_dotenv()
 
@@ -53,7 +59,7 @@ load_dotenv()
 
 # Photographs (bibo:Image). The "Photograph" resource template's default class
 # (33) is unused; every photograph item is filed under class 58.
-IMAGE_RESOURCE_CLASS_ID = 58
+IMAGE_RESOURCE_CLASS_ID = SUBSETS["images"].resource_class_ids[0]
 
 # Each photograph belongs to exactly one country-specific item set. Map the
 # item-set id to the canonical country label used across the dataset (matches
@@ -127,11 +133,11 @@ async def map_image_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
     """Transforme un item Omeka photographie (bibo:Image) en dict plat pour HF."""
 
     # Original image URL from the primary media (the actual JPEG).
-    image_url = ""
-    if item.get("o:primary_media"):
-        mid = item["o:primary_media"]["@id"].split("/")[-1]
-        mdata = await api.fetch_media_data(mid)
-        image_url = mdata.get("o:original_url", "")
+    image_url = await fetch_primary_media_url(
+        item,
+        api,
+        affected_fields=("image_url",),
+    )
 
     added_date = extract_added_date(item)
 
@@ -176,7 +182,7 @@ async def map_image_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
 
 SPEC = UploadSpec(
     config_name="images",
-    resource_class_ids=(58,),  # bibo:Image — curator field photographs
+    resource_class_ids=SUBSETS["images"].resource_class_ids,
     map_item=map_image_item,
     title="🖼️ IWAC Images Upload",
     cache_dir=".cache_omk_images",

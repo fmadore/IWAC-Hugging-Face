@@ -1,5 +1,10 @@
 # IWAC Code & Methods Audit — July 2026
 
+> Historical audit: this records the baseline that motivated the July/August
+> 2026 work. Statements such as “no tests/CI” are findings from that baseline,
+> not descriptions of the current tree. See `REFACTORING_ROADMAP.md` and
+> `README.md` for the safeguards now implemented.
+
 A full-repo examination following the completed `REFACTORING_ROADMAP.md`. That roadmap
 (Tiers 1–3 + post-roadmap pass) is done and verified; everything below is **new** —
 found by re-reading all 30 Python files after the refactor. Organized by priority:

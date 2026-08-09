@@ -32,7 +32,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pandas as pd
 from dotenv import load_dotenv
 from country_mapper import get_country_from_newspaper
-from iwac_common.omeka_client import OmekaApiClient, conn_manager, fetch_iiif_thumbnail_url
+from iwac_common.omeka_client import (
+    OmekaApiClient,
+    conn_manager,
+    fetch_iiif_thumbnail_url,
+    fetch_primary_media_url,
+)
 from iwac_common.field_mappers import (
     extract_added_date,
     get_value,
@@ -51,6 +56,7 @@ from iwac_common.sentiment_panel import (
     prefixes,
 )
 from iwac_common.upload_runner import UploadSpec, run_upload
+from iwac_common.schema import SUBSETS
 
 load_dotenv()
 
@@ -99,11 +105,9 @@ def _get_subjectivity_score(item: Dict[str, Any], field: str) -> Optional[int]:
 async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item Omeka en dict plat pour HF datasets."""
 
-    primary_url = ""
-    if item.get("o:primary_media"):
-        mid = item["o:primary_media"]["@id"].split("/")[-1]
-        mdata = await api.fetch_media_data(mid)
-        primary_url = mdata.get("o:original_url", "")
+    primary_url = await fetch_primary_media_url(
+        item, api, affected_fields=("PDF",)
+    )
 
     newspaper_name = get_value(item, "dcterms:publisher")
     country = get_country_from_newspaper(newspaper_name)
@@ -232,7 +236,7 @@ def _sentiment_columns_last(final_df: pd.DataFrame) -> pd.DataFrame:
 
 SPEC = UploadSpec(
     config_name="articles",
-    resource_class_ids=(36,),  # bibo:Article — newspaper articles only
+    resource_class_ids=SUBSETS["articles"].resource_class_ids,
     map_item=map_newspaper_article,
     title="📰 IWAC Newspaper Upload",
     cache_dir=".cache_omk",  # shared with islamic-publications (keys include class id)

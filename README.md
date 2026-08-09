@@ -30,9 +30,9 @@ The projection **masks full text per row rather than stripping it wholesale**. `
 
 Because a leak here would be unrecoverable, `publish_public.py` aborts rather than guessing: if a content subset lacks `OCR_is_public`, or if any column is absent from the per-subset allowlist in [`iwac_common/public_columns.json`](iwac_common/public_columns.json). Adding a legitimately new column means editing that allowlist deliberately.
 
-The uploads carry equivalent rails. `hub_merge` refuses a frame under 95% of the Hub's current row count; `fetch_items` raises on a short read against the `Omeka-S-Total-Results` header; and a mass media-lookup failure aborts, because the other guards check row *count* and an unreachable host would otherwise overwrite good URLs with blanks while the row count held steady.
+The uploads carry equivalent rails. Hub baselines fail closed on auth, network, schema, or config errors; a genuinely new config requires `--initialize`. `hub_merge` refuses a frame under 95% of the Hub's current row count; `fetch_items` requires and exactly reconciles the `Omeka-S-Total-Results` header; any mapper or media lookup failure aborts by default. The explicit `--allow-map-failures` and `--allow-media-failures` overrides retain the affected prior Hub row/fields instead of replacing them with blanks.
 
-One rail runs *after* the push instead of before it. `push_to_hub` refreshes a config's byte sizes in the dataset card but not its feature list, so any push that adds or drops a column leaves the card declaring the old schema — and `load_dataset` then raises `CastError: column names don't match`, making the subset unloadable for every consumer, this pipeline's own next run included. It happened twice on 2026-08-06, to the private mirror and then to the public citable dataset. [`iwac_common/card_sync.py`](iwac_common/card_sync.py) therefore checks the card against the parquet after every push and **repairs** it, since by that point aborting would only leave the dataset broken; it raises only if the mismatch survives the rewrite. Both writers to the Hub call it, and `tests/test_card_sync.py` asserts they still do.
+One rail runs *after* the push instead of before it. `push_to_hub` refreshes a config's byte sizes in the dataset card but not its feature list, so any push that adds or drops a column leaves the card declaring the old schema — and `load_dataset` then raises `CastError: column names don't match`, making the subset unloadable for every consumer, this pipeline's own next run included. It happened twice on 2026-08-06, to the private mirror and then to the public citable dataset. [`iwac_common/hub.py`](iwac_common/hub.py) is now the only write gateway: it validates IDs and embedding dimensions, rejects a changed source revision, acquires a local repo lock, pushes, repairs the card through [`card_sync.py`](iwac_common/card_sync.py), and reloads the exact published revision to verify columns and IDs. A test rejects any direct `push_to_hub` call outside this gateway.
 
 ## Dataset subsets
 
@@ -89,8 +89,9 @@ Generation 1 survives on the Hub through the merge, not through a copy: the uplo
 articles/  audiovisual/  document/  images/       Upload scripts, one per subset:
 index/     islamic-publications/  reference/      Omeka S -> Hugging Face
 
-iwac_common/        Shared infrastructure: Omeka client, Hub merge, field
-                    mappers, upload runner, sentiment panel, repo config
+iwac_common/        Shared infrastructure: Omeka client, fail-closed Hub
+                    gateway, schema registry, merge, mappers, upload runner
+iwac_pipeline/      Installed `iwac-*` command entry points
 post-processing/    Computed columns + publish_public.py
 analyses/           Report-only analyses; write to analyses/output/, never
                     add Hub columns
@@ -100,7 +101,7 @@ data/               fetch_datasets.py — local CSV mirrors for offline work
 
 ## Installation
 
-Requires **Python >= 3.10** (CI runs 3.11). Development is CPU-only throughout; the pipeline deliberately prefers CPU-viable models such as spaCy's `*_lg` pipelines over transformer equivalents.
+Requires **Python >= 3.12**. CI tests Python 3.12 on Linux and Windows and Python 3.13 on Linux. Development is CPU-only throughout; the pipeline deliberately prefers CPU-viable models such as spaCy's `*_lg` pipelines over transformer equivalents.
 
 ```bash
 git clone https://github.com/fmadore/IWAC-Hugging-Face.git
@@ -111,7 +112,7 @@ python -m venv .venv
 cp .env.example .env
 ```
 
-The editable install makes `iwac_common` and `country_mapper` importable from any working directory; the scripts keep `sys.path` fallbacks so they still run in an uninstalled venv.
+For development, install `requirements-dev.txt` instead; it includes pytest, coverage, and the undefined-name check. The editable install also exposes `iwac-upload`, `iwac-mirror`, and `iwac-publish-public` from the checkout.
 
 The lemmatisation step additionally needs spaCy models:
 
@@ -128,26 +129,26 @@ Set `IWAC_HF_PRIVATE_REPO` and `IWAC_HF_PUBLIC_REPO` to redirect the pipeline at
 
 ## Usage
 
-```bash
-.venv\Scripts\python script_name.py
-```
+The original script paths remain supported. The installed commands give the common operations one discoverable surface:
 
 The flow runs in three stages, in order:
 
 ```bash
 # 1. Upload — fetch from Omeka S, merge into the private repo
-.venv\Scripts\python articles/upload_newspaper_hf.py
+iwac-upload articles --dry-run
+iwac-upload articles
 
 # 2. Post-process — compute derived columns on the private repo
 .venv\Scripts\python post-processing/calculate_word_count.py --update-mode empty
 
 # 3. Publish — project the private repo into the public one
-.venv\Scripts\python post-processing/publish_public.py
+iwac-publish-public --dry-run
+iwac-publish-public
 ```
 
 Two properties of this flow are easy to get wrong:
 
-**Pushes to one repo must be sequential.** `push_to_hub` rewrites the whole dataset config and the shared README metadata, so two scripts pushing concurrently will clobber each other's columns through a lost update — even when they target different subsets. Finish one before starting the next.
+**Pushes to one repo must be sequential.** The writer enforces this locally with a repo-scoped lock and rejects a Hub revision that changed after computation began. That prevents overlapping processes on one machine and detects most remote lost updates; it is still good operational practice to finish one job before starting another.
 
 **Uploads merge rather than overwrite.** Each upload fetches from Omeka, loads the existing Hub rows, identifies columns that exist only on the Hub, and merges them back on `o:id`. That is what keeps embeddings and topics alive across a re-upload rather than blanking them.
 
@@ -155,9 +156,11 @@ Post-processing scripts share a `--update-mode` flag: `empty` fills only missing
 
 ## Reproducibility
 
-Topic models use a fixed seed (42), write their parameters to `training_parameters.json`, and record coherence metrics alongside the model. Omeka responses are cached in `.cache_omk*` for 24 hours. Lemma and embedding resume caches are fingerprinted by the configuration that produced them — spaCy model plus `LEMMA_LOGIC_VERSION`, embedding model plus dimension and task — so a cache written under a different configuration is ignored rather than silently mixed in. These caches are deleted on a successful push, which means a leftover cache file is a reliable signal of an interrupted run.
+Topic models use a fixed seed (42), write their parameters to `training_parameters.json`, and record coherence metrics alongside the model. Omeka responses are cached atomically in `.cache_omk*` for 24 hours; cache keys include the API host and credential identity so staging/public responses cannot be confused with production/private ones. Lemma and embedding resume caches are fingerprinted by the configuration that produced them — spaCy model plus `LEMMA_LOGIC_VERSION`, embedding model plus dimension and task — so a cache written under a different configuration is ignored rather than silently mixed in. These caches are deleted on a successful push, which means a leftover cache file is a reliable signal of an interrupted run.
 
-CI runs the test suite on every push, plus `pyflakes` specifically for undefined names: the import smoke tests only import each module, so a name used inside `main()` but never imported would otherwise pass tests and fail at runtime.
+`iwac-mirror --dataset private` creates the local `data/iwac_*.csv` files from one pinned Hub revision. Files are staged first and `data/mirror_manifest.json` records the repository SHA, row counts, and SHA-256 hashes. Offline consumers verify that manifest and refuse an interrupted or mixed-revision mirror.
+
+CI compiles every module, rejects undefined names, runs the unit/contract/import-smoke suite with a 70% `iwac_common` coverage floor, executes `pip check`, and tests the supported Linux/Windows/Python matrix. Dependabot tracks both Python and GitHub Action updates, while pull requests receive GitHub's dependency review.
 
 ## Limitations and caveats
 

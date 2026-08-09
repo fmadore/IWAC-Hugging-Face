@@ -49,10 +49,15 @@ import time
 from pathlib import Path
 from typing import List, Dict, Any
 from dotenv import load_dotenv
-from datasets import load_dataset
 # Make ``post-processing/_common.py`` and ``_embedding_utils.py`` importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import ensure_hf_token, PRIVATE_REPO_ID  # noqa: E402
+from _common import (  # noqa: E402
+    PRIVATE_REPO_ID,
+    ensure_hf_token,
+    load_hub_dataset,
+    push_dataset,
+)
+from iwac_common.schema import SUBSETS  # noqa: E402
 from _embedding_utils import (  # noqa: E402
     average_embeddings,
     cache_fingerprint,
@@ -327,7 +332,7 @@ def _save_completed_to_cache(
         logger.info(f"Checkpoint: saved {len(cache)} total embeddings to cache")
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Add semantic embedding column to a dataset subset using "
                     "Google Gemini embeddings."
@@ -391,6 +396,12 @@ def main():
         action="store_true",
         help="Resume a crashed --update-mode all run from its cache instead of starting fresh.",
     )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Push even if Gemini chunks failed. By default the cache is kept "
+             "and the Hub is left untouched for a safe retry.",
+    )
 
     args = parser.parse_args()
 
@@ -411,6 +422,12 @@ def main():
 
     # Resolve per-config settings
     text_column, embedding_column, cache_stem = CONFIG_SETTINGS[config_name]
+    expected_dimension = (SUBSETS[config_name].embedding_columns or {})[embedding_column]
+    if dimensionality != expected_dimension:
+        parser.error(
+            f"--dimensionality must be {expected_dimension} for the canonical "
+            f"{config_name}.{embedding_column} schema"
+        )
     # Key the resume cache by (model, dimensionality, task type) so a cache
     # written at one embedding configuration can never be restored into a run
     # with different parameters. Old un-fingerprinted cache files (e.g.
@@ -426,14 +443,14 @@ def main():
     api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
         console.print("[red]✗[/red] GOOGLE_API_KEY (or GEMINI_API_KEY) not found in environment.")
-        return
+        return 1
     console.print("[green]✓[/green] Gemini API key found.")
 
     # Hugging Face token
     try:
         hf_token = ensure_hf_token(console=console)
     except SystemExit:
-        return
+        return 1
     console.print("[green]✓[/green] Hugging Face authenticated.")
 
     # --- Step 2: Initialize Gemini client ---
@@ -451,7 +468,7 @@ def main():
         console.print(f"[blue]→[/blue] Output dimensionality: [cyan]{actual_dim}[/cyan]")
     except Exception as e:
         console.print(f"[red]✗[/red] Failed to initialize Gemini client: {e}")
-        return
+        return 1
 
     # --- Update mode selection ---
     if args.update_mode:
@@ -478,20 +495,14 @@ def main():
 
     # --- Step 3: Load dataset ---
     console.print(f"\n[bold cyan]Step 3:[/bold cyan] Loading dataset...")
-    try:
-        with console.status(f"[bold green]Loading '{repo_id}' (config: {config_name})...", spinner="dots"):
-            ds = load_dataset(repo_id, name=config_name, split="train", token=hf_token)
-    except Exception as e:
-        console.print(f"[red]✗[/red] Failed to load dataset: {e}")
-        return
-
-    console.print(f"[green]✓[/green] Dataset loaded: [cyan]{len(ds)}[/cyan] rows")
+    ds = load_hub_dataset(repo_id, config_name, token=hf_token, console=console)
+    source_revision = getattr(ds, "_iwac_source_revision", None)
 
     # --- Column checks ---
     if text_column not in ds.column_names:
         console.print(f"[red]✗[/red] Source column '{text_column}' not found in dataset.")
         console.print(f"[yellow]ℹ[/yellow] Available columns: {', '.join(ds.column_names)}")
-        return
+        return 1
 
     # --- Dimension consistency check ---
     if update_mode == "missing" and embedding_column in ds.column_names:
@@ -500,7 +511,7 @@ def main():
             console.print(f"[green]✓[/green] Existing embeddings are compatible (dim={actual_dim}).")
         except ValueError as e:
             console.print(f"[red]✗[/red] {e}")
-            return
+            return 1
 
     if embedding_column in ds.column_names:
         if update_mode == "all":
@@ -533,7 +544,7 @@ def main():
                 title="Nothing to do",
                 border_style="green",
             ))
-            return
+            return 0
 
     # Build the full embeddings list, pre-filling from cache
     # Normalize None to [] for consistent PyArrow typing
@@ -671,6 +682,16 @@ def main():
                 f"encoding."
             )
 
+    if error_counter["failed"] > 0 and not args.allow_partial:
+        console.print(Panel(
+            "[bold red]Embedding run incomplete; Hub left untouched.[/bold red]\n\n"
+            f"{error_counter['failed']} chunk(s) failed. Successful work remains "
+            f"in {cache_file}; re-run to retry, or pass --allow-partial explicitly.",
+            title="Fail-closed derived-data write",
+            border_style="red",
+        ))
+        return 1
+
     # --- Update the dataset ---
     console.print(f"\n[bold cyan]Step 6:[/bold cyan] Updating dataset...")
 
@@ -716,24 +737,25 @@ def main():
             title="Dry Run Complete",
             border_style="yellow",
         ))
-        return
+        return 0
 
     console.print(f"\n[bold cyan]Step 7:[/bold cyan] Pushing to Hugging Face Hub...")
 
-    try:
-        commit_message = (
-            f"Add/update '{embedding_column}' embeddings using {MODEL_NAME} "
-            f"(dim={dimensionality}, task={task_type}, config={config_name})"
-        )
+    commit_message = (
+        f"Add/update '{embedding_column}' embeddings using {MODEL_NAME} "
+        f"(dim={dimensionality}, task={task_type}, config={config_name})"
+    )
 
-        with console.status("[bold green]Pushing dataset to Hub...", spinner="dots"):
-            ds_processed.push_to_hub(
-                repo_id=repo_id,
-                config_name=config_name,
-                commit_message=commit_message,
-                token=hf_token,
-                max_shard_size=max_shard_size,
-            )
+    if push_dataset(
+        ds_processed,
+        repo_id=repo_id,
+        config_name=config_name,
+        commit_message=commit_message,
+        token=hf_token,
+        max_shard_size=max_shard_size,
+        console=console,
+        expected_revision=source_revision,
+    ):
 
         action = "updated" if embedding_column in ds.column_names else "created"
         total_valid = sum(1 for e in all_embeddings if not is_empty_embedding(e))
@@ -755,19 +777,9 @@ def main():
 
         # Clean up cache after successful push
         delete_cache(cache_file)
-
-    except Exception as e:
-        console.print(Panel(
-            f"[bold red]Failed to push dataset[/bold red]\n\n"
-            f"{e}\n\n"
-            f"[yellow]Embeddings are cached in {cache_file}[/yellow]\n"
-            f"Re-run the script to resume from where it left off "
-            f"(in --update-mode all, add --resume).",
-            title="Error",
-            border_style="red",
-        ))
-        logger.error("Push error details:", exc_info=True)
+        return 0
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

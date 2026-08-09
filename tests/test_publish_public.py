@@ -45,6 +45,12 @@ class TestMaskContentColumns:
         assert kept == 1 and blanked == 1
         assert df.loc[1, "OCR"] == ""
 
+    @pytest.mark.parametrize("flag", ["False", "true", 0, 1])
+    def test_non_boolean_flag_is_rejected(self, flag):
+        df = self._articles_df([flag])
+        with pytest.raises(pp.InvalidFlagError):
+            pp.mask_content_columns(df, "articles")
+
     def test_missing_flag_column_raises(self):
         df = self._articles_df([True, False]).drop(columns=["OCR_is_public"])
         with pytest.raises(pp.MissingFlagError):
@@ -112,11 +118,14 @@ class TestColumnAllowlist:
         with pytest.raises(SystemExit):
             pp.check_column_allowlist("mystery", df, approve=set())
 
-    def test_approved_column_persisted(self, monkeypatch, tmp_path):
+    def test_approved_column_is_deferred_until_publish(self, monkeypatch, tmp_path):
         f = self._patch_allowlist(monkeypatch, tmp_path, {"articles": ["o:id"]})
         df = pd.DataFrame({"o:id": ["1"], "new_metric": [0.9]})
         approved = pp.check_column_allowlist("articles", df, approve={"new_metric"})
         assert approved == ["new_metric"]
+        on_disk = json.loads(f.read_text(encoding="utf-8"))
+        assert "new_metric" not in on_disk["articles"]
+        pp.persist_public_column_approvals({"articles": approved})
         on_disk = json.loads(f.read_text(encoding="utf-8"))
         assert "new_metric" in on_disk["articles"]
 

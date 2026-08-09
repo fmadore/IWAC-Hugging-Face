@@ -31,7 +31,11 @@ def get_value(item: Dict[str, Any], field: str) -> str:
         ]
         return "|".join(filter(None, parts))
     if isinstance(val, dict):
-        return val.get("display_title", "") or val.get("@value", "")
+        return (
+            val.get("display_title", "")
+            or val.get("@value", "")
+            or val.get("@id", "")
+        )
     return str(val)
 
 

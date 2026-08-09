@@ -119,9 +119,10 @@ def main() -> None:
         args.repo, "articles", token=token, source=args.source,
         columns=["o:id", "subject", "country", "pub_date"], console=console,
     )
+    source_revision = articles.attrs.get("iwac_source_revision")
     index = load_subset_dataframe(
         args.repo, "index", token=token, source=args.source,
-        columns=["Titre", "Type"], console=console,
+        columns=["Titre", "Type"], console=console, revision=source_revision,
     )
 
     # Authority lookup: Titre -> Type.

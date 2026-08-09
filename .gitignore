@@ -11,6 +11,9 @@ data/iwac_documents.csv
 data/iwac_index.csv
 data/iwac_publications.csv
 data/iwac_references.csv
+data/iwac_images.csv
+data/mirror_manifest.json
+data/.iwac-mirror-*/
 bertopic_model/
 lda_model*/
 nul
@@ -19,3 +22,6 @@ analyses/output/
 *.egg-info/
 logs/
 .pytest_cache/
+.iwac_locks/
+.coverage
+coverage.xml

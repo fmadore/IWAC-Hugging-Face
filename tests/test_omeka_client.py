@@ -1,10 +1,11 @@
 """Fetch-truncation reconciliation (safety rail B1) — no network involved."""
 
 import asyncio
+import os
 
 import pytest
 
-from iwac_common.omeka_client import Config, OmekaApiClient, TruncatedFetchError
+from iwac_common.omeka_client import Cache, Config, OmekaApiClient, TruncatedFetchError
 
 
 class StubClient(OmekaApiClient):
@@ -29,6 +30,22 @@ def _items(n, start=0):
     return [{"o:id": i} for i in range(start, start + n)]
 
 
+class TestDiskCache:
+    def test_atomic_round_trip_leaves_no_temp_file(self, tmp_path):
+        cache = Cache(str(tmp_path))
+        asyncio.run(cache.set("key", {"value": 1}))
+        assert asyncio.run(cache.get("key")) == {"value": 1}
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    def test_corrupt_entry_is_deleted_and_treated_as_miss(self, tmp_path):
+        cache = Cache(str(tmp_path))
+        path = cache._path("key")
+        with open(path, "wb") as handle:
+            handle.write(b"not gzip")
+        assert asyncio.run(cache.get("key")) is None
+        assert not os.path.exists(path)
+
+
 class TestFetchReconciliation:
     def test_complete_fetch_passes(self):
         pages = [_items(100), _items(37, start=100)]
@@ -43,11 +60,11 @@ class TestFetchReconciliation:
         with pytest.raises(TruncatedFetchError):
             asyncio.run(client.fetch_items(36))
 
-    def test_unknown_total_skips_check(self):
+    def test_unknown_total_fails_closed(self):
         pages = [_items(42)]
         client = StubClient(pages, total=None)
-        items = asyncio.run(client.fetch_items(36))
-        assert len(items) == 42
+        with pytest.raises(TruncatedFetchError, match="no Omeka-S-Total-Results"):
+            asyncio.run(client.fetch_items(36))
 
     def test_verify_can_be_disabled(self):
         pages = [_items(10)]
@@ -78,24 +95,18 @@ class TestMediaFetchGuard:
         with pytest.raises(MediaFetchGuardError):
             self._stats(1501, 1501).check()
 
-    def test_a_few_bad_manifests_pass(self):
-        """5/500 is ordinary attrition, not an outage — must not abort."""
-        assert "5/500" in self._stats(500, 5).check().replace(",", "")
+    def test_a_few_bad_manifests_abort(self):
+        """Any lookup error could overwrite a valid prior URL."""
+        from iwac_common.omeka_client import MediaFetchGuardError
 
-    def test_small_subset_never_trips(self):
-        """Below MIN_ATTEMPTS the rate is too noisy: 3/3 on a tiny subset
-        must report but not abort, or `documents` (26 rows) would be
-        unrunnable whenever a couple of manifests are missing."""
-        assert self._stats(3, 3).check() is not None
-
-    def test_threshold_boundary(self):
-        from iwac_common.omeka_client import MediaFetchGuardError, MediaFetchStats
-
-        n = MediaFetchStats.MIN_ATTEMPTS * 10
-        at_limit = int(n * MediaFetchStats.MAX_FAILURE_RATE)
-        self._stats(n, at_limit).check()          # exactly at threshold: allowed
         with pytest.raises(MediaFetchGuardError):
-            self._stats(n, at_limit + 1).check()  # one over: aborts
+            self._stats(500, 5).check()
+
+    def test_small_subset_also_fails_closed(self):
+        from iwac_common.omeka_client import MediaFetchGuardError
+
+        with pytest.raises(MediaFetchGuardError):
+            self._stats(3, 1).check()
 
     def test_override_downgrades_to_warning(self):
         summary = self._stats(1501, 1501).check(allow_failures=True)

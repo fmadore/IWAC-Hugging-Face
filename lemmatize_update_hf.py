@@ -50,13 +50,17 @@ from typing import List
 import re
 import unicodedata
 
-import datasets
 from datasets import Dataset
 import spacy
 
 # Make ``post-processing/_common.py`` and ``_embedding_utils.py`` importable.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "post-processing"))
-from _common import ensure_hf_token, PRIVATE_REPO_ID  # noqa: E402
+from _common import (  # noqa: E402
+    PRIVATE_REPO_ID,
+    ensure_hf_token,
+    load_hub_dataset,
+    push_dataset,
+)
 from _embedding_utils import load_cache, save_cache, delete_cache  # noqa: E402
 
 # Rich console imports for beautiful output
@@ -341,7 +345,7 @@ def choose_subset() -> str:
     return LEMMATIZABLE_SUBSETS[int(choice) - 1]
 
 
-def main():
+def main() -> int:
     configure_logging()
 
     parser = argparse.ArgumentParser(description="Add lemmatised columns to a Hugging Face dataset")
@@ -398,9 +402,10 @@ def main():
         border_style="blue"
     ))
 
-    with console.status("[bold green]Loading dataset from Hugging Face Hub...", spinner="dots"):
-        ds: Dataset = datasets.load_dataset(args.repo, name=config_name, split="train", token=token)
-    console.print(f"[green]✓[/green] Loaded {len(ds):,} rows from '{args.repo}' (subset: {config_name})")
+    ds: Dataset = load_hub_dataset(
+        args.repo, config_name, token=token, console=console
+    )
+    source_revision = getattr(ds, "_iwac_source_revision", None)
 
     if args.text_column not in ds.column_names:
         console.print(f"[red]✗[/red] Column '{args.text_column}' not found in the dataset.")
@@ -464,7 +469,7 @@ def main():
     )
     if result is None:
         console.print("[green]✓[/green] No rows needed lemmatising. Nothing to do.")
-        return
+        return 0
     ds = result
 
     # ------------------------------------------------------------------
@@ -476,30 +481,29 @@ def main():
             "the resume cache is kept for a real run.[/yellow]",
             border_style="yellow",
         ))
-        return
+        return 0
 
     # ------------------------------------------------------------------
     # Push updated dataset to the Hub
     # ------------------------------------------------------------------
     console.print(f"[blue]→[/blue] Pushing updated dataset back to {args.repo} (subset: {config_name})…")
-    try:
-        with console.status("[bold green]Uploading to Hugging Face Hub...", spinner="dots"):
-            ds.push_to_hub(
-                args.repo,
-                config_name=config_name,
-                token=token,
-                max_shard_size=args.max_shard_size,
-                commit_message=f"Add/update columns '{args.lemma_column}' and '{args.clean_column}' for {config_name} (French lemmatisation, mode: {process_choice})",
-            )
-    except Exception as e:  # noqa: BLE001
-        console.print(Panel(
-            f"[bold red]Push failed:[/bold red] {e}\n\n"
-            f"[yellow]Computed lemmas remain cached in {cache_file}.[/yellow]\n"
-            f"Re-run the script to resume from the cache without re-lemmatising.",
-            title="[red]Error[/red]", border_style="red",
-        ))
-        logging.getLogger(__name__).error("Push error", exc_info=True)
-        return
+    if not push_dataset(
+        ds,
+        repo_id=args.repo,
+        config_name=config_name,
+        token=token,
+        max_shard_size=args.max_shard_size,
+        commit_message=(
+            f"Add/update columns '{args.lemma_column}' and '{args.clean_column}' "
+            f"for {config_name} (French lemmatisation, mode: {process_choice})"
+        ),
+        console=console,
+        expected_revision=source_revision,
+    ):
+        console.print(
+            f"[yellow]Computed lemmas remain cached in {cache_file}; re-run to resume.[/yellow]"
+        )
+        return 1
 
     # The cache only exists for resume; the push succeeded, so drop it.
     delete_cache(cache_file)
@@ -516,7 +520,8 @@ def main():
     table.add_row("Mode", process_choice)
     console.print(table)
     console.print("[green]✓[/green] Done!")
+    return 0
 
     
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

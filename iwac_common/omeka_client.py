@@ -22,9 +22,10 @@ import io
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Dict, Iterable, List, Optional, Type, Union
 
 import aiofiles
 import aiohttp
@@ -92,19 +93,39 @@ class Cache:
             return None
         mtime = datetime.fromtimestamp(os.path.getmtime(path))
         if datetime.now() - mtime > self.duration:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
             return None
-        async with aiofiles.open(path, "rb") as f:
-            data = await f.read()
-        with gzip.open(io.BytesIO(data), "rt", encoding="utf-8") as gz:
-            return json.load(gz)
+        try:
+            async with aiofiles.open(path, "rb") as f:
+                data = await f.read()
+            with gzip.open(io.BytesIO(data), "rt", encoding="utf-8") as gz:
+                return json.load(gz)
+        except (OSError, EOFError, json.JSONDecodeError) as exc:
+            logger.warning("Ignoring corrupt cache entry %s: %s", path, exc)
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            return None
 
     async def set(self, key: str, value: Any) -> None:
         path = self._path(key)
+        tmp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         buf = io.BytesIO()
         with gzip.open(buf, "wt", encoding="utf-8") as gz:
             json.dump(value, gz)
-        async with aiofiles.open(path, "wb") as f:
-            await f.write(buf.getvalue())
+        try:
+            async with aiofiles.open(tmp_path, "wb") as f:
+                await f.write(buf.getvalue())
+            os.replace(tmp_path, path)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -183,59 +204,53 @@ class TruncatedFetchError(RuntimeError):
 
 
 class MediaFetchGuardError(RuntimeError):
-    """Too large a share of per-item media lookups failed.
+    """At least one per-item media lookup failed without explicit override.
 
-    Media sub-fetches degrade gracefully by design: one unreachable manifest
-    yields an empty ``PDF``/``thumbnail`` for that item rather than killing
-    the run. Under a *network-wide* failure that same tolerance turns
-    catastrophic — every lookup fails, every media URL comes back empty, and
-    because those columns exist in the fresh frame the merge overwrites the
-    Hub's good values with blanks. Row counts are unchanged, so neither the
-    shrink tripwire nor the total-count reconciliation notices.
+    A lookup error is different from a genuine absence. By default even one
+    fails the run; with the explicit override, item-aware field preservation
+    carries the affected values forward from the Hub baseline.
 
     Observed 2026-07-27: a VPN made islam.zmo.de unreachable mid-run and
     1,501 publications were on course to lose every PDF URL."""
 
 
 class MediaFetchStats:
-    """Counts per-item media lookups so a run can abort on mass failure.
+    """Counts per-item media lookups and the fields each failure affects.
 
-    Both degradation paths report here: :meth:`OmekaApiClient.fetch_media_data`
-    (which raises, and is caught by each subset's mapper) and
-    :func:`fetch_iiif_thumbnail_url` (which swallows everything and returns
-    ``""``). Absences are never counted — an item with no primary media makes
-    no attempt — so the rate measures failure, not sparsity.
+    Both primary-media and IIIF helpers report here. Absences are never counted
+    — an item with no primary media makes no attempt — so the rate measures
+    transport/parse failures rather than sparse media coverage.
     """
-
-    #: Abort above this share of failed attempts.
-    MAX_FAILURE_RATE = 0.20
-    #: Below this many attempts the rate is too noisy to judge.
-    MIN_ATTEMPTS = 20
 
     def __init__(self) -> None:
         self.attempted = 0
         self.failed = 0
+        self.failed_fields_by_item: dict[str, set[str]] = {}
 
     def reset(self) -> None:
         self.attempted = 0
         self.failed = 0
+        self.failed_fields_by_item = {}
 
     def record_attempt(self) -> None:
         self.attempted += 1
 
-    def record_failure(self) -> None:
+    def record_failure(
+        self, item_id: Union[str, int, None] = None, fields: Iterable[str] = ()
+    ) -> None:
         self.failed += 1
+        if item_id is not None:
+            self.failed_fields_by_item.setdefault(str(item_id), set()).update(fields)
 
     @property
     def failure_rate(self) -> float:
         return self.failed / self.attempted if self.attempted else 0.0
 
     def check(self, *, allow_failures: bool = False) -> Optional[str]:
-        """Raise :class:`MediaFetchGuardError` on mass failure.
+        """Raise :class:`MediaFetchGuardError` on any media failure.
 
-        Returns a human-readable summary when failures occurred but stayed
-        under the threshold, else ``None``. With ``allow_failures`` the
-        breach is reported and downgraded to that summary.
+        Returns a human-readable summary when failures are explicitly allowed,
+        else ``None`` when every attempted lookup succeeded.
         """
         if not self.failed:
             return None
@@ -243,16 +258,12 @@ class MediaFetchStats:
             f"{self.failed:,}/{self.attempted:,} media lookups failed "
             f"({self.failure_rate:.0%})"
         )
-        breached = (
-            self.attempted >= self.MIN_ATTEMPTS
-            and self.failure_rate > self.MAX_FAILURE_RATE
-        )
-        if breached and not allow_failures:
+        if not allow_failures:
             raise MediaFetchGuardError(
-                f"{summary} — above the {self.MAX_FAILURE_RATE:.0%} threshold. "
-                "PDF/thumbnail URLs would be pushed empty, overwriting good "
-                "values on the Hub. Check connectivity to the Omeka host (a "
-                "VPN or DNS change is the usual cause) and re-run. Use "
+                f"{summary}. Even one transient failure can blank a good "
+                "PDF/thumbnail URL or drop a mapper row, so the run fails closed. "
+                "Check connectivity to the Omeka host (a VPN or DNS change is "
+                "the usual cause) and re-run. Use "
                 "--allow-media-failures only if the media really are gone."
             )
         return summary
@@ -282,7 +293,8 @@ class OmekaApiClient:
 
     @async_retry()
     async def _get(self, endpoint: str, params: Dict[str, Any]) -> Any:
-        params.update(
+        request_params = dict(params)
+        request_params.update(
             {
                 "key_identity": self.cfg.API_KEY_IDENTITY,
                 "key_credential": self.cfg.API_KEY_CREDENTIAL,
@@ -290,12 +302,18 @@ class OmekaApiClient:
         )
         url = f"{self.cfg.API_URL}/{endpoint}"
         sess = await conn_manager.get()
-        async with sess.get(url, params=params) as resp:
+        async with sess.get(url, params=request_params) as resp:
             resp.raise_for_status()
             return await resp.json()
 
     async def request(self, endpoint: str, params: Dict[str, Any]) -> Any:
-        key = f"{endpoint}:{json.dumps(params, sort_keys=True)}"
+        # Host + identity are part of the cache namespace. Without them, a run
+        # pointed at staging (or using a less privileged identity) can silently
+        # reuse production/private response bodies from the same cache folder.
+        key = (
+            f"{self.cfg.API_URL}|{self.cfg.API_KEY_IDENTITY}|{endpoint}:"
+            f"{json.dumps(params, sort_keys=True)}"
+        )
         if self.cache:
             cached = await self.cache.get(key)
             if cached is not None:
@@ -310,7 +328,13 @@ class OmekaApiClient:
     ) -> List[Dict[str, Any]]:
         return await self.request(
             "items",
-            {"resource_class_id": rcid, "page": page, "per_page": per},
+            {
+                "resource_class_id": rcid,
+                "page": page,
+                "per_page": per,
+                "sort_by": "o:id",
+                "sort_order": "asc",
+            },
         )
 
     @async_retry()
@@ -347,11 +371,30 @@ class OmekaApiClient:
         Omeka within the cache TTL) triggers the same signal — re-run with
         the cache disabled.
         """
-        first = await self.fetch_items_page(rcid, 1)
-        items = list(first)
         per = 100
-        if len(first) == per:
-            page = 2
+        expected: Optional[int] = None
+        if verify_total:
+            try:
+                expected = await self.fetch_total_results(rcid)
+            except Exception as exc:  # noqa: BLE001
+                raise TruncatedFetchError(
+                    f"Could not read Omeka-S-Total-Results for class {rcid}: "
+                    f"{exc}. Count reconciliation is required for a safe upload."
+                ) from exc
+            if expected is None:
+                raise TruncatedFetchError(
+                    f"Omeka returned no Omeka-S-Total-Results header for class {rcid}; "
+                    "refusing an unreconciled upload."
+                )
+
+        first = await self.fetch_items_page(rcid, 1, per)
+        items = list(first)
+        if expected is not None:
+            page_count = max(1, (expected + per - 1) // per)
+        else:
+            page_count = 1 if len(first) < per else None
+
+        if page_count and page_count > 1:
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[bold blue]Fetching pages..."),
@@ -360,41 +403,43 @@ class OmekaApiClient:
                 TimeElapsedColumn(),
                 console=self.console,
             ) as progress:
-                task = progress.add_task("[cyan]Fetching item pages", total=None)
-                while True:
-                    batch = await self.fetch_items_page(rcid, page)
-                    if not batch:
-                        break
-                    items.extend(batch)
+                task = progress.add_task(
+                    "[cyan]Fetching item pages", total=page_count - 1
+                )
+                semaphore = asyncio.Semaphore(4)
+
+                async def fetch_page(page: int):
+                    async with semaphore:
+                        batch = await self.fetch_items_page(rcid, page, per)
                     progress.update(
                         task, advance=1, description=f"[cyan]Page {page} fetched"
                     )
-                    if len(batch) < per:
-                        break
-                    page += 1
+                    return page, batch
+
+                batches = await asyncio.gather(
+                    *(fetch_page(page) for page in range(2, page_count + 1))
+                )
+                for page, batch in sorted(batches):
+                    items.extend(batch)
+        elif page_count is None:
+            page = 2
+            while True:
+                batch = await self.fetch_items_page(rcid, page, per)
+                if not batch:
+                    break
+                items.extend(batch)
+                if len(batch) < per:
+                    break
+                page += 1
 
         if verify_total:
-            expected: Optional[int] = None
-            try:
-                expected = await self.fetch_total_results(rcid)
-            except Exception as exc:  # noqa: BLE001
-                self.console.print(
-                    f"[yellow]⚠[/yellow] Could not read Omeka-S-Total-Results "
-                    f"for class {rcid} ({exc}); skipping count reconciliation."
-                )
-            if expected is not None and len(items) < expected:
+            if len(items) != expected:
                 raise TruncatedFetchError(
                     f"Fetched {len(items)} items for class {rcid} but the API "
                     f"reports {expected}. Either a page response was truncated "
                     f"mid-run, or the local cache is stale (items added on Omeka "
                     f"since it was written). Re-run — with --no-cache if it "
                     f"persists — instead of pushing a shrunken dataset."
-                )
-            if expected is not None and len(items) > expected:
-                self.console.print(
-                    f"[yellow]⚠[/yellow] Fetched {len(items)} items for class "
-                    f"{rcid} but the API reports {expected} (items deleted "
-                    f"mid-run or stale cache pages?)."
                 )
 
         self.console.print(
@@ -403,15 +448,30 @@ class OmekaApiClient:
         return items
 
     async def fetch_media_data(self, media_id: str) -> Any:
-        # Counted here rather than in the callers: every subset script wraps
-        # this in its own try/except, so this is the one place that sees all
-        # attempts and all failures (see MediaFetchStats).
-        media_stats.record_attempt()
-        try:
-            return await self.request(f"media/{media_id}", {})
-        except Exception:
-            media_stats.record_failure()
-            raise
+        return await self.request(f"media/{media_id}", {})
+
+
+async def fetch_primary_media_url(
+    item: Dict[str, Any],
+    api: OmekaApiClient,
+    *,
+    affected_fields: Iterable[str],
+) -> str:
+    """Return a primary media URL while recording item-aware failures."""
+    primary = item.get("o:primary_media")
+    if not primary:
+        return ""
+    media_stats.record_attempt()
+    try:
+        media_id = str(primary["@id"]).rstrip("/").split("/")[-1]
+        media = await api.fetch_media_data(media_id)
+        return str(media.get("o:original_url", ""))
+    except Exception as exc:  # noqa: BLE001
+        media_stats.record_failure(item.get("o:id"), affected_fields)
+        logger.warning(
+            "Primary media lookup failed for item %s: %s", item.get("o:id"), exc
+        )
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -426,10 +486,9 @@ async def fetch_iiif_thumbnail_url(
 ) -> str:
     """Fetch the thumbnail URL from an item's IIIF manifest.
 
-    Returns ``""`` on any failure — every error is caught and logged here so
-    one bad manifest never aborts an upload run. (The per-script copies this
-    replaces wrapped it in ``async_retry``, but the internal exception
-    handling meant it never actually retried; the decorator was dropped.)
+    Returns ``""`` for a genuine absence (404/410). Transport, parse, auth,
+    rate-limit, and server failures are recorded for the upload runner's
+    fail-closed guard while still allowing all in-flight mappers to finish.
     """
     manifest_url = f"{IIIF_BASE_URL}/{omeka_id}/manifest"
     thumbnail_url = ""
@@ -446,26 +505,37 @@ async def fetch_iiif_thumbnail_url(
                         if isinstance(thumbnail_info, dict):
                             thumbnail_url = thumbnail_info.get("id", "")
                 except json.JSONDecodeError as e_json:
+                    media_stats.record_failure(
+                        omeka_id, ("thumbnail", "iiif_manifest")
+                    )
                     logger.warning(
                         f"JSON decoding error for IIIF manifest {omeka_id}: {e_json}. URL: {manifest_url}"
                     )
-            elif resp.status not in [408, 429, 500, 502, 503, 504]:
+            elif resp.status in (404, 410):
+                logger.info(
+                    "No IIIF manifest for item %s (HTTP %s)", omeka_id, resp.status
+                )
+            else:
+                media_stats.record_failure(
+                    omeka_id, ("thumbnail", "iiif_manifest")
+                )
                 logger.warning(
-                    f"IIIF manifest request for {omeka_id} returned status {resp.status}. URL: {manifest_url}"
+                    f"IIIF request failed with HTTP {resp.status} for {omeka_id}. "
+                    f"URL: {manifest_url}"
                 )
     # Only transport-level errors count as failures. A 200 carrying no
     # thumbnail, or a 404 for an item with no manifest, is a genuine absence
     # and must not inflate the failure rate.
     except asyncio.TimeoutError:
-        media_stats.record_failure()
+        media_stats.record_failure(omeka_id, ("thumbnail", "iiif_manifest"))
         logger.warning(f"Timeout fetching IIIF manifest for {omeka_id}. URL: {manifest_url}")
     except aiohttp.ClientError as e_client:
-        media_stats.record_failure()
+        media_stats.record_failure(omeka_id, ("thumbnail", "iiif_manifest"))
         logger.warning(
             f"Client error fetching IIIF manifest for {omeka_id}: {e_client}. URL: {manifest_url}"
         )
     except Exception as e_general:
-        media_stats.record_failure()
+        media_stats.record_failure(omeka_id, ("thumbnail", "iiif_manifest"))
         logger.error(
             f"Unexpected error fetching IIIF manifest for {omeka_id}: {e_general}. URL: {manifest_url}"
         )
@@ -482,4 +552,7 @@ __all__ = [
     "TruncatedFetchError",
     "IIIF_BASE_URL",
     "fetch_iiif_thumbnail_url",
+    "fetch_primary_media_url",
+    "MediaFetchGuardError",
+    "media_stats",
 ]

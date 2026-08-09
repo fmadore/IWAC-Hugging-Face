@@ -55,11 +55,15 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from dotenv import load_dotenv
-from datasets import load_dataset
-
 # Make ``post-processing/_common.py`` and ``_embedding_utils.py`` importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import ensure_hf_token, PRIVATE_REPO_ID  # noqa: E402
+from _common import (  # noqa: E402
+    PRIVATE_REPO_ID,
+    ensure_hf_token,
+    load_hub_dataset,
+    push_dataset,
+)
+from iwac_common.schema import SUBSETS  # noqa: E402
 from _embedding_utils import (  # noqa: E402
     cache_fingerprint,
     delete_cache,
@@ -193,7 +197,7 @@ def display_config_panel(
     console.print(Panel(table, title="[bold blue]Multimodal Image Embedding Configuration", border_style="blue"))
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Add a multimodal image embedding column to the 'images' subset "
                     "using Google gemini-embedding-2."
@@ -221,6 +225,9 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true",
                         help="Resume a crashed --update-mode all run from its cache "
                              "instead of starting fresh.")
+    parser.add_argument("--allow-partial", action="store_true",
+                        help="Push despite download/embedding failures. By default "
+                             "the cache is kept and the Hub is left untouched.")
     args = parser.parse_args()
 
     repo_id = args.repo
@@ -230,6 +237,12 @@ def main() -> None:
     delay = args.delay
     update_mode = args.update_mode
     dry_run = args.dry_run
+    expected_dimension = (SUBSETS[CONFIG_NAME].embedding_columns or {})[EMBEDDING_COLUMN]
+    if dimensionality != expected_dimension:
+        parser.error(
+            f"--dimensionality must be {expected_dimension} for the canonical "
+            f"{CONFIG_NAME}.{EMBEDDING_COLUMN} schema"
+        )
     # Key the resume cache by (model, dimensionality, task) so a cache written
     # at one embedding configuration can never be restored into a run with
     # different parameters. Old un-fingerprinted cache files
@@ -253,12 +266,12 @@ def main() -> None:
     api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
         console.print("[red]✗[/red] GOOGLE_API_KEY (or GEMINI_API_KEY) not found in environment.")
-        return
+        return 1
     console.print("[green]✓[/green] Gemini API key found.")
     try:
         hf_token = ensure_hf_token(console=console)
     except SystemExit:
-        return
+        return 1
     console.print("[green]✓[/green] Hugging Face authenticated.")
 
     # --- Step 2: Initialize Gemini client ---
@@ -273,24 +286,20 @@ def main() -> None:
         console.print(f"[green]✓[/green] Gemini client ready. Model: [cyan]{MODEL_NAME}[/cyan] (dim={actual_dim})")
     except Exception as e:  # noqa: BLE001
         console.print(f"[red]✗[/red] Failed to initialize Gemini client: {e}")
-        return
+        return 1
 
     console.print()
     display_config_panel(repo_id, dimensionality, update_mode, batch_size, max_side, dry_run)
 
     # --- Step 3: Load dataset ---
     console.print(f"\n[bold cyan]Step 3:[/bold cyan] Loading '{repo_id}' (config: {CONFIG_NAME})...")
-    try:
-        ds = load_dataset(repo_id, name=CONFIG_NAME, split="train", token=hf_token)
-    except Exception as e:  # noqa: BLE001
-        console.print(f"[red]✗[/red] Failed to load dataset: {e}")
-        return
-    console.print(f"[green]✓[/green] Dataset loaded: [cyan]{len(ds)}[/cyan] rows")
+    ds = load_hub_dataset(repo_id, CONFIG_NAME, token=hf_token, console=console)
+    source_revision = getattr(ds, "_iwac_source_revision", None)
 
     if SOURCE_COLUMN not in ds.column_names:
         console.print(f"[red]✗[/red] Source column '{SOURCE_COLUMN}' not found.")
         console.print(f"[yellow]ℹ[/yellow] Available columns: {', '.join(ds.column_names)}")
-        return
+        return 1
 
     # Per-row image URL: prefer image_url, fall back to thumbnail.
     urls = list(ds[SOURCE_COLUMN])
@@ -321,7 +330,7 @@ def main() -> None:
             console.print(f"[red]✗[/red] Existing embeddings have dim {len(e)} ≠ target {actual_dim}. "
                           f"Use --update-mode all to recompute.")
             if update_mode != "all":
-                return
+                return 1
             break
 
     # --- Determine rows to process ---
@@ -340,6 +349,8 @@ def main() -> None:
     if no_url:
         console.print(f"[yellow]ℹ[/yellow] {no_url} row(s) have no image URL — skipped.")
 
+    failed_dl = 0
+    failed_emb = 0
     if not to_process:
         console.print(Panel("[green]All image embeddings are already computed![/green]",
                             title="Nothing to do", border_style="green"))
@@ -349,7 +360,6 @@ def main() -> None:
         # --- Step 4: Download images ---
         console.print(f"\n[bold cyan]Step 4:[/bold cyan] Downloading + downscaling images...")
         downloaded: List[tuple[int, bytes]] = []
-        failed_dl = 0
         with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}"), BarColumn(),
                       TaskProgressColumn(), TimeElapsedColumn(), console=console) as progress:
             task = progress.add_task("[cyan]Downloading", total=len(to_process))
@@ -365,7 +375,6 @@ def main() -> None:
 
         # --- Step 5: Embed in batches ---
         console.print(f"\n[bold cyan]Step 5:[/bold cyan] Embedding images via Gemini API...")
-        failed_emb = 0
         with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}"), BarColumn(),
                       TaskProgressColumn(), TimeElapsedColumn(), console=console) as progress:
             task = progress.add_task("[cyan]Embedding photos", total=len(downloaded))
@@ -389,6 +398,16 @@ def main() -> None:
         save_cache(cache, cache_file)
         console.print("[green]✓[/green] Embedding computation complete."
                       + (f" [yellow]{failed_emb} failed[/yellow]" if failed_emb else ""))
+
+    if (failed_dl or failed_emb) and not args.allow_partial:
+        console.print(Panel(
+            "[bold red]Image embedding run incomplete; Hub left untouched.[/bold red]\n\n"
+            f"Downloads failed: {failed_dl}; embedding calls failed: {failed_emb}. "
+            f"Successful work remains in {cache_file}; re-run to retry.",
+            title="Fail-closed derived-data write",
+            border_style="red",
+        ))
+        return 1
 
     # --- Step 6: Update dataset ---
     console.print(f"\n[bold cyan]Step 6:[/bold cyan] Updating dataset...")
@@ -415,17 +434,22 @@ def main() -> None:
             f"Would push [cyan]{len(ds_out)}[/cyan] rows to [cyan]{repo_id}[/cyan] (config: {CONFIG_NAME}).\n"
             f"Embeddings cached in {cache_file}.",
             title="Dry Run Complete", border_style="yellow"))
-        return
+        return 0
 
     console.print(f"\n[bold cyan]Step 7:[/bold cyan] Pushing to Hugging Face Hub...")
-    try:
-        with console.status("[bold green]Pushing dataset to Hub...", spinner="dots"):
-            ds_out.push_to_hub(
-                repo_id=repo_id, config_name=CONFIG_NAME,
-                commit_message=(f"Add/update '{EMBEDDING_COLUMN}' multimodal embeddings using "
-                                f"{MODEL_NAME} (dim={dimensionality})"),
-                token=hf_token, max_shard_size=args.max_shard_size,
-            )
+    if push_dataset(
+        ds_out,
+        repo_id=repo_id,
+        config_name=CONFIG_NAME,
+        commit_message=(
+            f"Add/update '{EMBEDDING_COLUMN}' multimodal embeddings using "
+            f"{MODEL_NAME} (dim={dimensionality})"
+        ),
+        token=hf_token,
+        max_shard_size=args.max_shard_size,
+        console=console,
+        expected_revision=source_revision,
+    ):
         console.print(Panel(
             f"[bold green]Dataset successfully published![/bold green]\n\n"
             f"Repository: [cyan]{repo_id}[/cyan]\n"
@@ -435,14 +459,9 @@ def main() -> None:
             f"Valid embeddings: [cyan]{valid}[/cyan] / {len(ds_out)}",
             title="Upload Complete", border_style="green"))
         delete_cache(cache_file)
-    except Exception as e:  # noqa: BLE001
-        console.print(Panel(
-            f"[bold red]Failed to push dataset[/bold red]\n\n{e}\n\n"
-            f"[yellow]Embeddings are cached in {cache_file}[/yellow] — re-run to resume "
-            f"(in --update-mode all, add --resume).",
-            title="Error", border_style="red"))
-        logger.error("Push error details:", exc_info=True)
+        return 0
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

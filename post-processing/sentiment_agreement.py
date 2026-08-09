@@ -64,7 +64,15 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import REPO_ROOT, ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
+from _common import (  # noqa: E402
+    PRIVATE_REPO_ID,
+    REPO_ROOT,
+    add_columns_by_id,
+    ensure_hf_token,
+    load_hub_dataset,
+    load_subset_dataframe,
+    push_dataset,
+)
 from iwac_common.sentiment_panel import (  # noqa: E402
     PANEL,
     SUBJECTIVITE_ORDER,
@@ -274,7 +282,7 @@ def majority(votes: List[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Inter-model sentiment agreement across the annotator panel + consensus columns. "
                     "Report-only by default (nothing is written); pass --push to add the "
@@ -320,10 +328,11 @@ def main() -> None:
         args.repo, args.config, token=token, source=args.source,
         columns=needed if args.source == "csv" else None, console=console,
     )
+    source_revision = df.attrs.get("iwac_source_revision")
     missing_cols = [c for c in sentiment_cols if c not in df.columns]
     if missing_cols:
         console.print(f"[red]✗[/red] Missing sentiment columns: {', '.join(missing_cols)}")
-        return
+        return 1
 
     report: Dict[str, Any] = {
         "generated_at": datetime.now().isoformat(),
@@ -465,37 +474,42 @@ def main() -> None:
     if not args.push:
         console.print("[yellow]ℹ[/yellow] Report-only run. Use [bold]--push[/bold] to add "
                       "the consensus columns to the Hub dataset.")
-        return
+        return 0
 
     if args.source != "hub":
         console.print("[red]✗[/red] --push requires --source hub (columns must align with live rows).")
-        return
-
-    from datasets import Dataset, load_dataset  # noqa: F401
+        return 1
 
     console.print("\n[bold cyan]Pushing consensus columns to the Hub...[/bold cyan]")
-    ds = load_dataset(args.repo, name=args.config, split="train", token=token)
-    updated = ds
-    for col in consensus_frame.columns:
-        if col in updated.column_names:
-            updated = updated.remove_columns([col])
-        values = consensus_frame[col]
-        if values.dtype == object:
-            updated = updated.add_column(col, [v if v else None for v in values.tolist()])
-        else:
-            updated = updated.add_column(col, [None if pd.isna(v) else float(v) for v in values.tolist()])
-    updated.push_to_hub(
+    ds = load_hub_dataset(
+        args.repo,
+        args.config,
+        token=token,
+        console=console,
+        revision=source_revision,
+    )
+    values_frame = pd.concat(
+        [df[["o:id"]].reset_index(drop=True), consensus_frame.reset_index(drop=True)],
+        axis=1,
+    )
+    updated = add_columns_by_id(ds, values_frame)
+    if push_dataset(
+        updated,
         repo_id=args.repo,
         config_name=args.config,
         token=token,
         max_shard_size=args.max_shard_size,
         commit_message=(
             "Add AI sentiment consensus columns "
-            f"({', '.join(consensus_frame.columns)}) from 3-model agreement analysis"
+            f"({', '.join(consensus_frame.columns)}) from model agreement analysis"
         ),
-    )
-    console.print("[green]✓[/green] Pushed.")
+        console=console,
+        expected_revision=source_revision,
+    ):
+        console.print("[green]✓[/green] Pushed.")
+        return 0
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

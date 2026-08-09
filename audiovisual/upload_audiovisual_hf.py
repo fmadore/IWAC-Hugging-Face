@@ -42,6 +42,7 @@ from iwac_common.omeka_client import (
     OmekaApiClient,
     conn_manager,
     fetch_iiif_thumbnail_url,
+    fetch_primary_media_url,
 )
 from iwac_common.field_mappers import (
     extract_added_date,
@@ -50,6 +51,7 @@ from iwac_common.field_mappers import (
     is_content_public,
 )
 from iwac_common.upload_runner import UploadSpec, run_upload
+from iwac_common.schema import SUBSETS
 
 load_dotenv()
 
@@ -110,11 +112,9 @@ def _get_at_value(item: Dict[str, Any], field: str) -> str:
 async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item Omeka audiovisuel en dict plat pour HF datasets."""
 
-    primary_url = ""
-    if item.get("o:primary_media"):
-        mid = item["o:primary_media"]["@id"].split("/")[-1]
-        mdata = await api.fetch_media_data(mid)
-        primary_url = mdata.get("o:original_url", "")
+    primary_url = await fetch_primary_media_url(
+        item, api, affected_fields=("PDF",)
+    )
 
     # Extract publisher and determine country
     publisher = _get_display_title(item, "dcterms:publisher")
@@ -182,7 +182,7 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
 
 SPEC = UploadSpec(
     config_name="audiovisual",
-    resource_class_ids=(38,),  # Audiovisual documents
+    resource_class_ids=SUBSETS["audiovisual"].resource_class_ids,
     map_item=map_audiovisual_document,
     title="🎬 IWAC Audiovisual Upload",
     cache_dir=".cache_omk_audiovisual",

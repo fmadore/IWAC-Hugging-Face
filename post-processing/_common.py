@@ -43,7 +43,6 @@ from rich.prompt import IntPrompt, Prompt
 from rich.table import Table
 from rich import box
 
-
 _DEFAULT_CONFIGS: List[str] = ["articles", "publications", "documents"]
 
 # Repo root (parent of post-processing/), used to locate the data/ CSV mirrors.
@@ -57,6 +56,12 @@ except ImportError:  # venv without the editable install
     sys.path.insert(0, str(REPO_ROOT))
     from iwac_common.repos import PRIVATE_REPO_ID, PUBLIC_REPO_ID  # noqa: F401
 
+from iwac_common.hub import (  # noqa: E402
+    HubBaselineUnavailableError,
+    get_repo_revision,
+    push_dataset_verified,
+)
+
 
 def load_subset_dataframe(
     repo_id: str,
@@ -67,6 +72,7 @@ def load_subset_dataframe(
     csv_path: Optional[Path] = None,
     columns: Optional[List[str]] = None,
     console: Optional[Console] = None,
+    revision: Optional[str] = None,
 ):
     """Load one IWAC subset as a pandas DataFrame.
 
@@ -81,13 +87,70 @@ def load_subset_dataframe(
 
     console = console or Console()
     if source == "csv":
+        verify_manifest = csv_path is None
         path = csv_path or (REPO_ROOT / "data" / f"iwac_{config_name}.csv")
         if not path.exists():
             raise FileNotFoundError(
                 f"Local mirror not found: {path}. Run data/fetch_datasets.py or use --source hub."
             )
+        manifest_entry = None
+        manifest = None
+        if verify_manifest:
+            import hashlib
+            import json
+
+            manifest_path = path.parent / "mirror_manifest.json"
+            if not manifest_path.exists():
+                raise RuntimeError(
+                    f"Local mirror manifest not found: {manifest_path}. Re-run "
+                    "data/fetch_datasets.py; unversioned CSVs are not a safe baseline."
+                )
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest_entry = manifest["configs"][config_name]
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise RuntimeError(
+                    f"Invalid mirror manifest for '{config_name}': {exc}"
+                ) from exc
+            if manifest.get("schema_version") != 1:
+                raise RuntimeError(
+                    f"Unsupported local mirror manifest schema: "
+                    f"{manifest.get('schema_version')!r}."
+                )
+            if manifest.get("repository") != repo_id:
+                raise RuntimeError(
+                    f"Local mirror belongs to {manifest.get('repository')!r}, not "
+                    f"the requested repository {repo_id!r}. Refresh the intended mirror."
+                )
+            if revision is not None and manifest.get("revision") != revision:
+                raise RuntimeError(
+                    f"Local mirror revision changed from requested {revision} to "
+                    f"{manifest.get('revision')}; restart the multi-subset analysis."
+                )
+            if manifest_entry.get("file") != path.name:
+                raise RuntimeError(
+                    f"Mirror manifest maps '{config_name}' to "
+                    f"{manifest_entry.get('file')!r}, expected {path.name!r}."
+                )
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+            if digest.hexdigest() != manifest_entry.get("sha256"):
+                raise RuntimeError(
+                    f"Local mirror hash mismatch for {path.name}; the refresh may "
+                    "have been interrupted. Re-run data/fetch_datasets.py."
+                )
         console.print(f"[blue]→[/blue] Loading local mirror [cyan]{path.name}[/cyan]")
         df = pd.read_csv(path, usecols=columns, dtype={"o:id": str}, low_memory=False)
+        if manifest_entry is not None and len(df) != manifest_entry.get("rows"):
+            raise RuntimeError(
+                f"Local mirror row count mismatch for {path.name}: read {len(df)}, "
+                f"manifest declares {manifest_entry.get('rows')}."
+            )
+        if manifest is not None:
+            df.attrs["iwac_source_revision"] = manifest.get("revision")
+            df.attrs["iwac_source_repository"] = manifest.get("repository")
         console.print(
             f"[yellow]ℹ[/yellow] Local CSV mirror may lag the live Hub dataset "
             f"(file date: {pd.Timestamp(path.stat().st_mtime, unit='s').date()})."
@@ -95,12 +158,17 @@ def load_subset_dataframe(
     elif source == "hub":
         from datasets import load_dataset
 
+        revision = revision or get_repo_revision(repo_id, token=token)
         with console.status(f"[bold green]Loading '{repo_id}' ({config_name}) from Hub...", spinner="dots"):
-            ds = load_dataset(repo_id, name=config_name, split="train", token=token)
+            ds = load_dataset(
+                repo_id, name=config_name, split="train", token=token,
+                revision=revision,
+            )
         if columns:
             keep = [c for c in columns if c in ds.column_names]
             ds = ds.select_columns(keep)
         df = ds.to_pandas()
+        df.attrs["iwac_source_revision"] = revision
     else:
         raise ValueError(f"Unknown source '{source}' (expected 'hub' or 'csv').")
 
@@ -244,23 +312,79 @@ def load_hub_dataset(
     *,
     token: Optional[str] = None,
     console: Optional[Console] = None,
+    revision: Optional[str] = None,
 ):
     """Load one config of a Hub dataset (train split) with a status spinner.
 
-    Returns the ``datasets.Dataset``, or ``None`` after printing the error
-    (callers bail out on ``None``).
+    Returns the ``datasets.Dataset`` pinned to the repository revision observed
+    before loading. The revision is attached as ``_iwac_source_revision`` for
+    the verified writer's lost-update check. Pass ``revision`` to reload the
+    exact baseline used by an earlier analytical step.
     """
     from datasets import load_dataset
 
     console = console or Console()
+    revision = revision or get_repo_revision(repo_id, token=token)
     try:
         with console.status(f"[bold green]Loading '{repo_id}' (config: {config_name})...", spinner="dots"):
-            ds = load_dataset(repo_id, name=config_name, split="train", token=token)
+            ds = load_dataset(
+                repo_id, name=config_name, split="train", token=token,
+                revision=revision,
+            )
     except Exception as e:  # noqa: BLE001
-        console.print(f"[red]✗[/red] Failed to load dataset: {e}")
-        return None
+        raise HubBaselineUnavailableError(
+            f"Failed to load '{repo_id}'/{config_name} at {revision}: {e}"
+        ) from e
+    setattr(ds, "_iwac_source_revision", revision)
     console.print(f"[green]✓[/green] Dataset loaded: [cyan]{len(ds):,}[/cyan] rows")
     return ds
+
+
+def add_columns_by_id(ds, values_frame, *, id_column: str = "o:id"):
+    """Return ``ds`` with frame columns aligned to its item-ID order.
+
+    Hub parquet row order is not a contract. Require unique IDs and exact set
+    equality before assigning computed values, preventing silent row shifts.
+    """
+    import pandas as pd
+
+    if id_column not in ds.column_names:
+        raise ValueError(f"Dataset is missing required ID column '{id_column}'.")
+    if id_column not in values_frame.columns:
+        raise ValueError(f"Values frame is missing required ID column '{id_column}'.")
+
+    dataset_ids = pd.Series(ds[id_column], dtype="string")
+    frame = values_frame.copy()
+    frame[id_column] = frame[id_column].astype("string")
+    if dataset_ids.duplicated().any():
+        raise ValueError(f"Dataset contains duplicate '{id_column}' values.")
+    if frame[id_column].duplicated().any():
+        raise ValueError(f"Values frame contains duplicate '{id_column}' values.")
+
+    dataset_id_set = set(dataset_ids)
+    frame_id_set = set(frame[id_column])
+    if dataset_id_set != frame_id_set:
+        missing = sorted(dataset_id_set - frame_id_set)[:10]
+        extra = sorted(frame_id_set - dataset_id_set)[:10]
+        raise ValueError(
+            "ID mismatch while aligning computed columns: "
+            f"missing={missing}, extra={extra}."
+        )
+
+    indexed = frame.set_index(id_column)
+    updated = ds
+    revision = getattr(ds, "_iwac_source_revision", None)
+    for column in frame.columns:
+        if column == id_column:
+            continue
+        if column in updated.column_names:
+            updated = updated.remove_columns([column])
+        values = indexed.loc[dataset_ids, column].tolist()
+        values = [None if pd.isna(value) else value for value in values]
+        updated = updated.add_column(column, values)
+    if revision is not None:
+        setattr(updated, "_iwac_source_revision", revision)
+    return updated
 
 
 def map_with_progress(
@@ -295,7 +419,7 @@ def map_with_progress(
             progress.update(task, advance=len(first) if first is not None else 0)
             return result
 
-        return ds.map(
+        mapped = ds.map(
             _with_progress,
             batched=True,
             batch_size=batch_size,
@@ -303,6 +427,9 @@ def map_with_progress(
             load_from_cache_file=False,
             new_fingerprint=str(uuid.uuid4()),
         )
+        if hasattr(ds, "_iwac_source_revision"):
+            setattr(mapped, "_iwac_source_revision", ds._iwac_source_revision)
+        return mapped
 
 
 def reorder_columns_after(ds, new_cols: List[str], after_col: str, console: Optional[Console] = None):
@@ -320,7 +447,10 @@ def reorder_columns_after(ds, new_cols: List[str], after_col: str, console: Opti
     remaining = [c for c in columns if c not in present_new]
     idx = remaining.index(after_col)
     ordered = remaining[: idx + 1] + present_new + remaining[idx + 1:]
+    revision = getattr(ds, "_iwac_source_revision", None)
     ds = ds.select_columns(ordered)
+    if revision is not None:
+        setattr(ds, "_iwac_source_revision", revision)
     console.print(f"[blue]→[/blue] Columns reordered ({', '.join(present_new)} after '{after_col}')")
     return ds
 
@@ -334,6 +464,7 @@ def push_dataset(
     commit_message: str,
     max_shard_size: str = "1GB",
     console: Optional[Console] = None,
+    expected_revision: Optional[str] = None,
 ) -> bool:
     """Push ``ds`` to the Hub with a status spinner. Returns True on success.
 
@@ -342,13 +473,21 @@ def push_dataset(
     """
     console = console or Console()
     try:
+        source_revision = expected_revision or getattr(
+            ds, "_iwac_source_revision", None
+        )
         with console.status("[bold green]Pushing dataset to Hub...", spinner="dots"):
-            ds.push_to_hub(
-                repo_id,
+            push_dataset_verified(
+                ds,
+                repo_id=repo_id,
                 config_name=config_name,
                 token=token,
                 max_shard_size=max_shard_size,
                 commit_message=commit_message,
+                expected_revision=source_revision,
+                expected_columns=list(ds.column_names),
+                expected_ids=ds["o:id"],
+                console=console,
             )
         return True
     except Exception as e:  # noqa: BLE001
@@ -388,6 +527,7 @@ __all__ = [
     "resolve_config",
     "choose_update_mode",
     "load_hub_dataset",
+    "add_columns_by_id",
     "load_subset_dataframe",
     "map_with_progress",
     "reorder_columns_after",

@@ -3,6 +3,13 @@
 > **Status:** the v1 roadmap below (Tiers 1–3 + post-roadmap pass) is **complete**.
 > The current plan is **[Roadmap v2](#roadmap-v2--july-2026)** at the end of this
 > file, driven by the findings in `CODE_AND_METHODS_AUDIT.md`.
+>
+> **August 2026 safety/maintainability pass:** completed. The unchecked v2
+> bullets are the original plan; the later progress tracker is authoritative.
+> The follow-up added fail-closed baselines, one verified Hub write gateway,
+> revision/lock guards, ID-keyed enrichment, canonical subset contracts,
+> integrity-checked mirrors, bounded concurrency, installed CLI entry points,
+> and expanded cross-platform CI/coverage regression tests.
 
 **Branch:** `claude/refactor-codebase-YP8F3`
 **Goal:** Reduce duplication, improve maintainability, preserve every existing function. No behavioral changes.

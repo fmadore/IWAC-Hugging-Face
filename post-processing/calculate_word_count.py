@@ -39,7 +39,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-from datasets import load_dataset, Dataset
+from datasets import Dataset
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
@@ -53,7 +53,12 @@ from rich.prompt import Prompt, Confirm
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _THIS_DIR)
 sys.path.insert(0, os.path.dirname(_THIS_DIR))
-from _common import ensure_hf_token, PRIVATE_REPO_ID  # noqa: E402
+from _common import (  # noqa: E402
+    PRIVATE_REPO_ID,
+    ensure_hf_token,
+    load_hub_dataset,
+    push_dataset,
+)
 from iwac_common.omeka_client import Config, OmekaApiClient, conn_manager  # noqa: E402
 from iwac_common.text_utils import tokenize_words  # noqa: E402
 
@@ -64,9 +69,6 @@ console = Console()
 # ---------------------------------------------------------------------------
 # Omeka client — shared infra from iwac_common + reference-specific fetches
 # ---------------------------------------------------------------------------
-
-# Reference resource classes
-REFERENCE_RESOURCE_CLASSES = [35, 43, 88, 40, 82, 178, 52, 77, 305]
 
 WORD_COUNT_CACHE_DIR = ".cache_word_count"
 
@@ -84,8 +86,9 @@ class ReferenceContentClient(OmekaApiClient):
         return await self.request(f"items/{item_id}", {})
 
     async def fetch_items_content(self, item_ids: List[int]) -> Dict[int, str]:
-        """Fetch bibo:content for multiple items concurrently."""
+        """Fetch bibo:content concurrently; fail if any item cannot be read."""
         results = {}
+        errors: list[tuple[int, str]] = []
 
         # Use semaphore to limit concurrent requests
         semaphore = asyncio.Semaphore(10)
@@ -95,10 +98,9 @@ class ReferenceContentClient(OmekaApiClient):
                 try:
                     item = await self.fetch_item(item_id)
                     content = self._extract_content(item)
-                    return (item_id, content)
+                    return (item_id, content, None)
                 except Exception as e:
-                    console.print(f"[yellow]⚠[/yellow] Failed to fetch item {item_id}: {e}")
-                    return (item_id, "")
+                    return (item_id, None, e)
 
         tasks = [fetch_one(item_id) for item_id in item_ids]
 
@@ -114,9 +116,19 @@ class ReferenceContentClient(OmekaApiClient):
             task = progress.add_task("[cyan]Fetching content from Omeka API", total=len(tasks))
 
             for coro in asyncio.as_completed(tasks):
-                item_id, content = await coro
-                results[item_id] = content
+                item_id, content, exc = await coro
+                if exc is None:
+                    results[item_id] = content
+                else:
+                    errors.append((item_id, str(exc)))
                 progress.update(task, advance=1)
+
+        if errors:
+            sample = "; ".join(f"{item_id}: {error}" for item_id, error in errors[:5])
+            raise RuntimeError(
+                f"Could not fetch private bibo:content for {len(errors)} reference(s) "
+                f"({sample}). Refusing to replace their existing word counts with zero."
+            )
 
         return results
 
@@ -197,7 +209,7 @@ def add_word_count_batch(
         batch[count_col] = [count_words(text) for text in texts_in_batch]
     return batch
 
-def main() -> None:
+def main() -> int:
     """
     Fonction principale pour ajouter une colonne de comptage de mots au dataset.
     
@@ -261,7 +273,7 @@ def main() -> None:
             )
         except KeyboardInterrupt:
             console.print("\n[yellow]⚠[/yellow] Opération annulée par l'utilisateur.")
-            return
+            return 0
     
     console.print(f"[green]→[/green] Configuration sélectionnée: [bold]{config_name_choice}[/bold]")
     
@@ -279,18 +291,13 @@ def main() -> None:
         if not omeka_cfg.API_KEY_IDENTITY or not omeka_cfg.API_KEY_CREDENTIAL:
             console.print("[red]✗[/red] Les credentials Omeka (OMEKA_KEY_IDENTITY et OMEKA_KEY_CREDENTIAL) sont requis pour les références.")
             console.print("[yellow]ℹ[/yellow] Ces credentials sont nécessaires pour accéder aux valeurs privées de bibo:content.")
-            return
+            return 1
         console.print("[green]✓[/green] Credentials Omeka configurés")
 
     # --- Chargement du dataset ---
     console.print(f"\n[blue]→[/blue] Chargement du dataset [bold]{repo_id}[/bold], configuration [bold]{config_name_choice}[/bold]...")
-    try:
-        with console.status("[bold green]Chargement en cours...", spinner="dots"):
-            ds = load_dataset(repo_id, name=config_name_choice, split="train", token=token)
-        console.print(f"[green]✓[/green] Dataset chargé: [bold]{len(ds):,}[/bold] lignes")
-    except Exception as e:
-        console.print(f"[red]✗[/red] Erreur lors du chargement du dataset: {e}")
-        return
+    ds = load_hub_dataset(repo_id, config_name_choice, token=token, console=console)
+    source_revision = getattr(ds, "_iwac_source_revision", None)
 
     # Display dataset info
     info_table = Table(title="Dataset Information", box=box.ROUNDED, show_header=False)
@@ -305,12 +312,12 @@ def main() -> None:
     if not is_references and text_column_fixed not in ds.column_names:
         console.print(f"[red]✗[/red] La colonne de texte [bold]{text_column_fixed}[/bold] n'existe pas dans le dataset.")
         console.print(f"[yellow]ℹ[/yellow] Colonnes disponibles: {', '.join(ds.column_names)}")
-        return
+        return 1
 
     # Check if o:id column exists (required for references)
     if is_references and "o:id" not in ds.column_names:
         console.print("[red]✗[/red] La colonne [bold]o:id[/bold] est requise pour les références mais n'existe pas.")
-        return
+        return 1
 
     if count_column_name in ds.column_names and args.update_mode == "all":
         # Ask user if they want to recalculate existing word counts
@@ -322,19 +329,21 @@ def main() -> None:
                 recalculate = Confirm.ask("Voulez-vous recalculer les comptes de mots existants?", default=False)
                 if not recalculate:
                     console.print("[yellow]ℹ[/yellow] Opération annulée. Les comptes de mots existants sont conservés.")
-                    return
+                    return 0
                 else:
                     console.print("[green]→[/green] Recalcul des comptes de mots confirmé.")
             except KeyboardInterrupt:
                 console.print("\n[yellow]⚠[/yellow] Opération annulée par l'utilisateur.")
-                return
+                return 0
 
     # --- Process based on configuration type ---
     if is_references:
         # For references: fetch content from Omeka API and calculate word counts
-        ds_processed = asyncio.run(process_references_word_count(ds, omeka_cfg, count_column_name))
+        ds_processed = asyncio.run(process_references_word_count(
+            ds, omeka_cfg, count_column_name, update_mode=args.update_mode
+        ))
         if ds_processed is None:
-            return
+            return 1
     else:
         # For other configs: use the OCR column directly
         console.print(f"\n[blue]→[/blue] Calcul du nombre de mots pour la colonne [bold]{text_column_fixed}[/bold]...")
@@ -397,26 +406,27 @@ def main() -> None:
             "[yellow]Dry run — aucun push effectué.[/yellow]",
             border_style="yellow",
         ))
-        return
+        return 0
 
     # --- Push du dataset mis à jour vers le Hub ---
     console.print(f"\n[blue]→[/blue] Push du dataset mis à jour vers [bold]{repo_id}[/bold] (config: [bold]{config_name_choice}[/bold])...")
-    try:
-        with console.status("[bold green]Upload en cours...", spinner="dots"):
-            commit_msg = f"Ajout/mise à jour de la colonne '{count_column_name}'"
-            if is_references:
-                commit_msg += " (calculée depuis bibo:content via API Omeka)"
-            else:
-                commit_msg += f" basée sur '{text_column_fixed}'"
-            commit_msg += f" (config: {config_name_choice})"
-            
-            ds_processed.push_to_hub(
-                repo_id,
-                config_name=config_name_choice,
-                token=token,
-                max_shard_size=max_shard_size,
-                commit_message=commit_msg,
-            )
+    commit_msg = f"Ajout/mise à jour de la colonne '{count_column_name}'"
+    if is_references:
+        commit_msg += " (calculée depuis bibo:content via API Omeka)"
+    else:
+        commit_msg += f" basée sur '{text_column_fixed}'"
+    commit_msg += f" (config: {config_name_choice})"
+
+    if push_dataset(
+        ds_processed,
+        repo_id=repo_id,
+        config_name=config_name_choice,
+        token=token,
+        max_shard_size=max_shard_size,
+        commit_message=commit_msg,
+        console=console,
+        expected_revision=source_revision,
+    ):
         console.print("[green]✓[/green] Dataset poussé avec succès vers le Hub")
         
         # Final summary
@@ -431,11 +441,17 @@ def main() -> None:
             border_style="green"
         )
         console.print(summary_panel)
-    except Exception as e:
-        console.print(f"[red]✗[/red] Erreur lors du push du dataset vers le Hub: {e}")
+        return 0
+    return 1
 
 
-async def process_references_word_count(ds: Dataset, omeka_cfg: Config, count_column_name: str) -> Optional[Dataset]:
+async def process_references_word_count(
+    ds: Dataset,
+    omeka_cfg: Config,
+    count_column_name: str,
+    *,
+    update_mode: str = "all",
+) -> Optional[Dataset]:
     """
     Process word count for references by fetching bibo:content from Omeka API.
     
@@ -456,7 +472,15 @@ async def process_references_word_count(ds: Dataset, omeka_cfg: Config, count_co
     
     # Get all item IDs from the dataset
     df = ds.to_pandas()
-    item_ids = df["o:id"].tolist()
+    if update_mode == "missing" and count_column_name in df.columns:
+        target_mask = df[count_column_name].isna()
+    else:
+        target_mask = pd.Series(True, index=df.index)
+    target_indices = df.index[target_mask].tolist()
+    item_ids = df.loc[target_indices, "o:id"].tolist()
+    if not item_ids:
+        console.print("[green]✓[/green] All reference word counts are already present.")
+        return ds
     
     # Convert to integers (they might be strings)
     try:
@@ -476,21 +500,25 @@ async def process_references_word_count(ds: Dataset, omeka_cfg: Config, count_co
     
     # Calculate word counts
     console.print("\n[blue]→[/blue] Calcul du nombre de mots...")
-    word_counts = []
+    word_counts: dict[int, int] = {}
     items_with_content = 0
     
     for item_id in item_ids:
         item_id_int = int(item_id)
         content = content_map.get(item_id_int, "")
         wc = count_words(content)
-        word_counts.append(wc)
+        word_counts[item_id_int] = wc
         if content:
             items_with_content += 1
     
     console.print(f"[green]✓[/green] Comptage terminé: {items_with_content}/{len(item_ids)} références avec contenu")
     
     # Add word counts to dataframe
-    df[count_column_name] = word_counts
+    if count_column_name not in df.columns:
+        df[count_column_name] = pd.NA
+    for row_index in target_indices:
+        item_id_int = int(df.at[row_index, "o:id"])
+        df.at[row_index, count_column_name] = word_counts[item_id_int]
     df[count_column_name] = df[count_column_name].astype('Int64')
     
     # Show sample
@@ -502,8 +530,9 @@ async def process_references_word_count(ds: Dataset, omeka_cfg: Config, count_co
     stats_table.add_column("Statistic", style="cyan")
     stats_table.add_column("Value", style="green")
     stats_table.add_row("Total references", f"{len(df):,}")
-    stats_table.add_row("References with content", f"{items_with_content:,}")
-    stats_table.add_row("References without content", f"{len(df) - items_with_content:,}")
+    stats_table.add_row("References processed", f"{len(item_ids):,}")
+    stats_table.add_row("Processed with content", f"{items_with_content:,}")
+    stats_table.add_row("Processed without content", f"{len(item_ids) - items_with_content:,}")
     stats_table.add_row("Total words", f"{df[count_column_name].sum():,}")
     stats_table.add_row("Average words/reference", f"{df[count_column_name].mean():.1f}")
     stats_table.add_row("Max words", f"{df[count_column_name].max():,}")
@@ -515,4 +544,4 @@ async def process_references_word_count(ds: Dataset, omeka_cfg: Config, count_co
     return ds_processed
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -22,11 +22,12 @@ Variables d'environnement
                         vous appelez login() de manière interactive)
 """
 
+import asyncio
 import os
 import sys
 import logging
 from typing import Dict, Any, List, Optional
-from collections import defaultdict, Counter
+from collections import defaultdict
 
 # Add parent directory to path for iwac_common import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,6 +43,12 @@ from iwac_common.field_mappers import (
     get_value_by_language,
 )
 from iwac_common.upload_runner import UploadSpec, run_upload
+from iwac_common.schema import SUBSETS
+from iwac_common.hub import (
+    ConcurrentHubWriteError,
+    HubBaselineUnavailableError,
+    get_repo_revision,
+)
 
 logger = logging.getLogger("upload")
 console = Console()
@@ -246,35 +253,46 @@ def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.Dat
 
 
 async def load_reference_datasets(token: Optional[str], repo: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Charge les datasets articles, publications et references depuis Hugging Face Hub"""
-    articles_df = pd.DataFrame()
-    publications_df = pd.DataFrame()
-    references_df = pd.DataFrame()
+    """Load every mandatory input from one stable Hub revision.
 
-    try:
-        logger.info(f"Loading articles dataset from {repo}...")
-        articles_ds = load_dataset(repo, name="articles", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
-        articles_df = articles_ds.to_pandas()
-        logger.info(f"Loaded {len(articles_df)} articles")
-    except Exception as e:
-        logger.warning(f"Could not load articles dataset: {e}")
+    Frequency statistics are a corpus-wide derived layer.  A missing input is
+    not equivalent to an empty corpus, so any load error aborts rather than
+    overwriting good statistics with zeros.
+    """
+    before = get_repo_revision(repo, token=token)
 
-    try:
-        logger.info(f"Loading publications dataset from {repo}...")
-        publications_ds = load_dataset(repo, name="publications", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
-        publications_df = publications_ds.to_pandas()
-        logger.info(f"Loaded {len(publications_df)} publications")
-    except Exception as e:
-        logger.warning(f"Could not load publications dataset: {e}")
+    def load_one(config_name: str) -> pd.DataFrame:
+        logger.info("Loading %s dataset from %s at %s...", config_name, repo, before)
+        try:
+            dataset = load_dataset(
+                repo,
+                name=config_name,
+                split="train",
+                token=token,
+                revision=before,
+                download_mode="force_redownload",
+                verification_mode="no_checks",
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HubBaselineUnavailableError(
+                f"Index enrichment requires '{config_name}', but it could not be "
+                f"loaded from {repo} at {before}: {exc}"
+            ) from exc
+        frame = dataset.to_pandas()
+        logger.info("Loaded %d %s rows", len(frame), config_name)
+        return frame
 
-    try:
-        logger.info(f"Loading references dataset from {repo}...")
-        references_ds = load_dataset(repo, name="references", split="train", token=token, download_mode="force_redownload", verification_mode="no_checks")
-        references_df = references_ds.to_pandas()
-        logger.info(f"Loaded {len(references_df)} references")
-    except Exception as e:
-        logger.warning(f"Could not load references dataset: {e}")
-
+    articles_df, publications_df, references_df = await asyncio.gather(
+        *(asyncio.to_thread(load_one, name) for name in (
+            "articles", "publications", "references"
+        ))
+    )
+    after = get_repo_revision(repo, token=token)
+    if after != before:
+        raise ConcurrentHubWriteError(
+            f"{repo} changed from {before} to {after} while index inputs were loading; "
+            "refusing mixed-revision frequency statistics."
+        )
     return articles_df, publications_df, references_df
 
 
@@ -314,7 +332,7 @@ async def _attach_frequency_stats(
 
 SPEC = UploadSpec(
     config_name="index",
-    resource_class_ids=(9, 94, 96, 54, 244),  # Lieux, Personnes, Organisations, Événements, Sujets/Notices
+    resource_class_ids=SUBSETS["index"].resource_class_ids,
     map_item=map_index_item,
     title="🗂️ IWAC Index Upload",
     cache_dir=".cache_omk_index",

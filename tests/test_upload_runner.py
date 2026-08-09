@@ -41,6 +41,8 @@ def stub_hub(monkeypatch):
 
     def _install(existing_df):
         monkeypatch.setattr(hub_merge, "load_dataset", lambda *a, **k: _FakeDS(existing_df))
+        monkeypatch.setattr(hub_merge, "get_repo_revision", lambda *a, **k: "rev-1")
+        monkeypatch.setattr(ur, "resolve_hf_token", lambda *a, **k: "token")
 
     return _install
 
@@ -68,8 +70,12 @@ def _run(spec, argv):
 class TestDryRun:
     def test_happy_path_dry_run_returns_zero(self, stub_omeka, stub_hub, monkeypatch):
         stub_omeka({36: [{"o:id": 1, "title": "a"}, {"o:id": 2, "title": "b"}]})
-        stub_hub(pd.DataFrame({"o:id": ["1", "2"], "title": ["a", "b"], "embedding_OCR": [[0.1], [0.2]]}))
-        # no HF token needed in dry-run; disable cache to avoid disk writes
+        stub_hub(pd.DataFrame({
+            "o:id": ["1", "2"],
+            "title": ["a", "b"],
+            "embedding_OCR": [[0.1] * 768, [0.2] * 768],
+        }))
+        # Hub baseline reads are authenticated even in dry-run.
         assert _run(_spec(), ["--dry-run", "--no-cache"]) == 0
 
     def test_empty_omeka_leaves_hub_untouched(self, stub_omeka, monkeypatch):
@@ -114,6 +120,31 @@ class TestDryRun:
         stub_omeka({35: [{"o:id": 1, "title": "a"}], 43: [{"o:id": 2, "title": "b"}]})
         stub_hub(pd.DataFrame())
         assert _run(_spec(resource_class_ids=(35, 43)), ["--dry-run", "--no-cache"]) == 0
+
+    def test_mapper_failure_aborts_by_default(self, stub_omeka, stub_hub):
+        stub_omeka({36: [{"o:id": 1, "title": "a"}, {"o:id": 2, "title": "b"}]})
+        stub_hub(pd.DataFrame({"o:id": ["1", "2"], "title": ["old-a", "old-b"]}))
+
+        async def sometimes_fails(item, api):
+            if item["o:id"] == 2:
+                raise ValueError("broken field")
+            return {"o:id": item["o:id"], "title": item["title"].upper()}
+
+        assert _run(_spec(map_item=sometimes_fails), ["--dry-run", "--no-cache"]) == 1
+
+    def test_allowed_mapper_failure_preserves_hub_row(self, stub_omeka, stub_hub):
+        stub_omeka({36: [{"o:id": 1, "title": "a"}, {"o:id": 2, "title": "b"}]})
+        stub_hub(pd.DataFrame({"o:id": ["1", "2"], "title": ["old-a", "old-b"]}))
+
+        async def sometimes_fails(item, api):
+            if item["o:id"] == 2:
+                raise ValueError("broken field")
+            return {"o:id": item["o:id"], "title": item["title"].upper()}
+
+        assert _run(
+            _spec(map_item=sometimes_fails),
+            ["--dry-run", "--no-cache", "--allow-map-failures"],
+        ) == 0
 
 
 class TestParser:

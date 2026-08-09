@@ -39,6 +39,7 @@ from iwac_common.omeka_client import (
     OmekaApiClient,
     conn_manager,
     fetch_iiif_thumbnail_url,
+    fetch_primary_media_url,
 )
 from iwac_common.field_mappers import (
     extract_added_date,
@@ -48,6 +49,7 @@ from iwac_common.field_mappers import (
     to_int_or_none,
 )
 from iwac_common.upload_runner import UploadSpec, run_upload
+from iwac_common.schema import SUBSETS
 
 load_dotenv()
 
@@ -80,11 +82,9 @@ def _get_label(item: Dict[str, Any], field: str) -> str:
 async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item Omeka en dict plat pour HF datasets."""
 
-    primary_url = ""
-    if item.get("o:primary_media"):
-        mid = item["o:primary_media"]["@id"].split("/")[-1]
-        mdata = await api.fetch_media_data(mid)
-        primary_url = mdata.get("o:original_url", "")
+    primary_url = await fetch_primary_media_url(
+        item, api, affected_fields=("PDF",)
+    )
 
     # Map country based on item set IDs
     country = ""
@@ -155,7 +155,7 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
 
 SPEC = UploadSpec(
     config_name="documents",
-    resource_class_ids=(49,),  # bibo:Document — general documents
+    resource_class_ids=SUBSETS["documents"].resource_class_ids,
     map_item=map_document,
     title="📄 IWAC Documents Upload",
     cache_dir=".cache_omk_documents",
