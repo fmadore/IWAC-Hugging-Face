@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import socket
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -91,28 +92,118 @@ def _lock_root() -> Path:
     return Path(__file__).resolve().parent.parent / ".iwac_locks"
 
 
+def _process_alive(pid: int) -> bool:
+    """Best-effort liveness check, biased towards reporting "alive".
+
+    A PID can be reused, so a true answer never proves it is *our* writer. That
+    is the safe direction: an unrelated live process keeps the lock held (the
+    operator investigates), while only a confirmed-dead PID lets it be
+    reclaimed automatically.
+    """
+    if pid <= 0:
+        return True
+    if os.name == "nt":  # pragma: no cover - exercised on the Windows CI leg
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == STILL_ACTIVE
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # PermissionError (alive, another user) and anything unexpected.
+        return True
+    return True
+
+
+def _lock_owner(path: Path) -> dict[str, str]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    fields = {}
+    for line in raw.splitlines():
+        key, _, value = line.partition("=")
+        if value:
+            fields[key.strip()] = value.strip()
+    return fields
+
+
+def _reclaim_if_dead(path: Path, repo_id: str, console=None) -> bool:
+    """Remove a lock whose owning process is gone. Returns True if reclaimed.
+
+    Only a lock written by *this* host is ever reclaimed: the lock directory can
+    sit on a shared filesystem, where a remote PID says nothing about the owner.
+    """
+    fields = _lock_owner(path)
+    if fields.get("host") != socket.gethostname():
+        return False
+    try:
+        pid = int(fields.get("pid", ""))
+    except ValueError:
+        return False
+    if _process_alive(pid):
+        return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return True
+    if console is not None:
+        console.print(
+            f"[yellow]⚠[/yellow] Reclaimed a stale write lock for {repo_id} "
+            f"(pid {pid} on this host is gone; started {fields.get('started', '?')})."
+        )
+    return True
+
+
 @contextmanager
-def hub_write_lock(repo_id: str):
-    """Process-local-machine lock preventing overlapping writes to one repo."""
+def hub_write_lock(repo_id: str, *, console=None):
+    """Process-local-machine lock preventing overlapping writes to one repo.
+
+    A lock left behind by a crashed local process is reclaimed automatically;
+    one held by a live process, or written by another host, still fails closed.
+    """
     root = _lock_root()
     root.mkdir(parents=True, exist_ok=True)
     slug = hashlib.sha256(repo_id.encode("utf-8")).hexdigest()[:16]
     path = root / f"{slug}.lock"
     payload = (
-        f"repo={repo_id}\npid={os.getpid()}\n"
+        f"repo={repo_id}\npid={os.getpid()}\nhost={socket.gethostname()}\n"
         f"started={datetime.now(timezone.utc).isoformat()}\n"
     )
+
+    def acquire():
+        return os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        fd = acquire()
     except FileExistsError as exc:
+        reclaimed = _reclaim_if_dead(path, repo_id, console)
         try:
-            owner = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            owner = "owner details unavailable"
-        raise HubWriteLockedError(
-            f"A write to {repo_id!r} is already locked at {path}: {owner}. "
-            "If the owning process crashed, remove this one lock file manually."
-        ) from exc
+            fd = acquire() if reclaimed else None
+        except FileExistsError:
+            fd = None  # Another process won the reclaim race.
+        if fd is None:
+            owner = _lock_owner(path)
+            detail = ", ".join(f"{k}={v}" for k, v in owner.items()) or "details unavailable"
+            raise HubWriteLockedError(
+                f"A write to {repo_id!r} is already locked at {path} ({detail}). "
+                "The owning process is still running (or the lock belongs to "
+                "another host). Wait for it to finish rather than deleting the "
+                "lock — two concurrent pushes lose each other's columns."
+            ) from exc
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
@@ -128,6 +219,81 @@ def _dataset_ids(ds) -> list[str]:
     if "o:id" not in ds.column_names:
         raise HubWriteError("Pushed dataset has no 'o:id' column")
     return [str(value) for value in ds["o:id"]]
+
+
+def _published_ids_columnar(
+    repo_id: str, config_name: str, revision: str, token: Optional[str]
+) -> list[str]:
+    """Read only the ``o:id`` column of the published parquet.
+
+    Parquet is columnar, so this transfers one narrow column instead of the
+    whole subset — the difference between a few MB and re-downloading every
+    768-dim embedding on each push. Raises on any problem so the caller can
+    fall back to the exhaustive reload rather than skip verification.
+    """
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfFileSystem
+
+    fs = HfFileSystem(token=token)
+    shards = sorted(fs.glob(f"datasets/{repo_id}@{revision}/{config_name}/*.parquet"))
+    if not shards:
+        raise HubWriteError(
+            f"No parquet found for '{config_name}' in {repo_id} at {revision}"
+        )
+    ids: list[str] = []
+    for shard in shards:
+        with fs.open(shard, "rb") as handle:
+            table = pq.ParquetFile(handle).read(columns=["o:id"])
+        ids.extend(str(value) for value in table.column("o:id").to_pylist())
+    return ids
+
+
+def _published_ids(
+    repo_id: str,
+    config_name: str,
+    revision: str,
+    token: Optional[str],
+    expected_columns: Sequence[str],
+    console,
+) -> list[str]:
+    """Return the published row ids, preferring the cheap columnar read.
+
+    Column-level verification is *not* done here: ``sync_card_features`` has
+    already compared the card's declared features against the parquet footer on
+    the Hub and against ``expected_columns``, which is what the CastError guard
+    needs. What remains is the row-level question — did every row land, exactly
+    once — and that needs one column, not all of them.
+    """
+    try:
+        return _published_ids_columnar(repo_id, config_name, revision, token)
+    except Exception as exc:  # noqa: BLE001 - never let a fast path skip verification
+        console.print(
+            f"[dim]ℹ Columnar id verification unavailable ({exc}); "
+            f"falling back to a full reload.[/dim]"
+        )
+    from datasets import load_dataset
+
+    from .schema import DataContractError, validate_dataset
+
+    reloaded = load_dataset(
+        repo_id,
+        name=config_name,
+        split="train",
+        token=token,
+        revision=revision,
+        download_mode="force_redownload",
+    )
+    try:
+        validate_dataset(reloaded, config_name)
+    except DataContractError as contract_exc:
+        raise HubWriteError(
+            f"Reloaded '{config_name}' violates its data contract: {contract_exc}"
+        ) from contract_exc
+    if list(reloaded.column_names) != list(expected_columns):
+        raise HubWriteError(
+            f"Reloaded '{config_name}' columns differ from the pushed frame"
+        )
+    return _dataset_ids(reloaded)
 
 
 def push_dataset_verified(
@@ -152,8 +318,11 @@ def push_dataset_verified(
     Hugging Face's high-level ``Dataset.push_to_hub`` has no parent-commit
     precondition, so the local lock plus this immediate recheck is the strongest
     safe guard available without reimplementing its parquet commit builder.
+
+    Verification after the push is split by cost: ``sync_card_features`` reads
+    the parquet footer to check the schema (cheap, and the CastError guard),
+    then ``verify_reload`` checks the published row ids through one column.
     """
-    from datasets import load_dataset
     from rich.console import Console
 
     from .card_sync import CardSchemaError, sync_card_features
@@ -170,7 +339,9 @@ def push_dataset_verified(
     if len(ids) != len(set(ids)):
         raise HubWriteError("Refusing to push duplicated 'o:id' values")
 
-    lock_context = hub_write_lock(repo_id) if acquire_lock else nullcontext()
+    lock_context = (
+        hub_write_lock(repo_id, console=console) if acquire_lock else nullcontext()
+    )
     with lock_context:
         before = get_repo_revision(repo_id, token=token)
         if expected_revision is not None and before != expected_revision:
@@ -196,25 +367,9 @@ def push_dataset_verified(
             )
             published_revision = get_repo_revision(repo_id, token=token)
             if verify_reload:
-                reloaded = load_dataset(
-                    repo_id,
-                    name=config_name,
-                    split="train",
-                    token=token,
-                    revision=published_revision,
-                    download_mode="force_redownload",
+                reloaded_ids = _published_ids(
+                    repo_id, config_name, published_revision, token, columns, console
                 )
-                try:
-                    validate_dataset(reloaded, config_name)
-                except DataContractError as exc:
-                    raise HubWriteError(
-                        f"Reloaded '{config_name}' violates its data contract: {exc}"
-                    ) from exc
-                if list(reloaded.column_names) != columns:
-                    raise HubWriteError(
-                        f"Reloaded '{config_name}' columns differ from the pushed frame"
-                    )
-                reloaded_ids = _dataset_ids(reloaded)
                 if len(reloaded_ids) != len(set(reloaded_ids)):
                     raise HubWriteError(
                         f"Reloaded '{config_name}' contains duplicate 'o:id' values"

@@ -30,6 +30,19 @@ iwac-upload = "iwac_pipeline.cli:upload_main"
 iwac-mirror = "iwac_pipeline.cli:mirror_main"
 iwac-publish-public = "iwac_pipeline.cli:publish_public_main"
 
+[tool.ruff]
+# Deliberately not a style gate. These two rules are the ones that catch
+# breakage the import-smoke tests cannot: F821 for a name used inside main()
+# or a rare branch after a refactor dropped its import, F401 for the imports
+# such a refactor leaves behind. Unlike pyflakes, ruff honours `# noqa: F401`,
+# which is what keeps deliberate availability checks (see
+# calculate_hijri_dates.py) out of the report.
+target-version = "py312"
+exclude = [".venv", ".cache_omk*", "*.ipynb"]
+
+[tool.ruff.lint]
+select = ["F401", "F811", "F821"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

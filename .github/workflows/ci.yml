@@ -28,22 +28,18 @@ jobs:
             requirements-dev.txt
 
       - name: Install static-check dependencies
-        run: python -m pip install pyflakes
+        run: python -m pip install ruff
 
       - name: Compile every Python module
         run: python -m compileall -q . -x '(^|/)(\.venv|\.git|\.cache[^/]*)/'
 
-      - name: Reject undefined names
-        shell: bash
-        run: |
-          # Pyflakes exits non-zero for every diagnostic, including warnings
-          # outside this focused gate. Capture its report first, then fail only
-          # for the undefined-name errors this step is intended to reject.
-          python -m pyflakes $(git ls-files '*.py') > pyflakes.log || true
-          cat pyflakes.log
-          if grep -qi "undefined name" pyflakes.log; then
-            exit 1
-          fi
+      - name: Reject undefined names and dead imports
+        # Rules are pinned in pyproject.toml ([tool.ruff.lint]): F821 catches a
+        # refactor that drops an import used inside main() or a rare branch —
+        # which the import-smoke tests cannot see — and F401 stops the dead
+        # imports such a refactor leaves behind from accumulating. Deliberate
+        # availability checks carry `# noqa: F401`, which ruff honours.
+        run: ruff check --output-format=github .
 
   tests:
     name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
