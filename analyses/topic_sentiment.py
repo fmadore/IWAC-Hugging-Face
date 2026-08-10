@@ -52,7 +52,6 @@ sys.path.insert(0, str(REPO_ROOT / "post-processing"))
 from _common import ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
 # Reuse the canonical sentiment vocabulary + consensus helpers.
 from sentiment_agreement import (  # noqa: E402
-    CENTRALITY_ORDER,
     MODELS,
     POLARITY_ORDER,
     majority,

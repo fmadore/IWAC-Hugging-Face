@@ -75,11 +75,128 @@ def test_bad_embedding_dimension_is_rejected(monkeypatch, lock_dir):
         )
 
 
+def test_columnar_verification_avoids_a_full_reload(monkeypatch, lock_dir):
+    ds = FakeDataset({"o:id": ["1", "2"], "title": ["a", "b"]})
+    revisions = iter(["before", "after", "after"])
+    monkeypatch.setattr(hub, "get_repo_revision", lambda *a, **k: next(revisions))
+    monkeypatch.setattr(card_sync, "sync_card_features", lambda *a, **k: True)
+    monkeypatch.setattr(
+        hub, "_published_ids_columnar", lambda *a, **k: ["1", "2"]
+    )
+
+    import datasets
+
+    def forbidden(*args, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("the columnar path must not trigger a full reload")
+
+    monkeypatch.setattr(datasets, "load_dataset", forbidden)
+    hub.push_dataset_verified(
+        ds,
+        repo_id="owner/repo",
+        config_name="articles",
+        token="token",
+        commit_message="test",
+        expected_revision="before",
+    )
+    assert len(ds.pushes) == 1
+
+
+def test_columnar_verification_catches_a_short_write(monkeypatch, lock_dir):
+    ds = FakeDataset({"o:id": ["1", "2"], "title": ["a", "b"]})
+    revisions = iter(["before", "after", "after"])
+    monkeypatch.setattr(hub, "get_repo_revision", lambda *a, **k: next(revisions))
+    monkeypatch.setattr(card_sync, "sync_card_features", lambda *a, **k: True)
+    monkeypatch.setattr(hub, "_published_ids_columnar", lambda *a, **k: ["1"])
+    with pytest.raises(hub.HubWriteError, match="id set differs"):
+        hub.push_dataset_verified(
+            ds,
+            repo_id="owner/repo",
+            config_name="articles",
+            token="token",
+            commit_message="test",
+            expected_revision="before",
+        )
+
+
+def test_columnar_failure_falls_back_to_the_full_reload(monkeypatch, lock_dir):
+    ds = FakeDataset({"o:id": ["1", "2"], "title": ["a", "b"]})
+    revisions = iter(["before", "after", "after"])
+    monkeypatch.setattr(hub, "get_repo_revision", lambda *a, **k: next(revisions))
+    monkeypatch.setattr(card_sync, "sync_card_features", lambda *a, **k: True)
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("HfFileSystem is unavailable")
+
+    monkeypatch.setattr(hub, "_published_ids_columnar", unavailable)
+
+    import datasets
+
+    reloads = []
+
+    def fake_load(*args, **kwargs):
+        reloads.append(kwargs)
+        return FakeDataset(ds.data)
+
+    monkeypatch.setattr(datasets, "load_dataset", fake_load)
+    hub.push_dataset_verified(
+        ds,
+        repo_id="owner/repo",
+        config_name="articles",
+        token="token",
+        commit_message="test",
+        expected_revision="before",
+    )
+    assert len(reloads) == 1, "verification must never be silently skipped"
+
+
 def test_local_lock_blocks_overlapping_writer(monkeypatch, lock_dir):
     with hub.hub_write_lock("owner/repo"):
         with pytest.raises(hub.HubWriteLockedError):
             with hub.hub_write_lock("owner/repo"):
                 pass
+
+
+def test_lock_held_by_a_live_process_is_not_reclaimed(lock_dir):
+    with hub.hub_write_lock("owner/repo"):
+        # The outer lock records this very process, which is obviously alive.
+        with pytest.raises(hub.HubWriteLockedError, match="still running"):
+            with hub.hub_write_lock("owner/repo"):
+                pass
+
+
+def test_stale_lock_from_a_dead_local_process_is_reclaimed(monkeypatch, lock_dir):
+    monkeypatch.setattr(hub, "_process_alive", lambda pid: False)
+    root = hub._lock_root()
+    root.mkdir(parents=True, exist_ok=True)
+    import hashlib
+    import socket
+
+    slug = hashlib.sha256(b"owner/repo").hexdigest()[:16]
+    path = root / f"{slug}.lock"
+    path.write_text(
+        f"repo=owner/repo\npid=999999\nhost={socket.gethostname()}\nstarted=x\n",
+        encoding="utf-8",
+    )
+    with hub.hub_write_lock("owner/repo"):
+        pass
+    assert not path.exists()
+
+
+def test_stale_lock_from_another_host_is_never_reclaimed(monkeypatch, lock_dir):
+    monkeypatch.setattr(hub, "_process_alive", lambda pid: False)
+    root = hub._lock_root()
+    root.mkdir(parents=True, exist_ok=True)
+    import hashlib
+
+    slug = hashlib.sha256(b"owner/repo").hexdigest()[:16]
+    path = root / f"{slug}.lock"
+    path.write_text(
+        "repo=owner/repo\npid=999999\nhost=some-other-machine\nstarted=x\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(hub.HubWriteLockedError):
+        with hub.hub_write_lock("owner/repo"):
+            pass
 
 
 def test_config_discovery_includes_parquet_missing_from_card(monkeypatch):

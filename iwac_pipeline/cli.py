@@ -1,4 +1,19 @@
-"""Thin installed CLI wrappers around the repository's maintained scripts."""
+"""Thin installed CLI wrappers around the repository's maintained scripts.
+
+**This is a bridge, not the end state.** The seven upload scripts still live at
+their historical paths and are loaded here by file path via ``importlib``,
+because they are scripts rather than importable modules — ``articles/`` and
+``islamic-publications/`` are not packages, and the latter is not even a legal
+module name. So this layer buys entry points and one documented invocation, and
+it deliberately reaches into two attributes only: ``SPEC`` for the uploads and
+``main`` for the mirror/publisher.
+
+Turning the scripts into real modules (``iwac_pipeline.uploads.articles``
+exporting its ``UploadSpec``) would delete ``_load_script`` entirely. Until
+then, treat the mapping below as the coupling point: moving or renaming a
+script breaks the console entry points, and ``tests/test_cli.py`` is what
+catches it.
+"""
 
 from __future__ import annotations
 

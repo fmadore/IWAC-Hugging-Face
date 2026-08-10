@@ -10,7 +10,7 @@ those stable facts.  It deliberately does *not* auto-approve public columns:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Mapping
 
 import pandas as pd
 

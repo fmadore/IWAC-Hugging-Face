@@ -4,7 +4,6 @@ Stubs the Omeka fetch and the Hub load so nothing hits the network; exercises
 fetch -> map -> post_map -> merge (with the real safety rails) -> dry-run.
 """
 
-import asyncio
 
 import pandas as pd
 import pytest

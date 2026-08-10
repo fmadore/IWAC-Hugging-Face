@@ -35,14 +35,37 @@ the per-subset allowlist in `iwac_common/public_columns.json`. If a new column i
 legitimate, add it to the allowlist deliberately — never silence the guard.
 
 The uploads have their own rails, and the same rule applies: an abort is
-information, not an obstacle. `hub_merge` refuses a frame under 95% of the Hub's
-row count (`--force-shrink`), `fetch_items` raises on a short read against the
-`Omeka-S-Total-Results` header, and a mass media-lookup failure aborts
-(`--allow-media-failures`). That last one exists because the others guard row
-*count*: when the Omeka host is unreachable, every media sub-fetch fails,
-`PDF`/`thumbnail` come back empty, and the merge overwrites good Hub URLs with
-blanks while the row count stays identical. If it fires, fix connectivity —
-overriding it is almost never right.
+information, not an obstacle. All of them **fail closed by default** — every
+override is opt-in, and every override preserves what it could not refresh
+rather than blanking it:
+
+- `hub_merge` refuses a frame under 95% of the Hub's row count
+  (`--force-shrink`). It also refuses to treat an unreadable Hub config as a
+  first run: a genuinely new config needs `--initialize`.
+- `fetch_items` *requires* the `Omeka-S-Total-Results` header and reconciles
+  against it exactly — a missing header or any count mismatch raises, where it
+  once only caught short reads.
+- **Any** media-lookup failure aborts (`--allow-media-failures`), not just a
+  mass one. The threshold was 20 %, which let a handful of transient failures
+  through — and those are exactly what blanks a good `PDF`/`thumbnail` while the
+  row count stays identical, so neither the shrink tripwire nor the count
+  reconciliation notices. With the override, `MediaFetchStats` tracks *which
+  fields of which item* failed and the merge carries those values forward from
+  the Hub.
+- **Any** mapper failure aborts (`--allow-map-failures`). With the override, the
+  affected items keep their complete existing Hub row instead of vanishing.
+
+If a media or mapper guard fires, fix connectivity first — a VPN or DNS change
+is the usual cause, and overriding is almost never right.
+
+**Every Hub write goes through `iwac_common/hub.py`.** `push_dataset_verified`
+is the only place allowed to call `push_to_hub`, and a test enforces that. It
+validates the frame, takes a machine-local repo lock, rejects a Hub revision
+that changed since the caller loaded its input (optimistic concurrency —
+`_iwac_source_revision` rides along through the post-processing transforms),
+pushes, repairs the card via `card_sync`, then verifies the published row ids.
+That last step reads only the `o:id` column from the parquet footers; if that
+fast path is unavailable it falls back to a full reload, never to skipping.
 
 ## DOIs: mint at release points, never on every update
 
@@ -98,6 +121,13 @@ config and the shared README metadata. Two scripts pushing concurrently — even
 different subsets — will clobber each other's columns via lost update. Finish one
 before starting the next.
 
+This is now enforced rather than merely documented: `hub_write_lock` (in
+`.iwac_locks/`, or `IWAC_LOCK_DIR`) blocks a second local writer, and the
+revision precondition catches most remote lost updates. A lock left by a crashed
+process on this host is reclaimed automatically; one held by a live process, or
+written by another machine, still fails closed — wait for it rather than deleting
+the file. Enforcement is per-machine, so the operational rule stands.
+
 **LDA stopwords come in tiers, and the tier decides the outcome.** Which set a
 word goes in matters more than whether it is in one at all:
 
@@ -129,8 +159,11 @@ alive across an upload. `reference/` merges `how="outer"` — the others use
 `"left"`.
 
 **Import-smoke tests cannot catch undefined names** used inside `main()` or in a
-rarely-taken branch. CI runs `pyflakes` for exactly that reason; a refactor that
-drops an import will otherwise pass tests and crash at runtime.
+rarely-taken branch. CI runs `ruff check` for exactly that reason — F821 for the
+undefined name a dropped import leaves behind, F401 so the dead imports don't
+accumulate (rules pinned in `pyproject.toml`; a deliberate availability check
+carries `# noqa: F401`). Without it a refactor passes the tests and crashes at
+runtime.
 
 **Caches:** Omeka responses in `.cache_omk*` (gzipped JSON, 24h TTL). Lemma and
 embedding resume caches are deleted on a successful push, so a leftover file
@@ -146,9 +179,29 @@ lemmatisation output changes for identical input.
 .venv\Scripts\python script_name.py
 ```
 
+The editable install also exposes three console entry points, which are the
+preferred way to drive the pipeline:
+
+```
+iwac-upload <subset>        # articles|publications|index|references|audiovisual|documents|images
+iwac-mirror --dataset private
+iwac-publish-public
+```
+
+`iwac-upload` forwards its remaining flags to the subset's own parser, so
+`iwac-upload articles --dry-run --no-cache` works. They are thin wrappers
+(`iwac_pipeline/cli.py`) that load the same scripts by path — there is no second
+code path to keep in step, but a moved or renamed script breaks them.
+
 `iwac_common` and `country_mapper` are editable-installed (`pip install -e .
 --no-deps`), so they import from any working directory; scripts keep sys.path
 fallbacks for uninstalled venvs.
+
+**The local CSV mirror is revision-pinned.** `iwac-mirror` writes
+`data/mirror_manifest.json` alongside the CSVs, recording the Hub SHA, row
+counts, and SHA-256 per file; `load_subset_dataframe(source="csv")` verifies it
+and refuses an interrupted or mixed-revision mirror. Deleting the manifest does
+not make the CSVs usable again — re-run `iwac-mirror`.
 
 Required in `.env`: `OMEKA_BASE_URL`, `OMEKA_KEY_IDENTITY`,
 `OMEKA_KEY_CREDENTIAL`, `HF_TOKEN`, and `GOOGLE_API_KEY` for the embedding

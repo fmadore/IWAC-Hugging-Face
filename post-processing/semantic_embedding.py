@@ -40,8 +40,6 @@ Dependencies
     pip install google-genai datasets huggingface_hub rich
 """
 import argparse
-import gzip
-import json
 import logging
 import os
 import sys

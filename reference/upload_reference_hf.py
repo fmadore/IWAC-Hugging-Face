@@ -37,7 +37,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
 
-from iwac_common.omeka_client import OmekaApiClient, conn_manager
+from iwac_common.omeka_client import OmekaApiClient
 from iwac_common.field_mappers import extract_added_date, get_value, is_content_public
 from iwac_common.upload_runner import UploadSpec, run_upload
 from iwac_common.schema import SUBSETS
