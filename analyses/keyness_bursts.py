@@ -10,6 +10,10 @@ Two classic corpus-DH analyses over the `articles` subset:
    with the same stopword sets as the LDA pipeline (geographic + generic
    noise removed, Islamic/domain terms kept, per the DH guidelines).
 
+   G² is the *complete* 2×2 log-likelihood ratio (all four cells of
+   token/other × corpus contribute), not the token-present two-cell
+   shorthand — the latter is not the statistic a df=1 chi-square tests.
+
    Statistical control: G² conflates effect size and sample size (a tiny
    rate difference on a huge corpus yields a huge G²), so G² is used only
    for the *significance test* — per-token p = chi2.sf(G², df=1), then
@@ -91,19 +95,52 @@ from _stats import bh_adjust  # noqa: E402,F401
 
 
 def dunning_g2(a: int, b: int, total_a: int, total_b: int) -> float:
-    """Signed G² for token overrepresentation in corpus A vs corpus B."""
-    if a == 0 or total_a == 0:
-        return 0.0
-    e1 = total_a * (a + b) / (total_a + total_b)
-    e2 = total_b * (a + b) / (total_a + total_b)
-    g2 = 0.0
-    if a > 0 and e1 > 0:
-        g2 += a * math.log(a / e1)
-    if b > 0 and e2 > 0:
-        g2 += b * math.log(b / e2)
-    g2 *= 2.0
+    """Signed G² for token overrepresentation in corpus A vs corpus B.
+
+    The full 2×2 log-likelihood ratio test of independence — every cell of
+
+        |          | token | other tokens |
+        | corpus A | a     | total_a - a  |
+        | corpus B | b     | total_b - b  |
+
+    contributes ``2·O·log(O/E)``, not just the token-present pair. The
+    two-cell form (Rayson & Garside 2000) is the common corpus-linguistics
+    shorthand and agrees to within ~0.1 % at realistic lemma rates, but it
+    understates G² for frequent terms and is not the statistic that
+    ``chi2.sf(G², df=1)`` in :func:`keyness_for_slices` actually tests.
+
+    Signed by the two relative rates: positive when overrepresented in A.
+    Antisymmetric under swapping the corpora,
+    ``dunning_g2(a, b, ta, tb) == -dunning_g2(b, a, tb, ta)``, so a token
+    absent from A but present in B scores a finite *negative* value.
+
+    Raises:
+        ValueError: if either corpus total is non-positive, or a count falls
+            outside its corpus (``0 <= a <= total_a``, ``0 <= b <= total_b``).
+    """
+    if total_a <= 0 or total_b <= 0:
+        raise ValueError(
+            f"corpus totals must be positive (total_a={total_a}, total_b={total_b})"
+        )
+    if not 0 <= a <= total_a:
+        raise ValueError(f"count a={a} outside its corpus [0, {total_a}]")
+    if not 0 <= b <= total_b:
+        raise ValueError(f"count b={b} outside its corpus [0, {total_b}]")
+
+    n = total_a + total_b
+    with_token = a + b
+    without_token = n - with_token
+    cells = (
+        (a, total_a * with_token / n),
+        (total_a - a, total_a * without_token / n),
+        (b, total_b * with_token / n),
+        (total_b - b, total_b * without_token / n),
+    )
+    # O == 0 contributes nothing (lim O·log O = 0 as O → 0). E == 0 only ever
+    # coincides with O == 0 here, so skipping those cells also guards O/E.
+    g2 = 2.0 * sum(o * math.log(o / e) for o, e in cells if o > 0)
     # Sign: positive when overrepresented in A
-    return g2 if (a / total_a) > ((b / total_b) if total_b else 0) else -g2
+    return g2 if (a / total_a) > (b / total_b) else -g2
 
 
 def log_ratio(a: int, b: int, total_a: int, total_b: int) -> float:
