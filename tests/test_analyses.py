@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -36,16 +37,45 @@ class TestDunningG2:
     def test_overrepresented_in_b_is_negative(self):
         assert kb.dunning_g2(5, 50, 1000, 1000) < 0
 
-    def test_zero_count_in_a(self):
-        assert kb.dunning_g2(0, 50, 1000, 1000) == 0.0
+    def test_zero_count_in_a_is_finite_and_negative(self):
+        # Absent from A, present in B → underrepresented, not "no signal".
+        g2 = kb.dunning_g2(0, 50, 1000, 1000)
+        assert math.isfinite(g2)
+        assert g2 < 0
 
-    def test_matches_textbook_value(self):
-        # Rayson & Garside worked formula: a=100,b=50,Na=10000,Nb=10000
+    def test_swapping_corpora_negates(self):
+        for a, b, ta, tb in [(100, 10, 1000, 1000), (0, 50, 1000, 1000),
+                             (7, 900, 2000, 5000), (300, 300, 1000, 4000)]:
+            assert math.isclose(kb.dunning_g2(a, b, ta, tb),
+                                -kb.dunning_g2(b, a, tb, ta))
+
+    def test_matches_full_2x2_contingency_table(self):
+        # a=100, b=10, Na=Nb=1000. The token-present cells alone give
+        # 85.4724383064 (Rayson & Garside's two-cell shorthand); the complete
+        # 2×2 log-likelihood ratio — what chi2.sf(G², df=1) tests — is larger.
+        assert math.isclose(kb.dunning_g2(100, 10, 1000, 1000),
+                            89.7597737585, rel_tol=1e-9)
+
+    def test_all_four_cells_contribute(self):
         a, b, na, nb = 100, 50, 10_000, 10_000
-        e1 = na * (a + b) / (na + nb)
-        e2 = nb * (a + b) / (na + nb)
-        expected = 2 * (a * math.log(a / e1) + b * math.log(b / e2))
+        n = na + nb
+        cells = [(a, na * (a + b) / n), (na - a, na * (n - a - b) / n),
+                 (b, nb * (a + b) / n), (nb - b, nb * (n - a - b) / n)]
+        expected = 2 * sum(o * math.log(o / e) for o, e in cells)
         assert math.isclose(kb.dunning_g2(a, b, na, nb), expected)
+
+    @pytest.mark.parametrize("a, b, total_a, total_b", [
+        (10, 10, 0, 1000),        # empty corpus A
+        (10, 10, 1000, 0),        # empty corpus B
+        (10, 10, -1000, 1000),    # negative total
+        (-1, 10, 1000, 1000),     # negative count
+        (10, -1, 1000, 1000),
+        (1001, 10, 1000, 1000),   # count exceeds its corpus
+        (10, 1001, 1000, 1000),
+    ])
+    def test_invalid_counts_raise(self, a, b, total_a, total_b):
+        with pytest.raises(ValueError):
+            kb.dunning_g2(a, b, total_a, total_b)
 
 
 class TestKleinbergBursts:
