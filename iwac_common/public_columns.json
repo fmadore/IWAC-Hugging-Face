@@ -228,7 +228,12 @@
     "nb_mots",
     "lemma_text",
     "lemma_nostop",
-    "OCR_is_public"
+    "OCR_is_public",
+    "lda_topic_id",
+    "lda_topic_prob",
+    "lda_topic_label",
+    "lda_topic_topk",
+    "lda_model_name"
   ],
   "references": [
     "o:id",
