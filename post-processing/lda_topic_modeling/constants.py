@@ -460,11 +460,43 @@ CONFIG_PRESETS: dict[str, dict] = {
     },
     "publications": {
         # Full periodical issues are long: chunked training/prediction.
+        #
+        # k pinned at 20 after the first fit (2026-08-11), for the same
+        # reason articles and references pin theirs: k is baked into the
+        # meaning of the lda_topic_id column, and re-deriving it on every
+        # fit silently renumbers every topic in the published dataset.
+        # This preset carried optimize_topics=True until that first fit
+        # had a value to pin.
+        #
+        # Unlike references, the metrics here DO discriminate. The sweep
+        # over k=15..40 (5,722 chunks from 1,451 of 1,501 issues, seed 42):
+        #
+        #     k   C_v      NPMI     U_Mass
+        #     15  0.5549   0.0512   -1.4291
+        #     20  0.5596   0.0513   -1.5886   <- selected
+        #     25  0.5344   0.0208   -2.0130
+        #     30  0.5416   0.0175   -2.4424
+        #     35  0.5488   0.0202   -2.6847
+        #     40  0.5554   0.0291   -2.3616
+        #
+        # C_v alone looks flat and even recovers at k=40 — read on its own
+        # it would suggest the ranking is noise. NPMI contradicts that
+        # outright: it holds at ~0.051 for k<=20 and HALVES to ~0.02 from
+        # k=25 on, and U_Mass degrades monotonically over the same range.
+        # Three metrics agreeing on "<=20, not >=25" is signal; C_v's
+        # recovery at 40 is the outlier. 15 vs 20 is genuinely a coin flip
+        # (NPMI 0.0512 vs 0.0513), so 20 wins on granularity: ~73 labelled
+        # issues per topic against ~97 at k=15.
+        #
+        # Re-check with --optimize-topics --stability-seeds 3 if the
+        # corpus grows substantially, and judge by topic stability rather
+        # than C_v — but expect to have to justify renumbering everything
+        # downstream before changing this number.
         "model_path": "lda_model_publications",
         "chunk_words": 1000,
         "language": "Français",
+        "num_topics": 20,
         "topic_range": (15, 40, 5),
-        "optimize_topics": True,
     },
     "references": {
         # Scholarly texts, one model per language.
