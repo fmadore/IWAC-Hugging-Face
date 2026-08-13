@@ -100,6 +100,49 @@ def get_value_by_language(
     return ""
 
 
+def get_uri_value(item: Dict[str, Any], field: str) -> str:
+    """Extract a URI property's ``@id``, pipe-joined for lists.
+
+    The counterpart to :func:`get_value` for ``uri``-typed properties such as
+    ``fabio:hasURL``. ``get_value`` would work by accident today — a URI value
+    carries neither ``display_title`` nor ``@value``, so the fallback chain
+    reaches ``@id`` last — but it would silently prefer a stray ``@value`` if
+    one were ever entered, which for a link column means publishing a label
+    where consumers expect a resolvable address.
+    """
+    if field not in item or item[field] is None:
+        return ""
+    val = item[field]
+    if isinstance(val, str):
+        return val
+    if isinstance(val, dict):
+        val = [val]
+    if not isinstance(val, list):
+        return ""
+    uris = [
+        str(v["@id"]) for v in val
+        if isinstance(v, dict) and isinstance(v.get("@id"), str) and v["@id"]
+    ]
+    return "|".join(uris)
+
+
+def get_rights_label(item: Dict[str, Any], field: str = "dcterms:rights") -> str:
+    """Rights statements carry a human ``o:label`` beside the ``@id`` URI;
+    prefer the label, fall back to the URI, then to ``@value``."""
+    if field not in item or item[field] is None:
+        return ""
+    val = item[field]
+    if isinstance(val, dict):
+        val = [val]
+    if not isinstance(val, list):
+        return ""
+    parts = [
+        str(v.get("o:label") or v.get("@id") or v.get("@value") or "")
+        for v in val if isinstance(v, dict)
+    ]
+    return "|".join(filter(None, parts))
+
+
 def is_content_public(item: Dict[str, Any], field: str = "bibo:content") -> bool:
     """True iff ``field``'s full text is publicly visible on Omeka.
 
@@ -182,6 +225,8 @@ def extract_added_date(item: Dict[str, Any]) -> str:
 __all__ = [
     "get_value",
     "get_value_by_language",
+    "get_uri_value",
+    "get_rights_label",
     "is_content_public",
     "get_media_ids",
     "to_int_or_none",

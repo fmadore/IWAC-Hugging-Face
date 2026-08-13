@@ -46,7 +46,7 @@ Seven subsets, each mapped from an Omeka S resource class:
 | `documents` | Archival and institutional documents |
 | `references` | Scholarly references (books, chapters, journal articles) |
 | `index` | Authority records: persons, places, organisations, events |
-| `audiovisual` | Audio and video records with transcriptions where available |
+| `audiovisual` | Deposited recordings and embedded YouTube videos, with transcriptions where available (`source_type` tells the two apart) |
 | `images` | Fieldwork photographs |
 
 Content subsets join to `index` authority records, which is what makes entity-level analysis possible across the corpus.

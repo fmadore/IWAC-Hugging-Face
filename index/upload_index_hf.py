@@ -200,25 +200,62 @@ def _accumulate_term_stats(
     fields: List[str],
 ) -> None:
     """Met à jour fréquence / première-dernière occurrence / pays pour tous les
-    termes (séparés par |) des colonnes ``fields`` d'une ligne."""
+    termes (séparés par |) des colonnes ``fields`` d'une ligne.
+
+    ``frequency`` compte des **items**, pas des mentions : les termes sont
+    dédupliqués sur la ligne avant comptage, si bien qu'une autorité citée à la
+    fois en ``subject`` et en ``spatial`` (ou deux fois dans le même champ)
+    n'est comptée qu'une fois. Sans cela « fréquence » mélangeait deux
+    grandeurs — le nombre de documents et le nombre de champs où le terme
+    apparaît — et seules les autorités présentes dans plusieurs champs étaient
+    gonflées, ce qui rendait la comparaison entre entités fausse.
+    """
     date_str = row.get('pub_date', '') or row.get('date', '')
     country = row.get('country', '')
-    for field in fields:
-        for term in extract_terms_from_field(row.get(field, '')):
-            stats = term_stats[term]
-            stats['frequency'] += 1
-            if country:
-                stats['countries'].add(country)
-            if date_str:
-                if not stats['first_occurrence'] or date_str < stats['first_occurrence']:
-                    stats['first_occurrence'] = date_str
-                if not stats['last_occurrence'] or date_str > stats['last_occurrence']:
-                    stats['last_occurrence'] = date_str
+    terms = {
+        term
+        for field in fields
+        for term in extract_terms_from_field(row.get(field, ''))
+    }
+    for term in terms:
+        stats = term_stats[term]
+        stats['frequency'] += 1
+        if country:
+            stats['countries'].add(country)
+        if date_str:
+            if not stats['first_occurrence'] or date_str < stats['first_occurrence']:
+                stats['first_occurrence'] = date_str
+            if not stats['last_occurrence'] or date_str > stats['last_occurrence']:
+                stats['last_occurrence'] = date_str
 
 
-def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.DataFrame, references_df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
-    """Calcule les statistiques de fréquence pour tous les termes des colonnes subject, spatial et author des datasets articles et publications,
-    ainsi que les colonnes author, editor et publisher du dataset references"""
+#: Colonnes scannées par subset. Chaque colonne est une liste d'autorités
+#: séparées par ``|`` dont les valeurs correspondent exactement au ``Titre``
+#: d'une ligne d'index (vocabulaire contrôlé) — d'où la comparaison par
+#: appartenance exacte après découpage, jamais par sous-chaîne.
+FREQUENCY_SOURCE_FIELDS: Dict[str, List[str]] = {
+    'articles': ['subject', 'spatial', 'author'],
+    'publications': ['subject', 'spatial', 'author'],
+    'references': ['author', 'editor', 'publisher'],
+    # ``creator``/``publisher`` plutôt que ``author``/``newspaper`` : c'est le
+    # nom des colonnes du subset audiovisuel. ``publisher`` fait entrer les
+    # chaînes YouTube (des foaf:Organization, donc des lignes d'index) dans
+    # les agrégats, ce qui leur donne enfin une fréquence réelle.
+    'audiovisual': ['subject', 'spatial', 'creator', 'publisher'],
+}
+
+
+def calculate_frequency_stats(
+    articles_df: pd.DataFrame,
+    publications_df: pd.DataFrame,
+    references_df: pd.DataFrame,
+    audiovisual_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Calcule fréquence / première-dernière occurrence / pays pour chaque
+    autorité, en balayant les colonnes de ``FREQUENCY_SOURCE_FIELDS``.
+
+    ``frequency`` est un nombre d'items : voir :func:`_accumulate_term_stats`
+    pour la déduplication par ligne."""
     term_stats = defaultdict(lambda: {
         'frequency': 0,
         'first_occurrence': None,
@@ -226,10 +263,16 @@ def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.Dat
         'countries': set()
     })
 
+    frames = {
+        'articles': articles_df,
+        'publications': publications_df,
+        'references': references_df,
+        'audiovisual': audiovisual_df,
+    }
     sources = [
-        (articles_df, ['subject', 'spatial', 'author'], 'articles'),
-        (publications_df, ['subject', 'spatial', 'author'], 'publications'),
-        (references_df, ['author', 'editor', 'publisher'], 'references'),
+        (frames[name], fields, name)
+        for name, fields in FREQUENCY_SOURCE_FIELDS.items()
+        if frames[name] is not None
     ]
     for df, fields, name in sources:
         logger.info(f"Calculating frequency stats from {name} dataset...")
@@ -252,12 +295,16 @@ def calculate_frequency_stats(articles_df: pd.DataFrame, publications_df: pd.Dat
     return result
 
 
-async def load_reference_datasets(token: Optional[str], repo: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+async def load_reference_datasets(
+    token: Optional[str], repo: str
+) -> Dict[str, pd.DataFrame]:
     """Load every mandatory input from one stable Hub revision.
 
     Frequency statistics are a corpus-wide derived layer.  A missing input is
     not equivalent to an empty corpus, so any load error aborts rather than
     overwriting good statistics with zeros.
+
+    Returns one frame per key of :data:`FREQUENCY_SOURCE_FIELDS`.
     """
     before = get_repo_revision(repo, token=token)
 
@@ -282,10 +329,9 @@ async def load_reference_datasets(token: Optional[str], repo: str) -> tuple[pd.D
         logger.info("Loaded %d %s rows", len(frame), config_name)
         return frame
 
-    articles_df, publications_df, references_df = await asyncio.gather(
-        *(asyncio.to_thread(load_one, name) for name in (
-            "articles", "publications", "references"
-        ))
+    names = list(FREQUENCY_SOURCE_FIELDS)
+    frames = await asyncio.gather(
+        *(asyncio.to_thread(load_one, name) for name in names)
     )
     after = get_repo_revision(repo, token=token)
     if after != before:
@@ -293,7 +339,7 @@ async def load_reference_datasets(token: Optional[str], repo: str) -> tuple[pd.D
             f"{repo} changed from {before} to {after} while index inputs were loading; "
             "refusing mixed-revision frequency statistics."
         )
-    return articles_df, publications_df, references_df
+    return dict(zip(names, frames))
 
 
 
@@ -306,11 +352,16 @@ async def _attach_frequency_stats(
     new_df: pd.DataFrame, api: OmekaApiClient, repo: str, token: Optional[str]
 ) -> pd.DataFrame:
     """post_map hook: enrich index rows with corpus-wide term frequency
-    statistics (occurrences + first/last year + countries) computed from the
-    articles, publications and references subsets, joined on the index Titre
+    statistics (occurrences + first/last year + countries) computed from every
+    content subset in FREQUENCY_SOURCE_FIELDS, joined on the index Titre
     (controlled vocabulary). Runs after mapping, before the Hub merge."""
-    articles_df, publications_df, references_df = await load_reference_datasets(token, repo)
-    frequency_stats = calculate_frequency_stats(articles_df, publications_df, references_df)
+    frames = await load_reference_datasets(token, repo)
+    frequency_stats = calculate_frequency_stats(
+        frames["articles"],
+        frames["publications"],
+        frames["references"],
+        frames["audiovisual"],
+    )
 
     console.print("[blue]→[/blue] Attaching frequency statistics to index records...")
     new_df["frequency"] = 0

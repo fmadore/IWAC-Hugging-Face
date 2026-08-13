@@ -465,7 +465,12 @@ async def fetch_primary_media_url(
     try:
         media_id = str(primary["@id"]).rstrip("/").split("/")[-1]
         media = await api.fetch_media_data(media_id)
-        return str(media.get("o:original_url", ""))
+        # ``or ""`` rather than a dict default: a media that stores no original
+        # returns the key with a *null* value, and ``str(None)`` would write the
+        # literal string "None" into PDF/image_url. Every YouTube media is this
+        # shape (the core ingester keeps thumbnails only, storing no file), so
+        # the default would have poisoned every embedded-video row.
+        return str(media.get("o:original_url") or "")
     except Exception as exc:  # noqa: BLE001
         media_stats.record_failure(item.get("o:id"), affected_fields)
         logger.warning(

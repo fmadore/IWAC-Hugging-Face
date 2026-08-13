@@ -1,4 +1,9 @@
 # country_mapper.py
+#
+# Outlet → country index. Despite the ``*_NEWSPAPERS`` names the lists also
+# carry broadcasters and YouTube channels: ``audiovisual`` resolves its own
+# ``publisher`` through the same lookup, so a radio station or a video channel
+# belongs here exactly like a newspaper does.
 
 BENIN_NEWSPAPERS = [
     "24 Heures au Bénin",
@@ -8,6 +13,7 @@ BENIN_NEWSPAPERS = [
     "Bénin Intelligent",
     "Benin Web TV",
     "Boulevard des Infos",
+    "Crystal News",
     "Daabaaru",
     "Daho-Express",
     "Ehuzu",
@@ -36,12 +42,15 @@ BURKINA_FASO_NEWSPAPERS = [
     "An-Nasr Trimestriel",
     "An-Nasr Vendredi",
     "Burkina 24",
+    "Burkina Info",
     "Carrefour africain",
+    "Cercle d'Études, de Recherches et de Formation Islamiques",
     "Faso Actu",
     "FasoZine",
     "Infowakat",
     "L'Appel",
     "L'Autre Regard",
+    "L'Autregard",
     "L'Evénement",
     "L'Observateur",
     "L'Observateur Paalga",
@@ -51,6 +60,8 @@ BURKINA_FASO_NEWSPAPERS = [
     "Le vrai visage de l'islam",
     "LeFaso.net",
     "Mutations",
+    "RTB - Radiodiffusion Télévision du Burkina",
+    "Radio Oméga",
     "San Finna",
     "Sidwaya",
     "Wakat Séra",
@@ -89,6 +100,13 @@ COTE_DIVOIRE_NEWSPAPERS = [
     "Les Échos de l'AEEMCI",
 ]
 
+# Nigeria has no press outlets in the collection; these two are the deposited
+# audiovisual publishers behind the Zaria/Yola sermon recordings.
+NIGERIA_NEWSPAPERS = [
+    "AA Rasheed Electronics",
+    "Daarul Hadeethis Salafiyyah",
+]
+
 NIGER_NEWSPAPERS = [
     "Al Maoulid Info",
     "Al Maoulid Magazine",
@@ -120,6 +138,7 @@ _NEWSPAPER_TO_COUNTRY: dict[str, str] = {
     **{name: "Burkina Faso" for name in BURKINA_FASO_NEWSPAPERS},
     **{name: "Côte d'Ivoire" for name in COTE_DIVOIRE_NEWSPAPERS},
     **{name: "Niger" for name in NIGER_NEWSPAPERS},
+    **{name: "Nigeria" for name in NIGERIA_NEWSPAPERS},
     **{name: "Togo" for name in TOGO_NEWSPAPERS},
 }
 
