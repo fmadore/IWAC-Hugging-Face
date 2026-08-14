@@ -32,10 +32,14 @@ Three rules encoded here:
 
 Not in the panel, deliberately: ``iwac:deepseekV4Flash*`` (the retired April
 preview — 11,482 real annotations on Omeka, superseded by 0731, never to be
-repointed), ``iwac:gemini35FlashLite*`` (the fourth generation-2 slot, still
-unannotated), and ``iwac:gemini36Flash*`` / ``iwac:qwen35A3b*`` /
-``iwac:qwen35A10b*`` (reserved or dropped, zero values). Eleven property
-prefixes in Omeka vocabulary 10 describe six columns' worth of annotators here.
+repointed), ``iwac:gemini35FlashLite*`` (held the generation-2 Google slot from
+2026-07-31 until Gemma took it on 2026-08-14 and wrote nothing in between —
+verified at 0 items on the day of the swap, so nothing was mixed), and
+``iwac:gemini36Flash*`` / ``iwac:qwen35A3b*`` / ``iwac:qwen35A10b*`` (reserved
+or dropped, zero values). Twelve property prefixes in Omeka vocabulary 10
+describe seven columns' worth of annotators here — and the five empty ones stay
+installed, since on this instance the vocabulary update adds what the TTL
+declares without deleting what it omits.
 """
 
 from __future__ import annotations
@@ -181,9 +185,11 @@ class SentimentModel:
 #: **Generation 2** is model-keyed, ran the rewritten prompt ``d14ace9ac192``,
 #: and is the panel any new analysis should use. Provenance below is measured
 #: from the annotation pipeline's own cache (``cache/sentiment_v2.jsonl``), not
-#: inferred. Its fourth slot, ``gemini-3.5-flash-lite``, is absent because it has
-#: annotated nothing yet: add it here once it has, do not pre-declare it, or the
-#: uploader will emit six empty columns and the publisher will happily ship them.
+#: inferred. A member is added once it has annotated something and not before:
+#: pre-declaring one makes the uploader emit six empty columns that the publisher
+#: will happily ship. That is why ``gemini-3.5-flash-lite`` never appeared here
+#: in the two weeks it held the Google slot, and why ``gemma-4-31b-it``, which
+#: replaced it, did on the day its first corpus pass began.
 #:
 #: **Generation 1 is frozen** (``omeka_prefix=None``). Its Omeka properties are
 #: being deleted from the archive; the six columns per model stay on the Hub as
@@ -231,6 +237,32 @@ PANEL: Tuple[SentimentModel, ...] = (
         run_config=(
             "temperature=1.0; reasoning_effort=high (API accepts only low|high|max; "
             "medium rounded up); response schema"
+        ),
+        prompt_fingerprint="d14ace9ac192",
+    ),
+    SentimentModel(
+        prefix="gemma_4_31b_it",
+        label="Gemma 4 31B",
+        model_id="google/gemma-4-31b-it",
+        omeka_prefix="iwac:gemma431bIt",
+        # Still running: 134 of 12,305 articles when this entry was added. A
+        # sparse gemma column is an unfinished pass, not a failed one — drop the
+        # parenthetical once the corpus is covered.
+        campaign="2026-08-14 (in progress)",
+        generation=2,
+        # Routed through OpenRouter under data_collection=deny, never the Gemini
+        # API: Gemma is free of charge there with no paid tier, and Google states
+        # free-tier content is used to improve its products — unacceptable for
+        # whole archival articles. (That route also caps this model at 16k input
+        # tokens/minute, so it buys no speed either.)
+        #
+        # Read the depth as requested, not as measured: OpenRouter fans the call
+        # across third-party backends serving the same weights, and they disagree
+        # on what an effort level means — `medium` and `high` are
+        # indistinguishable through this route.
+        run_config=(
+            "reasoning_effort=high (model has only MINIMAL|HIGH; medium rounded "
+            "up); response schema; no temperature; OpenRouter, data_collection=deny"
         ),
         prompt_fingerprint="d14ace9ac192",
     ),
