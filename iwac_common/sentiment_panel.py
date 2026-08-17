@@ -245,10 +245,9 @@ PANEL: Tuple[SentimentModel, ...] = (
         label="Gemma 4 31B",
         model_id="google/gemma-4-31b-it",
         omeka_prefix="iwac:gemma431bIt",
-        # Still running: 134 of 12,305 articles when this entry was added. A
-        # sparse gemma column is an unfinished pass, not a failed one — drop the
-        # parenthetical once the corpus is covered.
-        campaign="2026-08-14 (in progress)",
+        # Corpus complete on 2026-08-17: 12,298 on centralité and polarité,
+        # matching the other three exactly, and 12,055 on subjectivité.
+        campaign="2026-08-14/2026-08-15",
         generation=2,
         # Routed through OpenRouter under data_collection=deny, never the Gemini
         # API: Gemma is free of charge there with no paid tier, and Google states
