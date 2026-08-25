@@ -75,7 +75,7 @@ The sentiment panel writes columns keyed by the exact model id, so that no two g
 
 | Generation | Models | Campaign | Subjectivité | Status |
 |---|---|---|---|---|
-| 2 | `gpt-5.6-luna`, `mistral-small-2603`, `deepseek-v4-flash-0731`, `google/gemma-4-31b-it` | 2026-08 | label (`string`) | Live — use this panel. All four are complete at 12,298 articles on centralité and polarité; subjectivité is the one dimension where they diverge |
+| 2 | `gpt-5.6-luna`, `mistral-small-2603`, `deepseek-v4-flash-0731`, `google/gemma-4-31b-it`, `Qwen/Qwen3.8-27B` | 2026-08 | label (`string`) | Live — use this panel. The first four are complete at 12,298 articles on centralité and polarité; subjectivité is where they diverge. Qwen3.8 joined on 2026-08-25 at 12,098 and stays there: 153 articles were retired after four attempts each, so its shortfall is a finding about the model, not a run to repair |
 | 1 | `gemini-3-flash-preview`, `gpt-5-mini`, `ministral-14b-2512` | 2026-01/02 | integer 1–5 (`float64`) | Frozen. The Omeka properties were deleted in 2026-08; the 18 columns remain on the Hub as historical data |
 
 Column order follows that table: `PANEL` in `iwac_common/sentiment_panel.py` is ordered newest-generation-first, and the uploader's `post_merge` hook sorts the sentiment block by it, so the current panel precedes its history rather than trailing it.

@@ -31,15 +31,23 @@ Three rules encoded here:
    side with :data:`SUBJECTIVITE_ORDER` and say so.
 
 Not in the panel, deliberately: ``iwac:deepseekV4Flash*`` (the retired April
-preview — 11,482 real annotations on Omeka, superseded by 0731, never to be
-repointed), ``iwac:gemini35FlashLite*`` (held the generation-2 Google slot from
-2026-07-31 until Gemma took it on 2026-08-14 and wrote nothing in between —
-verified at 0 items on the day of the swap, so nothing was mixed), and
-``iwac:gemini36Flash*`` / ``iwac:qwen35A3b*`` / ``iwac:qwen35A10b*`` (reserved
-or dropped, zero values). Twelve property prefixes in Omeka vocabulary 10
-describe seven columns' worth of annotators here — and the five empty ones stay
-installed, since on this instance the vocabulary update adds what the TTL
-declares without deleting what it omits.
+preview, superseded by 0731 and never to be repointed — its 11,482 annotations
+were deleted from Omeka on 2026-08-07 alongside generation 1, and unlike
+generation 1 they were never mirrored to the Hub, so they are simply gone),
+``iwac:gemini35FlashLite*`` (held the generation-2 Google slot from 2026-07-31
+until Gemma took it on 2026-08-14 and wrote nothing in between — verified at 0
+items on the day of the swap, so nothing was mixed), and ``iwac:gemini36Flash*``
+/ ``iwac:qwen35A3b*`` / ``iwac:qwen35A10b*`` (reserved or dropped, zero values).
+Thirteen property prefixes in Omeka vocabulary 10 describe eight columns' worth
+of annotators here — and the five matching no panel member stay installed, all
+of them now measuring zero, since on this instance the vocabulary update adds
+what the TTL declares without deleting what it omits.
+
+``qwen3_8_27b`` names a **route**, not just weights: the same Qwen3.8 27B is
+also reachable through OpenRouter, and that twin must never join the panel
+beside the self-hosted one. Two routes to one set of weights would read as two
+annotators while being a single reading of the construct — the correlated-error
+failure a panel exists to avoid.
 """
 
 from __future__ import annotations
@@ -125,8 +133,9 @@ class SentimentModel:
 
     Reproducibility, not decoration: neither generation shares one config
     (Ministral capped output at 512 tokens and GPT-5 mini set no temperature at
-    all; in generation 2 only Luna gets the middle reasoning level it asked
-    for), so a column cannot be re-derived without it.
+    all; in generation 2 only Luna and Qwen3.8 get the middle reasoning level
+    the panel asks for, the other three having no middle rung to give), so a
+    column cannot be re-derived without it.
     """
 
     prompt_fingerprint: str = ""
@@ -190,6 +199,12 @@ class SentimentModel:
 #: will happily ship. That is why ``gemini-3.5-flash-lite`` never appeared here
 #: in the two weeks it held the Google slot, and why ``gemma-4-31b-it``, which
 #: replaced it, did on the day its first corpus pass began.
+#:
+#: Equal coverage is **not** a panel invariant, and stopped being true in
+#: practice on 2026-08-25: ``qwen3_8_27b`` sits at 12,098 articles where the
+#: other four sit at 12,298, because 153 of them were retired after four
+#: attempts each. A member short of its neighbours is not evidence of a broken
+#: run — check the campaign's failure log before re-running anything.
 #:
 #: **Generation 1 is frozen** (``omeka_prefix=None``). Its Omeka properties are
 #: being deleted from the archive; the six columns per model stay on the Hub as
@@ -262,6 +277,55 @@ PANEL: Tuple[SentimentModel, ...] = (
         run_config=(
             "reasoning_effort=high (model has only MINIMAL|HIGH; medium rounded "
             "up); response schema; no temperature; OpenRouter, data_collection=deny"
+        ),
+        prompt_fingerprint="d14ace9ac192",
+    ),
+    SentimentModel(
+        prefix="qwen3_8_27b",
+        label="Qwen3.8 27B (self-hosted)",
+        # What ``vllm serve`` reports back from ``/v1/models``. The label keeps
+        # "(self-hosted)" because an OpenRouter twin of these exact weights
+        # exists and is deliberately not in the panel — the id alone would not
+        # distinguish the two routes, and the route is half the provenance.
+        model_id="Qwen/Qwen3.8-27B",
+        omeka_prefix="iwac:qwen3827b",
+        # Full-corpus pass 2026-08-17/18 across three shards (one L40S, two
+        # H100), then three retry rounds ending 08-24. Written to Omeka on
+        # 2026-08-25 by importing the offline run, not by re-annotating: at
+        # temperature 1.0 a re-run is a fresh reading, so importing is what
+        # keeps the published values the ones that were actually measured.
+        campaign="2026-08-17/2026-08-24",
+        generation=2,
+        # **Expect 12,098, not 12,298, and do not try to repair it.** 153
+        # articles were attempted four times each and retired; the other 200-row
+        # difference from the rest of the panel is those 153 plus the 47
+        # articles that became eligible after this run began. 145 of the 153
+        # fail the schema's cross-field rule identically every time — a null
+        # subjectivité beside a non-null centralité — and they concentrate on
+        # low centrality (5.45% of ``Marginal`` against 0.00% of ``Non abordé``),
+        # so the model draws the "nothing to judge" line one notch higher than
+        # the instrument does. That makes the gap a finding, not a failed run,
+        # and it makes this column's missingness non-random: a subjectivité
+        # comparison restricted to rows every member answered is biased toward
+        # high-centrality material. The retired items are listed in the run's
+        # ``*_failures.json`` beside its merged JSONL.
+        #
+        # Read at the depth the panel actually asks for, which only Luna also
+        # manages: Qwen3.8 has a real low|medium|xhigh ladder (measured on the
+        # endpoint — 28.5 s / 37.0 s / 89.1 s median completion), where Mistral,
+        # DeepSeek and Gemma have no middle rung and round ``medium`` up to
+        # ``high``. Any write-up of panel results has to say that three of the
+        # five are read deeper than requested and two are not.
+        #
+        # temperature=1.0 is Qwen's *thinking-mode* recipe (its
+        # ``generation_config.json`` ships 1.0 / top_p 0.95 / top_k 20); the
+        # model card's 0.7 is the non-thinking recipe and does not apply. A
+        # self-hosted vLLM applies that generation_config server-side, so the
+        # sampling is the model's own rather than this pipeline's.
+        run_config=(
+            "temperature=1.0 (Qwen thinking-mode recipe); reasoning_effort=medium "
+            "(a rung the model has, not one it was rounded up to); guided decoding; "
+            "self-hosted vLLM, bf16, Festus/Bayreuth"
         ),
         prompt_fingerprint="d14ace9ac192",
     ),
