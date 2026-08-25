@@ -79,6 +79,14 @@ from iwac_common.sentiment_panel import (  # noqa: E402
     latest_generation,
 )
 
+# Read .env by absolute path, as publish_public.py does: this script is run from
+# the repo root but imports resolve relative to its own directory, and without
+# this HF_TOKEN is unset, ensure_hf_token falls through to an interactive
+# login(), and a non-interactive run dies on EOF instead of pushing.
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv(REPO_ROOT / ".env")
+
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
