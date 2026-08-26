@@ -236,7 +236,14 @@ def _accumulate_term_stats(
 FREQUENCY_SOURCE_FIELDS: Dict[str, List[str]] = {
     'articles': ['subject', 'spatial', 'author'],
     'publications': ['subject', 'spatial', 'author'],
-    'references': ['author', 'editor', 'publisher'],
+    # ``subject``/``spatial`` ont longtemps manqué ici, alors que les colonnes
+    # existent et sont peuplées (spatial sur 854 des 867 lignes, subject sur
+    # 313) : les lieux et thèmes d'une référence ne comptaient nulle part.
+    # 228 entrées d'index y gagnent 1 708 occurrences, et 227 d'entre elles
+    # n'en tiraient aucune — « Extrémisme violent » et « Contre-terrorisme »
+    # affichaient une fréquence de 0 alors que des références les portent en
+    # sujet. Même classe de bug que les signatures côté IwacSearch.
+    'references': ['subject', 'spatial', 'author', 'editor', 'publisher'],
     # ``creator``/``publisher`` plutôt que ``author``/``newspaper`` : c'est le
     # nom des colonnes du subset audiovisuel. ``publisher`` fait entrer les
     # chaînes YouTube (des foaf:Organization, donc des lignes d'index) dans

@@ -129,6 +129,41 @@ class TestOccurrenceWindowAndCountries:
         assert stats["Madore, Frédérick"]["first_occurrence"] == ""
 
 
+class TestReferencesScanSubjectAndSpatial:
+    """Les lieux et thèmes d'une référence ne comptaient nulle part.
+
+    ``references`` déclarait ``author``/``editor``/``publisher`` seulement,
+    alors que les colonnes ``subject`` et ``spatial`` existent et sont
+    peuplées (spatial sur 854 des 867 lignes). 228 entrées d'index y gagnent
+    1 708 occurrences ; 227 n'en tiraient aucune, si bien que « Extrémisme
+    violent » affichait une fréquence de 0 pendant que 25 références le
+    portaient en sujet.
+    """
+
+    def test_subject_and_spatial_are_declared_for_references(self):
+        for field in ("subject", "spatial"):
+            assert field in idx.FREQUENCY_SOURCE_FIELDS["references"]
+
+    def test_a_place_only_cited_in_a_reference_still_gets_a_frequency(self):
+        stats = _stats(references=_frame([
+            {"author": "Madore, Frédérick", "editor": "", "publisher": "Brill",
+             "subject": "Extrémisme violent", "spatial": "Burkina Faso",
+             "pub_date": "2021-01-01", "country": "Burkina Faso"},
+        ]))
+        assert stats["Extrémisme violent"]["frequency"] == 1
+        assert stats["Burkina Faso"]["frequency"] == 1
+
+    def test_one_reference_counts_once_for_a_term_in_two_of_its_fields(self):
+        # The dedupe must still hold across the widened field list, or the
+        # entities that appear in several roles are the only inflated ones.
+        stats = _stats(references=_frame([
+            {"author": "Kane, Ousmane", "editor": "Kane, Ousmane",
+             "publisher": "", "subject": "Kane, Ousmane", "spatial": "",
+             "pub_date": "2021-01-01", "country": "Niger"},
+        ]))
+        assert stats["Kane, Ousmane"]["frequency"] == 1
+
+
 class TestAudiovisualIsScanned:
     """Issue #13: the YouTube channel authorities were invisible in the index."""
 
