@@ -106,7 +106,13 @@ MODEL_NAME = "gemini-embedding-2"
 CHUNK_SIZE = 28_000
 CHUNK_OVERLAP = 2_000
 DEFAULT_DIMENSIONALITY = 768
-DEFAULT_BATCH_SIZE = 20
+# One text per call: measured 2026-08-27, gemini-embedding-2 answers 200 OK
+# with exactly ONE embedding however many texts a request carries (probed at
+# 1, 2 and 5). A larger batch therefore spends the whole retry ladder before
+# failing the batch outright. Raise this again once the endpoint honours a
+# multi-text request — the length check in embed_texts_with_retry is what
+# tells you it does not.
+DEFAULT_BATCH_SIZE = 1
 # Retry ladder (MAX_RETRIES / BASE_RETRY_DELAY) is shared with the image
 # embedding script and lives in _gemini_client.call_with_retry.
 CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache_embeddings"
@@ -212,7 +218,21 @@ def embed_texts_with_retry(
                 output_dimensionality=dimensionality,
             ),
         )
-        return [emb.values for emb in response.embeddings]
+        # A short response, or a null vector inside it, is a FAILURE and has
+        # to raise: the caller fills its slots positionally, so anything it
+        # never receives stays None silently — no retry, no log line, and the
+        # row is written empty as though nothing had gone wrong.
+        vectors = [emb.values for emb in (response.embeddings or [])]
+        if len(vectors) != len(texts):
+            raise RuntimeError(
+                f"Gemini returned {len(vectors)} embeddings for {len(texts)} texts"
+            )
+        if any(v is None for v in vectors):
+            missing = sum(v is None for v in vectors)
+            raise RuntimeError(
+                f"Gemini returned {missing} null vector(s) in a batch of {len(texts)}"
+            )
+        return vectors
 
     return call_with_retry(_call)
 
