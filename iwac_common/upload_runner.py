@@ -71,7 +71,7 @@ from .omeka_client import (
     media_stats,
 )
 from .repos import PRIVATE_REPO_ID
-from .schema import DataContractError, validate_frame
+from .schema import DataContractError, normalize_embedding_nulls, validate_frame
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
@@ -297,6 +297,9 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
         if final_df["o:id"].isnull().any():
             console.print("[bold red]✗ Critical:[/bold red] 'o:id' null after merge. Aborting push.")
             return 1
+        # A left-merge fills a brand-new item's embedding cell with NaN; make
+        # it a real null before the contract check and the Arrow conversion.
+        final_df = normalize_embedding_nulls(final_df, spec.config_name)
         try:
             validate_frame(final_df, spec.config_name)
         except DataContractError as exc:

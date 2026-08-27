@@ -62,6 +62,11 @@ from rich.table import Table
 from rich.logging import RichHandler
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich import box
+from dotenv import load_dotenv
+
+# Load .env so a non-interactive run finds HF_TOKEN instead of falling through
+# to an interactive login that cannot read stdin.
+load_dotenv()
 
 console = Console()
 

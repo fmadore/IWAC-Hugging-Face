@@ -80,6 +80,36 @@ def validate_ids(df: pd.DataFrame, *, label: str = "dataset") -> None:
         )
 
 
+def _is_missing(value: object) -> bool:
+    """True for a scalar null, including the ``NaN`` a left-merge leaves behind.
+
+    A merge against the Hub fills an unmatched row's object column with
+    ``float("nan")``, not ``None``: a subset that gains items on Omeka would
+    otherwise trip the embedding contract on the first new row (and fail the
+    Arrow conversion later) purely because it has nothing computed yet.
+    ``pd.isna`` on a list returns an array, so guard on the scalar case.
+    """
+    if value is None:
+        return True
+    return isinstance(value, float) and pd.isna(value)
+
+
+def normalize_embedding_nulls(df: pd.DataFrame, config_name: str) -> pd.DataFrame:
+    """Replace merge-introduced ``NaN`` with ``None`` in embedding columns.
+
+    Arrow cannot put a float into a list column, so the ``NaN`` a left-merge
+    leaves on brand-new rows has to become a real null before the push.
+    """
+    spec = SUBSETS.get(config_name)
+    if spec is None:
+        raise DataContractError(f"Unknown IWAC subset: {config_name!r}")
+    for column in (spec.embedding_columns or {}):
+        if column not in df.columns:
+            continue
+        df[column] = [None if _is_missing(v) else v for v in df[column]]
+    return df
+
+
 def validate_embedding_dimensions(
     df: pd.DataFrame, config_name: str, *, allow_empty: bool = True
 ) -> None:
@@ -91,7 +121,7 @@ def validate_embedding_dimensions(
         if column not in df.columns:
             continue
         for row_id, value in zip(df["o:id"], df[column]):
-            if value is None:
+            if _is_missing(value):
                 continue
             try:
                 size = len(value)
@@ -133,7 +163,7 @@ def validate_dataset(ds, config_name: str) -> None:
         if column not in ds.column_names:
             continue
         for row_id, value in zip(ids, ds[column]):
-            if value is None:
+            if _is_missing(value):
                 continue
             try:
                 size = len(value)
@@ -157,6 +187,7 @@ __all__ = [
     "CONTENT_COLUMNS",
     "DataContractError",
     "validate_ids",
+    "normalize_embedding_nulls",
     "validate_embedding_dimensions",
     "validate_frame",
     "validate_dataset",

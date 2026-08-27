@@ -71,6 +71,11 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.logging import RichHandler
 from rich.prompt import Prompt
 from rich import box
+from dotenv import load_dotenv
+
+# Load .env so a non-interactive run finds HF_TOKEN instead of falling through
+# to an interactive login that cannot read stdin.
+load_dotenv()
 
 # Initialize Rich console
 console = Console()
