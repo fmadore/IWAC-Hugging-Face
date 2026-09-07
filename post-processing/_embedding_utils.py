@@ -99,6 +99,8 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
     at ``chunk_size`` boundaries with ``overlap`` characters of overlap
     between consecutive chunks to preserve context continuity.
     """
+    if chunk_size <= 0 or not 0 <= overlap < chunk_size:
+        raise ValueError("Require chunk_size > 0 and 0 <= overlap < chunk_size")
     if len(text) <= chunk_size:
         return [text]
 

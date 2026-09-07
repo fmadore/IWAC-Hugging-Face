@@ -196,6 +196,18 @@ class TestShrinkGuard:
 
 
 class TestDuplicateIds:
+    @pytest.mark.parametrize("bad", [
+        pd.DataFrame({"title": ["title"]}),
+        pd.DataFrame({"o:id": [None]}),
+        pd.DataFrame({"o:id": ["  "]}),
+    ])
+    def test_invalid_fresh_ids_fail_before_hub_read(self, monkeypatch, bad):
+        def unexpected(*args, **kwargs):
+            pytest.fail("Invalid input must fail before reading the Hub")
+        monkeypatch.setattr(hub_merge, "load_dataset", unexpected)
+        with pytest.raises(ValueError, match="o:id"):
+            merge_with_hub_dataset(bad, "repo", "articles")
+
     def test_duplicate_new_ids_raise(self, hub):
         hub(_existing())
         bad = _new()

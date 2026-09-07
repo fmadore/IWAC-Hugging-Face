@@ -102,8 +102,11 @@ def merge_with_hub_dataset(
         raise ValueError(f"stale_rows must be 'keep' or 'drop', got {stale_rows!r}")
 
     if "o:id" not in new_df.columns:
-        console.print("[bold red]✗[/bold red] new_df is missing 'o:id'; skipping merge.")
-        return new_df
+        raise ValueError("New Omeka data is missing the required 'o:id' column")
+    if new_df["o:id"].isna().any():
+        raise ValueError("New Omeka data contains null 'o:id' values")
+    if new_df["o:id"].astype(str).str.strip().eq("").any():
+        raise ValueError("New Omeka data contains blank 'o:id' values")
 
     # Defensive: every script casts 'o:id' to str before merging anyway.
     new_df = new_df.copy()

@@ -1,17 +1,17 @@
 cff-version: 1.2.0
 message: >-
-  If you use this pipeline or the datasets it produces in your research,
-  please cite the repository as below.
+  If you use this pipeline in your research, please cite the software as below.
+  Cite the dataset separately using the DOI for the revision you analysed.
 title: "IWAC Hugging Face Pipeline"
-version: 1.0.0
-date-released: 2026-08-05
+version: 1.0.1
+date-released: 2026-09-07
 abstract: >-
   Python pipeline that mirrors the Islam West Africa Collection (IWAC) from an
   Omeka S archive into versioned Hugging Face datasets. It maps seven subsets
   (articles, audiovisual, documents, images, index, publications, references)
   from the Omeka S REST API, enriches them with computed columns — semantic
-  embeddings, spaCy lemmas, LDA topics, lexical metrics, Islamic-calendar dates
-  and a multi-model sentiment panel — and projects the result into a public
+  embeddings, spaCy lemmas, LDA topics, lexical metrics and Islamic-calendar dates —
+  imports a multi-model sentiment panel from Omeka, and projects the result into a public
   dataset in which full text is masked per row according to the access status
   of the source item. Built for the Islam West Africa Collection and adaptable
   to other Omeka S collections published as research datasets.

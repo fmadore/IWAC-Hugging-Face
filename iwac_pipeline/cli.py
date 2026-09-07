@@ -64,7 +64,11 @@ def upload_main(argv: Sequence[str] | None = None) -> int:
         description="Refresh one IWAC subset from Omeka into the private Hub mirror.",
     )
     parser.add_argument("subset", choices=ALL_CONFIGS)
-    args, remaining = parser.parse_known_args(argv)
+    # Parse only the dispatch argument: otherwise argparse consumes --help
+    # even after a subset and hides the subset's own options.
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(arguments[:1])
+    remaining = arguments[1:]
     module = _load_script(
         UPLOAD_SCRIPTS[args.subset], f"_iwac_upload_{args.subset}"
     )

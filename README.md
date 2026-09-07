@@ -12,9 +12,9 @@ Python pipeline that mirrors the [Islam West Africa Collection](https://islam.zm
 
 ## Context
 
-The [Islam West Africa Collection](https://islam.zmo.de/s/westafrica/) is an open-access digital database documenting Islam and Muslim communities in Benin, Burkina Faso, Côte d'Ivoire, Niger, Nigeria, and Togo since the 1960s. Created by [Frédérick Madore](https://www.frederickmadore.com/) and hosted at the Leibniz-Zentrum Moderner Orient (ZMO) in Berlin, it holds over 14,500 items curated in [Omeka S](https://omeka.org/s/).
+The [Islam West Africa Collection](https://islam.zmo.de/s/westafrica/) is an open-access digital database documenting Islam and Muslim communities in Benin, Burkina Faso, Côte d'Ivoire, Niger, Nigeria, and Togo since the 1960s. Created by [Frédérick Madore](https://www.frederickmadore.com/) and hosted at the Leibniz-Zentrum Moderner Orient (ZMO) in Berlin, it is a growing archive curated in [Omeka S](https://omeka.org/s/). Counts depend on the source date and dataset revision; report them from the snapshot used in your research.
 
-Omeka S is built for curation and public access, not for analysis. This pipeline turns the archive into something a researcher can actually compute over: it reads the Omeka S REST API, flattens each resource class into a tabular subset, enriches it with columns that do not exist in the source — semantic embeddings, lemmatised text, topic assignments, lexical metrics, Islamic-calendar dates, a multi-model sentiment panel — and publishes the result as a Hugging Face dataset that can be loaded in one line.
+This pipeline reads the Omeka S REST API, flattens selected resource classes into tabular subsets, and computes semantic embeddings, lemmatised text, topic assignments, lexical metrics, and Islamic-calendar dates. It also imports sentiment annotations generated upstream in Omeka and computes panel aggregates. The resulting Hugging Face dataset can be loaded in one line.
 
 It is the data layer behind the collection's [visualisations](https://github.com/fmadore/IwacVisualizations) and its MCP server, and a companion to [iwac-ai-pipelines](https://github.com/fmadore/iwac-ai-pipelines), which handles the LLM-assisted curation happening upstream inside Omeka S.
 
@@ -27,7 +27,7 @@ Much of the collection's full text is **private on the Omeka S source** — righ
 | [`fmadore/islam-west-africa-collection-full`](https://huggingface.co/datasets/fmadore/islam-west-africa-collection-full) | Private | Complete superset, full text for all rows. The canonical target of **every** upload and post-processing script. |
 | [`fmadore/islam-west-africa-collection`](https://huggingface.co/datasets/fmadore/islam-west-africa-collection) | Public | The citable projection. Written **only** by `post-processing/publish_public.py`. |
 
-The projection **masks full text per row rather than stripping it wholesale**. `OCR`, `lemma_text`, and `lemma_nostop` survive wherever `OCR_is_public` is true — a flag derived from the per-value `is_public` attribute on Omeka's `bibo:content` field. Roughly 61% of articles, 89% of publications, 25 of 26 documents, and 7 of 867 references keep their text in public. Everything that cannot reconstruct the source — embeddings, topics, sentiment and its justifications, `descriptionAI`, lexical metrics — is always projected.
+The projection **masks full text per row rather than stripping it wholesale**. `OCR`, `lemma_text`, and `lemma_nostop` survive wherever `OCR_is_public` is true — a flag derived from the per-value `is_public` attribute on Omeka's `bibo:content` field. Measure text availability in the revision you use; it changes as the archive grows and source permissions change. Reviewed derived fields — embeddings, topics, sentiment and its justifications, `descriptionAI`, lexical metrics — are retained. This allowlist is a publication policy, not a guarantee that derived outputs cannot disclose or quote source information.
 
 Because a leak here would be unrecoverable, `publish_public.py` aborts rather than guessing: if a content subset lacks `OCR_is_public`, or if any column is absent from the per-subset allowlist in [`iwac_common/public_columns.json`](iwac_common/public_columns.json). Adding a legitimately new column means editing that allowlist deliberately.
 
@@ -37,7 +37,7 @@ One rail runs *after* the push instead of before it. `push_to_hub` refreshes a c
 
 ## Dataset subsets
 
-Seven subsets, each mapped from an Omeka S resource class:
+Seven subsets, each mapped from one or more Omeka S resource classes:
 
 | Subset | Contents |
 |--------|----------|
@@ -67,7 +67,7 @@ articles = load_dataset("fmadore/islam-west-africa-collection", name="articles",
 | Topic modeling | `post-processing/lda_topic_modeling/` | LDA topic id, probability, label, and top-k terms |
 | Lexical metrics | `post-processing/calculate_lexical_richness.py`, `calculate_word_count.py` | Word count, lexical richness, readability |
 | Islamic calendar | `post-processing/calculate_hijri_dates.py` | Hijri year, month, and day (Umm al-Qura) |
-| Sentiment panel | `iwac_common/sentiment_panel.py` | Centrality, polarity, and subjectivity of Islam/Muslim representation, plus justifications, from a panel of models |
+| Sentiment panel | `iwac_common/sentiment_panel.py` | Registry and consensus helpers for centrality, polarity, and subjectivity annotations imported from Omeka; model inference happens upstream |
 | Related items | `post-processing/related_articles.py` | Nearest neighbours by embedding |
 | Model agreement | `post-processing/sentiment_agreement.py` | Inter-model agreement across the sentiment panel |
 
@@ -136,13 +136,13 @@ python -m pip install -e . --no-deps
 python -m pytest
 ```
 
-The editable install exposes `iwac-upload`, `iwac-mirror`, and `iwac-publish-public` from the checkout.
+The editable install exposes `iwac-upload`, `iwac-mirror`, and `iwac-publish-public` from the checkout. Keep the checkout in place: these commands load scripts at their repository paths. Standalone wheel installation is not currently supported, and runtime dependencies must be installed separately as above.
 
 The lemmatisation step additionally needs spaCy models:
 
 ```bash
-.venv\Scripts\python -m spacy download fr_core_news_lg
-.venv\Scripts\python -m spacy download en_core_web_lg
+python -m spacy download fr_core_news_lg
+python -m spacy download en_core_web_lg
 ```
 
 ## Configuration
@@ -171,7 +171,7 @@ iwac-upload articles --dry-run
 iwac-upload articles
 
 # 2. Post-process — compute derived columns on the private repo
-.venv\Scripts\python post-processing/calculate_word_count.py --update-mode empty
+python post-processing/calculate_word_count.py --update-mode empty
 
 # 3. Publish — project the private repo into the public one
 iwac-publish-public --dry-run
@@ -188,6 +188,17 @@ Post-processing scripts share a `--update-mode` flag: `empty` fills only missing
 
 ## Reproducibility
 
+For a publication, record the code commit, the dataset repository and full revision SHA, the exact command arguments, and the installed dependency and spaCy model versions. Archive the model artifacts and analysis outputs used for the paper. The dependency ranges in `requirements.txt` support maintenance; they are not a frozen research environment. See [the publication review](docs/publication-review.md) for remaining release work.
+
+Pin dataset reads to the revision used in the paper:
+
+```python
+articles = load_dataset(
+    "fmadore/islam-west-africa-collection",
+    name="articles", split="train", revision="<full dataset commit SHA>",
+)
+```
+
 Topic models use a fixed seed (42), write their parameters to `training_parameters.json`, and record coherence metrics alongside the model. Omeka responses are cached atomically in `.cache_omk*` for 24 hours; cache keys include the API host and credential identity so staging/public responses cannot be confused with production/private ones. Lemma and embedding resume caches are fingerprinted by the configuration that produced them — spaCy model plus `LEMMA_LOGIC_VERSION`, embedding model plus dimension and task — so a cache written under a different configuration is ignored rather than silently mixed in. These caches are deleted on a successful push, which means a leftover cache file is a reliable signal of an interrupted run.
 
 `iwac-mirror --dataset private` creates the local `data/iwac_*.csv` files from one pinned Hub revision. Files are staged first and `data/mirror_manifest.json` records the repository SHA, row counts, and SHA-256 hashes. Offline consumers verify that manifest and refuse an interrupted or mixed-revision mirror.
@@ -196,7 +207,7 @@ CI compiles every module, rejects undefined names, runs the unit/contract/import
 
 ## Limitations and caveats
 
-**The public dataset is not a complete corpus.** Full text is masked per row by the access status of the source item, so any analysis run against the public repo covers a subset of the material — one that is not random, since access status correlates with publisher and period. Results computed on the public projection can differ from the same analysis on the private mirror. Derived columns (embeddings, topics, sentiment, metrics) are complete for all rows either way, because they were computed before masking.
+**Public full text is incomplete.** Full text is masked per row by the access status of the source item, so analyses requiring that text cover a subset of the material. Treat access-related selection bias explicitly. The public projection retains the private mirror's rows and reviewed derived columns, allowing some analyses to include source-private items. Enrichment coverage still varies by subset, field, and processing run: new items and failed or inapplicable computations can have missing values. Report the usable row count for each analysis.
 
 **LLM sentiment is non-deterministic and opaque.** The same text sent twice may score differently — measurably so: re-annotating 1,485 articles with `deepseek-v4-flash-0731`, which the vendor runs at temperature 1.0, returned a different centrality for 19 of them. A re-run is a fresh reading, not a correction, and the models' reasoning cannot be traced. This is why sentiment runs as a model panel with a published agreement measure and per-model justification columns, rather than as a single score presented as ground truth. Treat disagreement as information about the item, not as noise to be averaged away.
 

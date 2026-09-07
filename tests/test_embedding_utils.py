@@ -63,6 +63,11 @@ class TestCacheRoundTrip:
 
 
 class TestChunkText:
+    @pytest.mark.parametrize("chunk_size,overlap", [(0, 0), (-1, 0), (10, -1), (10, 10), (10, 11)])
+    def test_invalid_window_rejected_even_for_short_text(self, chunk_size, overlap):
+        with pytest.raises(ValueError, match="chunk_size"):
+            chunk_text("abc", chunk_size=chunk_size, overlap=overlap)
+
     def test_short_text_single_chunk(self):
         assert chunk_text("abc", chunk_size=10, overlap=2) == ["abc"]
 

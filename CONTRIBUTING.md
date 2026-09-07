@@ -13,7 +13,8 @@ python -m venv .venv
 Before opening a pull request, run:
 
 ```powershell
-.venv\Scripts\python -m compileall -q iwac_common iwac_pipeline post-processing articles audiovisual document images index islamic-publications reference data
+.venv\Scripts\python -m compileall -q iwac_common iwac_pipeline post-processing articles audiovisual document images index islamic-publications reference data analyses country_mapper.py lemmatize_update_hf.py
+.venv\Scripts\python -m ruff check .
 .venv\Scripts\python -m pytest tests -q --cov=iwac_common --cov-fail-under=70
 .venv\Scripts\python -m pip check
 ```
