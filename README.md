@@ -234,6 +234,16 @@ The pipeline and the data it produces are separate objects, and which one you ci
 
 > Madore, Frédérick. *Islam West Africa Collection*. Leibniz-Zentrum Moderner Orient. https://islam.zmo.de/s/westafrica/
 
+## Acknowledgements
+
+One member of the sentiment panel is not a vendor API. `Qwen/Qwen3.8-27B` was served from a self-hosted vLLM instance on *festus*, the cluster of the Bayreuth Centre for High Performance Computing (BZHPC), across one L40S and two H100 shards; the serving harness lives in [iwac-ai-pipelines](https://github.com/fmadore/iwac-ai-pipelines). Everything else the pipeline computes — Gemini embeddings, spaCy lemmas, LDA, lexical metrics — ran off the cluster and is not covered by this.
+
+The centre states that its funding acknowledgement is mandatory rather than a courtesy, so any publication whose results depend on the `qwen3_8_27b_*` columns carries it verbatim:
+
+> Calculations were performed using the festus-cluster of the Bayreuth Centre for High Performance Computing (https://www.bzhpc.uni-bayreuth.de), funded by the Deutsche Forschungsgemeinschaft (DFG, German Research Foundation) - 523317330.
+
+Wording checked against the [festus system guide](https://www.hpc.uni-bayreuth.de/clusters/festus/) on 15 September 2026; re-check it there rather than copying it from here. `CITATION.cff` has no field for a funding acknowledgement under CFF 1.2.0, so it is not recorded there.
+
 ## License
 
 [MIT](LICENSE) © 2025-2026 Frédérick Madore
