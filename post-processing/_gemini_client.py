@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 # --- Retry ladder (identical across text and image embedding) ---
 MAX_RETRIES = 6
 BASE_RETRY_DELAY = 5  # seconds
+# google-genai's APIError carries the HTTP status as ``.code``.
+PERMANENT_STATUS_CODES = frozenset({400, 401, 403, 404})
 
 
 def call_with_retry(embed_call: Callable[[], List[List[float]]]) -> List[List[float]]:
@@ -42,6 +44,10 @@ def call_with_retry(embed_call: Callable[[], List[List[float]]]) -> List[List[fl
             return embed_call()
         except Exception as e:  # noqa: BLE001
             error_str = str(e)
+            # A bad key, a forbidden model or a malformed request fails the
+            # same way on every attempt; the ladder would only add ~2.5 min.
+            if getattr(e, "code", None) in PERMANENT_STATUS_CODES:
+                raise
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
                 wait = BASE_RETRY_DELAY * (2 ** attempt)
                 logger.warning(f"Rate limited (attempt {attempt + 1}/{MAX_RETRIES}), waiting {wait}s...")
@@ -97,6 +103,7 @@ def set_embedding_column(ds, column: str, all_embeddings: List[Any]):
 __all__ = [
     "MAX_RETRIES",
     "BASE_RETRY_DELAY",
+    "PERMANENT_STATUS_CODES",
     "call_with_retry",
     "restore_from_cache",
     "build_embedding_array",
