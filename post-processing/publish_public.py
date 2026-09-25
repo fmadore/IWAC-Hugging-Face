@@ -55,10 +55,13 @@ Usage
     # Publish selected subsets non-interactively
     python post-processing/publish_public.py --config articles,references -y
 
-    # One-time: squash the public repo's git history so previously public
-    # OCR/lemma parquet files disappear from old revisions. DESTRUCTIVE to
-    # history (downloads pinned to old revisions break). Run once after the
-    # first stripped publish.
+    # Squash the public repo's git history so previously public OCR/lemma
+    # parquet files disappear from old revisions. DESTRUCTIVE to history
+    # (downloads pinned to old revisions break). This was a one-time operation
+    # after the first stripped publish, and it is now REFUSED on any repo that
+    # carries a DOI: a DOI cites one revision, and squashing would make that
+    # revision unreachable. The production public repo has one
+    # (10.57967/hf/9857), so this only still works on a scratch repo.
     python post-processing/publish_public.py --squash -y
 """
 from __future__ import annotations
@@ -161,6 +164,35 @@ def find_suspect_columns(df, handled: set[str]) -> list[tuple[str, int, int]]:
         if mean_len > SUSPECT_MEAN_CHARS or max_len > SUSPECT_MAX_CHARS:
             suspects.append((col, mean_len, max_len))
     return suspects
+
+
+class SquashRefusedError(RuntimeError):
+    """History squashing would break a citation, or its safety is unknown."""
+
+
+def assert_squash_allowed(repo_id: str, *, token, api=None) -> None:
+    """Refuse ``super_squash_history`` on a repo with a DOI — or whose tags
+    cannot be read, which is the same risk unverified.
+
+    Hugging Face mints a dataset DOI against one revision. Squashing rewrites
+    history into a single new commit, so the cited revision stops resolving:
+    every existing citation of the dataset would point at nothing.
+    """
+    api = api or HfApi(token=token)
+    try:
+        info = api.dataset_info(repo_id=repo_id)
+    except Exception as exc:  # noqa: BLE001 - fail closed on an unknown state
+        raise SquashRefusedError(
+            f"Cannot read the tags of {repo_id!r} ({exc}); refusing to squash "
+            "a history that may carry a DOI."
+        ) from exc
+    dois = [str(tag) for tag in (getattr(info, "tags", None) or [])
+            if str(tag).lower().startswith("doi:")]
+    if dois:
+        raise SquashRefusedError(
+            f"{repo_id!r} carries {', '.join(dois)}. A DOI cites a specific "
+            "revision; squashing the history would make it unreachable. Refusing."
+        )
 
 
 class MissingFlagError(RuntimeError):
@@ -304,7 +336,8 @@ def main() -> None:
         "--squash",
         action="store_true",
         help="After publishing, super-squash the PUBLIC repo history into one commit "
-             "(purges previously public OCR/lemma files from old revisions; irreversible).",
+             "(purges previously public OCR/lemma files from old revisions; irreversible). "
+             "Refused on any repo that carries a DOI.",
     )
     parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts")
     args = parser.parse_args()
@@ -319,6 +352,15 @@ def main() -> None:
         sys.exit(1)
 
     token = ensure_hf_token(console=console)
+
+    if args.squash:
+        # Checked before anything is loaded or pushed, so a refused squash
+        # never leaves a half-finished run behind.
+        try:
+            assert_squash_allowed(args.repo_public, token=token)
+        except SquashRefusedError as exc:
+            console.print(f"[red]✗[/red] --squash refused: {exc}")
+            sys.exit(1)
 
     console.print(Panel(
         f"[bold]Source (private):[/bold] {args.repo_private}\n"
@@ -484,6 +526,12 @@ def main() -> None:
         ))
         if args.yes or Confirm.ask("Proceed with super_squash_history?", default=False):
             api = HfApi(token=token)
+            try:
+                # Re-checked: a DOI can be minted while the projection runs.
+                assert_squash_allowed(args.repo_public, token=token, api=api)
+            except SquashRefusedError as exc:
+                console.print(f"[red]✗[/red] --squash refused: {exc}")
+                sys.exit(1)
             api.super_squash_history(repo_id=args.repo_public, repo_type="dataset")
             console.print(f"[green]✓[/green] History of {args.repo_public} squashed to a single commit.")
         else:
