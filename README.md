@@ -31,9 +31,11 @@ The projection **masks full text per row rather than stripping it wholesale**. `
 
 Because a leak here would be unrecoverable, `publish_public.py` aborts rather than guessing: if a content subset lacks `OCR_is_public`, or if any column is absent from the per-subset allowlist in [`iwac_common/public_columns.json`](iwac_common/public_columns.json). Adding a legitimately new column means editing that allowlist deliberately.
 
-The uploads carry equivalent rails. Hub baselines fail closed on auth, network, schema, or config errors; a genuinely new config requires `--initialize`. `hub_merge` refuses a frame under 95% of the Hub's current row count; `fetch_items` requires and exactly reconciles the `Omeka-S-Total-Results` header; any mapper or media lookup failure aborts by default. The explicit `--allow-map-failures` and `--allow-media-failures` overrides retain the affected prior Hub row/fields instead of replacing them with blanks.
+The uploads carry equivalent rails. Hub baselines fail closed on auth, network, schema, or config errors; a genuinely new config requires `--initialize`. `hub_merge` refuses a frame under 95% of the Hub's current row count; `fetch_items` requires and exactly reconciles the `Omeka-S-Total-Results` header; any mapper or media lookup failure aborts by default. The explicit `--allow-map-failures` and `--allow-media-failures` overrides retain the affected prior Hub row/fields instead of replacing them with blanks. Omeka transport errors are sanitized at the HTTP boundary, so the API key (sent as query parameters) never reaches a log line or an abort panel.
 
-One rail runs *after* the push instead of before it. `push_to_hub` refreshes a config's byte sizes in the dataset card but not its feature list, so any push that adds or drops a column leaves the card declaring the old schema — and `load_dataset` then raises `CastError: column names don't match`, making the subset unloadable for every consumer, this pipeline's own next run included. It happened twice on 2026-08-06, to the private mirror and then to the public citable dataset. [`iwac_common/hub.py`](iwac_common/hub.py) is now the only write gateway: it validates IDs and embedding dimensions, rejects a changed source revision, acquires a local repo lock, pushes, repairs the card through [`card_sync.py`](iwac_common/card_sync.py), and verifies the exact published revision. That verification is split by cost: `card_sync` compares the card's declared features against the parquet footer on the Hub, and the row-level check then reads only the `o:id` column rather than re-downloading every embedding. If that columnar read is unavailable it falls back to a full reload — never to skipping the check. A test rejects any direct `push_to_hub` call outside this gateway.
+An upload also compares each item's source text (`OCR`, `tableOfContents`, `image_url`, `pub_date`) with the Hub copy. Where it changed, the preserved computed columns (embeddings, lemmas, metrics, topics, Hijri date — declared in `schema.DERIVED_FROM`) describe the old text: the run reports those rows and records them under `.iwac_state/stale_derived/`, or, with `--invalidate-derived`, clears them so each stage's `missing` mode recomputes exactly those rows. Resume caches are tied to their input the same way: each entry carries a hash of the text it was computed from, and the cache filename names the repository.
+
+One rail runs *after* the push instead of before it. `push_to_hub` refreshes a config's byte sizes in the dataset card but not its feature list, so any push that adds or drops a column leaves the card declaring the old schema — and `load_dataset` then raises `CastError: column names don't match`, making the subset unloadable for every consumer, this pipeline's own next run included. It happened twice on 2026-08-06, to the private mirror and then to the public citable dataset. [`iwac_common/hub.py`](iwac_common/hub.py) is now the only write gateway: it conforms every push to the subset's declared column types (nullable `int64` for counts, ids, pages and dates; `list<float32>` for embeddings — a pandas round trip anywhere upstream used to publish them as `float64`), validates IDs and embeddings (flat, finite, 768-dimensional), rejects a changed source revision, acquires a local repo lock, pushes, repairs the card through [`card_sync.py`](iwac_common/card_sync.py), and verifies the exact published revision. That verification is split by cost: `card_sync` compares the card's declared features against the parquet footer on the Hub, and the row-level check then reads only the `o:id` column rather than re-downloading every embedding. If that columnar read is unavailable it falls back to a full reload — never to skipping the check. A test rejects any direct `push_to_hub` call outside this gateway.
 
 ## Dataset subsets
 
@@ -49,7 +51,9 @@ Seven subsets, each mapped from one or more Omeka S resource classes:
 | `audiovisual` | Deposited recordings and embedded YouTube videos, with transcriptions where available (`source_type` tells the two apart) |
 | `images` | Fieldwork photographs |
 
-Content subsets join to `index` authority records, which is what makes entity-level analysis possible across the corpus.
+Content subsets join to `index` authority records, which is what makes entity-level analysis possible across the corpus. Join on the `*_ids` columns (`subject_ids`, `spatial_ids`, `author_ids`, `newspaper_ids`, `creator_ids`, `publisher_ids`, `editor_ids`) against `index.o:id`: they carry the linked authorities' Omeka ids, so homonyms stay apart and a renamed authority still matches. The label columns beside them hold display titles, pipe-joined.
+
+A few columns exist to save every consumer from re-parsing the same strings: `pub_year` and `pub_date_precision` (`day`, `month`, `year`, `range`, `other`) beside the verbatim `pub_date`; `latitude`/`longitude` beside the `"lat, lng"` coordinate string on `index` and `images`; and `abstract_en` on `references`, the English literal that used to be pipe-joined into `abstract`.
 
 ```python
 from datasets import load_dataset
@@ -65,10 +69,11 @@ articles = load_dataset("fmadore/islam-west-africa-collection", name="articles",
 | Image embeddings | `post-processing/semantic_embedding_images.py` | Embeddings over downscaled images |
 | Lemmatisation | `lemmatize_update_hf.py` | spaCy lemmas, with and without stopwords, per language |
 | Topic modeling | `post-processing/lda_topic_modeling/` | LDA topic id, probability, label, and top-k terms |
-| Lexical metrics | `post-processing/calculate_lexical_richness.py`, `calculate_word_count.py` | Word count, lexical richness, readability |
+| Lexical metrics | `post-processing/calculate_lexical_richness.py`, `calculate_word_count.py` | Word count (one elision-aware definition, shared with the upload mappers), MATTR lexical richness, French Flesch readability (primary-French rows only) |
 | Islamic calendar | `post-processing/calculate_hijri_dates.py` | Hijri year, month, and day (Umm al-Qura) |
 | Sentiment panel | `iwac_common/sentiment_panel.py` | Registry and consensus helpers for centrality, polarity, and subjectivity annotations imported from Omeka; model inference happens upstream |
 | Related items | `post-processing/related_articles.py` | Nearest neighbours by embedding |
+| Topic lookup | `post-processing/lda_topic_modeling/` | `topics.csv` beside each model: label, top words and document counts per `lda_topic_id` |
 | Model agreement | `post-processing/sentiment_agreement.py` | Inter-model agreement across the sentiment panel |
 
 The sentiment panel writes columns keyed by the exact model id, so that no two generations of a model can collide in the same column. Two generations now sit side by side on the Hub, the live one first:
@@ -76,7 +81,7 @@ The sentiment panel writes columns keyed by the exact model id, so that no two g
 | Generation | Models | Campaign | Subjectivité | Status |
 |---|---|---|---|---|
 | 2 | `gpt-5.6-luna`, `mistral-small-2603`, `deepseek-v4-flash-0731`, `google/gemma-4-31b-it`, `Qwen/Qwen3.8-27B` | 2026-08 | label (`string`) | Live — use this panel. The first four are complete at 12,298 articles on centralité and polarité; subjectivité is where they diverge. Qwen3.8 joined on 2026-08-25 at 12,098 and stays there: 153 articles were retired after four attempts each, so its shortfall is a finding about the model, not a run to repair |
-| 1 | `gemini-3-flash-preview`, `gpt-5-mini`, `ministral-14b-2512` | 2026-01/02 | integer 1–5 (`float64`) | Frozen. The Omeka properties were deleted in 2026-08; the 18 columns remain on the Hub as historical data |
+| 1 | `gemini-3-flash-preview`, `gpt-5-mini`, `ministral-14b-2512` | 2026-01/02 | integer 1–5 (nullable `int64`; `float64` in revisions published before the canonical types) | Frozen. The Omeka properties were deleted in 2026-08; the 18 columns remain on the Hub as historical data |
 
 Column order follows that table: `PANEL` in `iwac_common/sentiment_panel.py` is ordered newest-generation-first, and the uploader's `post_merge` hook sorts the sentiment block by it, so the current panel precedes its history rather than trailing it.
 
@@ -97,7 +102,8 @@ post-processing/    Computed columns + publish_public.py
 analyses/           Report-only analyses; write to analyses/output/, never
                     add Hub columns
 tests/              Unit tests and import smoke tests (run in CI)
-data/               fetch_datasets.py — local CSV mirrors for offline work
+data/               fetch_datasets.py — revision-pinned local Parquet (or CSV)
+                    mirror for offline work
 ```
 
 ## Installation
@@ -199,9 +205,11 @@ articles = load_dataset(
 )
 ```
 
-Topic models use a fixed seed (42), write their parameters to `training_parameters.json`, and record coherence metrics alongside the model. Omeka responses are cached atomically in `.cache_omk*` for 24 hours; cache keys include the API host and credential identity so staging/public responses cannot be confused with production/private ones. Lemma and embedding resume caches are fingerprinted by the configuration that produced them — spaCy model plus `LEMMA_LOGIC_VERSION`, embedding model plus dimension and task — so a cache written under a different configuration is ignored rather than silently mixed in. These caches are deleted on a successful push, which means a leftover cache file is a reliable signal of an interrupted run.
+Topic models use a fixed seed (42), write their parameters to `training_parameters.json`, and record coherence metrics alongside the model. Omeka responses are cached atomically in `.cache_omk*` for 24 hours; cache keys include the API host and credential identity so staging/public responses cannot be confused with production/private ones. Lemma and embedding resume caches are fingerprinted by the configuration that produced them — spaCy model plus `LEMMA_LOGIC_VERSION`, embedding model plus dimension and task — and by the repository, so a cache written under a different configuration or for a scratch repo is ignored rather than silently mixed in. Each entry also carries a hash of the input it was computed from, so a row whose text changed before a resumed run is recomputed. These caches are deleted on a successful push, which means a leftover cache file is a reliable signal of an interrupted run.
 
-`iwac-mirror --dataset private` creates the local `data/iwac_*.csv` files from one pinned Hub revision. Files are staged first and `data/mirror_manifest.json` records the repository SHA, row counts, and SHA-256 hashes. Offline consumers verify that manifest and refuse an interrupted or mixed-revision mirror.
+Report-only analyses write `<script>.manifest.json` beside their outputs (and a timestamped copy under `analyses/output/runs/`): code SHA and dirty flag, dataset repository and revision, arguments, library versions, model inputs, and the SHA-256 of every output.
+
+`iwac-mirror --dataset private` creates the local `data/iwac_*.parquet` files (typed: nullable ints, booleans and embedding vectors survive; `--format csv` keeps the legacy export) from one pinned Hub revision. Files are staged first and `data/mirror_manifest.json` records the repository SHA, row counts, and SHA-256 hashes. Offline consumers verify that manifest and refuse an interrupted or mixed-revision mirror.
 
 CI compiles every module, rejects undefined names, runs the unit/contract/import-smoke suite with a 70% `iwac_common` coverage floor, executes `pip check`, and tests the supported Linux/Windows/Python matrix. Dependabot tracks both Python and GitHub Action updates, while pull requests receive GitHub's dependency review.
 
@@ -211,7 +219,7 @@ CI compiles every module, rejects undefined names, runs the unit/contract/import
 
 **LLM sentiment is non-deterministic and opaque.** The same text sent twice may score differently — measurably so: re-annotating 1,485 articles with `deepseek-v4-flash-0731`, which the vendor runs at temperature 1.0, returned a different centrality for 19 of them. A re-run is a fresh reading, not a correction, and the models' reasoning cannot be traced. This is why sentiment runs as a model panel with a published agreement measure and per-model justification columns, rather than as a single score presented as ground truth. Treat disagreement as information about the item, not as noise to be averaged away.
 
-**Metrics keyed to a French or English lexicon mis-score the collection's own material.** Readability and lexical-richness measures have no valid reading for the Ewé, Kabiyè, and Dendi items. Those are scored null rather than low: a metric that ranks correctly transcribed African-language sources as garbage is worse than no metric.
+**Metrics keyed to a French or English lexicon mis-score the collection's own material.** Readability has no valid reading outside French: `Lisibilite_OCR` applies the French Flesch formula, so it is computed only for rows whose primary `language` is French and is null for every other row, the Ewé, Kabiyè, and Dendi items included — a metric that ranks correctly transcribed African-language sources as garbage is worse than no metric. MATTR (`Richesse_Lexicale_OCR`) carries no lexicon and is kept for every language, but its values are not comparable across languages.
 
 **The number of topics is pinned, not swept.** On the smaller subsets, C_v coherence cannot choose *k* — a three-seed sweep on `references` placed every *k* from 12 to 32 within 0.014 mean C_v while a single *k* varied by up to 0.035 across seeds, so successive re-fits each produced a confident-looking but different "best k". Because *k* defines what `lda_topic_id` means, an auto-sweep would renumber every topic on each re-fit. *k* is therefore fixed per language in `CONFIG_PRESETS` and judged by multi-seed stability and documents-per-topic instead.
 

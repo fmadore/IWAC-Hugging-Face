@@ -20,6 +20,23 @@ the high-priority findings, then archive one validated code/data/model/environme
 snapshot. Passing tests alone does not establish that published enrichments
 match the current source text.
 
+## Status update (2026-09-25)
+
+The September refactoring pass addressed most findings below; see
+[`refactoring-2026-09-runbook.md`](refactoring-2026-09-runbook.md) for what it
+changed and which runs apply it to the data.
+
+| # | Finding | Status |
+|---|---|---|
+| 1 | Resumed enrichments not tied to inputs | Addressed: every cache entry carries a hash of its input; filenames name the repository |
+| 2 | Credentials in error logs | Addressed: transport errors sanitized at the HTTP boundary, raised `from None`; reproduced and tested |
+| 3 | Refreshed text keeps old computed columns | Addressed in part: uploads detect changed source text per `schema.DERIVED_FROM`, record a worklist, and `--invalidate-derived` clears the stale values. No per-row provenance column |
+| 4 | Analysis provenance | Addressed: run manifests with code SHA, dataset revision, arguments and output hashes; `pipeline_version` read from package metadata |
+| 5 | Editable-only packaging | Open |
+| 6 | Publication environment lock | Open |
+| 7 | Vector validation checks length only | Addressed: flat, finite, numeric vectors; blank ids rejected on every write path |
+| 8 | Non-atomic publication | Open; public commits now name their private source revision |
+
 ## Open findings, ordered by priority
 
 ### 1. High: resumed enrichments are not tied to their source inputs

@@ -54,13 +54,22 @@ rather than blanking it:
   the Hub.
 - **Any** mapper failure aborts (`--allow-map-failures`). With the override, the
   affected items keep their complete existing Hub row instead of vanishing.
+- A changed source text is detected, not silently kept. Each upload compares
+  `OCR`/`tableOfContents`/`image_url`/`pub_date` with the Hub copy; rows whose
+  source changed have stale preserved columns (`schema.DERIVED_FROM`). They are
+  reported and recorded in `.iwac_state/stale_derived/` by default;
+  `--invalidate-derived` clears them so each stage's `missing` mode recomputes
+  exactly those rows. The comparison only works in the run that lands the
+  change — once pushed, the Hub text equals Omeka again — hence the worklist.
 
 If a media or mapper guard fires, fix connectivity first — a VPN or DNS change
 is the usual cause, and overriding is almost never right.
 
 **Every Hub write goes through `iwac_common/hub.py`.** `push_dataset_verified`
 is the only place allowed to call `push_to_hub`, and a test enforces that. It
-validates the frame, takes a machine-local repo lock, rejects a Hub revision
+conforms the frame to the subset's declared types (`schema.SUBSETS[...]
+.int_columns` → nullable `int64`, embeddings → `list<float32>`; a fractional
+value in an int column fails the write), validates it, takes a machine-local repo lock, rejects a Hub revision
 that changed since the caller loaded its input (optimistic concurrency —
 `_iwac_source_revision` rides along through the post-processing transforms),
 pushes, repairs the card via `card_sync`, then verifies the published row ids.
@@ -84,6 +93,9 @@ it permanently. So the order is fixed:
    what gets *written* and say nothing about what is already *there*. Verified
    clean on 2026-08-05: 14,797 rows, 5,914 source-private, none leaking.
 2. Only then mint, and only on `fmadore/islam-west-africa-collection`.
+
+`publish_public.py --squash` refuses any repo carrying a `doi:` tag (or whose
+tags cannot be read): squashing would make the cited revision unreachable.
 
 **Mint at deliberate release points, not on every pipeline push.** The Hub has
 no concept DOI: each "Generate new DOI" supersedes the last and marks it
@@ -168,10 +180,20 @@ runtime.
 **Caches:** Omeka responses in `.cache_omk*` (gzipped JSON, 24h TTL). Lemma and
 embedding resume caches are deleted on a successful push, so a leftover file
 means an interrupted run. Both are fingerprinted by the config that produced
-them (spaCy model + `LEMMA_LOGIC_VERSION`; embedding model + dim + task), so a
-cache from a different configuration is ignored rather than silently mixed in —
-no manual date-checking needed. Bump `LEMMA_LOGIC_VERSION` whenever the
-lemmatisation output changes for identical input.
+them (spaCy model + `LEMMA_LOGIC_VERSION`; embedding model + dim + task) and by
+the repository, and every entry carries a hash of its input text
+(`_embedding_utils.make_entry`), so a cache from a different configuration,
+repo or text version is ignored rather than silently mixed in — no manual
+date-checking needed. Bump `LEMMA_LOGIC_VERSION` whenever the lemmatisation
+output changes for identical input.
+
+**Never round-trip a whole subset through pandas to fix one column's type.**
+`to_pandas()` turns every nullable int column into `float64`; that is how
+`lda_topic_id`/`nb_pages`/`hijri_*` reached the public card as floats. Declare
+the output types instead (`map_with_progress(..., output_types=...)`), which
+also avoids the `datasets` failure when a first batch is all `None` ("Couldn't
+cast array of type int64 to null"). The gateway's conform step is the backstop,
+not the method.
 
 ## Running things
 
@@ -197,11 +219,18 @@ code path to keep in step, but a moved or renamed script breaks them.
 --no-deps`), so they import from any working directory; scripts keep sys.path
 fallbacks for uninstalled venvs.
 
-**The local CSV mirror is revision-pinned.** `iwac-mirror` writes
-`data/mirror_manifest.json` alongside the CSVs, recording the Hub SHA, row
-counts, and SHA-256 per file; `load_subset_dataframe(source="csv")` verifies it
-and refuses an interrupted or mixed-revision mirror. Deleting the manifest does
-not make the CSVs usable again — re-run `iwac-mirror`.
+**The local mirror is revision-pinned.** `iwac-mirror` writes typed Parquet
+(`--format csv` for the legacy export) and `data/mirror_manifest.json`,
+recording the Hub SHA, row counts, and SHA-256 per file;
+`load_subset_dataframe(source="local")` (alias `"csv"`) verifies it and refuses
+an interrupted or mixed-revision mirror. Deleting the manifest does not make the
+files usable again — re-run `iwac-mirror`.
+
+**Hub reads take only the columns they need.** `hub.load_hub_columns` reads the
+requested parquet columns at a pinned revision (full-load fallback);
+`load_subset_dataframe` uses it whenever `columns=` is given. Report-only
+analyses write `<script>.manifest.json` (code SHA, dataset revision, arguments,
+output hashes) beside their outputs.
 
 Required in `.env`: `OMEKA_BASE_URL`, `OMEKA_KEY_IDENTITY`,
 `OMEKA_KEY_CREDENTIAL`, `HF_TOKEN`, and `GOOGLE_API_KEY` for the embedding
@@ -238,6 +267,13 @@ English stopwords in French documents.
 keyed to a French or English lexicon will mis-score the Ewé, Kabiyè, and Dendi
 items. Score them as null rather than as low quality; a metric that ranks
 correctly-transcribed African-language sources as garbage is worse than no metric.
+`Lisibilite_OCR` (French Flesch) is therefore computed for primary-French rows
+only and nulled everywhere else, in every update mode.
+
+**Join authorities on ids, not titles.** Content subsets carry `*_ids` beside
+each linked-authority label column; the index frequency and `entity_networks`
+join them to `index.o:id` and fall back to the exact title only for rows
+without ids.
 
 **Topic modeling:** ~30 topics for ~12K documents; prioritise C_v coherence
 (≥ 0.5 is good); domain collocations are forced in `constants.py`.

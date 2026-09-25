@@ -147,9 +147,13 @@ class TestCredentialRedaction:
             app.router.add_get("/api/items", handler)
             runner = web.AppRunner(app)
             await runner.setup()
-            site = web.TCPSite(runner, "127.0.0.1", 0)
+            import socket
+
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            site = web.TCPSite(runner, "127.0.0.1", port)
             await site.start()
-            port = site._server.sockets[0].getsockname()[1]
             cfg = Config(
                 API_URL=f"http://127.0.0.1:{port}/api",
                 API_KEY_IDENTITY="IDENT-abc",
