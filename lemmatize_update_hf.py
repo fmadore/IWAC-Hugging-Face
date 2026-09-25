@@ -61,7 +61,15 @@ from _common import (  # noqa: E402
     load_hub_dataset,
     push_dataset,
 )
-from _embedding_utils import load_cache, save_cache, delete_cache  # noqa: E402
+from _embedding_utils import (  # noqa: E402
+    cached_value,
+    delete_cache,
+    input_fingerprint,
+    load_cache,
+    make_entry,
+    repo_slug,
+    save_cache,
+)
 
 # Rich console imports for beautiful output
 from rich.console import Console
@@ -251,6 +259,7 @@ def lemmatise_dataset(
             )
 
     cache = load_cache(cache_file)
+    fingerprints = [input_fingerprint(texts[i] or "") for i in range(n)]
 
     final_lemmas: List[str] = [""] * n
     final_clean: List[str] = [""] * n
@@ -261,7 +270,9 @@ def lemmatise_dataset(
             final_lemmas[i] = existing_lemmas[i] or ""
             final_clean[i] = existing_clean[i] or ""
             continue
-        cached = cache.get(row_ids[i])
+        # Reused only when computed from this exact text: an entry for text
+        # that changed since (or a legacy entry without a hash) is redone.
+        cached = cached_value(cache, row_ids[i], fingerprints[i])
         if cached is not None:
             final_lemmas[i], final_clean[i] = cached[0], cached[1]
             continue
@@ -300,7 +311,7 @@ def lemmatise_dataset(
                 clean_text = " ".join(lemma for lemma, is_stop in tokens if not is_stop)
                 final_lemmas[i] = lemma_text
                 final_clean[i] = clean_text
-                cache[row_ids[i]] = [lemma_text, clean_text]
+                cache[row_ids[i]] = make_entry([lemma_text, clean_text], fingerprints[i])
                 since_ckpt += 1
                 progress.update(task, advance=1)
                 if since_ckpt >= CHECKPOINT_EVERY:
@@ -450,7 +461,11 @@ def main() -> int:
     # interrupted run is ignored once either of those changes.
     cache_suffix = f"_{language_filter}" if language_filter else ""
     fingerprint = cache_fingerprint(spacy_model, nlp.meta.get("version", "unknown"))
-    cache_file = CACHE_DIR / f"{config_name}{cache_suffix}_{fingerprint}.json.gz"
+    # The repository is part of the name (a scratch run must not feed a
+    # production one), and each entry carries a hash of its input text.
+    cache_file = (
+        CACHE_DIR / f"{config_name}{cache_suffix}_{repo_slug(args.repo)}_{fingerprint}.json.gz"
+    )
 
     # An un-fingerprinted cache is from before this scheme and cannot be
     # trusted; say so rather than leaving it to rot silently.

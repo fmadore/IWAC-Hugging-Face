@@ -90,6 +90,46 @@ SUBSETS: dict[str, SubsetDefinition] = {
 
 ALL_CONFIGS: tuple[str, ...] = tuple(SUBSETS)
 
+_OCR_METRICS = ("nb_mots", "Richesse_Lexicale_OCR", "Lisibilite_OCR")
+_LEMMAS = ("lemma_text", "lemma_nostop")
+_LDA = ("lda_topic_id", "lda_topic_prob", "lda_topic_label", "lda_topic_topk",
+        "lda_model_name")
+
+#: Which computed columns are derived from which source column, per subset.
+#: The upload compares each source column with the Hub copy; where a row's
+#: source changed, its derived values describe an older version of the item.
+#: Only Hub-only (post-processed) columns are ever affected — a column the
+#: mapper produces is fresh by construction. Sentiment is deliberately absent:
+#: it is read from Omeka (and generation 1 is frozen history), not computed
+#: from OCR here.
+DERIVED_FROM: dict[str, dict[str, tuple[str, ...]]] = {
+    "articles": {
+        "OCR": ("embedding_OCR", *_LEMMAS, *_OCR_METRICS, *_LDA, "related_articles"),
+        "pub_date": _HIJRI,
+    },
+    "publications": {
+        "OCR": (*_LEMMAS, *_OCR_METRICS, *_LDA),
+        "tableOfContents": ("embedding_tableOfContents", "related_articles"),
+        "pub_date": _HIJRI,
+    },
+    "references": {
+        "OCR": ("embedding_OCR", *_LEMMAS, *_OCR_METRICS, *_LDA),
+    },
+    "documents": {
+        "OCR": (*_LEMMAS, *_OCR_METRICS),
+        "pub_date": _HIJRI,
+    },
+    "audiovisual": {
+        "OCR": _OCR_METRICS,
+        "pub_date": _HIJRI,
+    },
+    "images": {
+        "image_url": ("embedding_image",),
+        "pub_date": _HIJRI,
+    },
+    "index": {},
+}
+
 #: Country-specific Omeka item sets, per subset → the canonical country label
 #: (the un-accented ``Benin``/``Nigeria`` that country_mapper emits). Format
 #: collections (e.g. audiovisual 2183/2184) are absent on purpose: they group
@@ -443,6 +483,7 @@ __all__ = [
     "ALL_CONFIGS",
     "CONTENT_COLUMNS",
     "COUNTRY_ITEM_SETS",
+    "DERIVED_FROM",
     "EMBEDDING_VALUE_TYPE",
     "DataContractError",
     "validate_ids",

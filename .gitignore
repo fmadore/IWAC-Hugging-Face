@@ -23,5 +23,6 @@ analyses/output/
 logs/
 .pytest_cache/
 .iwac_locks/
+.iwac_state/
 .coverage
 coverage.xml

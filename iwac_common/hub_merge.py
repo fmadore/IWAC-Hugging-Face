@@ -26,7 +26,9 @@ from typing import Iterable, MutableMapping, Optional, Sequence
 
 import pandas as pd
 from datasets import load_dataset
+from rich import box
 from rich.console import Console
+from rich.table import Table
 
 from .hub import (
     HubBaselineUnavailableError,
@@ -57,6 +59,38 @@ def _assert_unique_ids(df: pd.DataFrame, label: str) -> None:
             f"{label} contains {dupes.nunique()} duplicated 'o:id' value(s) "
             f"(e.g. {sample}); merging would multiply rows. Deduplicate first."
         )
+
+
+def _normalized_text(value) -> str:
+    """Comparable form of a source value: null → "", whitespace collapsed, so
+    a re-wrapped OCR line is not mistaken for a changed text."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return " ".join(str(value).split())
+
+
+def detect_source_changes(
+    new_df: pd.DataFrame,
+    existing_df: pd.DataFrame,
+    derived_from: Mapping[str, Sequence[str]],
+) -> dict[str, list[str]]:
+    """``{source column: [o:id, …]}`` for rows present in both frames whose
+    source value changed (after whitespace normalisation)."""
+    changes: dict[str, list[str]] = {}
+    common = new_df[["o:id"]].merge(existing_df[["o:id"]], on="o:id")["o:id"]
+    if common.empty:
+        return changes
+    fresh = new_df.set_index("o:id")
+    hub = existing_df.set_index("o:id")
+    for source in derived_from:
+        if source not in fresh.columns or source not in hub.columns:
+            continue
+        before = hub.loc[common, source].map(_normalized_text)
+        after = fresh.loc[common, source].map(_normalized_text)
+        changed = common[(before.to_numpy() != after.to_numpy())]
+        if len(changed):
+            changes[source] = [str(i) for i in changed]
+    return changes
 
 
 def stable_column_order(
@@ -110,6 +144,9 @@ def merge_with_hub_dataset(
     preserve_existing_ids: Iterable[object] = (),
     preserve_fields_by_id: Optional[Mapping[object, Iterable[str]]] = None,
     revision_out: Optional[MutableMapping[str, str]] = None,
+    derived_from: Optional[Mapping[str, Sequence[str]]] = None,
+    invalidate_derived: bool = False,
+    stale_out: Optional[MutableMapping[str, dict]] = None,
 ) -> pd.DataFrame:
     """Merge ``new_df`` with the existing HF Hub config, preserving any
     columns that exist on the Hub but not in ``new_df`` (typically
@@ -129,6 +166,14 @@ def merge_with_hub_dataset(
     when ``allow_initialize=True`` and the Hub confirms that the config is not
     declared. ``revision_out`` receives the baseline repository SHA for an
     optimistic-concurrency check immediately before the later push.
+
+    Stale derived values: with ``derived_from`` (``schema.DERIVED_FROM[config]``)
+    rows whose source text changed since the Hub copy are reported, because
+    their preserved computed columns (embeddings, lemmas, metrics, topics)
+    describe the old text. ``stale_out`` receives
+    ``{source: {"ids": [...], "derived": [...]}}``. With
+    ``invalidate_derived=True`` those preserved values are nulled for the
+    changed rows, so each stage's ``missing`` mode recomputes exactly them.
     """
     console = console or Console()
     token = resolve_hf_token(token)
@@ -293,6 +338,41 @@ def merge_with_hub_dataset(
         if col not in new_df.columns and col not in excluded
     ]
 
+    stale: dict[str, dict] = {}
+    if derived_from:
+        for source, ids in detect_source_changes(new_df, existing_df, derived_from).items():
+            affected = [c for c in derived_from[source] if c in extra_cols]
+            if affected:
+                stale[source] = {"ids": ids, "derived": affected}
+    if stale:
+        table = Table(
+            title="Source text changed since the Hub copy", box=box.SIMPLE,
+        )
+        table.add_column("Source", style="cyan")
+        table.add_column("Rows", justify="right")
+        table.add_column("Preserved values now stale", style="yellow")
+        table.add_column("e.g. o:id", style="dim")
+        for source, info in stale.items():
+            table.add_row(
+                source, f"{len(info['ids']):,}", ", ".join(info["derived"]),
+                ", ".join(info["ids"][:3]),
+            )
+        console.print(table)
+        if invalidate_derived:
+            console.print(
+                "[yellow]⚠[/yellow] --invalidate-derived: those values are cleared "
+                "for the changed rows; re-run each stage in 'missing' mode."
+            )
+        else:
+            console.print(
+                "[yellow]⚠[/yellow] Kept as-is. Re-run with --invalidate-derived to "
+                "clear them (then each stage's 'missing' mode recomputes exactly "
+                "those rows), or re-run the stages with --update-mode all."
+            )
+    if stale_out is not None:
+        stale_out.clear()
+        stale_out.update(stale)
+
     if not extra_cols and how != "outer":
         console.print("[yellow]ℹ[/yellow] No unique columns to preserve from existing dataset.")
         if excluded:
@@ -337,6 +417,12 @@ def merge_with_hub_dataset(
     final_df = final_df[stable_column_order(
         list(final_df.columns), list(existing_df.columns), list(new_df.columns)
     )]
+    if invalidate_derived and stale:
+        final_df = final_df.reset_index(drop=True)
+        for info in stale.values():
+            mask = final_df["o:id"].isin(info["ids"])
+            for column in info["derived"]:
+                final_df.loc[mask, column] = None
 
     if excluded:
         console.print(f"[dim]Excluded columns: {', '.join(sorted(excluded))}[/dim]")
@@ -357,6 +443,7 @@ def merge_with_hub_dataset(
 __all__ = [
     "merge_with_hub_dataset",
     "stable_column_order",
+    "detect_source_changes",
     "resolve_hf_token",
     "ShrinkGuardError",
     "DuplicateIdError",

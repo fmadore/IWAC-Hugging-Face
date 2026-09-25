@@ -27,9 +27,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, Sequence
 
 import pandas as pd
@@ -71,7 +74,12 @@ from .omeka_client import (
     media_stats,
 )
 from .repos import PRIVATE_REPO_ID
-from .schema import DataContractError, normalize_embedding_nulls, validate_frame
+from .schema import (
+    DERIVED_FROM,
+    DataContractError,
+    normalize_embedding_nulls,
+    validate_frame,
+)
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
@@ -105,6 +113,46 @@ class UploadSpec:
     # Expose --stale-rows (only meaningful for outer merges).
     supports_stale_rows: bool = False
     extra_config_rows: Sequence[tuple] = field(default_factory=tuple)  # (label, value) panel rows
+
+
+def _state_root() -> Path:
+    configured = os.getenv("IWAC_STATE_DIR")
+    if configured:
+        return Path(configured)
+    return Path(__file__).resolve().parent.parent / ".iwac_state"
+
+
+def record_stale_derived(
+    repo: str, config_name: str, stale: Dict[str, dict], revision: Optional[str]
+) -> Optional[Path]:
+    """Append the rows whose preserved derived values went stale in this push
+    to a local worklist, ``.iwac_state/stale_derived/<repo>__<config>.json``
+    (or ``IWAC_STATE_DIR``).
+
+    The comparison that detects a changed source text only works in the run
+    that lands the change: once pushed, the Hub text equals Omeka again. The
+    worklist keeps that knowledge, per derived column, until someone acts on
+    it (re-run the stage with --update-mode all, or clear the file after an
+    upload with --invalidate-derived).
+    """
+    if not stale:
+        return None
+    root = _state_root() / "stale_derived"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{repo.replace('/', '__')}__{config_name}.json"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        record = {"repository": repo, "config": config_name, "columns": {}}
+    columns = record.setdefault("columns", {})
+    for info in stale.values():
+        for column in info["derived"]:
+            ids = set(columns.get(column, [])) | set(info["ids"])
+            columns[column] = sorted(ids, key=lambda v: (len(v), v))
+    record["updated_at"] = datetime.now(timezone.utc).isoformat()
+    record["last_revision_before_push"] = revision
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
 
 
 def report_unmapped_values(
@@ -298,6 +346,7 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
         # raise instead of silently shrinking or fanning out).
         console.print("\n[bold cyan]Step 2:[/bold cyan] Merging with existing Hub dataset...")
         revision: dict[str, str] = {}
+        stale: dict[str, dict] = {}
         final_df = merge_with_hub_dataset(
             new_df,
             args.repo,
@@ -319,6 +368,9 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
                 if args.allow_media_failures else None
             ),
             revision_out=revision,
+            derived_from=DERIVED_FROM.get(spec.config_name),
+            invalidate_derived=args.invalidate_derived,
+            stale_out=stale,
         )
 
         if spec.post_merge is not None:
@@ -377,6 +429,14 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
                     expected_revision=revision.get("revision"),
                     expected_columns=list(final_df.columns),
                     expected_ids=final_df["o:id"].tolist(),
+                )
+            if stale and not args.invalidate_derived:
+                worklist = record_stale_derived(
+                    args.repo, spec.config_name, stale, revision.get("revision")
+                )
+                console.print(
+                    f"[yellow]⚠[/yellow] Rows with stale derived values recorded in "
+                    f"[cyan]{worklist}[/cyan]."
                 )
             console.print(Panel(
                 f"[bold green]✓ Dataset successfully published![/bold green]\n\n"
@@ -490,6 +550,14 @@ def build_parser(spec: UploadSpec) -> argparse.ArgumentParser:
         help="Maximum concurrent Omeka item mappers (default: 8)",
     )
     parser.add_argument(
+        "--invalidate-derived", action="store_true",
+        help="Where a row's source text (OCR, table of contents, image URL, "
+             "date) changed since the Hub copy, clear its preserved derived "
+             "values (embeddings, lemmas, metrics, topics, Hijri date) so each "
+             "stage's 'missing' mode recomputes them. Without it the stale rows "
+             "are reported and recorded in .iwac_state/, but kept.",
+    )
+    parser.add_argument(
         "--initialize", action="store_true",
         help="Allow creation of a deliberately new Hub config. Existing configs "
              "still fail closed on every read/auth/network error.",
@@ -517,4 +585,10 @@ def run_upload(spec: UploadSpec, argv: Optional[Sequence[str]] = None) -> int:
         return 130
 
 
-__all__ = ["UploadSpec", "run_upload", "build_parser", "report_unmapped_values"]
+__all__ = [
+    "UploadSpec",
+    "run_upload",
+    "build_parser",
+    "report_unmapped_values",
+    "record_stale_derived",
+]

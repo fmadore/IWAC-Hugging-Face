@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, List, Sequence
 
 import pyarrow as pa
 
-from _embedding_utils import is_empty_embedding
+from _embedding_utils import cached_value, is_empty_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -65,17 +65,22 @@ def restore_from_cache(
     all_embeddings: List[Any],
     row_ids: Sequence[Any],
     cache: Dict[str, Any],
+    fingerprints: Sequence[str],
 ) -> int:
-    """Overwrite rows whose ``o:id`` has a cached vector; return the count.
+    """Overwrite rows whose cached vector was computed from their current
+    input; return the count.
 
-    Mutates ``all_embeddings`` in place. Cache keys are stringified row ids
-    (the resume caches written by ``_embedding_utils.save_cache``).
+    Mutates ``all_embeddings`` in place. Cache keys are stringified row ids and
+    entries carry an input fingerprint (``_embedding_utils.make_entry``). An
+    entry for text that has changed since — or a legacy entry with no
+    fingerprint — is not restored, so the row is embedded afresh instead of
+    receiving a vector of some earlier version of its text.
     """
     restored = 0
-    for i, oid in enumerate(row_ids):
-        oid_str = str(oid)
-        if oid_str in cache:
-            all_embeddings[i] = cache[oid_str]
+    for i, (oid, fingerprint) in enumerate(zip(row_ids, fingerprints)):
+        vector = cached_value(cache, oid, fingerprint)
+        if vector is not None:
+            all_embeddings[i] = vector
             restored += 1
     return restored
 
