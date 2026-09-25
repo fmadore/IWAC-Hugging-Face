@@ -40,16 +40,22 @@ from iwac_common.omeka_client import (
     conn_manager,
     fetch_iiif_thumbnail_url,
     fetch_primary_media_url,
+    iiif_manifest_url,
+    item_page_url,
 )
 from iwac_common.field_mappers import (
+    countries_from_item_sets,
     extract_added_date,
+    get_resource_ids,
+    get_rights_label,
     get_value,
     get_value_by_language,
     is_content_public,
+    parse_pub_date,
     to_int_or_none,
 )
 from iwac_common.upload_runner import UploadSpec, run_upload
-from iwac_common.schema import SUBSETS
+from iwac_common.schema import COUNTRY_ITEM_SETS, SUBSETS
 
 load_dotenv()
 
@@ -63,70 +69,40 @@ load_dotenv()
 # Fonctions d'aide pour mapper les champs Omeka → plat
 # ---------------------------------------------------------------------------
 
-def _get_label(item: Dict[str, Any], field: str) -> str:
-    """Extract o:label from a field that contains an array of objects with o:label."""
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        labels = []
-        for v in val:
-            if isinstance(v, dict) and "o:label" in v:
-                labels.append(str(v["o:label"]))
-        return "|".join(filter(None, labels))
-    elif isinstance(val, dict) and "o:label" in val:
-        return str(val["o:label"])
-    return ""
-
-
 async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item Omeka en dict plat pour HF datasets."""
 
     primary_url = await fetch_primary_media_url(
         item, api, affected_fields=("PDF",)
     )
+    pub_date = get_value(item, "dcterms:date")
+    pub_year, pub_date_precision = parse_pub_date(pub_date)
 
-    # Map country based on item set IDs
-    country = ""
-    if "o:item_set" in item and isinstance(item["o:item_set"], list):
-        for item_set in item["o:item_set"]:
-            if isinstance(item_set, dict) and "o:id" in item_set:
-                item_set_id = item_set["o:id"]
-                if item_set_id == 23452:
-                    country = "Benin"
-                    break
-                elif item_set_id == 23453:
-                    country = "Burkina Faso"
-                    break
-                elif item_set_id == 26327:
-                    country = "Togo"
-                    break
-
-    nb_pages_int = to_int_or_none(get_value(item, "bibo:numPages"))
-    added_date = extract_added_date(item)
-
-    # Fetch thumbnail URL and set IIIF manifest URL only if PDF exists
-    session = await conn_manager.get()
+    # Thumbnail and IIIF manifest only when there is a PDF behind them.
     thumbnail_url = ""
-    iiif_manifest_url = ""
-
-    if primary_url:  # Only fetch IIIF data if there's a PDF
+    manifest_url = ""
+    if primary_url:
+        session = await conn_manager.get()
         thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
-        iiif_manifest_url = f"https://islam.zmo.de/iiif/3/{item['o:id']}/manifest"
+        manifest_url = iiif_manifest_url(item["o:id"])
 
     return {
         "o:id": item["o:id"],
         "identifier": get_value(item, "dcterms:identifier"),
-        "added_date": added_date, # Date when item was added to Omeka
-        "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
-        "iiif_manifest": iiif_manifest_url,
+        "added_date": extract_added_date(item),  # Date when item was added to Omeka
+        "iwac_url": item_page_url(item["o:id"]),
+        "iiif_manifest": manifest_url,
         "PDF": primary_url,
         "thumbnail": thumbnail_url,
         "title": get_value(item, "dcterms:title"),
         "author": get_value(item, "dcterms:creator"),
+        "author_ids": get_resource_ids(item, "dcterms:creator"),
         "contributor": get_value(item, "dcterms:contributor"),
-        "country": country,
-        "pub_date": get_value(item, "dcterms:date"),
+        # Country from the item's country-specific collection.
+        "country": countries_from_item_sets(item, COUNTRY_ITEM_SETS["documents"]),
+        "pub_date": pub_date,
+        "pub_year": pub_year,
+        "pub_date_precision": pub_date_precision,
         # Like articles: documents have no table of contents, and their
         # abstract is the AI-generated one in bibo:shortDescription. The
         # dcterms:abstract field is being retired on the Omeka side.
@@ -138,12 +114,16 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
             item, "bibo:shortDescription", "en"
         ),
         "subject": get_value(item, "dcterms:subject"),
+        "subject_ids": get_resource_ids(item, "dcterms:subject"),
         "spatial": get_value(item, "dcterms:spatial"),
+        "spatial_ids": get_resource_ids(item, "dcterms:spatial"),
         "language": get_value(item, "dcterms:language"),
         "type": get_value(item, "dcterms:type"),
-        "nb_pages": nb_pages_int,
+        "nb_pages": to_int_or_none(get_value(item, "bibo:numPages")),
         "source": get_value(item, "dcterms:source"),
-        "rights": _get_label(item, "dcterms:rights"),
+        # Label, falling back to the statement URI (same rule as audiovisual
+        # and images; the local helper this replaced returned "" instead).
+        "rights": get_rights_label(item),
         "OCR": get_value(item, "bibo:content"),
         "OCR_is_public": is_content_public(item),
     }

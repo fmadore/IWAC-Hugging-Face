@@ -564,7 +564,39 @@ async def fetch_primary_media_url(
 # IIIF helpers
 # ---------------------------------------------------------------------------
 
-IIIF_BASE_URL = "https://islam.zmo.de/iiif/3"
+#: Production host. Item-page and IIIF URLs are built from the *configured*
+#: Omeka host instead (see :func:`public_base_url`), so a run pointed at a
+#: staging instance no longer publishes production links.
+DEFAULT_PUBLIC_BASE_URL = "https://islam.zmo.de"
+#: Omeka S site slug of the public IWAC site.
+SITE_SLUG = "afrique_ouest"
+IIIF_BASE_URL = f"{DEFAULT_PUBLIC_BASE_URL}/iiif/3"  # production default, kept for callers
+
+
+def public_base_url() -> str:
+    """Base URL of the public Omeka site, read at call time.
+
+    ``IWAC_PUBLIC_BASE_URL`` wins; otherwise ``OMEKA_BASE_URL`` minus its
+    ``/api`` suffix; otherwise the production host. Read lazily because the
+    scripts load ``.env`` after importing this module.
+    """
+    explicit = os.getenv("IWAC_PUBLIC_BASE_URL")
+    if explicit:
+        return explicit.rstrip("/")
+    api = os.getenv("OMEKA_BASE_URL", "").rstrip("/")
+    if api.endswith("/api"):
+        return api[: -len("/api")]
+    return DEFAULT_PUBLIC_BASE_URL
+
+
+def item_page_url(item_id: Union[str, int]) -> str:
+    """Public item page (the ``iwac_url`` column)."""
+    return f"{public_base_url()}/s/{SITE_SLUG}/item/{item_id}"
+
+
+def iiif_manifest_url(item_id: Union[str, int]) -> str:
+    """IIIF Presentation 3 manifest of an item (the ``iiif_manifest`` column)."""
+    return f"{public_base_url()}/iiif/3/{item_id}/manifest"
 
 
 async def fetch_iiif_thumbnail_url(
@@ -576,7 +608,7 @@ async def fetch_iiif_thumbnail_url(
     rate-limit, and server failures are recorded for the upload runner's
     fail-closed guard while still allowing all in-flight mappers to finish.
     """
-    manifest_url = f"{IIIF_BASE_URL}/{omeka_id}/manifest"
+    manifest_url = iiif_manifest_url(omeka_id)
     thumbnail_url = ""
     media_stats.record_attempt()
     try:
@@ -640,6 +672,11 @@ __all__ = [
     "OmekaApiClient",
     "TruncatedFetchError",
     "IIIF_BASE_URL",
+    "DEFAULT_PUBLIC_BASE_URL",
+    "SITE_SLUG",
+    "public_base_url",
+    "item_page_url",
+    "iiif_manifest_url",
     "fetch_iiif_thumbnail_url",
     "fetch_primary_media_url",
     "MediaFetchGuardError",

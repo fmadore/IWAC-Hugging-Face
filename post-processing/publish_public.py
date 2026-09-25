@@ -114,6 +114,7 @@ PUBLIC_TEXT_ALLOWLIST = {
     "descriptionAI",
     "descriptionAI_en",
     "abstract",
+    "abstract_en",
     "Description",
     "lda_topic_label",
     # Sentiment justifications, for every panel member including frozen ones.

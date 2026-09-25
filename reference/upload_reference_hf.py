@@ -28,7 +28,6 @@ Variables d'environnement
 import os
 import sys
 import re
-import logging
 import pandas as pd
 from typing import Dict, Any, List
 
@@ -37,18 +36,22 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
 
-from iwac_common.omeka_client import OmekaApiClient
-from iwac_common.field_mappers import extract_added_date, get_value, is_content_public
+from iwac_common.omeka_client import OmekaApiClient, item_page_url
+from iwac_common.field_mappers import (
+    countries_from_item_sets,
+    extract_added_date,
+    get_resource_ids,
+    get_uri_value,
+    get_value,
+    is_content_public,
+    parse_pub_date,
+    split_by_language,
+)
 from iwac_common.text_utils import count_words
 from iwac_common.upload_runner import UploadSpec, run_upload
-from iwac_common.schema import SUBSETS
+from iwac_common.schema import COUNTRY_ITEM_SETS, SUBSETS
 
 load_dotenv()
-
-# Rich logging itself is configured by iwac_common.upload_runner; this is the
-# named logger the field-mapping warnings below write to.
-logger = logging.getLogger("upload")
-
 
 # Orchestration (fetch of all 9 reference classes → map loop → outer merge →
 # validate → push), the CLI (--repo/--max-shard-size/--no-cache/--dry-run/
@@ -75,15 +78,7 @@ RESOURCE_CLASS_MAPPING = {
     305: 'Article de blog'
 }
 
-# Country mapping based on item sets
-COUNTRY_ITEM_SETS = {
-    2193: 'Benin',
-    2212: 'Burkina Faso',
-    2217: 'Côte d\'Ivoire',
-    2222: 'Niger',
-    2225: 'Nigeria',
-    2228: 'Togo'
-}
+# Country-specific reference collections live in iwac_common.schema.
 
 
 # ---------------------------------------------------------------------------
@@ -168,173 +163,95 @@ def _get_resource_class(item: Dict[str, Any]) -> str:
     return ""
 
 
-def _get_countries_from_item_sets(item: Dict[str, Any]) -> str:
-    """Map country based on item set IDs"""
-    countries = []
-    if "o:item_set" in item and isinstance(item["o:item_set"], list):
-        for item_set in item["o:item_set"]:
-            if isinstance(item_set, dict) and "o:id" in item_set:
-                item_set_id = item_set["o:id"]
-                if item_set_id in COUNTRY_ITEM_SETS:
-                    countries.append(COUNTRY_ITEM_SETS[item_set_id])
-    return "|".join(countries) if countries else ""
-
-
 async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item Omeka de référence en dict plat pour HF datasets."""
 
-    # Map country based on item set IDs
-    country = _get_countries_from_item_sets(item)
-
-    # Custom logic to extract URL from fabio:hasURL, prioritizing @id
-    fabio_has_url_data = item.get("fabio:hasURL")
-    extracted_fabio_url = ""
-    if isinstance(fabio_has_url_data, list):
-        urls = []
-        for v_item in fabio_has_url_data:
-            if isinstance(v_item, dict):
-                id_val = v_item.get("@id")
-                if id_val and isinstance(id_val, str):
-                    urls.append(id_val)
-        if urls:
-            extracted_fabio_url = "|".join(urls)
-    elif isinstance(fabio_has_url_data, dict):
-        id_val = fabio_has_url_data.get("@id")
-        if id_val and isinstance(id_val, str): # Ensure it's a non-empty string
-            extracted_fabio_url = id_val
-    elif isinstance(fabio_has_url_data, str) and fabio_has_url_data: # If it's already a non-empty string
-        extracted_fabio_url = fabio_has_url_data
-    # If none of the above, extracted_fabio_url remains ""
-
     # Normalise bibo:doi: keep real DOIs (bare form) in ``doi``, and fold any
     # non-DOI URL mistakenly stored there into the ``URL`` column instead.
+    url_parts = [u for u in get_uri_value(item, "fabio:hasURL").split("|") if u]
     doi_clean, doi_urls = split_doi_and_urls(item)
-    if doi_urls:
-        url_parts = [u for u in extracted_fabio_url.split("|") if u]
-        for u in doi_urls:
-            if u not in url_parts:
-                url_parts.append(u)
-        extracted_fabio_url = "|".join(url_parts)
+    for u in doi_urls:
+        if u not in url_parts:
+            url_parts.append(u)
 
-    # Keep volume as string (can contain multiple values like "1|2")
-    volume_str = get_value(item, "bibo:volume")
+    pub_date = get_value(item, "dcterms:date")
+    pub_year, pub_date_precision = parse_pub_date(pub_date)
 
-    # Keep issue as string (can contain multiple values like "3|4")
-    issue_str = get_value(item, "bibo:issue")
-
-    # Convert edition to int
-    edition_str = get_value(item, "bibo:edition")
-    edition_int = ""
-    if edition_str:
-        try:
-            edition_int = int(edition_str)
-        except ValueError:
-            logger.warning(
-                f"Could not convert edition '{edition_str}' to int for item {item['o:id']}. Defaulting to empty."
-            )
-
-    # Convert chapter to int
-    chapter_str = get_value(item, "bibo:chapter")
-    chapter_int = ""
-    if chapter_str:
-        try:
-            chapter_int = int(chapter_str)
-        except ValueError:
-            logger.warning(
-                f"Could not convert chapter '{chapter_str}' to int for item {item['o:id']}. Defaulting to empty."
-            )
-
-    # Convert nb_pages to int
-    nb_pages_str = get_value(item, "bibo:numPages")
-    nb_pages_int = ""
-    if nb_pages_str:
-        try:
-            nb_pages_int = int(nb_pages_str)
-        except ValueError:
-            logger.warning(
-                f"Could not convert nb_pages '{nb_pages_str}' to int for item {item['o:id']}. Defaulting to empty."
-            )
-
-    # Convert page start/end to int
-    page_start_str = get_value(item, "bibo:pageStart")
-    page_start_int = ""
-    if page_start_str:
-        try:
-            page_start_int = int(page_start_str)
-        except ValueError:
-            logger.warning(
-                f"Could not convert pageStart '{page_start_str}' to int for item {item['o:id']}. Defaulting to empty."
-            )
-
-    page_end_str = get_value(item, "bibo:pageEnd")
-    page_end_int = ""
-    if page_end_str:
-        try:
-            page_end_int = int(page_end_str)
-        except ValueError:
-            logger.warning(
-                f"Could not convert pageEnd '{page_end_str}' to int for item {item['o:id']}. Defaulting to empty."
-            )
-
-    added_date = extract_added_date(item)
+    # A reference often carries its abstract twice, in French and in English,
+    # as two literals of one property; get_value() pipe-joined them. The
+    # English-tagged one now has its own column; untagged values stay in
+    # ``abstract`` (their language is unknown), and an English-only abstract
+    # appears in both, so ``abstract`` never loses one.
+    abstract, abstract_en = split_by_language(item, "dcterms:abstract", "en")
 
     # Full text (bibo:content) — kept as the OCR column. This is private on
-    # the Omeka side, so the references subset must only be pushed to the
-    # PRIVATE repo; publish_public.py strips OCR before the public push.
+    # the Omeka side for most references: publish_public.py masks it per row
+    # (OCR_is_public), so only the private repo carries it in full.
     content_text = get_value(item, "bibo:content")
-    nb_mots = count_words(content_text)
 
     return {
         "o:id": item["o:id"],
-        "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
+        "iwac_url": item_page_url(item["o:id"]),
         "identifier": _get_iwac_identifier(item, "dcterms:identifier"),
-        "added_date": added_date,
+        "added_date": extract_added_date(item),
         "o:resource_class": _get_resource_class(item),
         "title": get_value(item, "dcterms:title"),
         "author": get_value(item, "bibo:authorList"),
+        "author_ids": get_resource_ids(item, "bibo:authorList"),
         "editor": get_value(item, "bibo:editorList"),
+        "editor_ids": get_resource_ids(item, "bibo:editorList"),
         "review_of": get_value(item, "bibo:reviewOf"),
         "publisher": get_value(item, "dcterms:publisher"),
-        "pub_date": get_value(item, "dcterms:date"),
+        "publisher_ids": get_resource_ids(item, "dcterms:publisher"),
+        "pub_date": pub_date,
+        "pub_year": pub_year,
+        "pub_date_precision": pub_date_precision,
         "type": get_value(item, "dcterms:type"),
         "book_title": get_value(item, "dcterms:alternative"),
-        "chapter": chapter_int,
-        "volume": volume_str,
-        "issue": issue_str,
-        "abstract": get_value(item, "dcterms:abstract"),
-        "edition": edition_int,
-        "nb_pages": nb_pages_int,
-        "page_start": page_start_int,
-        "page_end": page_end_int,
+        # Bibliographic numbers stay verbatim strings: the source holds ranges
+        # and roman numerals ("12-15", "iv"), which an int conversion used to
+        # blank before the column was cast back to str anyway.
+        "chapter": get_value(item, "bibo:chapter"),
+        "volume": get_value(item, "bibo:volume"),  # may hold several: "1|2"
+        "issue": get_value(item, "bibo:issue"),  # may hold several: "3|4"
+        "abstract": abstract,
+        "abstract_en": abstract_en,
+        "edition": get_value(item, "bibo:edition"),
+        "nb_pages": get_value(item, "bibo:numPages"),
+        "page_start": get_value(item, "bibo:pageStart"),
+        "page_end": get_value(item, "bibo:pageEnd"),
         "extent": get_value(item, "dcterms:extent"),
         "is_part_of": get_value(item, "dcterms:isPartOf"),
         "provenance": get_value(item, "dcterms:provenance"),
         "subject": get_value(item, "dcterms:subject"),
+        "subject_ids": get_resource_ids(item, "dcterms:subject"),
         "spatial": get_value(item, "dcterms:spatial"),
+        "spatial_ids": get_resource_ids(item, "dcterms:spatial"),
         "language": get_value(item, "dcterms:language"),
         "doi": doi_clean,
-        "URL": extracted_fabio_url,
+        "URL": "|".join(url_parts),
         "OCR": content_text,
         "OCR_is_public": is_content_public(item),
-        "nb_mots": nb_mots,
-        "country": country,
+        "nb_mots": count_words(content_text),
+        "country": countries_from_item_sets(
+            item, COUNTRY_ITEM_SETS["references"], first_only=False
+        ),
     }
-
-
 
 
 # ---------------------------------------------------------------------------
 # Spec + entry point (shared pipeline in iwac_common.upload_runner)
 # ---------------------------------------------------------------------------
 
-def _cast_mixed_columns_to_str(final_df: pd.DataFrame) -> pd.DataFrame:
-    """References mix ints and strings in these bibliographic columns
-    (e.g. "12-15" vs 12); cast to str so Arrow gets a stable schema. Empty
-    values stay empty strings, not the literal 'nan'."""
-    mixed_type_columns = ["chapter", "edition", "nb_pages", "page_start", "page_end"]
-    for col in mixed_type_columns:
+BIBLIOGRAPHIC_STRING_COLUMNS = ("chapter", "edition", "nb_pages", "page_start", "page_end")
+
+
+def _blank_missing_bibliographic_numbers(final_df: pd.DataFrame) -> pd.DataFrame:
+    """Hub-only rows kept by the outer merge have no Omeka values; give these
+    string columns ``""`` rather than null, as the other rows have."""
+    for col in BIBLIOGRAPHIC_STRING_COLUMNS:
         if col in final_df.columns:
-            final_df[col] = final_df[col].astype(str).replace("nan", "")
+            final_df[col] = final_df[col].fillna("").astype(str)
     return final_df
 
 
@@ -351,7 +268,7 @@ SPEC = UploadSpec(
     merge_suffixes=("", "_old"),
     columns_to_exclude=("o:item_set", "o:media/file", "iiif_manifest", "thumbnail"),
     supports_stale_rows=True,
-    post_merge=_cast_mixed_columns_to_str,
+    post_merge=_blank_missing_bibliographic_numbers,
 )
 
 

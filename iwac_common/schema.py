@@ -89,6 +89,26 @@ SUBSETS: dict[str, SubsetDefinition] = {
 }
 
 ALL_CONFIGS: tuple[str, ...] = tuple(SUBSETS)
+
+#: Country-specific Omeka item sets, per subset → the canonical country label
+#: (the un-accented ``Benin``/``Nigeria`` that country_mapper emits). Format
+#: collections (e.g. audiovisual 2183/2184) are absent on purpose: they group
+#: by medium, not place, and must never resolve a country.
+COUNTRY_ITEM_SETS: dict[str, dict[int, str]] = {
+    "documents": {23452: "Benin", 23453: "Burkina Faso", 26327: "Togo"},
+    "references": {
+        2193: "Benin", 2212: "Burkina Faso", 2217: "Côte d'Ivoire",
+        2222: "Niger", 2225: "Nigeria", 2228: "Togo",
+    },
+    "audiovisual": {
+        2194: "Benin",           # Vidéos YouTube (Bénin)
+        108260: "Burkina Faso",  # Vidéos YouTube (Burkina Faso)
+    },
+    "images": {
+        2192: "Benin", 2211: "Burkina Faso", 2216: "Côte d'Ivoire",
+        2220: "Niger", 2227: "Togo",
+    },
+}
 CONTENT_COLUMNS: dict[str, list[str]] = {
     name: list(spec.content_columns)
     for name, spec in SUBSETS.items()
@@ -422,6 +442,7 @@ __all__ = [
     "SUBSETS",
     "ALL_CONFIGS",
     "CONTENT_COLUMNS",
+    "COUNTRY_ITEM_SETS",
     "EMBEDDING_VALUE_TYPE",
     "DataContractError",
     "validate_ids",

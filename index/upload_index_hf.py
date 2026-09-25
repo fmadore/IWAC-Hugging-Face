@@ -36,11 +36,19 @@ import pandas as pd
 from dotenv import load_dotenv
 from datasets import load_dataset
 from rich.console import Console
-from iwac_common.omeka_client import OmekaApiClient, conn_manager, fetch_iiif_thumbnail_url
+from iwac_common.omeka_client import (
+    OmekaApiClient,
+    conn_manager,
+    fetch_iiif_thumbnail_url,
+    item_page_url,
+)
 from iwac_common.field_mappers import (
     extract_added_date,
+    get_display_titles,
+    get_literal_values,
     get_value,
     get_value_by_language,
+    parse_coordinates,
 )
 from iwac_common.upload_runner import UploadSpec, run_upload
 from iwac_common.schema import SUBSETS
@@ -65,33 +73,6 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Fonctions d'aide pour mapper les champs Omeka → plat
 # ---------------------------------------------------------------------------
-
-def _get_value_only(item: Dict[str, Any], field: str) -> str:
-    """Extrait seulement les valeurs @value d'un champ Omeka (pour dcterms:identifier)"""
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        # Ne prendre que les @value, ignorer les autres types
-        parts = [str(v.get("@value", "")) for v in val if isinstance(v, dict) and v.get("@value")]
-        return "|".join(filter(None, parts))
-    if isinstance(val, dict):
-        return val.get("@value", "")
-    return str(val)
-
-
-def _get_display_title(item: Dict[str, Any], field: str) -> str:
-    """Extrait les display_title d'un champ"""
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        parts = [str(v.get("display_title", "")) for v in val if v.get("display_title")]
-        return "|".join(filter(None, parts))
-    elif isinstance(val, dict):
-        return val.get("display_title", "")
-    return ""
-
 
 def _get_resource_class_type(item: Dict[str, Any]) -> str:
     """Mappe le resource_class_id vers le type correspondant"""
@@ -129,34 +110,19 @@ def _get_resource_class_type(item: Dict[str, Any]) -> str:
     return resource_class_mapping.get(class_id, "")
 
 
-def _get_item_set_ids(item: Dict[str, Any]) -> str:
-    """Extrait les IDs des item sets (gardé pour compatibilité si nécessaire ailleurs)"""
-    if "o:item_set" not in item or item["o:item_set"] is None:
-        return ""
-    item_sets = item["o:item_set"]
-    if isinstance(item_sets, list):
-        ids = []
-        for item_set in item_sets:
-            if isinstance(item_set, dict) and "o:id" in item_set:
-                ids.append(str(item_set["o:id"]))
-        return "|".join(ids)
-    return ""
-
-
 async def map_index_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item d'index Omeka en dict plat pour HF datasets."""
     
-    added_date = extract_added_date(item)
-
-    # Fetch thumbnail URL
     session = await conn_manager.get()
     thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
+    coordinates = get_value(item, "curation:coordinates")
+    latitude, longitude = parse_coordinates(coordinates)
 
     return {
         "o:id": item["o:id"],
-        "identifier": _get_value_only(item, "dcterms:identifier"),
-        "added_date": added_date, # Date when item was added to Omeka
-        "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
+        "identifier": get_literal_values(item, "dcterms:identifier"),
+        "added_date": extract_added_date(item),  # Date when item was added to Omeka
+        "iwac_url": item_page_url(item["o:id"]),
         "thumbnail": thumbnail_url,
         "Titre": item.get("o:title", ""),
         "Titre alternatif": get_value(item, "dcterms:alternative"),
@@ -170,16 +136,20 @@ async def map_index_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
         ),
         "Date création": get_value(item, "dcterms:created"),
         "date": get_value(item, "dcterms:date"),
-        "Relation": _get_display_title(item, "dcterms:relation"),
+        "Relation": get_display_titles(item, "dcterms:relation"),
         "Remplacé par": get_value(item, "dcterms:isReplacedBy"),
-        "Partie de": _get_display_title(item, "dcterms:isPartOf"),
+        "Partie de": get_display_titles(item, "dcterms:isPartOf"),
         "spatial": get_value(item, "dcterms:spatial"),
-        "A une partie": _get_display_title(item, "dcterms:hasPart"),
+        "A une partie": get_display_titles(item, "dcterms:hasPart"),
         "Prénom": get_value(item, "foaf:firstName"),
         "Nom": get_value(item, "foaf:lastName"),
-        "Genre": _get_display_title(item, "foaf:gender"),
+        "Genre": get_display_titles(item, "foaf:gender"),
         "Naissance": get_value(item, "foaf:birthday"),
-        "Coordonnées": get_value(item, "curation:coordinates"),
+        "Coordonnées": coordinates,
+        # Analysable companions of the "lat, lng" string; null when it is
+        # absent, multiple or malformed.
+        "latitude": latitude,
+        "longitude": longitude,
     }
 
 

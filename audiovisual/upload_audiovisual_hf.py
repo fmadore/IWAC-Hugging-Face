@@ -59,18 +59,24 @@ from iwac_common.omeka_client import (
     conn_manager,
     fetch_iiif_thumbnail_url,
     fetch_primary_media_url,
+    iiif_manifest_url,
+    item_page_url,
 )
 from iwac_common.field_mappers import (
     extract_added_date,
+    get_display_titles,
+    get_literal_values,
+    get_resource_ids,
     get_rights_label,
     get_uri_value,
     get_value,
     get_value_by_language,
     is_content_public,
+    parse_pub_date,
 )
 from iwac_common.text_utils import count_words
 from iwac_common.upload_runner import UploadSpec, run_upload
-from iwac_common.schema import SUBSETS
+from iwac_common.schema import COUNTRY_ITEM_SETS, SUBSETS
 from country_mapper import get_country_from_newspaper
 
 load_dotenv()
@@ -86,10 +92,7 @@ YOUTUBE_TEMPLATE_ID = 23
 # from one country's channels, so membership settles the country outright.
 # Bénin is pre-declared and still empty; the ingester creates one set per
 # country as channels are approved.
-ITEM_SET_COUNTRY = {
-    2194: "Benin",           # Vidéos YouTube (Bénin)
-    108260: "Burkina Faso",  # Vidéos YouTube (Burkina Faso)
-}
+ITEM_SET_COUNTRY = COUNTRY_ITEM_SETS["audiovisual"]
 
 # ``dcterms:spatial`` links to the French-labelled place authority, while the
 # dataset's canonical country labels are the ones country_mapper emits (note
@@ -125,38 +128,6 @@ _ISO_DURATION_RE = re.compile(
 # ---------------------------------------------------------------------------
 # Fonctions d'aide pour mapper les champs Omeka → plat
 # ---------------------------------------------------------------------------
-
-def _get_display_title(item: Dict[str, Any], field: str) -> str:
-    """Extract display_title from a field."""
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        titles = []
-        for v in val:
-            if isinstance(v, dict) and "display_title" in v:
-                titles.append(str(v["display_title"]))
-        return "|".join(filter(None, titles))
-    elif isinstance(val, dict) and "display_title" in val:
-        return str(val["display_title"])
-    return ""
-
-
-def _get_at_value(item: Dict[str, Any], field: str) -> str:
-    """Extract @value from a field."""
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        values = []
-        for v in val:
-            if isinstance(v, dict) and "@value" in v:
-                values.append(str(v["@value"]))
-        return "|".join(filter(None, values))
-    elif isinstance(val, dict) and "@value" in val:
-        return str(val["@value"])
-    return ""
-
 
 def _source_type(item: Dict[str, Any]) -> str:
     """``youtube`` for an embedded video, ``deposited`` for a DVD/CD recording.
@@ -223,7 +194,7 @@ def _resolve_country(item: Dict[str, Any]) -> str:
         if country:
             return country
 
-    for publisher in _get_display_title(item, "dcterms:publisher").split("|"):
+    for publisher in get_display_titles(item, "dcterms:publisher").split("|"):
         country = get_country_from_newspaper(publisher.strip())
         if country:
             return country
@@ -237,7 +208,7 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
         item, api, affected_fields=("PDF",)
     )
 
-    publisher = _get_display_title(item, "dcterms:publisher")
+    publisher = get_display_titles(item, "dcterms:publisher")
     country = _resolve_country(item)
     source_type = _source_type(item)
 
@@ -258,25 +229,27 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
     # file behind it; take the thumbnail whenever the item has any media.
     session = await conn_manager.get()
     thumbnail_url = ""
-    iiif_manifest_url = ""
+    manifest_url = ""
 
     if item.get("o:primary_media"):
         thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
         if not thumbnail_url:
             thumbnail_url = (item.get("thumbnail_display_urls") or {}).get("large", "")
     if primary_url:
-        iiif_manifest_url = f"https://islam.zmo.de/iiif/3/{item['o:id']}/manifest"
+        manifest_url = iiif_manifest_url(item["o:id"])
 
-    extent = _get_at_value(item, "dcterms:extent")
+    extent = get_literal_values(item, "dcterms:extent")
+    pub_date = get_value(item, "dcterms:date")
+    pub_year, pub_date_precision = parse_pub_date(pub_date)
 
     return {
         "o:id": item["o:id"],
         "identifier": get_value(item, "dcterms:identifier"),
         "added_date": added_date,
-        "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
+        "iwac_url": item_page_url(item["o:id"]),
         # Empty on a YouTube row: that media stores no file, so there is no
         # canvas to show. Kept for the deposited recordings.
-        "iiif_manifest": iiif_manifest_url,
+        "iiif_manifest": manifest_url,
         # Legacy name, kept for compatibility: the deposited recordings' file
         # is video/audio, never a PDF. Empty for YouTube — see ``URL``.
         "PDF": primary_url,
@@ -288,12 +261,16 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
         "source_type": source_type,
         "title": get_value(item, "dcterms:title"),
         "creator": get_value(item, "dcterms:creator"),
+        "creator_ids": get_resource_ids(item, "dcterms:creator"),
         # Linked authority (the channel's foaf:Organization, or the producer
         # of a deposited recording), pipe-joined if an item ever carries more
         # than one.
         "publisher": publisher,
+        "publisher_ids": get_resource_ids(item, "dcterms:publisher"),
         "country": country,
-        "pub_date": get_value(item, "dcterms:date"),
+        "pub_date": pub_date,
+        "pub_year": pub_year,
+        "pub_date_precision": pub_date_precision,
         # The human-authored blurb — the public YouTube description on an
         # embedded video. Distinct from ``descriptionAI``, which is reserved
         # for the model-written bibo:shortDescription.
@@ -307,22 +284,24 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
         "descriptionAI_en": get_value_by_language(
             item, "bibo:shortDescription", "en"
         ),
-        "volume": _get_at_value(item, "bibo:volume"),
-        "issue": _get_at_value(item, "bibo:issue"),
-        "is_part_of": _get_at_value(item, "dcterms:isPartOf"),
+        "volume": get_literal_values(item, "bibo:volume"),
+        "issue": get_literal_values(item, "bibo:issue"),
+        "is_part_of": get_literal_values(item, "dcterms:isPartOf"),
         "extent": extent,
         "duration_seconds": _parse_iso_duration_seconds(extent),
         # The carrier as catalogued: "DVD"/"CD" for a deposited recording,
         # "Vidéo sur le web" for an embedded one. Read ``source_type`` to
         # branch on the record's shape; this field states what the object is.
-        "medium": _get_display_title(item, "dcterms:medium"),
-        "type": _get_display_title(item, "dcterms:type"),
+        "medium": get_display_titles(item, "dcterms:medium"),
+        "type": get_display_titles(item, "dcterms:type"),
         "rights": get_rights_label(item),
         # Provenance — who deposited or ingested the item, as on `documents`.
         # Distinct from ``creator``.
-        "contributor": _get_display_title(item, "dcterms:contributor"),
+        "contributor": get_display_titles(item, "dcterms:contributor"),
         "subject": get_value(item, "dcterms:subject"),
+        "subject_ids": get_resource_ids(item, "dcterms:subject"),
         "spatial": get_value(item, "dcterms:spatial"),
+        "spatial_ids": get_resource_ids(item, "dcterms:spatial"),
         "language": get_value(item, "dcterms:language"),
         "source": get_value(item, "dcterms:source"),
         "OCR": content_text,

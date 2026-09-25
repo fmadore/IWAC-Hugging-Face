@@ -107,6 +107,45 @@ class UploadSpec:
     extra_config_rows: Sequence[tuple] = field(default_factory=tuple)  # (label, value) panel rows
 
 
+def report_unmapped_values(
+    source_column: str, derived_column: str, *, limit: int = 15
+) -> Callable[[pd.DataFrame, OmekaApiClient, str, Optional[str]], Awaitable[pd.DataFrame]]:
+    """A ``post_map`` hook listing ``source_column`` values whose
+    ``derived_column`` came out blank — e.g. outlets missing from
+    ``country_mapper``, which otherwise leave ``country`` empty in silence.
+    Report-only: the frame is returned unchanged.
+    """
+
+    async def hook(df: pd.DataFrame, api, repo, token) -> pd.DataFrame:
+        if source_column not in df.columns or derived_column not in df.columns:
+            return df
+        source = df[source_column].fillna("").astype(str).str.strip()
+        derived = df[derived_column].fillna("").astype(str).str.strip()
+        unmapped = source[(derived == "") & (source != "")].value_counts()
+        if unmapped.empty:
+            return df
+        console = Console()
+        table = Table(
+            title=f"{int(unmapped.sum()):,} rows with a {source_column} but no {derived_column}",
+            box=box.SIMPLE,
+        )
+        table.add_column(source_column, style="yellow")
+        table.add_column("Rows", justify="right")
+        for value, count in unmapped.head(limit).items():
+            table.add_row(value, f"{count:,}")
+        if len(unmapped) > limit:
+            table.add_row(f"… {len(unmapped) - limit} more", "")
+        console.print(table)
+        console.print(
+            f"[yellow]⚠[/yellow] {derived_column} stays blank for these; add the "
+            f"missing {source_column} values to country_mapper.py if they belong "
+            "to a collection country."
+        )
+        return df
+
+    return hook
+
+
 def _setup_console_logging() -> tuple[Console, logging.Logger]:
     console = Console()
     logging.basicConfig(
@@ -478,4 +517,4 @@ def run_upload(spec: UploadSpec, argv: Optional[Sequence[str]] = None) -> int:
         return 130
 
 
-__all__ = ["UploadSpec", "run_upload", "build_parser"]
+__all__ = ["UploadSpec", "run_upload", "build_parser", "report_unmapped_values"]
