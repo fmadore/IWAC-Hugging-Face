@@ -252,7 +252,8 @@ def main() -> None:
               f"found {len(pol_present)}.")
 
     # --- row filter: real topic + >= 2 polarity votes ---
-    topic_id = pd.to_numeric(df["lda_topic_id"], errors="coerce")  # float64 on the Hub
+    # float64 on older Hub revisions, nullable int64 since the canonical types
+    topic_id = pd.to_numeric(df["lda_topic_id"], errors="coerce")
     has_topic = topic_id.notna() & (topic_id != -1)
 
     votes = df[pol_present].apply(

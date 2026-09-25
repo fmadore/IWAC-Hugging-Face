@@ -5,21 +5,23 @@ entity_networks.py
 
 Subject co-occurrence networks from the IWAC authority file.
 
-``articles.subject`` is a controlled vocabulary: each pipe-separated value
-matches an ``index.Titre`` exactly (persons, organisations, places, events,
-subjects). This builds an undirected graph whose nodes are those authority
-entities and whose edges weight how often two entities are tagged on the same
-article — the actor/topic network of the corpus, ready for Gephi.
+``articles.subject`` links authority records (persons, organisations,
+places, events, subjects). This builds an undirected graph whose nodes are
+those authority entities and whose edges weight how often two entities are
+tagged on the same article — the actor/topic network of the corpus, ready for
+Gephi.
 
-For each article: split ``subject`` on ``|``, deduplicate, keep values that
-match an ``index.Titre``, and attach the entity ``Type`` from the index plus
-the article's country/year. Edge weight = number of co-occurring articles;
-edge ``pmi`` = pointwise mutual information over articles (association
-strength independent of raw frequency).
+Entities are resolved by id: ``articles.subject_ids`` carries the linked
+authorities' ``o:id``, joined to ``index.o:id`` — two authorities sharing a
+title stay two nodes. Rows without ids (a Hub revision older than the ids
+columns) fall back to matching each ``subject`` value against ``index.Titre``
+exactly. Edge weight = number of co-occurring articles; edge ``pmi`` =
+pointwise mutual information over articles (association strength independent
+of raw frequency).
 
 Outputs (analyses/output/, Gephi-ready):
-- entity_nodes.csv   Id, Label, Type, articles_count, first_year, last_year
-- entity_edges.csv   Source, Target, Weight, pmi, Type=Undirected
+- entity_nodes.csv   Id (index o:id), Label, Type, articles_count, first_year, last_year
+- entity_edges.csv   Source, Target (index o:ids), Weight, pmi, Type=Undirected
 
 Never writes to the Hub.
 
@@ -37,7 +39,7 @@ import sys
 from collections import Counter, defaultdict
 from itertools import combinations
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -66,6 +68,22 @@ def split_subjects(raw) -> Set[str]:
     if raw is None or (isinstance(raw, float) and pd.isna(raw)):
         return set()
     return {s.strip() for s in str(raw).split("|") if s.strip()}
+
+
+def resolve_entities(
+    row, id_to_title: Dict[str, str], title_to_id: Dict[str, str]
+) -> Tuple[Set[str], int]:
+    """``(entity ids, subject tokens considered)`` for one article.
+
+    ``subject_ids`` wins when the row has it; otherwise each ``subject`` label
+    is matched to an index title (the first index row with that title, which is
+    how the title join always resolved homonyms).
+    """
+    ids = split_subjects(row.get("subject_ids"))
+    if ids:
+        return {i for i in ids if i in id_to_title}, len(ids)
+    labels = split_subjects(row.get("subject"))
+    return {title_to_id[t] for t in labels if t in title_to_id}, len(labels)
 
 
 def parse_year(pub_date) -> Optional[int]:
@@ -110,28 +128,34 @@ def main() -> None:
 
     console.print(Panel.fit(
         "[bold cyan]Entity Co-occurrence Networks[/bold cyan]\n"
-        "[dim]Subject authority join (articles.subject ↔ index.Titre)[/dim]",
+        "[dim]Subject authority join (articles.subject_ids ↔ index.o:id)[/dim]",
         border_style="cyan",
     ))
 
     token = ensure_hf_token(console=console) if args.source == "hub" else None
     articles = load_subset_dataframe(
         args.repo, "articles", token=token, source=args.source,
-        columns=["o:id", "subject", "country", "pub_date"], console=console,
+        columns=["o:id", "subject", "subject_ids", "country", "pub_date"], console=console,
     )
     source_revision = articles.attrs.get("iwac_source_revision")
     index = load_subset_dataframe(
         args.repo, "index", token=token, source=args.source,
-        columns=["Titre", "Type"], console=console, revision=source_revision,
+        columns=["o:id", "Titre", "Type"], console=console, revision=source_revision,
     )
 
-    # Authority lookup: Titre -> Type.
+    # Authority lookups: o:id -> Titre / Type, and Titre -> first o:id.
+    id_to_title: Dict[str, str] = {}
     entity_type: Dict[str, str] = {}
-    for _, r in index.iterrows():
-        titre = str(r.get("Titre", "")).strip()
-        if titre and titre not in entity_type:
-            entity_type[titre] = str(r.get("Type", "") or "").strip()
-    console.print(f"[blue]→[/blue] Authority file: {len(entity_type):,} entities")
+    title_to_id: Dict[str, str] = {}
+    for r in index.to_dict("records"):
+        oid = str(r.get("o:id", "")).strip()
+        titre = str(r.get("Titre", "") or "").strip()
+        if not oid or not titre:
+            continue
+        id_to_title[oid] = titre
+        entity_type[oid] = str(r.get("Type", "") or "").strip()
+        title_to_id.setdefault(titre, oid)
+    console.print(f"[blue]→[/blue] Authority file: {len(id_to_title):,} entities")
 
     # Optional filters.
     df = articles
@@ -152,10 +176,10 @@ def main() -> None:
     total_subject_tokens = 0
     matched_subject_tokens = 0
 
-    for _, row in df.iterrows():
-        subs = split_subjects(row.get("subject"))
-        total_subject_tokens += len(subs)
-        matched = sorted(s for s in subs if s in entity_type)
+    for row in df.to_dict("records"):
+        entities, considered = resolve_entities(row, id_to_title, title_to_id)
+        total_subject_tokens += considered
+        matched = sorted(entities)
         matched_subject_tokens += len(matched)
         if not matched:
             continue
@@ -182,7 +206,7 @@ def main() -> None:
     for n in sorted(kept_nodes):
         yrs = node_years.get(n, [])
         node_rows.append({
-            "Id": n, "Label": n, "Type": entity_type.get(n, ""),
+            "Id": n, "Label": id_to_title.get(n, n), "Type": entity_type.get(n, ""),
             "articles_count": node_articles[n],
             "first_year": min(yrs) if yrs else "",
             "last_year": max(yrs) if yrs else "",
@@ -228,7 +252,7 @@ def main() -> None:
         top.add_column("Type", style="cyan")
         top.add_column("Wt. degree", justify="right")
         for entity, deg in wdeg.most_common(10):
-            top.add_row(entity, entity_type.get(entity, ""), str(int(deg)))
+            top.add_row(id_to_title.get(entity, entity), entity_type.get(entity, ""), str(int(deg)))
         console.print(top)
 
     if not edges_df.empty:
@@ -238,7 +262,11 @@ def main() -> None:
         et.add_column("Weight", justify="right")
         et.add_column("PMI", justify="right")
         for _, e in edges_df.head(args.top_edges).iterrows():
-            et.add_row(e["Source"], e["Target"], str(int(e["Weight"])), f"{e['pmi']:.2f}")
+            et.add_row(
+                id_to_title.get(e["Source"], e["Source"]),
+                id_to_title.get(e["Target"], e["Target"]),
+                str(int(e["Weight"])), f"{e['pmi']:.2f}",
+            )
         console.print(et)
 
     console.print(f"\n[green]✓[/green] Gephi-ready CSVs in [cyan]{OUTPUT_DIR}[/cyan]")

@@ -59,6 +59,7 @@ except ImportError:  # venv without the editable install
 from iwac_common.hub import (  # noqa: E402
     HubBaselineUnavailableError,
     get_repo_revision,
+    load_hub_columns,
     push_dataset_verified,
 )
 
@@ -142,7 +143,15 @@ def load_subset_dataframe(
                     "have been interrupted. Re-run data/fetch_datasets.py."
                 )
         console.print(f"[blue]→[/blue] Loading local mirror [cyan]{path.name}[/cyan]")
-        df = pd.read_csv(path, usecols=columns, dtype={"o:id": str}, low_memory=False)
+        # A requested column the mirror lacks (e.g. one added after the mirror
+        # was taken) is skipped, as the Hub path skips it; callers check.
+        wanted = set(columns) if columns else None
+        df = pd.read_csv(
+            path,
+            usecols=(lambda c: c in wanted) if wanted is not None else None,
+            dtype={"o:id": str},
+            low_memory=False,
+        )
         if manifest_entry is not None and len(df) != manifest_entry.get("rows"):
             raise RuntimeError(
                 f"Local mirror row count mismatch for {path.name}: read {len(df)}, "
@@ -156,18 +165,24 @@ def load_subset_dataframe(
             f"(file date: {pd.Timestamp(path.stat().st_mtime, unit='s').date()})."
         )
     elif source == "hub":
-        from datasets import load_dataset
-
         revision = revision or get_repo_revision(repo_id, token=token)
         with console.status(f"[bold green]Loading '{repo_id}' ({config_name}) from Hub...", spinner="dots"):
-            ds = load_dataset(
-                repo_id, name=config_name, split="train", token=token,
-                revision=revision,
-            )
-        if columns:
-            keep = [c for c in columns if c in ds.column_names]
-            ds = ds.select_columns(keep)
-        df = ds.to_pandas()
+            if columns:
+                # Column-pruned parquet read: only the requested columns travel
+                # (an analysis of lemma_nostop no longer downloads embeddings).
+                # Falls back to a full load of the same revision on failure.
+                df = load_hub_columns(
+                    repo_id, config_name, revision=revision, columns=columns,
+                    token=token, console=console,
+                )
+            else:
+                from datasets import load_dataset
+
+                ds = load_dataset(
+                    repo_id, name=config_name, split="train", token=token,
+                    revision=revision,
+                )
+                df = ds.to_pandas()
         df.attrs["iwac_source_revision"] = revision
     else:
         raise ValueError(f"Unknown source '{source}' (expected 'hub' or 'csv').")
