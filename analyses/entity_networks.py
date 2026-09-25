@@ -46,7 +46,12 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "post-processing"))
 
-from _common import ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
+from _common import (  # noqa: E402
+    PRIVATE_REPO_ID,
+    ensure_hf_token,
+    load_subset_dataframe,
+    write_run_manifest,
+)
 
 from rich import box  # noqa: E402
 from rich.console import Console  # noqa: E402
@@ -269,6 +274,11 @@ def main() -> None:
             )
         console.print(et)
 
+    write_run_manifest(
+        OUTPUT_DIR, script="entity_networks", repo_id=args.repo,
+        revision=source_revision, args=args,
+        outputs=[OUTPUT_DIR / "entity_nodes.csv", OUTPUT_DIR / "entity_edges.csv"],
+    )
     console.print(f"\n[green]✓[/green] Gephi-ready CSVs in [cyan]{OUTPUT_DIR}[/cyan]")
 
 

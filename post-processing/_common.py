@@ -210,6 +210,97 @@ def load_subset_dataframe(
     return df
 
 
+def _git_state() -> Dict[str, Any]:
+    """Code SHA and dirty flag of the checkout, or ``None`` values outside git."""
+    import subprocess
+
+    def run(*argv: str) -> Optional[str]:
+        try:
+            out = subprocess.run(
+                ["git", *argv], cwd=REPO_ROOT, capture_output=True, text=True,
+                timeout=10, check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout.strip()
+
+    sha = run("rev-parse", "HEAD")
+    status = run("status", "--porcelain")
+    return {"sha": sha, "dirty": None if status is None else bool(status)}
+
+
+def _package_versions(names: List[str]) -> Dict[str, Optional[str]]:
+    from importlib import metadata
+
+    versions: Dict[str, Optional[str]] = {}
+    for name in names:
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+def write_run_manifest(
+    output_dir: Path,
+    *,
+    script: str,
+    repo_id: Optional[str],
+    revision: Optional[str],
+    args: Any = None,
+    outputs: List[Path] = (),
+    inputs: Optional[Dict[str, Any]] = None,
+) -> Path:
+    """Record how a report-only run produced its outputs.
+
+    Written beside the outputs as ``<script>.manifest.json`` (the latest run)
+    and copied to ``runs/<script>_<UTC timestamp>.json`` so earlier runs stay
+    traceable although their CSVs are overwritten. Records the code SHA and
+    whether the checkout was dirty, the dataset repository and revision, the
+    command arguments, Python and key library versions, extra ``inputs`` (a
+    model directory, parameters), and the SHA-256 of every output file — what a
+    figure in a paper needs to be reproducible, which a seed alone is not.
+    """
+    import hashlib
+    import json
+    import platform
+    from datetime import datetime, timezone
+
+    def sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    now = datetime.now(timezone.utc)
+    manifest = {
+        "script": script,
+        "generated_at": now.isoformat(),
+        "code": _git_state(),
+        "dataset": {"repository": repo_id, "revision": revision},
+        "arguments": vars(args) if hasattr(args, "__dict__") else args,
+        "python": platform.python_version(),
+        "packages": _package_versions([
+            "iwac-hugging-face", "pandas", "numpy", "pyarrow", "datasets",
+            "gensim", "scipy", "spacy",
+        ]),
+        "inputs": inputs or {},
+        "outputs": {
+            Path(p).name: {"sha256": sha256(Path(p)), "bytes": Path(p).stat().st_size}
+            for p in outputs if Path(p).exists()
+        },
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(manifest, ensure_ascii=False, indent=2, default=str) + "\n"
+    latest = output_dir / f"{script}.manifest.json"
+    latest.write_text(text, encoding="utf-8")
+    runs = output_dir / "runs"
+    runs.mkdir(exist_ok=True)
+    (runs / f"{script}_{now.strftime('%Y%m%dT%H%M%SZ')}.json").write_text(text, encoding="utf-8")
+    return latest
+
+
 def ensure_hf_token(console: Optional[Console] = None) -> str:
     """Return a usable HF Hub token.
 
@@ -565,6 +656,7 @@ def print_dry_run_panel(
 
 
 __all__ = [
+    "write_run_manifest",
     "ensure_hf_token",
     "get_available_configs",
     "choose_config",

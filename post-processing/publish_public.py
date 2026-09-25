@@ -482,8 +482,12 @@ def main() -> None:
                         config_name=cfg,
                         token=token,
                         max_shard_size=args.max_shard_size,
+                        # The private source revision rides in the commit
+                        # message, so each public commit names exactly the
+                        # snapshot it was projected from.
                         commit_message=(
-                            f"Public projection of '{cfg}' from private mirror"
+                            f"Public projection of '{cfg}' from private mirror "
+                            f"@ {source_revision}"
                             + (
                                 f" ({blanked:,} private-content rows masked)"
                                 if content_cols else ""

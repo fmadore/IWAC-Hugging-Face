@@ -75,6 +75,7 @@ from lda_topic_modeling.modeling import (  # type: ignore
     chunk_tokens,
     create_lda_model,
     save_lda_model,
+    export_topic_table,
     load_lda_model,
     predict_batch,
     compute_coherence,
@@ -586,6 +587,21 @@ def main() -> int:
     logger.info("Predicting topics for all documents...")
 
     theta_col = None if args.no_theta_export else "_lda_theta"
+    # Declared output types: a first batch in which every row belongs to the
+    # other language (or has no text) is all None and would otherwise fix a
+    # new column's type as null, failing the next batch.
+    from datasets import Sequence as HFSequence, Value
+
+    predict_features = ds.features.copy()
+    predict_features.update({
+        topic_id_col: Value("int64"),
+        topic_prob_col: Value("float64"),
+        topic_label_col: Value("string"),
+        topic_topk_col: Value("string"),
+        model_name_col: Value("string"),
+    })
+    if theta_col is not None:
+        predict_features[theta_col] = HFSequence(Value("float64"))
     ds_processed = ds.map(
         lambda batch: predict_batch(
             lda_model,
@@ -610,6 +626,7 @@ def main() -> int:
         batched=True,
         batch_size=args.batch_size,
         desc="LDA prediction",
+        features=predict_features,
     )
 
     logger.info("Prediction complete.")
@@ -659,6 +676,12 @@ def main() -> int:
             logger.info(f"Mean probability: {np.mean(valid_probs_list):.3f}")
 
         counts = Counter(valid_ids)
+        topics_path = export_topic_table(
+            lda_model, model_dir, model_name=model_dir.name, counts=counts,
+            top_n=args.topic_label_words, lambda_relevance=lambda_relevance,
+            word_probs=word_probs_for_predict,
+        )
+        logger.info(f"Topic lookup table written to {topics_path}")
         logger.info("Top 10 most frequent topics:")
         for tid, count in counts.most_common(10):
             label = get_topic_label(

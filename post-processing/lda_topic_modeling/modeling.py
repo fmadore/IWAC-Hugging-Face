@@ -757,6 +757,63 @@ def compute_coherence(
     return metrics
 
 
+def pipeline_version() -> str:
+    """The installed package version (``pyproject.toml``), recorded with every
+    model. It used to be a hardcoded ``"1.1.0"`` that matched no release."""
+    from importlib import metadata
+
+    try:
+        return metadata.version("iwac-hugging-face")
+    except metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def export_topic_table(
+    model: LdaModel,
+    model_dir: Path,
+    *,
+    model_name: str,
+    counts: Dict[int, int] | None = None,
+    top_n: int = 6,
+    top_words: int = 15,
+    lambda_relevance: float | None = None,
+    word_probs: np.ndarray | None = None,
+) -> Path:
+    """Write ``<model_dir>/topics.csv``: one row per topic of this model.
+
+    ``lda_topic_id`` is only meaningful next to the model that produced it; this
+    table is the lookup a reader needs — the label the dataset carries, the
+    top words with their probabilities, and how many documents this run
+    assigned to the topic as dominant. Topic ids are per model, so the table
+    carries ``lda_model_name`` like the dataset column does.
+    """
+    import csv
+
+    counts = counts or {}
+    total = sum(counts.values())
+    path = model_dir / "topics.csv"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "lda_model_name", "lda_topic_id", "lda_topic_label", "top_words",
+            "n_documents", "share",
+        ])
+        for tid in range(model.num_topics):
+            label = get_topic_label(
+                model, tid, top_n=top_n, lambda_relevance=lambda_relevance,
+                word_probs=word_probs,
+            )
+            words = "|".join(
+                f"{word}:{prob:.4f}" for word, prob in model.show_topic(tid, topn=top_words)
+            )
+            n = int(counts.get(tid, 0))
+            writer.writerow([
+                model_name, tid, label, words, n,
+                f"{n / total:.4f}" if total else "",
+            ])
+    return path
+
+
 def save_model_parameters(
     model_dir: Path,
     num_topics: int,
@@ -786,7 +843,7 @@ def save_model_parameters(
         "metadata": {
             "created_at": datetime.now().isoformat(),
             "method": "LDA (gensim)",
-            "pipeline_version": "1.1.0",
+            "pipeline_version": pipeline_version(),
         },
         "lda": {
             "num_topics": num_topics,

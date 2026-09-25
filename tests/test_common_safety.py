@@ -110,3 +110,23 @@ def test_parquet_mirror_round_trip_keeps_types(monkeypatch, tmp_path):
     assert str(frame["lda_topic_id"].dtype) == "Int64"
     assert list(frame["embedding_OCR"][0]) == [0.5, 0.25]
     assert "absent" not in frame.columns
+
+
+def test_run_manifest_records_provenance(tmp_path):
+    import argparse
+
+    out = tmp_path / "result.csv"
+    out.write_text("a,b\n1,2\n", encoding="utf-8")
+    latest = _common.write_run_manifest(
+        tmp_path, script="demo", repo_id="owner/repo", revision="rev9",
+        args=argparse.Namespace(config="articles", seed=42),
+        outputs=[out], inputs={"model_dir": "lda_model_articles"},
+    )
+    record = json.loads(latest.read_text(encoding="utf-8"))
+    assert record["dataset"] == {"repository": "owner/repo", "revision": "rev9"}
+    assert record["arguments"] == {"config": "articles", "seed": 42}
+    assert record["outputs"]["result.csv"]["sha256"] == hashlib.sha256(
+        out.read_bytes()
+    ).hexdigest()
+    assert "sha" in record["code"] and "dirty" in record["code"]
+    assert len(list((tmp_path / "runs").glob("demo_*.json"))) == 1
