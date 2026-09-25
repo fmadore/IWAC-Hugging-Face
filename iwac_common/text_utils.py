@@ -66,4 +66,18 @@ def tokenize_words(text: str) -> List[str]:
     return _WORD_RE.findall(lowered)
 
 
-__all__ = ["simple_tokenize", "tokenize_words"]
+def count_words(text: object) -> int:
+    """``nb_mots``: the number of :func:`tokenize_words` tokens (0 if empty).
+
+    The single definition of the word count. It used to exist twice — the
+    references and audiovisual upload mappers counted ``\b\w+\b`` matches
+    (``l'islam`` = 2) while ``calculate_word_count.py`` counted elision-aware
+    tokens (``l'islam`` = 1) — so a references row's ``nb_mots`` depended on
+    which of the two had run last.
+    """
+    if not text:
+        return 0
+    return len(tokenize_words(str(text)))
+
+
+__all__ = ["simple_tokenize", "tokenize_words", "count_words"]

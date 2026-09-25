@@ -3,51 +3,44 @@
 calculate_word_count.py
 =======================
 
-Ajoute une colonne avec le nombre de mots à un dataset Hugging Face existant.
-Le script charge un dataset depuis le repository Hugging Face 'fmadore/islam-west-africa-collection',
-compte les mots dans la colonne 'OCR', et ajoute ces comptes dans une nouvelle
-colonne nommée 'nb_mots'. Le dataset mis à jour est ensuite poussé vers le Hub.
+Adds or refreshes the ``nb_mots`` column of an IWAC subset from its ``OCR``
+column, and pushes the subset back to the private Hub repository.
 
-L'utilisateur est invité à choisir la configuration ('articles', 'publications', 'documents',
-'references' ou 'audiovisual') à traiter.
+``nb_mots`` has a single definition, :func:`iwac_common.text_utils.count_words`
+(French-elision-aware: ``l'islam`` is one word). The references and
+audiovisual upload mappers use the same function, so a value is the same
+whichever of the two wrote it last — which was not the case while the
+mappers counted ``\\b\\w+\\b`` matches.
 
-Pour la configuration 'references', le script récupère le contenu bibo:content depuis l'API Omeka
-(incluant les valeurs privées) pour calculer le nombre de mots, sans stocker le contenu complet.
+``references`` is counted like every other subset. The private repository
+holds its full text in ``OCR``, so the per-item Omeka fetch this script used to
+make for references (to see private ``bibo:content``) is no longer needed.
 
 Usage
 -----
-    python post-processing/calculate_word_count.py [--config articles|publications|documents|references] [-y]
+    python post-processing/calculate_word_count.py            # interactive
+    python post-processing/calculate_word_count.py --config articles -y
+    python post-processing/calculate_word_count.py --config references --update-mode missing
 
-Exemple:
-    python post-processing/calculate_word_count.py            # menu interactif
-    python post-processing/calculate_word_count.py --config articles -y   # non interactif
-
-Variables d'environnement
----------------------
-HF_TOKEN              Jeton d'accès personnel pour le Hugging Face Hub (sinon, une
-                      connexion interactive sera demandée).
-OMEKA_BASE_URL        Base URL de l'API Omeka (pour references)
-OMEKA_KEY_IDENTITY    Identité de la clé Omeka (pour references, accès aux valeurs privées)
-OMEKA_KEY_CREDENTIAL  Credential de la clé Omeka (pour references, accès aux valeurs privées)
+Environment
+-----------
+HF_TOKEN    Hugging Face token (otherwise an interactive login is requested).
 """
+from __future__ import annotations
+
 import argparse
-import asyncio
 import logging
 import os
 import sys
-import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-import pandas as pd
-from datasets import Dataset
 from dotenv import load_dotenv
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
-from rich.logging import RichHandler
 from rich import box
-from rich.prompt import Prompt, Confirm
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.panel import Panel
+from rich.prompt import Confirm
+from rich.table import Table
 
 # Make ``post-processing/_common.py`` and ``iwac_common`` importable.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -57,491 +50,175 @@ from _common import (  # noqa: E402
     PRIVATE_REPO_ID,
     ensure_hf_token,
     load_hub_dataset,
+    map_with_progress,
+    print_dry_run_panel,
     push_dataset,
+    reorder_columns_after,
+    resolve_config,
 )
-from iwac_common.omeka_client import Config, OmekaApiClient, conn_manager  # noqa: E402
-from iwac_common.text_utils import tokenize_words  # noqa: E402
+from iwac_common.text_utils import count_words as _count_words  # noqa: E402
 
 load_dotenv()
 
 console = Console()
 
-# ---------------------------------------------------------------------------
-# Omeka client — shared infra from iwac_common + reference-specific fetches
-# ---------------------------------------------------------------------------
-
-WORD_COUNT_CACHE_DIR = ".cache_word_count"
-
-
-class ReferenceContentClient(OmekaApiClient):
-    """Omeka client with per-item ``bibo:content`` fetches for references.
-
-    Cache, retry, connection pooling and auth come from
-    ``iwac_common.omeka_client``; only the content extraction (which needs
-    the API key to see private values) is specific to this script.
-    """
-
-    async def fetch_item(self, item_id: int) -> Dict[str, Any]:
-        """Fetch a single item by ID to get its bibo:content including private values."""
-        return await self.request(f"items/{item_id}", {})
-
-    async def fetch_items_content(self, item_ids: List[int]) -> Dict[int, str]:
-        """Fetch bibo:content concurrently; fail if any item cannot be read."""
-        results = {}
-        errors: list[tuple[int, str]] = []
-
-        # Use semaphore to limit concurrent requests
-        semaphore = asyncio.Semaphore(10)
-
-        async def fetch_one(item_id: int) -> tuple:
-            async with semaphore:
-                try:
-                    item = await self.fetch_item(item_id)
-                    content = self._extract_content(item)
-                    return (item_id, content, None)
-                except Exception as e:
-                    return (item_id, None, e)
-
-        tasks = [fetch_one(item_id) for item_id in item_ids]
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TextColumn("[bold]{task.completed}/{task.total}"),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("[cyan]Fetching content from Omeka API", total=len(tasks))
-
-            for coro in asyncio.as_completed(tasks):
-                item_id, content, exc = await coro
-                if exc is None:
-                    results[item_id] = content
-                else:
-                    errors.append((item_id, str(exc)))
-                progress.update(task, advance=1)
-
-        if errors:
-            sample = "; ".join(f"{item_id}: {error}" for item_id, error in errors[:5])
-            raise RuntimeError(
-                f"Could not fetch private bibo:content for {len(errors)} reference(s) "
-                f"({sample}). Refusing to replace their existing word counts with zero."
-            )
-
-        return results
-
-    def _extract_content(self, item: Dict[str, Any]) -> str:
-        """Extract bibo:content from an item."""
-        if "bibo:content" not in item or item["bibo:content"] is None:
-            return ""
-        val = item["bibo:content"]
-        if isinstance(val, list):
-            parts = [str(v.get("@value", "")) for v in val]
-            return " ".join(filter(None, parts))
-        if isinstance(val, dict):
-            return val.get("@value", "")
-        return str(val)
+TEXT_COLUMN = "OCR"
+COUNT_COLUMN = "nb_mots"
+WORD_COUNT_SUBSETS = ["articles", "publications", "documents", "references", "audiovisual"]
 
 
 def configure_logging() -> None:
-    """Configure le logging avec Rich."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
         datefmt="[%X]",
-        handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)]
+        handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)],
     )
 
+
 def count_words(text: str | None) -> int:
-    """
-    Compte le nombre de mots dans une chaîne de caractères.
+    """Word count of ``text`` — see :func:`iwac_common.text_utils.count_words`."""
+    return _count_words(text)
 
-    Utilise le tokenizer partagé ``iwac_common.text_utils.tokenize_words``
-    (sensible à l'élision française) : les clitiques élidés ne comptent plus
-    comme des mots séparés — « l'islam » = 1 mot (avant : 2).
-
-    Args:
-        text: Texte à analyser (peut être None)
-
-    Returns:
-        Nombre de mots trouvés (0 si le texte est None ou vide)
-    """
-    if not text:
-        return 0
-    return len(tokenize_words(str(text)))
 
 def add_word_count_batch(
-    batch: dict[str, list], text_col: str, count_col: str, update_mode: str = "all"
-) -> dict[str, list]:
-    """
-    Applique le comptage de mots à un batch d'exemples.
+    batch: Dict[str, List[Any]], text_col: str, count_col: str, update_mode: str = "all"
+) -> Dict[str, List[Any]]:
+    """Fill ``count_col`` for one ``.map(batched=True)`` batch.
 
-    Args:
-        batch: Dictionnaire contenant les colonnes du batch
-        text_col: Nom de la colonne contenant le texte à analyser
-        count_col: Nom de la colonne où stocker les comptes de mots
-        update_mode: "all" recalcule chaque ligne; "missing" ne calcule que les
-            lignes dont ``count_col`` est absent/nul (les valeurs existantes
-            sont conservées).
-
-    Returns:
-        Le batch avec la colonne de comptage ajoutée ou mise à jour
+    ``update_mode="all"`` recounts every row; ``"missing"`` only fills rows
+    whose count is null and keeps the existing values.
     """
     if text_col not in batch:
-        # Si la colonne de texte n'est pas dans ce batch (peut arriver avec des datasets hétérogènes)
-        # ou si le batch est vide, retourner le batch tel quel ou avec une colonne de comptes vide.
+        # An empty batch (or a subset without the text column): guard against
+        # next(iter(batch)) raising StopIteration.
         if count_col not in batch:
-            # Garde-fou: next(iter(batch)) lèverait StopIteration sur un batch vide.
             first_col = next(iter(batch), None)
             batch[count_col] = [0] * (len(batch[first_col]) if first_col is not None else 0)
         return batch
 
-    texts_in_batch: list = batch[text_col]
+    texts = batch[text_col]
     existing = batch.get(count_col) if update_mode == "missing" else None
     if existing is not None:
         batch[count_col] = [
             existing[i] if existing[i] is not None else count_words(text)
-            for i, text in enumerate(texts_in_batch)
+            for i, text in enumerate(texts)
         ]
     else:
-        batch[count_col] = [count_words(text) for text in texts_in_batch]
+        batch[count_col] = [count_words(text) for text in texts]
     return batch
 
-def main() -> int:
-    """
-    Fonction principale pour ajouter une colonne de comptage de mots au dataset.
-    
-    Charge le dataset depuis Hugging Face Hub, compte les mots dans la colonne OCR
-    (ou depuis l'API Omeka pour les références), et pousse le dataset mis à jour vers le Hub.
-    """
-    configure_logging()
-    logger = logging.getLogger(__name__)
 
-    # Display script header
+def print_summary(counts: List[Any], config_name: str) -> None:
+    values = [v for v in counts if v is not None]
+    table = Table(title=f"Word counts — {config_name}", box=box.ROUNDED)
+    table.add_column("Statistic", style="cyan")
+    table.add_column("Value", style="green", justify="right")
+    table.add_row("Rows", f"{len(counts):,}")
+    table.add_row("Rows with text", f"{sum(1 for v in values if v):,}")
+    table.add_row("Total words", f"{sum(values):,}")
+    if values:
+        table.add_row("Mean words/row", f"{sum(values) / len(values):.1f}")
+        table.add_row("Max words", f"{max(values):,}")
+    console.print(table)
+
+
+def main() -> int:
+    configure_logging()
     console.print(Panel.fit(
         "[bold cyan]Word Count Calculator[/bold cyan]\n"
-        "[dim]Add word count column to Hugging Face dataset[/dim]",
-        border_style="cyan"
+        f"[dim]{COUNT_COLUMN} from {TEXT_COLUMN} (elision-aware)[/dim]",
+        border_style="cyan",
     ))
 
     parser = argparse.ArgumentParser(
-        description="Ajoute/actualise la colonne 'nb_mots' d'un subset du dataset IWAC."
+        description=f"Add/refresh the '{COUNT_COLUMN}' column of an IWAC subset."
     )
     parser.add_argument("--repo", default=PRIVATE_REPO_ID)
-    parser.add_argument(
-        "--config",
-        choices=["articles", "publications", "documents", "references", "audiovisual"],
-        default=None,
-        help="Subset à traiter (évite le menu interactif)",
-    )
-    parser.add_argument(
-        "-y", "--yes",
-        action="store_true",
-        help="Recalculer sans confirmation quand 'nb_mots' existe déjà",
-    )
-    parser.add_argument(
-        "--update-mode",
-        choices=["missing", "all"],
-        default="all",
-        help="'all' recalcule tout (défaut, comportement historique); "
-             "'missing' ne calcule que les lignes sans 'nb_mots'",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Calcule et affiche un aperçu, mais ne pousse rien vers le Hub",
-    )
+    parser.add_argument("--config", choices=WORD_COUNT_SUBSETS, default=None,
+                        help="Subset to process (skips the interactive menu)")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help=f"Recompute without confirmation when '{COUNT_COLUMN}' exists")
+    parser.add_argument("--update-mode", choices=["missing", "all"], default="all",
+                        help="'all' recounts every row (default); 'missing' fills only null counts")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Compute and report, but push nothing")
+    parser.add_argument("--max-shard-size", default="1GB")
+    parser.add_argument("--batch-size", type=int, default=1000)
     args = parser.parse_args()
 
-    repo_id = args.repo
-    count_column_name = "nb_mots"
-    max_shard_size = "1GB"
-    batch_size = 1000
-
-    # --- Choix de la configuration (CLI ou menu interactif) ---
-    valid_configs = ["articles", "publications", "documents", "references", "audiovisual"]
-    if args.config:
-        config_name_choice = args.config
-    else:
-        try:
-            config_name_choice = Prompt.ask(
-                "[cyan]Quelle configuration traiter?[/cyan]",
-                choices=valid_configs,
-                default="articles"
-            )
-        except KeyboardInterrupt:
-            console.print("\n[yellow]⚠[/yellow] Opération annulée par l'utilisateur.")
-            return 0
-    
-    console.print(f"[green]→[/green] Configuration sélectionnée: [bold]{config_name_choice}[/bold]")
-    
-    # For references, we fetch content from API; for others, we use the OCR column
-    is_references = config_name_choice == "references"
-    text_column_fixed = None if is_references else "OCR"
-
-    # --- Authentification avec le Hub ---
     token = ensure_hf_token(console=console)
-    console.print("[green]✓[/green] Authentification Hugging Face réussie")
+    config_name = resolve_config(
+        args.repo, token=token, cli_config=args.config,
+        restrict_to=WORD_COUNT_SUBSETS, console=console,
+    )
+    console.print(f"[green]→[/green] Subset: [bold]{config_name}[/bold]")
 
-    # --- For references, check Omeka API credentials ---
-    if is_references:
-        omeka_cfg = Config(CACHE_DIR=WORD_COUNT_CACHE_DIR)
-        if not omeka_cfg.API_KEY_IDENTITY or not omeka_cfg.API_KEY_CREDENTIAL:
-            console.print("[red]✗[/red] Les credentials Omeka (OMEKA_KEY_IDENTITY et OMEKA_KEY_CREDENTIAL) sont requis pour les références.")
-            console.print("[yellow]ℹ[/yellow] Ces credentials sont nécessaires pour accéder aux valeurs privées de bibo:content.")
-            return 1
-        console.print("[green]✓[/green] Credentials Omeka configurés")
-
-    # --- Chargement du dataset ---
-    console.print(f"\n[blue]→[/blue] Chargement du dataset [bold]{repo_id}[/bold], configuration [bold]{config_name_choice}[/bold]...")
-    ds = load_hub_dataset(repo_id, config_name_choice, token=token, console=console)
+    ds = load_hub_dataset(args.repo, config_name, token=token, console=console)
     source_revision = getattr(ds, "_iwac_source_revision", None)
 
-    # Display dataset info
-    info_table = Table(title="Dataset Information", box=box.ROUNDED, show_header=False)
-    info_table.add_column("Property", style="cyan")
-    info_table.add_column("Value", style="green")
-    info_table.add_row("Nombre de lignes", f"{len(ds):,}")
-    info_table.add_row("Nombre de colonnes", str(len(ds.column_names)))
-    info_table.add_row("Colonnes", ", ".join(ds.column_names[:5]) + ("..." if len(ds.column_names) > 5 else ""))
-    console.print(info_table)
-
-    # For non-references, check that OCR column exists
-    if not is_references and text_column_fixed not in ds.column_names:
-        console.print(f"[red]✗[/red] La colonne de texte [bold]{text_column_fixed}[/bold] n'existe pas dans le dataset.")
-        console.print(f"[yellow]ℹ[/yellow] Colonnes disponibles: {', '.join(ds.column_names)}")
+    if TEXT_COLUMN not in ds.column_names:
+        console.print(f"[red]✗[/red] '{TEXT_COLUMN}' is missing from this subset.")
         return 1
 
-    # Check if o:id column exists (required for references)
-    if is_references and "o:id" not in ds.column_names:
-        console.print("[red]✗[/red] La colonne [bold]o:id[/bold] est requise pour les références mais n'existe pas.")
-        return 1
-
-    if count_column_name in ds.column_names and args.update_mode == "all":
-        # Ask user if they want to recalculate existing word counts
-        console.print(f"\n[yellow]⚠[/yellow] La colonne [bold]{count_column_name}[/bold] existe déjà.")
-        if args.yes or args.dry_run:
-            console.print("[green]→[/green] Recalcul confirmé (--yes/--dry-run).")
-        else:
-            try:
-                recalculate = Confirm.ask("Voulez-vous recalculer les comptes de mots existants?", default=False)
-                if not recalculate:
-                    console.print("[yellow]ℹ[/yellow] Opération annulée. Les comptes de mots existants sont conservés.")
-                    return 0
-                else:
-                    console.print("[green]→[/green] Recalcul des comptes de mots confirmé.")
-            except KeyboardInterrupt:
-                console.print("\n[yellow]⚠[/yellow] Opération annulée par l'utilisateur.")
-                return 0
-
-    # --- Process based on configuration type ---
-    if is_references:
-        # For references: fetch content from Omeka API and calculate word counts
-        ds_processed = asyncio.run(process_references_word_count(
-            ds, omeka_cfg, count_column_name, update_mode=args.update_mode
-        ))
-        if ds_processed is None:
-            return 1
-    else:
-        # For other configs: use the OCR column directly
-        console.print(f"\n[blue]→[/blue] Calcul du nombre de mots pour la colonne [bold]{text_column_fixed}[/bold]...")
-        
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(f"Comptage des mots dans '{text_column_fixed}'", total=None)
-            ds_processed = ds.map(
-                add_word_count_batch,
-                batched=True,
-                batch_size=batch_size,
-                fn_kwargs={
-                    "text_col": text_column_fixed,
-                    "count_col": count_column_name,
-                    "update_mode": args.update_mode,
-                },
-                # Ne jamais resservir un cache .map() périmé lors des re-runs
-                # (même pattern que calculate_lexical_richness.py).
-                load_from_cache_file=False,
-                new_fingerprint=str(uuid.uuid4()),
-            )
-        
-        console.print(f"[green]✓[/green] Comptage des mots terminé")
-        sample_counts = ds_processed[count_column_name][:5]
-        console.print(f"[dim]Aperçu (premiers 5): {sample_counts}[/dim]")
-
-        # Convert to pandas to ensure proper integer typing, then back to Dataset
-        with console.status("[bold blue]Conversion en format entier...", spinner="dots"):
-            df = ds_processed.to_pandas()
-            if count_column_name in df.columns:
-                df[count_column_name] = df[count_column_name].astype('Int64')  # Nullable integer type
-            ds_processed = Dataset.from_pandas(df, preserve_index=False)
-        console.print(f"[green]✓[/green] Colonne [bold]{count_column_name}[/bold] convertie en type entier (Int64)")
-
-        # --- Réorganisation des colonnes ---
-        console.print(f"\n[blue]→[/blue] Réorganisation des colonnes pour placer [bold]{count_column_name}[/bold] après [bold]{text_column_fixed}[/bold]")
-        current_columns = ds_processed.column_names
-        
-        if count_column_name in current_columns:
-            current_columns.remove(count_column_name)
-        
+    if COUNT_COLUMN in ds.column_names and args.update_mode == "all" and not (
+        args.yes or args.dry_run
+    ):
+        console.print(f"\n[yellow]⚠[/yellow] '{COUNT_COLUMN}' already exists.")
         try:
-            ocr_index = current_columns.index(text_column_fixed)
-            new_column_order = current_columns[:ocr_index+1] + [count_column_name] + current_columns[ocr_index+1:]
-            ds_processed = ds_processed.select_columns(new_column_order)
-            console.print(f"[green]✓[/green] Colonnes réorganisées")
-            console.print(f"[dim]Nouvel ordre: {', '.join(ds_processed.column_names[:5])}{'...' if len(ds_processed.column_names) > 5 else ''}[/dim]")
-        except ValueError:
-            console.print(f"[yellow]⚠[/yellow] La colonne de référence [bold]{text_column_fixed}[/bold] n'a pas été trouvée. Le dataset sera poussé sans réorganisation.")
+            if not Confirm.ask("Recompute every count?", default=False):
+                console.print("[yellow]ℹ[/yellow] Cancelled; existing counts kept.")
+                return 0
+        except KeyboardInterrupt:
+            console.print("\n[yellow]⚠[/yellow] Cancelled.")
+            return 0
 
-    # --- Dry-run: on s'arrête avant le push ---
+    from datasets import Value
+
+    ds = map_with_progress(
+        ds,
+        lambda batch: add_word_count_batch(
+            batch, text_col=TEXT_COLUMN, count_col=COUNT_COLUMN,
+            update_mode=args.update_mode,
+        ),
+        batch_size=args.batch_size,
+        description=f"[cyan]Counting words in '{TEXT_COLUMN}'",
+        console=console,
+        output_types={COUNT_COLUMN: Value("int64")},
+    )
+    ds = reorder_columns_after(ds, [COUNT_COLUMN], TEXT_COLUMN, console=console)
+    print_summary(ds[COUNT_COLUMN][:], config_name)
+
     if args.dry_run:
-        console.print(Panel(
-            "[yellow]Dry run — aucun push effectué.[/yellow]",
-            border_style="yellow",
-        ))
+        print_dry_run_panel(
+            repo_id=args.repo, config_name=config_name, n_rows=len(ds), console=console,
+        )
         return 0
 
-    # --- Push du dataset mis à jour vers le Hub ---
-    console.print(f"\n[blue]→[/blue] Push du dataset mis à jour vers [bold]{repo_id}[/bold] (config: [bold]{config_name_choice}[/bold])...")
-    commit_msg = f"Ajout/mise à jour de la colonne '{count_column_name}'"
-    if is_references:
-        commit_msg += " (calculée depuis bibo:content via API Omeka)"
-    else:
-        commit_msg += f" basée sur '{text_column_fixed}'"
-    commit_msg += f" (config: {config_name_choice})"
-
     if push_dataset(
-        ds_processed,
-        repo_id=repo_id,
-        config_name=config_name_choice,
+        ds,
+        repo_id=args.repo,
+        config_name=config_name,
         token=token,
-        max_shard_size=max_shard_size,
-        commit_message=commit_msg,
+        max_shard_size=args.max_shard_size,
+        commit_message=(
+            f"Add/update '{COUNT_COLUMN}' from '{TEXT_COLUMN}' "
+            f"(elision-aware count; config: {config_name}, mode: {args.update_mode})"
+        ),
         console=console,
         expected_revision=source_revision,
     ):
-        console.print("[green]✓[/green] Dataset poussé avec succès vers le Hub")
-        
-        # Final summary
-        source_info = "bibo:content (API Omeka)" if is_references else f"colonne '{text_column_fixed}'"
-        summary_panel = Panel(
-            f"[green]✓[/green] Colonne [bold]{count_column_name}[/bold] ajoutée avec succès\n"
-            f"[dim]Configuration: {config_name_choice}\n"
-            f"Source: {source_info}\n"
-            f"Lignes traitées: {len(ds_processed):,}\n"
-            f"Repository: {repo_id}[/dim]",
-            title="[bold green]Opération terminée[/bold green]",
-            border_style="green"
-        )
-        console.print(summary_panel)
+        console.print(Panel(
+            f"[green]✓[/green] '{COUNT_COLUMN}' written for [bold]{config_name}[/bold]\n"
+            f"[dim]Rows: {len(ds):,} · Repository: {args.repo}\n"
+            "Remember: the public dataset only changes when "
+            "post-processing/publish_public.py is re-run.[/dim]",
+            title="[bold green]Done[/bold green]",
+            border_style="green",
+        ))
         return 0
     return 1
 
-
-async def process_references_word_count(
-    ds: Dataset,
-    omeka_cfg: Config,
-    count_column_name: str,
-    *,
-    update_mode: str = "all",
-) -> Optional[Dataset]:
-    """
-    Process word count for references by fetching bibo:content from Omeka API.
-    
-    This function fetches the content from the Omeka API (including private values)
-    for each reference item, calculates the word count, and adds it to the dataset
-    without storing the actual content.
-    
-    Args:
-        ds: The references dataset from Hugging Face Hub
-        omeka_cfg: Configuration for Omeka API access
-        count_column_name: Name of the column to store word counts
-        
-    Returns:
-        The updated dataset with word counts, or None on failure
-    """
-    console.print("\n[blue]→[/blue] Récupération du contenu depuis l'API Omeka (incluant les valeurs privées)...")
-    console.print("[dim]Note: Le contenu bibo:content n'est pas stocké, seul le nombre de mots est conservé.[/dim]")
-    
-    # Get all item IDs from the dataset
-    df = ds.to_pandas()
-    if update_mode == "missing" and count_column_name in df.columns:
-        target_mask = df[count_column_name].isna()
-    else:
-        target_mask = pd.Series(True, index=df.index)
-    target_indices = df.index[target_mask].tolist()
-    item_ids = df.loc[target_indices, "o:id"].tolist()
-    if not item_ids:
-        console.print("[green]✓[/green] All reference word counts are already present.")
-        return ds
-    
-    # Convert to integers (they might be strings)
-    try:
-        item_ids_int = [int(item_id) for item_id in item_ids]
-    except (ValueError, TypeError) as e:
-        console.print(f"[red]✗[/red] Erreur lors de la conversion des IDs: {e}")
-        return None
-    
-    console.print(f"[blue]→[/blue] {len(item_ids_int)} références à traiter...")
-    
-    # Fetch content for all items
-    api = ReferenceContentClient(omeka_cfg, use_cache=True, console=console)
-    try:
-        content_map = await api.fetch_items_content(item_ids_int)
-    finally:
-        await conn_manager.close()
-    
-    # Calculate word counts
-    console.print("\n[blue]→[/blue] Calcul du nombre de mots...")
-    word_counts: dict[int, int] = {}
-    items_with_content = 0
-    
-    for item_id in item_ids:
-        item_id_int = int(item_id)
-        content = content_map.get(item_id_int, "")
-        wc = count_words(content)
-        word_counts[item_id_int] = wc
-        if content:
-            items_with_content += 1
-    
-    console.print(f"[green]✓[/green] Comptage terminé: {items_with_content}/{len(item_ids)} références avec contenu")
-    
-    # Add word counts to dataframe
-    if count_column_name not in df.columns:
-        df[count_column_name] = pd.NA
-    for row_index in target_indices:
-        item_id_int = int(df.at[row_index, "o:id"])
-        df.at[row_index, count_column_name] = word_counts[item_id_int]
-    df[count_column_name] = df[count_column_name].astype('Int64')
-    
-    # Show sample
-    sample_counts = df[count_column_name].head(5).tolist()
-    console.print(f"[dim]Aperçu (premiers 5): {sample_counts}[/dim]")
-    
-    # Show statistics
-    stats_table = Table(title="Word Count Statistics", box=box.ROUNDED)
-    stats_table.add_column("Statistic", style="cyan")
-    stats_table.add_column("Value", style="green")
-    stats_table.add_row("Total references", f"{len(df):,}")
-    stats_table.add_row("References processed", f"{len(item_ids):,}")
-    stats_table.add_row("Processed with content", f"{items_with_content:,}")
-    stats_table.add_row("Processed without content", f"{len(item_ids) - items_with_content:,}")
-    stats_table.add_row("Total words", f"{df[count_column_name].sum():,}")
-    stats_table.add_row("Average words/reference", f"{df[count_column_name].mean():.1f}")
-    stats_table.add_row("Max words", f"{df[count_column_name].max():,}")
-    console.print(stats_table)
-    
-    # Convert back to Dataset
-    ds_processed = Dataset.from_pandas(df, preserve_index=False)
-    
-    return ds_processed
 
 if __name__ == "__main__":
     raise SystemExit(main())

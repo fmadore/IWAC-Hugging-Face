@@ -68,6 +68,7 @@ from iwac_common.field_mappers import (
     get_value_by_language,
     is_content_public,
 )
+from iwac_common.text_utils import count_words
 from iwac_common.upload_runner import UploadSpec, run_upload
 from iwac_common.schema import SUBSETS
 from country_mapper import get_country_from_newspaper
@@ -124,18 +125,6 @@ _ISO_DURATION_RE = re.compile(
 # ---------------------------------------------------------------------------
 # Fonctions d'aide pour mapper les champs Omeka → plat
 # ---------------------------------------------------------------------------
-
-def count_words(text: Optional[str]) -> int:
-    """Compte le nombre de mots dans une chaîne. Retourne 0 si vide/None.
-
-    Même logique que ``reference/upload_reference_hf.py`` : les mots sont les
-    séquences alphanumériques (``\\b\\w+\\b``), ce qui gère la ponctuation et
-    les séparateurs multiples.
-    """
-    if not text:
-        return 0
-    return len(re.findall(r"\b\w+\b", str(text).lower()))
-
 
 def _get_display_title(item: Dict[str, Any], field: str) -> str:
     """Extract display_title from a field."""

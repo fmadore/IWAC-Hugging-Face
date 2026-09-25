@@ -39,6 +39,7 @@ from dotenv import load_dotenv
 
 from iwac_common.omeka_client import OmekaApiClient
 from iwac_common.field_mappers import extract_added_date, get_value, is_content_public
+from iwac_common.text_utils import count_words
 from iwac_common.upload_runner import UploadSpec, run_upload
 from iwac_common.schema import SUBSETS
 
@@ -88,20 +89,6 @@ COUNTRY_ITEM_SETS = {
 # ---------------------------------------------------------------------------
 # Fonctions d'aide pour mapper les champs Omeka → plat
 # ---------------------------------------------------------------------------
-
-def count_words(text: str) -> int:
-    """
-    Compte le nombre de mots dans une chaîne de caractères.
-    Les mots sont simplement séparés par des espaces.
-    Retourne 0 si le texte est None ou vide.
-    """
-    if not text:
-        return 0
-    # Utilise une expression régulière pour mieux gérer les séparateurs multiples
-    # et la ponctuation simple attachée aux mots.
-    words = re.findall(r"\b\w+\b", str(text).lower())
-    return len(words)
-
 
 # ``bibo:doi`` holds a URI value that is *usually* a DOI (as an https://doi.org/
 # link) but is sometimes a plain article/repository URL (ethnographiques.org,

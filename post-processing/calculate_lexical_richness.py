@@ -10,6 +10,16 @@ Adds lexical richness (MATTR - Moving Average Type-Token Ratio) and readability
 The user is prompted to choose the dataset configuration. Column names:
 "Richesse_Lexicale_OCR" (MATTR) and "Lisibilite_OCR" (Flesch).
 
+Readability is only defined for French. ``Lisibilite_OCR`` applies the
+Kandel–Moles French constants and French syllabification, so it is computed
+only for rows whose PRIMARY ``language`` (first pipe-separated value) is
+``Français``; every other row — English, Arabic, Hausa, Ewé, Kabiyè, Dendi,
+or no language at all — is stored as null, in every update mode, so a value
+computed before this rule existed is cleared rather than kept. A French
+formula applied to an African-language source ranks correct text as
+unreadable, which is worse than no score. MATTR is kept for every language:
+it counts types over tokens and carries no lexicon.
+
 Usage
 -----
     python post-processing/calculate_lexical_richness.py [--repo USER/DATASET]
@@ -38,6 +48,7 @@ from collections import Counter
 from typing import List, Dict, Any, Optional
 
 import textstat
+from datasets import Value
 
 # Make ``post-processing/_common.py`` and ``iwac_common`` importable.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -144,6 +155,21 @@ def calculate_readability(text: str) -> Optional[float]:
         return None
 
 
+#: The only language the Flesch column is defined for (the label Omeka uses).
+READABILITY_LANGUAGE = "Français"
+
+
+def primary_language(value: Any) -> str:
+    """First pipe-separated ``language`` value, stripped (``""`` if none).
+
+    Same rule as the lemmatiser's per-language passes, so a bilingual row
+    belongs to exactly one language everywhere in the pipeline.
+    """
+    if value is None:
+        return ""
+    return str(value).split("|")[0].strip()
+
+
 def compute_metrics_batch(
     batch: Dict[str, List[Any]],
     *,
@@ -153,6 +179,7 @@ def compute_metrics_batch(
     update_mode: str,
     window_size: int,
     error_counter: Dict[str, int],
+    language_col: str = "language",
 ) -> Dict[str, List[Any]]:
     """Compute lexical richness and readability for a batch.
 
@@ -166,7 +193,11 @@ def compute_metrics_batch(
         error_counter: Mutable dict to accumulate counts. 'richness_too_short'
             counts non-empty texts shorter than the MATTR window (stored as
             None by design, not an error); 'readability_failed' counts
-            readability computation failures.
+            readability computation failures; 'readability_not_french' counts
+            rows nulled because their primary language is not French.
+        language_col: Column holding the pipe-joined ``language`` labels.
+            Without it no row can be shown to be French, so readability is
+            null throughout.
 
     Returns:
         Batch with metrics added.
@@ -175,12 +206,15 @@ def compute_metrics_batch(
     existing_richness = batch.get(richness_col, [None] * len(texts))
     existing_readability = batch.get(readability_col, [None] * len(texts))
 
+    languages = batch.get(language_col, [None] * len(texts))
+
     richness_results = list(existing_richness)
     readability_results = list(existing_readability)
 
     for i, text in enumerate(texts):
         text_str = str(text) if text is not None else ""
         has_content = text is not None and text_str.strip()
+        is_french = primary_language(languages[i]) == READABILITY_LANGUAGE
 
         # Determine whether to process this row
         if update_mode == "missing":
@@ -198,7 +232,15 @@ def compute_metrics_batch(
                 error_counter["richness_too_short"] += 1
             richness_results[i] = result
 
-        if readability_needed:
+        if not is_french:
+            # Regardless of update mode: a French formula applied to another
+            # language is not a stale value to keep, it is a wrong one.
+            if has_content:
+                error_counter["readability_not_french"] = (
+                    error_counter.get("readability_not_french", 0) + 1
+                )
+            readability_results[i] = None
+        elif readability_needed:
             result = calculate_readability(text_str)
             if result is None and has_content:
                 error_counter["readability_failed"] += 1
@@ -421,7 +463,14 @@ def main() -> int:
     mode_desc = "all rows" if update_mode == "all" else "missing rows only"
     console.print(f"[blue]→[/blue] Processing {mode_desc}...")
 
-    error_counter: Dict[str, int] = {"richness_too_short": 0, "readability_failed": 0}
+    error_counter: Dict[str, int] = {
+        "richness_too_short": 0, "readability_failed": 0, "readability_not_french": 0,
+    }
+    if "language" not in ds.column_names:
+        console.print(
+            "[yellow]⚠[/yellow] No 'language' column: no row can be shown to be "
+            "French, so Lisibilite_OCR will be null throughout."
+        )
 
     with Progress(
         SpinnerColumn(),
@@ -446,6 +495,11 @@ def main() -> int:
             progress.update(task, advance=len(batch[text_column_name]))
             return result
 
+        # Declared, not inferred: a first batch of non-French rows is all None
+        # and would otherwise fix the column's type as null.
+        features = ds.features.copy()
+        features[richness_column_name] = Value("float64")
+        features[readability_column_name] = Value("float64")
         ds_processed = ds.map(
             compute_with_progress,
             batched=True,
@@ -453,6 +507,7 @@ def main() -> int:
             desc=None,
             load_from_cache_file=False,
             new_fingerprint=str(uuid.uuid4()),
+            features=features,
         )
 
     console.print("[green]✓[/green] Metrics computation complete.")
@@ -467,6 +522,12 @@ def main() -> int:
     if total_failures > 0:
         console.print(
             f"[yellow]⚠[/yellow] Failures: {total_failures} readability (stored as None)."
+        )
+    not_french = error_counter["readability_not_french"]
+    if not_french > 0:
+        console.print(
+            f"[yellow]ℹ[/yellow] {not_french} non-French texts: Lisibilite_OCR "
+            "stored as None (the French Flesch formula does not apply)."
         )
 
     # --- Verify results ---
@@ -526,7 +587,8 @@ def main() -> int:
 
     commit_message = (
         f"Add/update '{richness_column_name}' (MATTR, window={window_size}) and "
-        f"'{readability_column_name}' (Flesch) from '{text_column_name}' "
+        f"'{readability_column_name}' (French Flesch, primary-French rows only) "
+        f"from '{text_column_name}' "
         f"(config: {config_name_choice}, mode: {update_mode})"
     )
     if push_dataset(
