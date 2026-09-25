@@ -69,3 +69,44 @@ def test_multi_subset_read_rejects_revision_change(monkeypatch, tmp_path):
         _common.load_subset_dataframe(
             "owner/repo", "articles", source="csv", revision="older"
         )
+
+
+def test_parquet_mirror_round_trip_keeps_types(monkeypatch, tmp_path):
+    """Writer → manifest → loader, offline. The CSV mirror turned nullable ints
+    into floats and embeddings into JSON strings; the parquet one keeps both."""
+    import importlib.util
+    from pathlib import Path
+
+    import pyarrow as pa
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("_mirror_ut", root / "data" / "fetch_datasets.py")
+    mirror = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mirror)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    table = pa.table({
+        "o:id": ["1", "2"],
+        "lda_topic_id": pa.array([3, None], pa.int64()),
+        "embedding_OCR": pa.array([[0.5, 0.25], None], pa.list_(pa.float32())),
+    })
+    monkeypatch.setattr(mirror, "DATA_DIR", data_dir)
+    monkeypatch.setattr(mirror, "ALL_CONFIGS", ("articles",))
+    monkeypatch.setattr(mirror, "get_repo_revision", lambda *a, **k: "rev1")
+    monkeypatch.setattr(mirror, "load_dataset", lambda *a, **k: Dataset(table))
+    assert mirror.main(dataset_id="owner/repo", label="public", fmt="parquet") == 0
+
+    manifest = json.loads((data_dir / "mirror_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 2
+    assert manifest["configs"]["articles"]["file"] == "iwac_articles.parquet"
+
+    monkeypatch.setattr(_common, "REPO_ROOT", tmp_path)
+    frame = _common.load_subset_dataframe(
+        "owner/repo", "articles", source="local",
+        columns=["o:id", "lda_topic_id", "embedding_OCR", "absent"],
+    )
+    assert frame.attrs["iwac_source_revision"] == "rev1"
+    assert str(frame["lda_topic_id"].dtype) == "Int64"
+    assert list(frame["embedding_OCR"][0]) == [0.5, 0.25]
+    assert "absent" not in frame.columns

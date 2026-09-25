@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Create a revision-pinned, integrity-checked local CSV mirror of IWAC."""
+"""Create a revision-pinned, integrity-checked local mirror of IWAC.
+
+Parquet by default: types survive (nullable ints stay ints, booleans stay
+booleans, embeddings stay float vectors instead of JSON strings), and files are
+several times smaller than the CSV export — the articles CSV alone was 388 MB.
+``--format csv`` keeps the legacy CSV export for spreadsheet use.
+"""
 
 from __future__ import annotations
 
@@ -86,8 +92,34 @@ def _json_safe(value):
     return value
 
 
-def main(dataset_id: str = PRIVATE_REPO_ID, label: str = "private") -> int:
+MIRROR_FORMATS = ("parquet", "csv")
+
+
+def _write_config(dataset, path: Path, fmt: str) -> tuple[int, int]:
+    """Write one config; return ``(rows, columns)``."""
+    if fmt == "parquet":
+        import pyarrow.parquet as pq
+
+        table = dataset.with_format("arrow")[:]
+        pq.write_table(table, path)
+        return table.num_rows, table.num_columns
+    frame = dataset.to_pandas()
+    for column in frame.columns:
+        if frame[column].map(
+            lambda value: isinstance(value, (list, tuple, np.ndarray))
+        ).any():
+            frame[column] = frame[column].map(_json_safe)
+    frame.to_csv(path, index=False, encoding="utf-8")
+    return len(frame), len(frame.columns)
+
+
+def main(
+    dataset_id: str = PRIVATE_REPO_ID, label: str = "private", fmt: str = "parquet"
+) -> int:
     """Download every config at one Hub revision and publish the mirror atomically."""
+    if fmt not in MIRROR_FORMATS:
+        console.print(f"[red]✗[/red] Unknown mirror format {fmt!r}; use one of {MIRROR_FORMATS}.")
+        return 2
     token = (os.getenv("HF_TOKEN") or get_token()) if label == "private" else None
     if label == "private" and not token:
         console.print(
@@ -126,27 +158,22 @@ def main(dataset_id: str = PRIVATE_REPO_ID, label: str = "private") -> int:
                         token=token,
                         revision=revision,
                     )
-                    frame = dataset.to_pandas()
-                    for column in frame.columns:
-                        if frame[column].map(
-                            lambda value: isinstance(value, (list, tuple, np.ndarray))
-                        ).any():
-                            frame[column] = frame[column].map(_json_safe)
-
-                    filename = f"iwac_{config_name}.csv"
+                    filename = f"iwac_{config_name}.{fmt}"
                     path = staging / filename
-                    frame.to_csv(path, index=False, encoding="utf-8")
+                    rows, columns = _write_config(dataset, path, fmt)
                     results.append({
                         "config": config_name,
                         "file": filename,
-                        "rows": len(frame),
-                        "columns": len(frame.columns),
+                        "format": fmt,
+                        "rows": rows,
+                        "columns": columns,
                         "sha256": _sha256(path),
                     })
                     progress.update(task, advance=1)
 
             manifest = {
-                "schema_version": 1,
+                "schema_version": 2,
+                "format": fmt,
                 "repository": dataset_id,
                 "visibility": label,
                 "revision": revision,
@@ -200,6 +227,12 @@ if __name__ == "__main__":
         default=None,
         help="Repository to mirror (default: interactive prompt).",
     )
+    parser.add_argument(
+        "--format",
+        choices=MIRROR_FORMATS,
+        default="parquet",
+        help="Mirror file format (default: parquet; csv for spreadsheet use).",
+    )
     parsed = parser.parse_args()
     resolved_id, resolved_label = choose_dataset(parsed.dataset)
-    raise SystemExit(main(dataset_id=resolved_id, label=resolved_label))
+    raise SystemExit(main(dataset_id=resolved_id, label=resolved_label, fmt=parsed.format))

@@ -82,10 +82,12 @@ def mirror_main(argv: Sequence[str] | None = None) -> int:
     """Create a verified local CSV mirror."""
     parser = argparse.ArgumentParser(prog="iwac-mirror")
     parser.add_argument("--dataset", choices=["private", "public"], default=None)
+    parser.add_argument("--format", choices=["parquet", "csv"], default="parquet",
+                        help="Mirror file format (default: parquet)")
     args = parser.parse_args(argv)
     module = _load_script("data/fetch_datasets.py", "_iwac_mirror")
     repo_id, label = module.choose_dataset(args.dataset)
-    return int(module.main(dataset_id=repo_id, label=label))
+    return int(module.main(dataset_id=repo_id, label=label, fmt=args.format))
 
 
 def publish_public_main() -> int:

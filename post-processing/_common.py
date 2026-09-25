@@ -78,33 +78,31 @@ def load_subset_dataframe(
     """Load one IWAC subset as a pandas DataFrame.
 
     source="hub" downloads the live dataset (authoritative, needs network);
-    source="csv" reads the local ``data/iwac_<config>.csv`` mirror written by
-    ``data/fetch_datasets.py`` (fast, offline — but may lag the Hub).
+    source="local" (alias "csv", the historical name) reads the local mirror
+    written by ``data/fetch_datasets.py`` — ``data/iwac_<config>.parquet`` (or a
+    legacy ``.csv``), verified against ``mirror_manifest.json`` (fast, offline,
+    revision-pinned — but may lag the Hub).
 
-    ``columns`` restricts the frame (and, for CSV, what is parsed at all —
-    important for the 388 MB articles mirror). ``o:id`` is always cast to str.
+    ``columns`` restricts the frame (and what is read at all). ``o:id`` is
+    always cast to str.
     """
     import pandas as pd  # local import: keep module import light
 
     console = console or Console()
-    if source == "csv":
-        verify_manifest = csv_path is None
-        path = csv_path or (REPO_ROOT / "data" / f"iwac_{config_name}.csv")
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Local mirror not found: {path}. Run data/fetch_datasets.py or use --source hub."
-            )
+    if source in ("csv", "local"):
         manifest_entry = None
         manifest = None
-        if verify_manifest:
-            import hashlib
+        if csv_path is not None:
+            path = csv_path
+        else:
             import json
 
-            manifest_path = path.parent / "mirror_manifest.json"
+            data_dir = REPO_ROOT / "data"
+            manifest_path = data_dir / "mirror_manifest.json"
             if not manifest_path.exists():
                 raise RuntimeError(
                     f"Local mirror manifest not found: {manifest_path}. Re-run "
-                    "data/fetch_datasets.py; unversioned CSVs are not a safe baseline."
+                    "data/fetch_datasets.py; unversioned mirror files are not a safe baseline."
                 )
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -113,7 +111,7 @@ def load_subset_dataframe(
                 raise RuntimeError(
                     f"Invalid mirror manifest for '{config_name}': {exc}"
                 ) from exc
-            if manifest.get("schema_version") != 1:
+            if manifest.get("schema_version") not in (1, 2):
                 raise RuntimeError(
                     f"Unsupported local mirror manifest schema: "
                     f"{manifest.get('schema_version')!r}."
@@ -128,11 +126,20 @@ def load_subset_dataframe(
                     f"Local mirror revision changed from requested {revision} to "
                     f"{manifest.get('revision')}; restart the multi-subset analysis."
                 )
-            if manifest_entry.get("file") != path.name:
+            expected = {f"iwac_{config_name}.parquet", f"iwac_{config_name}.csv"}
+            if manifest_entry.get("file") not in expected:
                 raise RuntimeError(
                     f"Mirror manifest maps '{config_name}' to "
-                    f"{manifest_entry.get('file')!r}, expected {path.name!r}."
+                    f"{manifest_entry.get('file')!r}, expected one of {sorted(expected)}."
                 )
+            path = data_dir / manifest_entry["file"]
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Local mirror not found: {path}. Run data/fetch_datasets.py or use --source hub."
+            )
+        if manifest_entry is not None:
+            import hashlib
+
             digest = hashlib.sha256()
             with path.open("rb") as handle:
                 for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -143,15 +150,25 @@ def load_subset_dataframe(
                     "have been interrupted. Re-run data/fetch_datasets.py."
                 )
         console.print(f"[blue]→[/blue] Loading local mirror [cyan]{path.name}[/cyan]")
-        # A requested column the mirror lacks (e.g. one added after the mirror
-        # was taken) is skipped, as the Hub path skips it; callers check.
-        wanted = set(columns) if columns else None
-        df = pd.read_csv(
-            path,
-            usecols=(lambda c: c in wanted) if wanted is not None else None,
-            dtype={"o:id": str},
-            low_memory=False,
-        )
+        if path.suffix == ".parquet":
+            # Typed mirror: nullable ints, bools and embedding lists survive.
+            import pyarrow.parquet as pq
+
+            from iwac_common.schema import arrow_to_pandas
+
+            names = pq.read_schema(path).names
+            wanted = [c for c in columns if c in names] if columns else None
+            df = arrow_to_pandas(pq.read_table(path, columns=wanted))
+        else:
+            # A requested column the mirror lacks (e.g. one added after the
+            # mirror was taken) is skipped, as the Hub path skips it.
+            wanted_set = set(columns) if columns else None
+            df = pd.read_csv(
+                path,
+                usecols=(lambda c: c in wanted_set) if wanted_set is not None else None,
+                dtype={"o:id": str},
+                low_memory=False,
+            )
         if manifest_entry is not None and len(df) != manifest_entry.get("rows"):
             raise RuntimeError(
                 f"Local mirror row count mismatch for {path.name}: read {len(df)}, "
@@ -161,7 +178,7 @@ def load_subset_dataframe(
             df.attrs["iwac_source_revision"] = manifest.get("revision")
             df.attrs["iwac_source_repository"] = manifest.get("repository")
         console.print(
-            f"[yellow]ℹ[/yellow] Local CSV mirror may lag the live Hub dataset "
+            f"[yellow]ℹ[/yellow] Local mirror may lag the live Hub dataset "
             f"(file date: {pd.Timestamp(path.stat().st_mtime, unit='s').date()})."
         )
     elif source == "hub":
@@ -185,7 +202,7 @@ def load_subset_dataframe(
                 df = ds.to_pandas()
         df.attrs["iwac_source_revision"] = revision
     else:
-        raise ValueError(f"Unknown source '{source}' (expected 'hub' or 'csv').")
+        raise ValueError(f"Unknown source '{source}' (expected 'hub', 'local' or 'csv').")
 
     if "o:id" in df.columns:
         df["o:id"] = df["o:id"].astype(str)

@@ -46,7 +46,7 @@ import sys
 import argparse
 import logging
 from pathlib import Path
-from typing import List
+from typing import Iterable, Iterator, List
 import re
 import unicodedata
 
@@ -203,6 +203,54 @@ def lemmatise_one(nlp, text: str) -> List[tuple]:
     return tokens
 
 
+def lemmatise_many(
+    nlp, texts: Iterable[str], *, batch_size: int = 32, n_process: int = 1
+) -> Iterator[List[tuple]]:
+    """Lemmatise many already-normalized texts; yield one token list per text,
+    in input order (an empty text yields ``[]``).
+
+    Same output as calling :func:`lemmatise_one` on each text, but through
+    ``nlp.pipe``: spaCy batches the chunks through tok2vec/tagger instead of
+    one call per chunk, which is the standard large CPU speed-up, and
+    ``n_process`` > 1 spreads batches over worker processes. Chunking is
+    unchanged, so the lemmas are identical.
+    """
+    total = [0]
+
+    def stream():
+        for idx, text in enumerate(texts):
+            total[0] = idx + 1
+            if not text:
+                continue
+            for chunk in chunk_on_whitespace(text, SPACY_MAX_CHUNK_CHARS):
+                yield chunk, idx
+
+    next_idx = 0
+    current: int | None = None
+    tokens: List[tuple] = []
+    for doc, idx in nlp.pipe(
+        stream(), as_tuples=True, batch_size=batch_size, n_process=n_process
+    ):
+        if current is not None and idx != current:
+            while next_idx < current:
+                yield []
+                next_idx += 1
+            yield tokens
+            next_idx = current + 1
+            tokens = []
+        current = idx
+        tokens.extend((tok.lemma_.lower(), tok.is_stop) for tok in doc if tok.is_alpha)
+    if current is not None:
+        while next_idx < current:
+            yield []
+            next_idx += 1
+        yield tokens
+        next_idx = current + 1
+    while next_idx < total[0]:
+        yield []
+        next_idx += 1
+
+
 def lemmatise_dataset(
     ds,
     nlp,
@@ -213,6 +261,8 @@ def lemmatise_dataset(
     process_choice: str,
     cache_file: Path,
     language_filter: str | None = None,
+    batch_size: int = 32,
+    n_process: int = 1,
 ):
     """Add lemma columns to ``ds``, checkpointing to ``cache_file`` for resume.
 
@@ -303,8 +353,13 @@ def lemmatise_dataset(
             console=console,
         ) as progress:
             task = progress.add_task("[cyan]lemmatising", total=len(indices_to_process))
-            for i in indices_to_process:
-                tokens = lemmatise_one(nlp, normalize(texts[i]))
+            token_lists = lemmatise_many(
+                nlp,
+                (normalize(texts[i]) for i in indices_to_process),
+                batch_size=batch_size,
+                n_process=n_process,
+            )
+            for i, tokens in zip(indices_to_process, token_lists):
                 lemma_text = " ".join(lemma for lemma, _ in tokens)
                 # Stop-word filtering uses token.is_stop on the surface token
                 # (not the lemma vs. the surface-form stop-word list).
@@ -381,7 +436,14 @@ def main() -> int:
     parser.add_argument("--french-only", action="store_true", help="Deprecated alias for --language Français")
     parser.add_argument("--dry-run", action="store_true",
                         help="Lemmatise and report what would change, but do not push to the Hub or delete the cache")
+    parser.add_argument("--batch-size", type=int, default=32,
+                        help="Texts per spaCy nlp.pipe batch (default: 32)")
+    parser.add_argument("--n-process", type=int, default=1,
+                        help="spaCy worker processes (default: 1). More processes "
+                             "use more RAM: each loads its own copy of the model.")
     args = parser.parse_args()
+    if args.batch_size < 1 or args.n_process < 1:
+        parser.error("--batch-size and --n-process must be at least 1")
 
     # Resolve the recompute mode: --update-mode wins; --mode is the deprecated
     # alias (all|empty), where 'empty' maps to 'missing'.
@@ -486,6 +548,8 @@ def main() -> int:
         process_choice=process_choice,
         cache_file=cache_file,
         language_filter=language_filter,
+        batch_size=args.batch_size,
+        n_process=args.n_process,
     )
     if result is None:
         console.print("[green]✓[/green] No rows needed lemmatising. Nothing to do.")

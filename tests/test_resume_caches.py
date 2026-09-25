@@ -81,9 +81,13 @@ class _FakeNlp:
         self.calls.append(text)
         return [_Token(t) for t in text.split()]
 
-    def pipe(self, texts, batch_size=None, n_process=1):
-        for text in texts:
-            yield self(text)
+    def pipe(self, texts, as_tuples=False, batch_size=None, n_process=1):
+        for item in texts:
+            if as_tuples:
+                text, context = item
+                yield self(text), context
+            else:
+                yield self(item)
 
 
 def _lemmatizer():
@@ -112,3 +116,15 @@ def test_lemma_cache_is_not_restored_for_changed_text(tmp_path):
     )
     assert out["lemma_text"][:] == ["nouveau texte corrigé", "kept"]
     assert load_cache(cache_file)["1"]["h"] == input_fingerprint("nouveau texte corrigé")
+
+
+def test_batched_lemmatisation_matches_the_per_text_path(monkeypatch):
+    """nlp.pipe batching must not change a lemma, drop an empty text, or
+    misalign a text split into several chunks."""
+    lem = _lemmatizer()
+    monkeypatch.setattr(lem, "SPACY_MAX_CHUNK_CHARS", 12)
+    texts = ["", "la mosquée centrale de Ouagadougou", "", "le prêche", ""]
+    batched = list(lem.lemmatise_many(_FakeNlp(), iter(texts), batch_size=2))
+    one_by_one = [lem.lemmatise_one(_FakeNlp(), t) for t in texts]
+    assert batched == one_by_one
+    assert len(batched) == len(texts)
