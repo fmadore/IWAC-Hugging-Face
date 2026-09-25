@@ -81,14 +81,16 @@ def restore_from_cache(
 
 
 def build_embedding_array(all_embeddings: List[Any]) -> pa.Array:
-    """Typed ``list<float64>`` array with ``None`` for empty embeddings.
+    """Typed ``list<float32>`` array with ``None`` for empty embeddings.
 
     Building the column explicitly avoids PyArrow type-inference issues when
-    embeddings are sparse (all-null or mixed null/list columns).
+    embeddings are sparse (all-null or mixed null/list columns). float32 is the
+    canonical storage type (``iwac_common.schema.EMBEDDING_VALUE_TYPE``); the
+    write gateway would cast to it anyway.
     """
     return pa.array(
         [None if is_empty_embedding(e) else e for e in all_embeddings],
-        type=pa.list_(pa.float64()),
+        type=pa.list_(pa.float32()),
     )
 
 

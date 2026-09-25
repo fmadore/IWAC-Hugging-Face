@@ -322,15 +322,22 @@ def push_dataset_verified(
     Verification after the push is split by cost: ``sync_card_features`` reads
     the parquet footer to check the schema (cheap, and the CastError guard),
     then ``verify_reload`` checks the published row ids through one column.
+
+    Before any of that, :func:`iwac_common.schema.conform_dataset` applies the
+    subset's canonical column types, so every writer publishes the same schema.
     """
     from rich.console import Console
 
     from .card_sync import CardSchemaError, sync_card_features
-    from .schema import DataContractError, validate_dataset
+    from .schema import DataContractError, conform_dataset, validate_dataset
 
     console = console or Console()
     token = resolve_hf_token(token)
     try:
+        # Canonical types first (declared int columns back to int64, embeddings
+        # to list<float32>), so a pandas round trip anywhere upstream cannot
+        # change the published schema. Then the contracts.
+        ds = conform_dataset(ds, config_name)
         validate_dataset(ds, config_name)
     except DataContractError as exc:
         raise HubWriteError(f"Refusing invalid {config_name!r} dataset: {exc}") from exc

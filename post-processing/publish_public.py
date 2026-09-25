@@ -343,6 +343,10 @@ def main() -> None:
                 revision=source_revision,
             )
         public_df = ds.to_pandas()
+        # The pandas hop below is only for masking and the prose heuristics;
+        # the private schema is restored exactly when the frame goes back to
+        # Arrow (a bare from_pandas turns nullable ints into float64).
+        features = ds.features
 
         # Primary guard: every column must be explicitly allow-listed.
         approved_by_config[cfg] = check_column_allowlist(cfg, public_df, approve)
@@ -367,7 +371,7 @@ def main() -> None:
                           "PUBLIC_TEXT_ALLOWLIST (this script), then re-run.")
             sys.exit(1)
 
-        plans.append((cfg, content_cols, kept, blanked, public_df))
+        plans.append((cfg, content_cols, kept, blanked, public_df, features))
 
     table = Table(title="Projection Plan (full text masked per row by OCR_is_public)", box=box.ROUNDED)
     table.add_column("Subset", style="cyan")
@@ -376,7 +380,7 @@ def main() -> None:
     table.add_column("OCR kept", justify="right", style="green")
     table.add_column("OCR blanked", justify="right", style="red")
     table.add_column("Public cols", justify="right", style="blue")
-    for cfg, content_cols, kept, blanked, public_df in plans:
+    for cfg, content_cols, kept, blanked, public_df, _features in plans:
         table.add_row(
             cfg, f"{len(public_df):,}", ", ".join(content_cols) or "—",
             f"{kept:,}" if content_cols else "—",
@@ -414,7 +418,7 @@ def main() -> None:
         # from interleaving different subset revisions.
         with hub_write_lock(args.repo_public):
             target_revision = get_repo_revision(args.repo_public, token=token)
-            for cfg, content_cols, kept, blanked, public_df in plans:
+            for cfg, content_cols, kept, blanked, public_df, features in plans:
                 # to_pandas returns embeddings as np.ndarray; from_pandas infers
                 # list types more reliably from plain Python lists.
                 for col in public_df.columns:
@@ -426,7 +430,9 @@ def main() -> None:
                     f"[bold green]Pushing '{cfg}' to {args.repo_public}...",
                     spinner="dots",
                 ):
-                    pub_ds = Dataset.from_pandas(public_df, preserve_index=False)
+                    pub_ds = Dataset.from_pandas(
+                        public_df, preserve_index=False, features=features
+                    )
                     result = push_dataset_verified(
                         pub_ds,
                         repo_id=args.repo_public,

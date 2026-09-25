@@ -316,24 +316,22 @@ def main() -> int:
             console.print("\n[yellow]⚠[/yellow] Cancelled.")
             return 0
 
+    from datasets import Value
+
+    # Declared nullable int64: an imprecise date has no lunar day, and that
+    # absence stays a null rather than becoming a 0 that charts would plot.
+    # Declaring the type (instead of round-tripping the whole subset through
+    # pandas) also leaves every other column's type untouched.
     ds = map_with_progress(
         ds,
         lambda batch: add_hijri_batch(batch, update_mode=args.update_mode),
         description="[cyan]Converting pub_date to Umm al-Qura",
         console=console,
+        output_types={col: Value("int64") for col in HIJRI_COLUMNS},
     )
-
-    # Nullable Int64: an imprecise date has no lunar day, and that absence has
-    # to survive the round trip rather than become a 0 that charts would plot.
-    df = ds.to_pandas()
-    for col in HIJRI_COLUMNS:
-        df[col] = df[col].astype("Int64")
-    from datasets import Dataset
-
-    ds = Dataset.from_pandas(df, preserve_index=False)
     ds = reorder_columns_after(ds, HIJRI_COLUMNS, SOURCE_COLUMN, console=console)
 
-    report(df, config_name)
+    report(ds.select_columns([SOURCE_COLUMN, *HIJRI_COLUMNS]).to_pandas(), config_name)
 
     if args.dry_run:
         print_dry_run_panel(

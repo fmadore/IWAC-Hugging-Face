@@ -394,6 +394,7 @@ def map_with_progress(
     batch_size: int = 1000,
     description: str = "[cyan]Processing",
     console: Optional[Console] = None,
+    output_types: Optional[Dict[str, Any]] = None,
 ):
     """``ds.map(batched=True)`` with a Rich progress bar and cache-busting.
 
@@ -401,6 +402,12 @@ def map_with_progress(
     plus a fresh ``new_fingerprint``) so re-runs never resurface stale computed
     columns. ``batch_fn`` takes and returns a batch dict, exactly like a plain
     ``.map`` callable.
+
+    ``output_types`` declares the ``datasets`` feature of each column the batch
+    function writes (e.g. ``{"nb_mots": Value("int64")}``). Declare them: without
+    it the writer infers the type from the first batch, so a first batch that is
+    all ``None`` fixes the column as ``null`` and the next batch fails with
+    "Couldn't cast array of type int64 to null".
     """
     console = console or Console()
     with Progress(
@@ -419,6 +426,10 @@ def map_with_progress(
             progress.update(task, advance=len(first) if first is not None else 0)
             return result
 
+        features = None
+        if output_types:
+            features = ds.features.copy()
+            features.update(output_types)
         mapped = ds.map(
             _with_progress,
             batched=True,
@@ -426,6 +437,7 @@ def map_with_progress(
             desc=None,
             load_from_cache_file=False,
             new_fingerprint=str(uuid.uuid4()),
+            features=features,
         )
         if hasattr(ds, "_iwac_source_revision"):
             setattr(mapped, "_iwac_source_revision", ds._iwac_source_revision)

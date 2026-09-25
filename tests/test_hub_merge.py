@@ -242,3 +242,64 @@ class TestOuterMergeStaleRows:
         hub(_existing())
         with pytest.raises(ValueError):
             merge_with_hub_dataset(_new(), "repo", "references", stale_rows="maybe")
+
+
+class TestSchemaStability:
+    def test_hub_column_order_survives_an_upload(self, hub):
+        existing = pd.DataFrame({
+            "o:id": ["1", "2"],
+            "pub_date": ["2001-01-01", "2002"],
+            "hijri_year": pd.array([1421, None], dtype="Int64"),
+            "title": ["a", "b"],
+        })
+        hub(existing)
+        fresh = pd.DataFrame({
+            "o:id": ["1", "2"], "title": ["A", "B"],
+            "pub_date": ["2001-01-01", "2002"], "descriptionAI": ["x", "y"],
+        })
+        out = merge_with_hub_dataset(fresh, "repo", "articles")
+        # hijri stays beside pub_date; the brand-new column follows its
+        # mapper predecessor instead of the Hub-only block moving to the end.
+        assert list(out.columns) == [
+            "o:id", "pub_date", "descriptionAI", "hijri_year", "title"
+        ]
+
+    def test_stable_order_puts_a_leading_new_column_first(self):
+        from iwac_common.hub_merge import stable_column_order
+
+        assert stable_column_order(
+            ["new", "o:id", "x"], ["o:id", "x"], ["new", "o:id"]
+        ) == ["new", "o:id", "x"]
+
+    def test_nullable_int_hub_column_is_not_turned_into_float(self, monkeypatch):
+        import pyarrow as pa
+        from datasets import Dataset
+
+        table = pa.table({
+            "o:id": ["1", "2"],
+            "title": ["a", "b"],
+            "lda_topic_id": pa.array([3, None], pa.int64()),
+        })
+        monkeypatch.setattr(hub_merge, "load_dataset", lambda *a, **k: Dataset(table))
+        out = merge_with_hub_dataset(
+            pd.DataFrame({"o:id": ["1", "2", "3"], "title": ["A", "B", "C"]}),
+            "repo", "articles",
+        )
+        assert str(out["lda_topic_id"].dtype) == "Int64"
+        assert out["lda_topic_id"].tolist()[0] == 3
+        assert Dataset.from_pandas(out, preserve_index=False).features[
+            "lda_topic_id"
+        ].dtype == "int64"
+
+    def test_pinned_revision_reuses_the_cache(self, monkeypatch):
+        calls = []
+
+        def fake_load(*args, **kwargs):
+            calls.append(kwargs)
+            return FakeDataset(_existing())
+
+        monkeypatch.setattr(hub_merge, "load_dataset", fake_load)
+        monkeypatch.setattr(hub_merge, "get_repo_revision", lambda *a, **k: "abc123")
+        merge_with_hub_dataset(_new(), "repo", "articles", revision_out={})
+        assert calls[0]["revision"] == "abc123"
+        assert calls[0]["download_mode"] == "reuse_dataset_if_exists"

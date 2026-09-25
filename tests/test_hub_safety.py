@@ -217,3 +217,42 @@ def test_config_discovery_includes_parquet_missing_from_card(monkeypatch):
     assert hub.get_repo_configs("owner/repo", token="token") == {
         "articles", "references"
     }
+
+
+def test_gateway_publishes_canonical_types(monkeypatch, lock_dir):
+    """Whatever the writer did upstream, the pushed schema is the declared one."""
+    import pyarrow as pa
+    from datasets import Dataset
+
+    pushed = []
+    monkeypatch.setattr(
+        Dataset, "push_to_hub", lambda self, **kwargs: pushed.append(self)
+    )
+    revisions = iter(["before", "after", "after"])
+    monkeypatch.setattr(hub, "get_repo_revision", lambda *a, **k: next(revisions))
+    monkeypatch.setattr(card_sync, "sync_card_features", lambda *a, **k: True)
+    monkeypatch.setattr(hub, "_published_ids_columnar", lambda *a, **k: ["1", "2"])
+    ds = Dataset(pa.table({
+        "o:id": ["1", "2"],
+        "lda_topic_id": pa.array([4.0, None]),
+        "embedding_OCR": pa.array([[0.25] * 768, None], pa.list_(pa.float64())),
+    }))
+    hub.push_dataset_verified(
+        ds, repo_id="owner/repo", config_name="articles", token="t",
+        commit_message="test", expected_revision="before",
+    )
+    (published,) = pushed
+    assert published.features["lda_topic_id"].dtype == "int64"
+    assert published.features["embedding_OCR"].feature.dtype == "float32"
+
+
+def test_gateway_refuses_fractional_int(monkeypatch, lock_dir):
+    import pyarrow as pa
+    from datasets import Dataset
+
+    ds = Dataset(pa.table({"o:id": ["1"], "nb_pages": pa.array([2.5])}))
+    with pytest.raises(hub.HubWriteError, match="fractional"):
+        hub.push_dataset_verified(
+            ds, repo_id="owner/repo", config_name="articles", token="t",
+            commit_message="test",
+        )

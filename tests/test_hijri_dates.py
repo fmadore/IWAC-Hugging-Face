@@ -95,3 +95,26 @@ class TestMonthTable:
         assert len(HIJRI_MONTHS) == 12
         assert HIJRI_MONTHS[8] == "Ramadan"
         assert HIJRI_MONTHS[11] == "Dhu al-Hijja"
+
+
+class TestTypedMap:
+    def test_a_first_batch_without_dates_does_not_crash_the_run(self):
+        """Without declared output types, datasets fixes a column as ``null``
+        from an all-None first batch and fails on the next one."""
+        from datasets import Dataset, Value
+
+        from _common import map_with_progress
+
+        ds = Dataset.from_dict({
+            "o:id": ["1", "2", "3", "4"],
+            "pub_date": ["1998", "", "1999-04-17", "2024-03-20"],
+            "nb_pages": [1, None, 3, 4],
+        })
+        out = map_with_progress(
+            ds, add_hijri_batch, batch_size=2,
+            output_types={c: Value("int64") for c in HIJRI_COLUMNS},
+        )
+        assert out.features["hijri_year"].dtype == "int64"
+        assert out["hijri_year"][:] == [None, None, 1420, 1445]
+        # Untouched columns keep their type (no pandas round trip).
+        assert out.features["nb_pages"].dtype == "int64"

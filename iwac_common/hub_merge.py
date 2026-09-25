@@ -34,6 +34,7 @@ from .hub import (
     get_repo_revision,
     resolve_hf_token,
 )
+from .schema import dataset_to_pandas
 
 
 class ShrinkGuardError(RuntimeError):
@@ -56,6 +57,40 @@ def _assert_unique_ids(df: pd.DataFrame, label: str) -> None:
             f"{label} contains {dupes.nunique()} duplicated 'o:id' value(s) "
             f"(e.g. {sample}); merging would multiply rows. Deduplicate first."
         )
+
+
+def stable_column_order(
+    final_columns: Sequence[str],
+    hub_columns: Sequence[str],
+    new_columns: Sequence[str],
+) -> list[str]:
+    """Column order for a merged frame: the Hub's order, with new columns slotted in.
+
+    A plain merge puts every mapper column first and every Hub-only column
+    after them, so a column a post-processing script placed deliberately (the
+    Hijri date beside ``pub_date``) migrated to the end on each upload and came
+    back on the next re-run — needless churn in the published schema, and a card
+    repair commit every time. Existing columns keep their Hub position; a column
+    the Hub has never seen goes right after its predecessor in the mapper's
+    order (or first, if it leads the mapper's output).
+    """
+    final_set = set(final_columns)
+    ordered = [c for c in hub_columns if c in final_set]
+    placed = set(ordered)
+    mapper_order = [c for c in new_columns if c in final_set]
+    for position, column in enumerate(mapper_order):
+        if column in placed:
+            continue
+        anchor = next(
+            (mapper_order[i] for i in range(position - 1, -1, -1)
+             if mapper_order[i] in placed),
+            None,
+        )
+        index = ordered.index(anchor) + 1 if anchor is not None else 0
+        ordered.insert(index, column)
+        placed.add(column)
+    ordered.extend(c for c in final_columns if c not in placed)
+    return ordered
 
 
 def merge_with_hub_dataset(
@@ -127,10 +162,18 @@ def merge_with_hub_dataset(
                 split="train",
                 token=token,
                 revision=baseline_revision,
-                download_mode="force_redownload",
+                # A commit SHA is immutable and the datasets cache is keyed by
+                # it, so a pinned read can safely reuse the local copy; only an
+                # unpinned read (no revision_out) must bypass the cache.
+                download_mode=(
+                    "reuse_dataset_if_exists" if baseline_revision else "force_redownload"
+                ),
                 verification_mode="no_checks",
             )
-            existing_df = existing_ds.to_pandas()
+            # Nullable ints/bools survive: the default to_pandas() turns an
+            # int64 column with nulls into float64, which is how preserved
+            # columns such as lda_topic_id reached the Hub as floats.
+            existing_df = dataset_to_pandas(existing_ds)
 
         if existing_df.empty:
             console.print(
@@ -254,7 +297,10 @@ def merge_with_hub_dataset(
         console.print("[yellow]ℹ[/yellow] No unique columns to preserve from existing dataset.")
         if excluded:
             console.print(f"[dim]Excluded columns: {', '.join(sorted(excluded))}[/dim]")
-        return append_preserved_rows(new_df)
+        merged = append_preserved_rows(new_df)
+        return merged[stable_column_order(
+            list(merged.columns), list(existing_df.columns), list(new_df.columns)
+        )]
 
     if extra_cols:
         console.print(f"[green]✓[/green] Preserving columns: {', '.join(extra_cols)}")
@@ -288,6 +334,9 @@ def merge_with_hub_dataset(
         final_df = final_df.drop(columns="_merge")
 
     final_df = append_preserved_rows(final_df)
+    final_df = final_df[stable_column_order(
+        list(final_df.columns), list(existing_df.columns), list(new_df.columns)
+    )]
 
     if excluded:
         console.print(f"[dim]Excluded columns: {', '.join(sorted(excluded))}[/dim]")
@@ -307,6 +356,7 @@ def merge_with_hub_dataset(
 
 __all__ = [
     "merge_with_hub_dataset",
+    "stable_column_order",
     "resolve_hf_token",
     "ShrinkGuardError",
     "DuplicateIdError",
