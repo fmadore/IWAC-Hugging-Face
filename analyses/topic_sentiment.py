@@ -49,7 +49,12 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "post-processing"))
 
-from _common import ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
+from _common import (  # noqa: E402
+    PRIVATE_REPO_ID,
+    ensure_hf_token,
+    load_subset_dataframe,
+    write_run_manifest,
+)
 # Reuse the canonical sentiment vocabulary + consensus helpers.
 from sentiment_agreement import (  # noqa: E402
     MODELS,
@@ -137,21 +142,12 @@ def load_articles(args: argparse.Namespace) -> pd.DataFrame:
         + POLARITY_COLS + CENTRALITY_COLS + SUBJECTIVITY_COLS
         + ["consensus_polarite", "consensus_centralite", "consensus_subjectivite_score"]
     )
-    columns: Optional[List[str]] = None
-    if args.source == "csv":
-        # usecols raises on missing columns, so intersect with the mirror header
-        # (consensus_* columns are optional).
-        csv_path = REPO_ROOT / "data" / f"iwac_{args.config}.csv"
-        if csv_path.exists():
-            header = pd.read_csv(csv_path, nrows=0).columns
-            columns = [c for c in wanted if c in header]
-    else:
-        columns = wanted  # hub loader intersects with ds.column_names itself
-
+    # Both loaders skip requested columns a source lacks (consensus_* are
+    # optional), so the same list serves the Hub and the local mirror.
     token = ensure_hf_token(console=console) if args.source == "hub" else None
     return load_subset_dataframe(
         args.repo, args.config, token=token, source=args.source,
-        columns=columns, console=console,
+        columns=wanted, console=console,
     )
 
 
@@ -240,6 +236,7 @@ def main() -> None:
     ))
 
     df = load_articles(args)
+    source_revision = df.attrs.get("iwac_source_revision")
 
     # --- column checks ---
     for col in ("lda_topic_id", "lda_topic_label", "pub_date", "country"):
@@ -252,7 +249,8 @@ def main() -> None:
               f"found {len(pol_present)}.")
 
     # --- row filter: real topic + >= 2 polarity votes ---
-    topic_id = pd.to_numeric(df["lda_topic_id"], errors="coerce")  # float64 on the Hub
+    # float64 on older Hub revisions, nullable int64 since the canonical types
+    topic_id = pd.to_numeric(df["lda_topic_id"], errors="coerce")
     has_topic = topic_id.notna() & (topic_id != -1)
 
     votes = df[pol_present].apply(
@@ -384,6 +382,11 @@ def main() -> None:
         f"[green]✓[/green] {out_time}",
         title="Outputs", border_style="blue",
     ))
+    write_run_manifest(
+        OUTPUT_DIR, script="topic_sentiment", repo_id=args.repo,
+        revision=source_revision, args=args,
+        outputs=[out_summary, out_country, out_time],
+    )
     console.print("[yellow]ℹ[/yellow] Report-only script — nothing is pushed to the Hub.")
 
 

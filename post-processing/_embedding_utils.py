@@ -1,5 +1,6 @@
 """Pure helpers for embedding workflows: chunking, mean-pooling, and a
-generic gzipped on-disk JSON cache keyed by ``o:id``.
+generic gzipped on-disk JSON cache keyed by ``o:id``, whose entries carry a
+hash of the input they were computed from.
 
 Extracted from ``semantic_embedding.py`` to keep that script focused on
 orchestration. None of these helpers know about Gemini, datasets, or the
@@ -15,6 +16,7 @@ read time (``related_articles.py`` does).
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -33,6 +35,50 @@ def cache_fingerprint(model: str, dimensionality: int, task_type: str) -> str:
     """
     safe_model = model.replace("/", "-")
     return f"{safe_model}_{dimensionality}d_{task_type.lower()}"
+
+
+def repo_slug(repo_id: str) -> str:
+    """Filesystem-safe form of a repository id, for resume-cache filenames.
+
+    A scratch run (``IWAC_HF_PRIVATE_REPO``) and a production run must never
+    share a cache: identical ``o:id`` values would restore one repo's results
+    into the other.
+    """
+    return repo_id.replace("/", "__")
+
+
+def input_fingerprint(*parts: Any) -> str:
+    """Stable hash of everything a cached value was computed from.
+
+    A configuration fingerprint in the filename proves the cache came from the
+    same model; it says nothing about whether the row's *text* is still the
+    text that was embedded. Every cache entry therefore carries this hash of
+    its input (text plus any per-row processing settings such as chunking), and
+    a restore only reuses an entry whose hash matches the current input.
+    """
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(str(part).encode("utf-8"))
+        digest.update(b"\x1f")
+    return digest.hexdigest()[:32]
+
+
+def make_entry(value: Any, fingerprint: str) -> Dict[str, Any]:
+    """A cache entry tied to its input: ``{"h": fingerprint, "v": value}``."""
+    return {"h": fingerprint, "v": value}
+
+
+def cached_value(cache: Dict[str, Any], key: Any, fingerprint: str) -> Any:
+    """The cached value for ``key`` if it was computed from this exact input.
+
+    Returns ``None`` for a missing entry, an entry computed from other input,
+    and a legacy entry that carries no fingerprint (it cannot prove its input,
+    so it is recomputed rather than trusted).
+    """
+    entry = cache.get(str(key))
+    if isinstance(entry, dict) and entry.get("h") == fingerprint:
+        return entry.get("v")
+    return None
 
 
 def load_cache(cache_file: Path) -> Dict[str, Any]:
@@ -148,6 +194,10 @@ def average_embeddings(
 
 __all__ = [
     "cache_fingerprint",
+    "repo_slug",
+    "input_fingerprint",
+    "make_entry",
+    "cached_value",
     "load_cache",
     "save_cache",
     "delete_cache",

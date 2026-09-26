@@ -58,7 +58,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "post-processing"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # analyses/ for _stats
 
-from _common import ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
+from _common import (  # noqa: E402
+    PRIVATE_REPO_ID,
+    ensure_hf_token,
+    load_subset_dataframe,
+    write_run_manifest,
+)
 from iwac_common.text_utils import simple_tokenize  # noqa: E402
 from lda_topic_modeling.constants import (  # noqa: E402
     DOMAIN_STOPWORDS,
@@ -358,6 +363,7 @@ def main() -> None:
         columns=["o:id", "lemma_nostop", "pub_date", "country", "subject", "language"],
         console=console,
     )
+    source_revision = df.attrs.get("iwac_source_revision")
 
     years = pd.to_numeric(df["pub_date"].astype(str).str[:4], errors="coerce")
     df = df.assign(year=years)
@@ -489,6 +495,16 @@ def main() -> None:
             bt.add_row(r.subject, period, f"{r.weight:,.0f}", f"{r.mentions_in_burst:,}")
         console.print(bt)
 
+    write_run_manifest(
+        OUTPUT_DIR, script="keyness_bursts", repo_id=args.repo,
+        revision=source_revision, args=args,
+        outputs=[
+            OUTPUT_DIR / "keyness_country.csv",
+            OUTPUT_DIR / "keyness_decade.csv",
+            OUTPUT_DIR / "subject_bursts.csv",
+            OUTPUT_DIR / "keyness_bursts_summary.json",
+        ],
+    )
     console.print(f"\n[green]✓[/green] Outputs in [cyan]{OUTPUT_DIR}[/cyan]")
 
 

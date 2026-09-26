@@ -165,3 +165,37 @@ class TestLiveAllowlistFile:
             assert "descriptionAI_en" in cols, (
                 f"allowlist[{cfg}] has descriptionAI but not descriptionAI_en"
             )
+
+
+class TestSquashGuard:
+    """A DOI cites one revision; squashing the history would orphan it."""
+
+    class _Api:
+        def __init__(self, tags=None, error=None):
+            self._tags, self._error = tags, error
+
+        def dataset_info(self, **kwargs):
+            if self._error:
+                raise self._error
+
+            class Info:
+                pass
+
+            info = Info()
+            info.tags = self._tags
+            return info
+
+    def test_repo_with_doi_is_refused(self):
+        api = self._Api(tags=["language:fr", "doi:10.57967/hf/9857"])
+        with pytest.raises(pp.SquashRefusedError, match="10.57967/hf/9857"):
+            pp.assert_squash_allowed("owner/public", token="t", api=api)
+
+    def test_unreadable_tags_fail_closed(self):
+        api = self._Api(error=RuntimeError("401"))
+        with pytest.raises(pp.SquashRefusedError, match="Cannot read"):
+            pp.assert_squash_allowed("owner/public", token="t", api=api)
+
+    def test_scratch_repo_without_doi_is_allowed(self):
+        pp.assert_squash_allowed(
+            "owner/scratch", token="t", api=self._Api(tags=["language:fr"])
+        )

@@ -96,3 +96,21 @@ class TestEntityNetworkHelpers:
     def test_pmi_negative_when_avoiding(self):
         # co-occur less than chance
         assert en.pmi(1, 50, 20, 100) < 0
+
+
+class TestEntityResolution:
+    ID_TO_TITLE = {"10": "Moussa Traoré", "11": "Moussa Traoré", "12": "Ramadan"}
+    TITLE_TO_ID = {"Moussa Traoré": "10", "Ramadan": "12"}
+
+    def test_ids_keep_homonyms_apart(self):
+        entities, considered = en.resolve_entities(
+            {"subject": "Moussa Traoré", "subject_ids": "11"},
+            self.ID_TO_TITLE, self.TITLE_TO_ID,
+        )
+        assert entities == {"11"} and considered == 1
+
+    def test_labels_are_the_fallback(self):
+        entities, considered = en.resolve_entities(
+            {"subject": "Ramadan|Inconnu"}, self.ID_TO_TITLE, self.TITLE_TO_ID,
+        )
+        assert entities == {"12"} and considered == 2

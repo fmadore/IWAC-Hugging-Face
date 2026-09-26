@@ -88,3 +88,39 @@ class TestIsEmptyEmbedding:
         assert is_empty_embedding([])
         assert is_empty_embedding([0.0, 0.0])
         assert not is_empty_embedding([0.0, 0.1])
+
+
+class TestGeminiRetryLadder:
+    def test_permanent_error_is_raised_without_backoff(self, monkeypatch):
+        import _gemini_client
+
+        sleeps = []
+        monkeypatch.setattr(_gemini_client.time, "sleep", sleeps.append)
+
+        class PermissionDenied(Exception):
+            code = 403
+
+        calls = {"n": 0}
+
+        def call():
+            calls["n"] += 1
+            raise PermissionDenied("403 PERMISSION_DENIED")
+
+        with pytest.raises(PermissionDenied):
+            _gemini_client.call_with_retry(call)
+        assert calls["n"] == 1 and sleeps == []
+
+    def test_transient_error_is_retried(self, monkeypatch):
+        import _gemini_client
+
+        monkeypatch.setattr(_gemini_client.time, "sleep", lambda _s: None)
+        calls = {"n": 0}
+
+        def call():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("503 UNAVAILABLE")
+            return [[0.1]]
+
+        assert _gemini_client.call_with_retry(call) == [[0.1]]
+        assert calls["n"] == 3

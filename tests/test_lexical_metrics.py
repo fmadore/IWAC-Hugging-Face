@@ -74,3 +74,58 @@ class TestCountWords:
         batch = {"OCR": ["un deux", "trois"], "nb_mots": [999, None]}
         out = wc.add_word_count_batch(batch, text_col="OCR", count_col="nb_mots", update_mode="missing")
         assert out["nb_mots"] == [999, 1]  # existing kept, null filled
+
+
+class TestReadabilityLanguageGate:
+    """French Flesch on a non-French text ranks correct text as unreadable;
+    those rows must be null, never a low score."""
+
+    FRENCH = ("Le conseil des imams a tenu sa réunion annuelle à Ouagadougou. " * 12)
+
+    def _run(self, languages, update_mode="all", existing=None):
+        lex.textstat.set_lang("fr")
+        n = len(languages)
+        batch = {
+            "OCR": [self.FRENCH] * n,
+            "language": languages,
+            "Richesse_Lexicale_OCR": [None] * n,
+            "Lisibilite_OCR": existing or [None] * n,
+        }
+        counter = {"richness_too_short": 0, "readability_failed": 0}
+        out = lex.compute_metrics_batch(
+            batch, text_col="OCR", richness_col="Richesse_Lexicale_OCR",
+            readability_col="Lisibilite_OCR", update_mode=update_mode,
+            window_size=50, error_counter=counter,
+        )
+        return out, counter
+
+    def test_only_primary_french_rows_get_a_score(self):
+        out, counter = self._run(
+            ["Français", "Français|Anglais", "Anglais|Français", "Ewé", "", None]
+        )
+        scores = out["Lisibilite_OCR"]
+        assert scores[0] is not None and scores[1] is not None
+        assert scores[2:] == [None, None, None, None]
+        assert counter["readability_not_french"] == 4
+        # MATTR carries no lexicon and is kept for every row.
+        assert all(v is not None for v in out["Richesse_Lexicale_OCR"])
+
+    def test_missing_mode_clears_an_old_score_on_a_non_french_row(self):
+        out, _ = self._run(["Kabiyè", "Français"], update_mode="missing",
+                           existing=[12.5, 60.0])
+        assert out["Lisibilite_OCR"] == [None, 60.0]
+
+    def test_without_a_language_column_nothing_is_scored(self):
+        lex.textstat.set_lang("fr")
+        batch = {"OCR": [self.FRENCH], "Richesse_Lexicale_OCR": [None],
+                 "Lisibilite_OCR": [None]}
+        out = lex.compute_metrics_batch(
+            batch, text_col="OCR", richness_col="Richesse_Lexicale_OCR",
+            readability_col="Lisibilite_OCR", update_mode="all", window_size=50,
+            error_counter={"richness_too_short": 0, "readability_failed": 0},
+        )
+        assert out["Lisibilite_OCR"] == [None]
+
+    def test_primary_language_parsing(self):
+        assert lex.primary_language(" Français | Anglais") == "Français"
+        assert lex.primary_language(None) == ""

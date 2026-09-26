@@ -17,10 +17,13 @@ chunks, each chunk is embedded separately, and the chunk embeddings are
 pooled into a single vector per row with a length-weighted average.
 
 Progress is checkpointed to a resume cache in ``.cache_embeddings/``. The
-cache filename embeds a fingerprint of (model, dimensionality, task type),
-so a cache written under one embedding configuration is never restored into
-a run with different parameters. Only rows whose chunks ALL embedded
-successfully are cached — partially-embedded rows are retried on re-run.
+cache filename embeds the repository and a fingerprint of (model,
+dimensionality, task type), so a cache written under one embedding
+configuration — or for another repository — is never restored. Each entry
+also carries a hash of the row's text and chunking settings, so a row whose
+text changed since it was cached is embedded afresh. Only rows whose chunks
+ALL embedded successfully are cached — partially-embedded rows are retried on
+re-run.
 
 Usage
 -----
@@ -59,10 +62,14 @@ from iwac_common.schema import SUBSETS  # noqa: E402
 from _embedding_utils import (  # noqa: E402
     average_embeddings,
     cache_fingerprint,
+    cached_value,
     chunk_text as _chunk_text_chars,
     delete_cache,
+    input_fingerprint,
     is_empty_embedding,
     load_cache,
+    make_entry,
+    repo_slug,
     save_cache,
 )
 from _gemini_client import (  # noqa: E402
@@ -317,13 +324,20 @@ def display_embedding_stats(existing_embeddings: List[Any]) -> tuple[int, int]:
     return valid_embeddings, empty_embeddings
 
 
+def text_fingerprint(text: Any) -> str:
+    """Input identity of one row's embedding: its text plus the chunking
+    settings that shape the pooled vector."""
+    return input_fingerprint(str(text or ""), CHUNK_SIZE, CHUNK_OVERLAP)
+
+
 def _save_completed_to_cache(
-    cache: Dict[str, List[float]],
+    cache: Dict[str, Any],
     row_chunks: List[tuple[int, List[str]]],
     flat_embeddings: List[Any],
     row_ids: List[Any],
     all_embeddings: List[Any],
     cache_file: Path,
+    fingerprints: List[str],
 ) -> None:
     """Reassemble fully-completed chunk embeddings into row embeddings and save cache.
 
@@ -341,8 +355,9 @@ def _save_completed_to_cache(
             averaged = average_embeddings(chunk_embs, weights=[len(c) for c in chunks])
             all_embeddings[row_idx] = averaged
             oid_str = str(row_ids[row_idx])
-            if oid_str not in cache:
-                cache[oid_str] = averaged
+            fingerprint = fingerprints[row_idx]
+            if cached_value(cache, oid_str, fingerprint) is None:
+                cache[oid_str] = make_entry(averaged, fingerprint)
                 updated += 1
         flat_offset += len(chunks)
     if updated > 0:
@@ -450,8 +465,12 @@ def main() -> int:
     # written at one embedding configuration can never be restored into a run
     # with different parameters. Old un-fingerprinted cache files (e.g.
     # "ocr_embeddings.json.gz") are simply ignored (fresh start), not migrated.
+    # The repository is part of the name too: a scratch run and a production
+    # run must not share results for identical o:id values. Entries inside
+    # carry a hash of their input text (see text_fingerprint).
     cache_file = CACHE_DIR / (
-        f"{cache_stem}_{cache_fingerprint(MODEL_NAME, dimensionality, task_type)}.json.gz"
+        f"{cache_stem}_{repo_slug(repo_id)}_"
+        f"{cache_fingerprint(MODEL_NAME, dimensionality, task_type)}.json.gz"
     )
 
     # --- Step 1: Authentication ---
@@ -553,6 +572,7 @@ def main() -> int:
     # Use [] instead of None for missing embeddings so PyArrow infers a consistent list<float> type
     existing_embeddings = ds[embedding_column] if embedding_column in ds.column_names else [[] for _ in range(len(ds))]
     row_ids = ds["o:id"]  # stable row identifier for cache keys
+    fingerprints = [text_fingerprint(t) for t in texts]  # input identity per row
 
     if update_mode == "missing" and embedding_column in ds.column_names:
         valid_count, missing_count = display_embedding_stats(existing_embeddings)
@@ -567,7 +587,7 @@ def main() -> int:
     # Build the full embeddings list, pre-filling from cache
     # Normalize None to [] for consistent PyArrow typing
     all_embeddings: List[Any] = [emb if emb is not None else [] for emb in existing_embeddings]
-    cache_hits = restore_from_cache(all_embeddings, row_ids, cache)
+    cache_hits = restore_from_cache(all_embeddings, row_ids, cache, fingerprints)
 
     if cache_hits > 0:
         console.print(f"[green]✓[/green] Restored [cyan]{cache_hits}[/cyan] embeddings from cache")
@@ -580,8 +600,7 @@ def main() -> int:
             if text is not None and str(text).strip():
                 # In 'all' mode, skip only if already in cache (this run's
                 # checkpoints, or a crashed run's cache kept via --resume)
-                oid_str = str(row_ids[i])
-                if oid_str not in cache:
+                if cached_value(cache, row_ids[i], fingerprints[i]) is None:
                     indices_to_process.append(i)
         elif update_mode == "missing":
             if is_empty_embedding(emb) and text is not None and str(text).strip():
@@ -657,7 +676,8 @@ def main() -> int:
                 # Checkpoint: reassemble completed rows and save cache
                 if batch_count % CHECKPOINT_EVERY == 0:
                     _save_completed_to_cache(
-                        cache, row_chunks, flat_embeddings, row_ids, all_embeddings, cache_file,
+                        cache, row_chunks, flat_embeddings, row_ids, all_embeddings,
+                        cache_file, fingerprints,
                     )
 
                 # Delay between API calls to respect rate limits
@@ -667,7 +687,8 @@ def main() -> int:
         # Final reassemble: group chunk embeddings by row and length-weighted
         # average (only rows whose chunks ALL succeeded are assembled/cached).
         _save_completed_to_cache(
-            cache, row_chunks, flat_embeddings, row_ids, all_embeddings, cache_file,
+            cache, row_chunks, flat_embeddings, row_ids, all_embeddings,
+            cache_file, fingerprints,
         )
 
         # Rows with any failed chunk must end EMPTY — never a truncated

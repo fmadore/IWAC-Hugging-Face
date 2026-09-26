@@ -85,6 +85,87 @@ def get_repo_configs(repo_id: str, *, token: Optional[str] = None) -> set[str]:
     return names
 
 
+def read_hub_columns(
+    repo_id: str,
+    config_name: str,
+    *,
+    revision: str,
+    columns: Sequence[str],
+    token: Optional[str] = None,
+    fs=None,
+):
+    """Read only ``columns`` of one config's parquet at a pinned revision.
+
+    Parquet is columnar and ``HfFileSystem`` serves byte ranges, so only the
+    requested column chunks travel: the index frequency pass needs five short
+    string columns of ``articles``, not its full text and embeddings. Columns a
+    shard does not carry are skipped (the caller checks what it needs).
+    Nullable integers stay ``Int64``. Raises on any problem, so callers can fall
+    back to a full load rather than proceed without data.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfFileSystem
+
+    from .schema import arrow_to_pandas
+
+    fs = fs or HfFileSystem(token=token)
+    shards = sorted(fs.glob(f"datasets/{repo_id}@{revision}/{config_name}/*.parquet"))
+    if not shards:
+        raise HubBaselineUnavailableError(
+            f"No parquet found for '{config_name}' in {repo_id} at {revision}"
+        )
+    tables = []
+    for shard in shards:
+        with fs.open(shard, "rb") as handle:
+            parquet = pq.ParquetFile(handle)
+            available = [c for c in columns if c in parquet.schema_arrow.names]
+            tables.append(parquet.read(columns=available))
+    table = pa.concat_tables(tables, promote_options="default")
+    return arrow_to_pandas(table)
+
+
+def load_hub_columns(
+    repo_id: str,
+    config_name: str,
+    *,
+    revision: str,
+    columns: Sequence[str],
+    token: Optional[str] = None,
+    console=None,
+):
+    """:func:`read_hub_columns`, falling back to a full ``load_dataset``.
+
+    The fallback reads the same pinned revision and keeps the same column
+    selection and nullable integers; it only costs more bandwidth. A failure of
+    both raises :class:`HubBaselineUnavailableError`.
+    """
+    try:
+        return read_hub_columns(
+            repo_id, config_name, revision=revision, columns=columns, token=token
+        )
+    except Exception as exc:  # noqa: BLE001 - never proceed without the data
+        if console is not None:
+            console.print(
+                f"[dim]ℹ Column-pruned read of '{config_name}' unavailable ({exc}); "
+                "falling back to a full load.[/dim]"
+            )
+    from datasets import load_dataset
+
+    from .schema import dataset_to_pandas
+
+    try:
+        ds = load_dataset(
+            repo_id, name=config_name, split="train", token=token, revision=revision,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HubBaselineUnavailableError(
+            f"Cannot load '{config_name}' from {repo_id} at {revision}: {exc}"
+        ) from exc
+    keep = [c for c in columns if c in ds.column_names]
+    return dataset_to_pandas(ds.select_columns(keep))
+
+
 def _lock_root() -> Path:
     configured = os.getenv("IWAC_LOCK_DIR")
     if configured:
@@ -322,15 +403,22 @@ def push_dataset_verified(
     Verification after the push is split by cost: ``sync_card_features`` reads
     the parquet footer to check the schema (cheap, and the CastError guard),
     then ``verify_reload`` checks the published row ids through one column.
+
+    Before any of that, :func:`iwac_common.schema.conform_dataset` applies the
+    subset's canonical column types, so every writer publishes the same schema.
     """
     from rich.console import Console
 
     from .card_sync import CardSchemaError, sync_card_features
-    from .schema import DataContractError, validate_dataset
+    from .schema import DataContractError, conform_dataset, validate_dataset
 
     console = console or Console()
     token = resolve_hf_token(token)
     try:
+        # Canonical types first (declared int columns back to int64, embeddings
+        # to list<float32>), so a pandas round trip anywhere upstream cannot
+        # change the published schema. Then the contracts.
+        ds = conform_dataset(ds, config_name)
         validate_dataset(ds, config_name)
     except DataContractError as exc:
         raise HubWriteError(f"Refusing invalid {config_name!r} dataset: {exc}") from exc
@@ -407,6 +495,8 @@ __all__ = [
     "resolve_hf_token",
     "get_repo_revision",
     "get_repo_configs",
+    "read_hub_columns",
+    "load_hub_columns",
     "hub_write_lock",
     "push_dataset_verified",
 ]

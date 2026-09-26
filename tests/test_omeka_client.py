@@ -122,3 +122,92 @@ class TestMediaFetchGuard:
             s.record_attempt()          # only items that HAVE media
         assert s.failure_rate == 0.0
         assert s.check() is None
+
+
+class TestCredentialRedaction:
+    """Omeka authenticates through query parameters, so an unsanitized aiohttp
+    error prints ``key_credential=…`` into every retry warning and the final
+    abort panel. Reproduced against a local server; no external network."""
+
+    SECRET = "SECRET-CRED-xyz/+="
+
+    def _run_against(self, status, caplog):
+        from aiohttp import web
+
+        from iwac_common import omeka_client as oc
+
+        hits = {"n": 0}
+
+        async def handler(request):
+            hits["n"] += 1
+            return web.Response(status=status)
+
+        async def scenario():
+            app = web.Application()
+            app.router.add_get("/api/items", handler)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            import socket
+
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            site = web.TCPSite(runner, "127.0.0.1", port)
+            await site.start()
+            cfg = Config(
+                API_URL=f"http://127.0.0.1:{port}/api",
+                API_KEY_IDENTITY="IDENT-abc",
+                API_KEY_CREDENTIAL=self.SECRET,
+            )
+            client = OmekaApiClient(cfg, use_cache=False)
+            real_sleep = asyncio.sleep
+
+            async def no_backoff(_seconds):
+                await real_sleep(0)
+
+            oc.asyncio.sleep = no_backoff
+            try:
+                with pytest.raises(TruncatedFetchError) as info:
+                    await client.fetch_items(36)
+            finally:
+                oc.asyncio.sleep = real_sleep
+                await oc.conn_manager.close()
+                await runner.cleanup()
+            return info.value
+
+        with caplog.at_level("WARNING"):
+            error = asyncio.run(scenario())
+        return error, hits["n"]
+
+    def _assert_clean(self, text):
+        from urllib.parse import quote_plus
+
+        assert self.SECRET not in text
+        assert quote_plus(self.SECRET) not in text
+        assert "IDENT-abc" not in text
+
+    def test_retry_warnings_and_final_error_carry_no_credentials(self, caplog):
+        error, hits = self._run_against(503, caplog)
+        assert hits == 5  # 503 is transient: the full ladder runs
+        self._assert_clean(caplog.text)
+        self._assert_clean(str(error))
+        cause = error.__cause__
+        assert cause is not None and cause.__suppress_context__
+        self._assert_clean(str(cause))
+        assert "HTTP 503" in str(error)
+
+    def test_permanent_status_is_not_retried(self, caplog):
+        error, hits = self._run_against(403, caplog)
+        assert hits == 1
+        self._assert_clean(str(error))
+
+    def test_redact_secrets_masks_query_and_literal_forms(self):
+        from iwac_common.omeka_client import redact_secrets
+
+        text = (
+            "url='https://x/api/items?page=1&key_identity=abc&key_credential=s3cr%2Bt'"
+            " raw s3cr+t"
+        )
+        out = redact_secrets(text, ["s3cr+t"])
+        assert "abc" not in out and "s3cr" not in out
+        assert "key_credential=***" in out and "page=1" in out

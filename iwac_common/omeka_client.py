@@ -22,10 +22,12 @@ import io
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Type, Union
+from urllib.parse import quote_plus
 
 import aiofiles
 import aiohttp
@@ -156,6 +158,73 @@ conn_manager = ConnectionManager()
 
 
 # ---------------------------------------------------------------------------
+# Credential-safe transport errors
+# ---------------------------------------------------------------------------
+
+#: Omeka S authenticates through query parameters, so every request URL
+#: carries the key. aiohttp puts that URL into ``str(ClientResponseError)``,
+#: which is how a single 503 used to print ``key_credential=…`` into every
+#: retry warning and the final abort panel.
+_SENSITIVE_PARAMS = ("key_identity", "key_credential")
+_SENSITIVE_RE = re.compile(
+    r"(?P<name>" + "|".join(_SENSITIVE_PARAMS) + r")=(?P<value>[^&\s'\"]*)",
+    re.IGNORECASE,
+)
+
+#: HTTP statuses worth retrying. Every other 4xx (401 bad key, 403, 404) is
+#: permanent: retrying it only spends the backoff ladder before failing anyway.
+RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def redact_secrets(text: object, secrets: Iterable[str] = ()) -> str:
+    """Mask Omeka key parameters, and any literal ``secrets``, in ``text``.
+
+    Literal values are masked in both plain and URL-encoded form, so a secret
+    survives neither in a query string nor in free text.
+    """
+    result = _SENSITIVE_RE.sub(lambda m: f"{m.group('name')}=***", str(text))
+    for secret in secrets:
+        if not secret:
+            continue
+        for form in {secret, quote_plus(secret)}:
+            result = result.replace(form, "***")
+    return result
+
+
+class OmekaTransportError(RuntimeError):
+    """A sanitized Omeka request failure.
+
+    Raised in place of aiohttp's own exceptions, with ``from None`` so the
+    original (whose message and ``request_info`` carry the authenticated URL)
+    is not chained into tracebacks. ``retryable`` tells :func:`async_retry`
+    whether another attempt can help.
+    """
+
+    def __init__(self, message: str, *, status: Optional[int] = None, retryable: bool = True):
+        super().__init__(message)
+        self.status = status
+        self.retryable = retryable
+
+
+def _sanitized_transport_error(
+    exc: BaseException, endpoint: str, secrets: Iterable[str]
+) -> OmekaTransportError:
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return OmekaTransportError(
+            f"HTTP {exc.status} ({redact_secrets(exc.message, secrets)}) for "
+            f"Omeka endpoint '{endpoint}'",
+            status=exc.status,
+            retryable=exc.status in RETRYABLE_STATUSES,
+        )
+    if isinstance(exc, asyncio.TimeoutError):
+        return OmekaTransportError(f"Timeout for Omeka endpoint '{endpoint}'")
+    return OmekaTransportError(
+        f"{type(exc).__name__} for Omeka endpoint '{endpoint}': "
+        f"{redact_secrets(exc, secrets)}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Async retry decorator
 # ---------------------------------------------------------------------------
 
@@ -165,12 +234,15 @@ def async_retry(
     exceptions: Union[Type[Exception], tuple] = (
         aiohttp.ClientError,
         asyncio.TimeoutError,
+        OmekaTransportError,
     ),
 ):
     """Retry an async callable with exponential backoff (1, 2, 4, … seconds).
 
     The last failed attempt re-raises the original exception (no trailing
-    backoff sleep).
+    backoff sleep). An exception whose ``retryable`` attribute is false — a
+    permanent HTTP status — is re-raised at once. Warnings go through
+    :func:`redact_secrets`, whatever the exception type.
     """
 
     def decorator(func):
@@ -180,10 +252,11 @@ def async_retry(
                 try:
                     return await func(*args, **kwargs)
                 except exceptions as exc:
-                    if attempt == max_tries - 1:
+                    if attempt == max_tries - 1 or not getattr(exc, "retryable", True):
                         raise
                     logger.warning(
-                        f"{func.__name__}: tentative {attempt + 1}/{max_tries} échouée ({exc})"
+                        f"{func.__name__}: tentative {attempt + 1}/{max_tries} échouée "
+                        f"({redact_secrets(exc)})"
                     )
                     await asyncio.sleep(2**attempt)
 
@@ -291,8 +364,10 @@ class OmekaApiClient:
         self.cache = Cache(cfg.CACHE_DIR, cfg.CACHE_HOURS) if use_cache else None
         self.console = console or Console()
 
-    @async_retry()
-    async def _get(self, endpoint: str, params: Dict[str, Any]) -> Any:
+    def _secrets(self) -> tuple[str, ...]:
+        return (self.cfg.API_KEY_IDENTITY, self.cfg.API_KEY_CREDENTIAL)
+
+    def _auth_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         request_params = dict(params)
         request_params.update(
             {
@@ -300,11 +375,18 @@ class OmekaApiClient:
                 "key_credential": self.cfg.API_KEY_CREDENTIAL,
             }
         )
+        return request_params
+
+    @async_retry()
+    async def _get(self, endpoint: str, params: Dict[str, Any]) -> Any:
         url = f"{self.cfg.API_URL}/{endpoint}"
         sess = await conn_manager.get()
-        async with sess.get(url, params=request_params) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+        try:
+            async with sess.get(url, params=self._auth_params(params)) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise _sanitized_transport_error(exc, endpoint, self._secrets()) from None
 
     async def request(self, endpoint: str, params: Dict[str, Any]) -> Any:
         # Host + identity are part of the cache namespace. Without them, a run
@@ -344,18 +426,15 @@ class OmekaApiClient:
         Deliberately bypasses the cache (the JSON cache stores bodies, not
         headers) — one cheap per_page=1 request per class.
         """
-        params = {
-            "resource_class_id": rcid,
-            "page": 1,
-            "per_page": 1,
-            "key_identity": self.cfg.API_KEY_IDENTITY,
-            "key_credential": self.cfg.API_KEY_CREDENTIAL,
-        }
+        params = self._auth_params({"resource_class_id": rcid, "page": 1, "per_page": 1})
         sess = await conn_manager.get()
-        async with sess.get(f"{self.cfg.API_URL}/items", params=params) as resp:
-            resp.raise_for_status()
-            total = resp.headers.get("Omeka-S-Total-Results")
-            return int(total) if total is not None else None
+        try:
+            async with sess.get(f"{self.cfg.API_URL}/items", params=params) as resp:
+                resp.raise_for_status()
+                total = resp.headers.get("Omeka-S-Total-Results")
+                return int(total) if total is not None else None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise _sanitized_transport_error(exc, "items", self._secrets()) from None
 
     async def fetch_items(
         self, rcid: int, *, verify_total: bool = True
@@ -379,7 +458,8 @@ class OmekaApiClient:
             except Exception as exc:  # noqa: BLE001
                 raise TruncatedFetchError(
                     f"Could not read Omeka-S-Total-Results for class {rcid}: "
-                    f"{exc}. Count reconciliation is required for a safe upload."
+                    f"{redact_secrets(exc, self._secrets())}. Count reconciliation "
+                    "is required for a safe upload."
                 ) from exc
             if expected is None:
                 raise TruncatedFetchError(
@@ -474,7 +554,8 @@ async def fetch_primary_media_url(
     except Exception as exc:  # noqa: BLE001
         media_stats.record_failure(item.get("o:id"), affected_fields)
         logger.warning(
-            "Primary media lookup failed for item %s: %s", item.get("o:id"), exc
+            "Primary media lookup failed for item %s: %s",
+            item.get("o:id"), redact_secrets(exc, getattr(api, "_secrets", tuple)()),
         )
         return ""
 
@@ -483,7 +564,39 @@ async def fetch_primary_media_url(
 # IIIF helpers
 # ---------------------------------------------------------------------------
 
-IIIF_BASE_URL = "https://islam.zmo.de/iiif/3"
+#: Production host. Item-page and IIIF URLs are built from the *configured*
+#: Omeka host instead (see :func:`public_base_url`), so a run pointed at a
+#: staging instance no longer publishes production links.
+DEFAULT_PUBLIC_BASE_URL = "https://islam.zmo.de"
+#: Omeka S site slug of the public IWAC site.
+SITE_SLUG = "afrique_ouest"
+IIIF_BASE_URL = f"{DEFAULT_PUBLIC_BASE_URL}/iiif/3"  # production default, kept for callers
+
+
+def public_base_url() -> str:
+    """Base URL of the public Omeka site, read at call time.
+
+    ``IWAC_PUBLIC_BASE_URL`` wins; otherwise ``OMEKA_BASE_URL`` minus its
+    ``/api`` suffix; otherwise the production host. Read lazily because the
+    scripts load ``.env`` after importing this module.
+    """
+    explicit = os.getenv("IWAC_PUBLIC_BASE_URL")
+    if explicit:
+        return explicit.rstrip("/")
+    api = os.getenv("OMEKA_BASE_URL", "").rstrip("/")
+    if api.endswith("/api"):
+        return api[: -len("/api")]
+    return DEFAULT_PUBLIC_BASE_URL
+
+
+def item_page_url(item_id: Union[str, int]) -> str:
+    """Public item page (the ``iwac_url`` column)."""
+    return f"{public_base_url()}/s/{SITE_SLUG}/item/{item_id}"
+
+
+def iiif_manifest_url(item_id: Union[str, int]) -> str:
+    """IIIF Presentation 3 manifest of an item (the ``iiif_manifest`` column)."""
+    return f"{public_base_url()}/iiif/3/{item_id}/manifest"
 
 
 async def fetch_iiif_thumbnail_url(
@@ -495,7 +608,7 @@ async def fetch_iiif_thumbnail_url(
     rate-limit, and server failures are recorded for the upload runner's
     fail-closed guard while still allowing all in-flight mappers to finish.
     """
-    manifest_url = f"{IIIF_BASE_URL}/{omeka_id}/manifest"
+    manifest_url = iiif_manifest_url(omeka_id)
     thumbnail_url = ""
     media_stats.record_attempt()
     try:
@@ -553,9 +666,17 @@ __all__ = [
     "ConnectionManager",
     "conn_manager",
     "async_retry",
+    "redact_secrets",
+    "OmekaTransportError",
+    "RETRYABLE_STATUSES",
     "OmekaApiClient",
     "TruncatedFetchError",
     "IIIF_BASE_URL",
+    "DEFAULT_PUBLIC_BASE_URL",
+    "SITE_SLUG",
+    "public_base_url",
+    "item_page_url",
+    "iiif_manifest_url",
     "fetch_iiif_thumbnail_url",
     "fetch_primary_media_url",
     "MediaFetchGuardError",

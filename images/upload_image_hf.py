@@ -44,10 +44,22 @@ from iwac_common.omeka_client import (
     conn_manager,
     fetch_iiif_thumbnail_url,
     fetch_primary_media_url,
+    iiif_manifest_url,
+    item_page_url,
 )
-from iwac_common.field_mappers import extract_added_date, get_value
+from iwac_common.field_mappers import (
+    countries_from_item_sets,
+    extract_added_date,
+    get_display_titles,
+    get_literal_values,
+    get_resource_ids,
+    get_rights_label,
+    get_value,
+    parse_coordinates,
+    parse_pub_date,
+)
 from iwac_common.upload_runner import UploadSpec, run_upload
-from iwac_common.schema import SUBSETS
+from iwac_common.schema import COUNTRY_ITEM_SETS, SUBSETS
 
 load_dotenv()
 
@@ -61,73 +73,14 @@ load_dotenv()
 # (33) is unused; every photograph item is filed under class 58.
 IMAGE_RESOURCE_CLASS_ID = SUBSETS["images"].resource_class_ids[0]
 
-# Each photograph belongs to exactly one country-specific item set. Map the
-# item-set id to the canonical country label used across the dataset (matches
-# country_mapper.py, incl. the un-accented raw ``Benin``).
-ITEM_SET_COUNTRY = {
-    2192: "Benin",           # Photographies (Bénin)
-    2211: "Burkina Faso",    # Photographies (Burkina Faso)
-    2216: "Côte d'Ivoire",   # Photographies (Côte d'Ivoire)
-    2220: "Niger",           # Photographies (Niger)
-    2227: "Togo",            # Photographies (Togo)
-}
+# Each photograph belongs to exactly one country-specific item set; the
+# mapping lives in iwac_common.schema.COUNTRY_ITEM_SETS["images"].
+ITEM_SET_COUNTRY = COUNTRY_ITEM_SETS["images"]
 
 
 # ---------------------------------------------------------------------------
 # Fonctions d'aide pour mapper les champs Omeka → plat
 # ---------------------------------------------------------------------------
-
-def _get_display_title(item: Dict[str, Any], field: str) -> str:
-    """Extract display_title from a field (pipe-joined for lists)."""
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        titles = [str(v["display_title"]) for v in val
-                  if isinstance(v, dict) and "display_title" in v]
-        return "|".join(filter(None, titles))
-    if isinstance(val, dict) and "display_title" in val:
-        return str(val["display_title"])
-    return ""
-
-
-def _get_at_value(item: Dict[str, Any], field: str) -> str:
-    """Extract @value from a field (pipe-joined for lists)."""
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, list):
-        values = [str(v["@value"]) for v in val
-                  if isinstance(v, dict) and "@value" in v]
-        return "|".join(filter(None, values))
-    if isinstance(val, dict) and "@value" in val:
-        return str(val["@value"])
-    return ""
-
-
-def _get_rights_label(item: Dict[str, Any], field: str = "dcterms:rights") -> str:
-    """Rights statements carry a human ``o:label`` alongside the ``@id`` URI;
-    prefer the label, fall back to the URI, then to ``@value``."""
-    if field not in item or item[field] is None:
-        return ""
-    val = item[field]
-    if isinstance(val, dict):
-        val = [val]
-    if not isinstance(val, list):
-        return ""
-    parts = [str(v.get("o:label") or v.get("@id") or v.get("@value") or "")
-             for v in val if isinstance(v, dict)]
-    return "|".join(filter(None, parts))
-
-
-def _get_country_from_item_sets(item: Dict[str, Any]) -> str:
-    """Map the item's country-specific photo collection to a country label."""
-    for s in item.get("o:item_set", []) or []:
-        country = ITEM_SET_COUNTRY.get(s.get("o:id"))
-        if country:
-            return country
-    return ""
-
 
 async def map_image_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item Omeka photographie (bibo:Image) en dict plat pour HF."""
@@ -139,41 +92,49 @@ async def map_image_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
         affected_fields=("image_url",),
     )
 
-    added_date = extract_added_date(item)
+    pub_date = get_value(item, "dcterms:date")
+    pub_year, pub_date_precision = parse_pub_date(pub_date)
+    coordinates = get_literal_values(item, "curation:coordinates")
+    latitude, longitude = parse_coordinates(coordinates)
 
     # IIIF thumbnail + manifest (only meaningful when media exists). Fall back
     # to the item's baked-in ``large`` derivative if the IIIF manifest is
     # unavailable.
-    session = await conn_manager.get()
     thumbnail_url = ""
-    iiif_manifest_url = ""
+    manifest_url = ""
     if image_url:
+        session = await conn_manager.get()
         thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
         if not thumbnail_url:
             thumbnail_url = (item.get("thumbnail_display_urls") or {}).get("large", "")
-        iiif_manifest_url = f"https://islam.zmo.de/iiif/3/{item['o:id']}/manifest"
+        manifest_url = iiif_manifest_url(item["o:id"])
 
     return {
         "o:id": item["o:id"],
         "identifier": get_value(item, "dcterms:identifier"),
-        "added_date": added_date,
-        "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
-        "iiif_manifest": iiif_manifest_url,
+        "added_date": extract_added_date(item),
+        "iwac_url": item_page_url(item["o:id"]),
+        "iiif_manifest": manifest_url,
         "image_url": image_url,
         "thumbnail": thumbnail_url,
         "title": get_value(item, "dcterms:title"),
-        "type": _get_display_title(item, "dcterms:type"),
+        "type": get_display_titles(item, "dcterms:type"),
         "creator": get_value(item, "dcterms:creator"),
-        "pub_date": get_value(item, "dcterms:date"),
+        "creator_ids": get_resource_ids(item, "dcterms:creator"),
+        "pub_date": pub_date,
+        "pub_year": pub_year,
+        "pub_date_precision": pub_date_precision,
         "description": get_value(item, "dcterms:description"),
-        "rights": _get_rights_label(item),
+        "rights": get_rights_label(item),
         "subject": get_value(item, "dcterms:subject"),
+        "subject_ids": get_resource_ids(item, "dcterms:subject"),
         "spatial": get_value(item, "dcterms:spatial"),
-        "coordinates": _get_at_value(item, "curation:coordinates"),
-        "country": _get_country_from_item_sets(item),
+        "spatial_ids": get_resource_ids(item, "dcterms:spatial"),
+        "coordinates": coordinates,
+        "latitude": latitude,
+        "longitude": longitude,
+        "country": countries_from_item_sets(item, ITEM_SET_COUNTRY),
     }
-
-
 
 
 # ---------------------------------------------------------------------------

@@ -37,12 +37,17 @@ from iwac_common.omeka_client import (
     conn_manager,
     fetch_iiif_thumbnail_url,
     fetch_primary_media_url,
+    iiif_manifest_url,
+    item_page_url,
 )
 from iwac_common.field_mappers import (
     extract_added_date,
+    get_resource_ids,
+    get_uri_value,
     get_value,
     get_value_by_language,
     is_content_public,
+    parse_pub_date,
     to_int_or_none,
 )
 from iwac_common.sentiment_panel import (
@@ -55,7 +60,7 @@ from iwac_common.sentiment_panel import (
     numeric_subjectivite_columns,
     prefixes,
 )
-from iwac_common.upload_runner import UploadSpec, run_upload
+from iwac_common.upload_runner import UploadSpec, report_unmapped_values, run_upload
 from iwac_common.schema import SUBSETS
 
 load_dotenv()
@@ -111,50 +116,34 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
 
     newspaper_name = get_value(item, "dcterms:publisher")
     country = get_country_from_newspaper(newspaper_name)
+    pub_date = get_value(item, "dcterms:date")
+    pub_year, pub_date_precision = parse_pub_date(pub_date)
 
-    # Custom logic to extract URL from fabio:hasURL, prioritizing @id
-    fabio_has_url_data = item.get("fabio:hasURL")
-    extracted_fabio_url = ""
-    if isinstance(fabio_has_url_data, list):
-        urls = []
-        for v_item in fabio_has_url_data:
-            if isinstance(v_item, dict):
-                id_val = v_item.get("@id")
-                if id_val and isinstance(id_val, str): # Ensure it's a non-empty string
-                    urls.append(id_val)
-        if urls:
-            extracted_fabio_url = "|".join(urls)
-    elif isinstance(fabio_has_url_data, dict):
-        id_val = fabio_has_url_data.get("@id")
-        if id_val and isinstance(id_val, str): # Ensure it's a non-empty string
-            extracted_fabio_url = id_val
-    elif isinstance(fabio_has_url_data, str) and fabio_has_url_data: # If it's already a non-empty string
-        extracted_fabio_url = fabio_has_url_data
-    nb_pages_int = to_int_or_none(get_value(item, "bibo:numPages"))
-    added_date = extract_added_date(item)
-
-    # Fetch thumbnail URL and set IIIF manifest URL only if PDF exists
-    session = await conn_manager.get()
+    # Thumbnail and IIIF manifest only when there is a PDF behind them.
     thumbnail_url = ""
-    iiif_manifest_url = ""
-    
-    if primary_url:  # Only fetch IIIF data if there's a PDF
+    manifest_url = ""
+    if primary_url:
+        session = await conn_manager.get()
         thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
-        iiif_manifest_url = f"https://islam.zmo.de/iiif/3/{item['o:id']}/manifest"
+        manifest_url = iiif_manifest_url(item["o:id"])
 
     return {
         "o:id": item["o:id"],
         "identifier": get_value(item, "dcterms:identifier"),
-        "added_date": added_date, # Date when item was added to Omeka
-        "iwac_url": f"https://islam.zmo.de/s/afrique_ouest/item/{item['o:id']}",
-        "iiif_manifest": iiif_manifest_url,
+        "added_date": extract_added_date(item),  # Date when item was added to Omeka
+        "iwac_url": item_page_url(item["o:id"]),
+        "iiif_manifest": manifest_url,
         "PDF": primary_url,
-        "thumbnail": thumbnail_url, # Added thumbnail field
+        "thumbnail": thumbnail_url,
         "title": get_value(item, "dcterms:title"),
         "author": get_value(item, "dcterms:creator"),
+        "author_ids": get_resource_ids(item, "dcterms:creator"),
         "newspaper": newspaper_name,
-        "country": country, # Added country field
-        "pub_date": get_value(item, "dcterms:date"),
+        "newspaper_ids": get_resource_ids(item, "dcterms:publisher"),
+        "country": country,
+        "pub_date": pub_date,
+        "pub_year": pub_year,
+        "pub_date_precision": pub_date_precision,
         # One column per language, NOT get_value(): the summariser writes an
         # `fr` and an `en` literal on the same property, and pipe-joining them
         # yields a string splittable only on a delimiter the prose may contain,
@@ -167,10 +156,12 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
             item, "bibo:shortDescription", "en"
         ),
         "subject": get_value(item, "dcterms:subject"),
+        "subject_ids": get_resource_ids(item, "dcterms:subject"),
         "spatial": get_value(item, "dcterms:spatial"),
+        "spatial_ids": get_resource_ids(item, "dcterms:spatial"),
         "language": get_value(item, "dcterms:language"),
-        "nb_pages": nb_pages_int, # Use converted integer value
-        "URL": extracted_fabio_url, # Use the specifically extracted URL
+        "nb_pages": to_int_or_none(get_value(item, "bibo:numPages")),
+        "URL": get_uri_value(item, "fabio:hasURL"),
         "source": get_value(item, "dcterms:source"),
         "OCR": get_value(item, "bibo:content"),
         # Whether the full text is publicly visible on Omeka; drives
@@ -248,6 +239,7 @@ SPEC = UploadSpec(
         *numeric_subjectivite_columns(),
     ),
     columns_to_exclude=LEGACY_VENDOR_COLUMNS,
+    post_map=report_unmapped_values("newspaper", "country"),
     post_merge=_sentiment_columns_last,
 )
 

@@ -26,7 +26,9 @@ CI repeats these checks on Linux/Python 3.12, Linux/Python 3.13, and Windows/Pyt
 - Never call `Dataset.push_to_hub` directly. Route writes through `iwac_common.hub.push_dataset_verified` (or `post-processing/_common.py:push_dataset`).
 - Treat a failed Hub baseline read, missing Omeka total-count header, mapper exception, or media transport error as fatal by default. Overrides must preserve the affected existing Hub values.
 - Join computed outputs on `o:id`; never assume two Hub reads have the same row order.
-- Add stable subset/resource-class/embedding facts to `iwac_common/schema.py`, not another local list.
+- Add stable subset/resource-class/embedding facts to `iwac_common/schema.py`, not another local list — including a new integer column (`int_columns`) and the source a new computed column derives from (`DERIVED_FROM`).
+- Do not round-trip a whole subset through pandas to set one column's type: `to_pandas()` turns nullable ints into `float64`. Declare output types (`map_with_progress(..., output_types=...)`); the gateway's conform step is a backstop.
+- Join content subsets to `index` on the `*_ids` columns, not on display titles.
 - A new public column must be reviewed in `iwac_common/public_columns.json`. Full-text-like columns belong in the masked content contract, not merely the public allowlist.
 - Run write-capable scripts against a scratch repo first via `IWAC_HF_PRIVATE_REPO` / `IWAC_HF_PUBLIC_REPO`. Tests must not require live Hub or Omeka access.
 

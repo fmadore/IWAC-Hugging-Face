@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -200,3 +201,144 @@ class TestAudiovisualIsScanned:
         # failure raises there instead of silently zeroing the statistics.
         stats = idx.calculate_frequency_stats(EMPTY, EMPTY, EMPTY, None)
         assert stats == {}
+
+
+class TestAuthorityIdJoin:
+    """Joining on the linked authority's o:id instead of its display title."""
+
+    def _index(self):
+        return pd.DataFrame({
+            "o:id": ["10", "11", "12"],
+            "Titre": ["Moussa Traoré", "Moussa Traoré", "Ramadan"],
+        })
+
+    def test_homonyms_no_longer_pool_their_counts(self):
+        frames = {
+            "articles": _frame([
+                {"subject": "Moussa Traoré", "subject_ids": "11", "spatial": "",
+                 "author": "", "pub_date": "1991-03-26", "country": "Burkina Faso"},
+            ]),
+            "publications": EMPTY, "references": EMPTY, "audiovisual": EMPTY,
+        }
+        out = idx.attach_frequency_stats(self._index(), frames)
+        assert out.set_index("o:id")["frequency"].to_dict() == {"10": 0, "11": 1, "12": 0}
+
+    def test_rows_without_ids_fall_back_to_the_title(self):
+        # A subset not re-uploaded since the ids columns were added.
+        frames = {
+            "articles": _frame([
+                {"subject": "Ramadan", "spatial": "", "author": "",
+                 "pub_date": "2020-04-24", "country": "Togo"},
+            ]),
+            "publications": EMPTY, "references": EMPTY, "audiovisual": EMPTY,
+        }
+        out = idx.attach_frequency_stats(self._index(), frames).set_index("o:id")
+        assert out.loc["12", "frequency"] == 1
+        assert out.loc["12", "countries"] == "Togo"
+
+    def test_a_renamed_authority_keeps_counting(self):
+        frames = {
+            "articles": _frame([
+                {"subject": "Ramadhan (old label)", "subject_ids": "12", "spatial": "",
+                 "author": "", "pub_date": "2020-04-24", "country": "Togo"},
+            ]),
+            "publications": EMPTY, "references": EMPTY, "audiovisual": EMPTY,
+        }
+        out = idx.attach_frequency_stats(self._index(), frames).set_index("o:id")
+        assert out.loc["12", "frequency"] == 1
+
+    def test_multi_country_rows_count_each_country(self):
+        stats = _stats(references=_frame([
+            {"subject": "", "spatial": "Niger", "author": "", "editor": "",
+             "publisher": "", "pub_date": "1981", "country": "Burkina Faso|Niger"},
+            {"subject": "", "spatial": "Niger", "author": "", "editor": "",
+             "publisher": "", "pub_date": "1985", "country": "Niger"},
+        ]))
+        assert stats["Niger"]["countries"] == "Burkina Faso|Niger"
+
+    def test_unparseable_dates_do_not_win_the_occurrence_window(self):
+        stats = _stats(articles=_frame([
+            {"subject": "COSIM", "spatial": "", "author": "",
+             "pub_date": "s.d.", "country": ""},
+            {"subject": "COSIM", "spatial": "", "author": "",
+             "pub_date": "1981-04/1981-06", "country": ""},
+            {"subject": "COSIM", "spatial": "", "author": "",
+             "pub_date": "1979", "country": ""},
+        ]))
+        assert stats["COSIM"]["frequency"] == 3
+        assert stats["COSIM"]["first_occurrence"] == "1979"
+        assert stats["COSIM"]["last_occurrence"] == "1981-06"
+
+    def test_only_the_needed_columns_are_requested(self):
+        cols = idx.frequency_input_columns("references")
+        assert {"o:id", "pub_date", "country", "editor", "editor_ids"} <= set(cols)
+        assert "OCR" not in cols and "embedding_OCR" not in cols
+
+
+class TestColumnPrunedHubRead:
+    def _fs_with(self, tables):
+        import io
+
+        import fsspec
+        import pyarrow.parquet as pq
+
+        fs = fsspec.filesystem("memory")
+        for name, table in tables.items():
+            buf = io.BytesIO()
+            pq.write_table(table, buf)
+            fs.pipe(f"/datasets/owner/repo@abc/articles/{name}", buf.getvalue())
+        return fs
+
+    def test_reads_only_requested_columns_across_shards(self):
+        import pyarrow as pa
+
+        from iwac_common.hub import read_hub_columns
+
+        fs = self._fs_with({
+            "train-00000.parquet": pa.table({
+                "o:id": ["1"], "subject": ["A"], "OCR": ["long text"],
+                "lda_topic_id": pa.array([None], pa.int64()),
+            }),
+            "train-00001.parquet": pa.table({
+                "o:id": ["2"], "subject": ["B"], "OCR": ["more"],
+                "lda_topic_id": pa.array([4], pa.int64()),
+            }),
+        })
+        df = read_hub_columns(
+            "owner/repo", "articles", revision="abc",
+            columns=["o:id", "subject", "lda_topic_id", "not_there"], fs=fs,
+        )
+        assert list(df.columns) == ["o:id", "subject", "lda_topic_id"]
+        assert df["o:id"].tolist() == ["1", "2"]
+        assert str(df["lda_topic_id"].dtype) == "Int64"
+
+    def test_no_parquet_fails_closed(self):
+        import fsspec
+
+        from iwac_common.hub import HubBaselineUnavailableError, read_hub_columns
+
+        with pytest.raises(HubBaselineUnavailableError):
+            read_hub_columns("owner/none", "articles", revision="abc", columns=["o:id"],
+                             fs=fsspec.filesystem("memory"))
+
+    def test_fallback_is_a_full_load_of_the_same_revision(self, monkeypatch):
+        import datasets
+        import pyarrow as pa
+
+        from iwac_common import hub
+
+        def unavailable(*args, **kwargs):
+            raise RuntimeError("no range reads")
+
+        calls = []
+
+        def fake_load(*args, **kwargs):
+            calls.append(kwargs)
+            return datasets.Dataset(pa.table({"o:id": ["1"], "subject": ["A"], "OCR": ["x"]}))
+
+        monkeypatch.setattr(hub, "read_hub_columns", unavailable)
+        monkeypatch.setattr(datasets, "load_dataset", fake_load)
+        df = hub.load_hub_columns("owner/repo", "articles", revision="abc",
+                                  columns=["o:id", "subject"])
+        assert list(df.columns) == ["o:id", "subject"]
+        assert calls[0]["revision"] == "abc"

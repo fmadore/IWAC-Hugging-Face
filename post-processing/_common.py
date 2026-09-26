@@ -59,6 +59,7 @@ except ImportError:  # venv without the editable install
 from iwac_common.hub import (  # noqa: E402
     HubBaselineUnavailableError,
     get_repo_revision,
+    load_hub_columns,
     push_dataset_verified,
 )
 
@@ -77,33 +78,31 @@ def load_subset_dataframe(
     """Load one IWAC subset as a pandas DataFrame.
 
     source="hub" downloads the live dataset (authoritative, needs network);
-    source="csv" reads the local ``data/iwac_<config>.csv`` mirror written by
-    ``data/fetch_datasets.py`` (fast, offline — but may lag the Hub).
+    source="local" (alias "csv", the historical name) reads the local mirror
+    written by ``data/fetch_datasets.py`` — ``data/iwac_<config>.parquet`` (or a
+    legacy ``.csv``), verified against ``mirror_manifest.json`` (fast, offline,
+    revision-pinned — but may lag the Hub).
 
-    ``columns`` restricts the frame (and, for CSV, what is parsed at all —
-    important for the 388 MB articles mirror). ``o:id`` is always cast to str.
+    ``columns`` restricts the frame (and what is read at all). ``o:id`` is
+    always cast to str.
     """
     import pandas as pd  # local import: keep module import light
 
     console = console or Console()
-    if source == "csv":
-        verify_manifest = csv_path is None
-        path = csv_path or (REPO_ROOT / "data" / f"iwac_{config_name}.csv")
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Local mirror not found: {path}. Run data/fetch_datasets.py or use --source hub."
-            )
+    if source in ("csv", "local"):
         manifest_entry = None
         manifest = None
-        if verify_manifest:
-            import hashlib
+        if csv_path is not None:
+            path = csv_path
+        else:
             import json
 
-            manifest_path = path.parent / "mirror_manifest.json"
+            data_dir = REPO_ROOT / "data"
+            manifest_path = data_dir / "mirror_manifest.json"
             if not manifest_path.exists():
                 raise RuntimeError(
                     f"Local mirror manifest not found: {manifest_path}. Re-run "
-                    "data/fetch_datasets.py; unversioned CSVs are not a safe baseline."
+                    "data/fetch_datasets.py; unversioned mirror files are not a safe baseline."
                 )
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -112,7 +111,7 @@ def load_subset_dataframe(
                 raise RuntimeError(
                     f"Invalid mirror manifest for '{config_name}': {exc}"
                 ) from exc
-            if manifest.get("schema_version") != 1:
+            if manifest.get("schema_version") not in (1, 2):
                 raise RuntimeError(
                     f"Unsupported local mirror manifest schema: "
                     f"{manifest.get('schema_version')!r}."
@@ -127,11 +126,20 @@ def load_subset_dataframe(
                     f"Local mirror revision changed from requested {revision} to "
                     f"{manifest.get('revision')}; restart the multi-subset analysis."
                 )
-            if manifest_entry.get("file") != path.name:
+            expected = {f"iwac_{config_name}.parquet", f"iwac_{config_name}.csv"}
+            if manifest_entry.get("file") not in expected:
                 raise RuntimeError(
                     f"Mirror manifest maps '{config_name}' to "
-                    f"{manifest_entry.get('file')!r}, expected {path.name!r}."
+                    f"{manifest_entry.get('file')!r}, expected one of {sorted(expected)}."
                 )
+            path = data_dir / manifest_entry["file"]
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Local mirror not found: {path}. Run data/fetch_datasets.py or use --source hub."
+            )
+        if manifest_entry is not None:
+            import hashlib
+
             digest = hashlib.sha256()
             with path.open("rb") as handle:
                 for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -142,7 +150,25 @@ def load_subset_dataframe(
                     "have been interrupted. Re-run data/fetch_datasets.py."
                 )
         console.print(f"[blue]→[/blue] Loading local mirror [cyan]{path.name}[/cyan]")
-        df = pd.read_csv(path, usecols=columns, dtype={"o:id": str}, low_memory=False)
+        if path.suffix == ".parquet":
+            # Typed mirror: nullable ints, bools and embedding lists survive.
+            import pyarrow.parquet as pq
+
+            from iwac_common.schema import arrow_to_pandas
+
+            names = pq.read_schema(path).names
+            wanted = [c for c in columns if c in names] if columns else None
+            df = arrow_to_pandas(pq.read_table(path, columns=wanted))
+        else:
+            # A requested column the mirror lacks (e.g. one added after the
+            # mirror was taken) is skipped, as the Hub path skips it.
+            wanted_set = set(columns) if columns else None
+            df = pd.read_csv(
+                path,
+                usecols=(lambda c: c in wanted_set) if wanted_set is not None else None,
+                dtype={"o:id": str},
+                low_memory=False,
+            )
         if manifest_entry is not None and len(df) != manifest_entry.get("rows"):
             raise RuntimeError(
                 f"Local mirror row count mismatch for {path.name}: read {len(df)}, "
@@ -152,30 +178,127 @@ def load_subset_dataframe(
             df.attrs["iwac_source_revision"] = manifest.get("revision")
             df.attrs["iwac_source_repository"] = manifest.get("repository")
         console.print(
-            f"[yellow]ℹ[/yellow] Local CSV mirror may lag the live Hub dataset "
+            f"[yellow]ℹ[/yellow] Local mirror may lag the live Hub dataset "
             f"(file date: {pd.Timestamp(path.stat().st_mtime, unit='s').date()})."
         )
     elif source == "hub":
-        from datasets import load_dataset
-
         revision = revision or get_repo_revision(repo_id, token=token)
         with console.status(f"[bold green]Loading '{repo_id}' ({config_name}) from Hub...", spinner="dots"):
-            ds = load_dataset(
-                repo_id, name=config_name, split="train", token=token,
-                revision=revision,
-            )
-        if columns:
-            keep = [c for c in columns if c in ds.column_names]
-            ds = ds.select_columns(keep)
-        df = ds.to_pandas()
+            if columns:
+                # Column-pruned parquet read: only the requested columns travel
+                # (an analysis of lemma_nostop no longer downloads embeddings).
+                # Falls back to a full load of the same revision on failure.
+                df = load_hub_columns(
+                    repo_id, config_name, revision=revision, columns=columns,
+                    token=token, console=console,
+                )
+            else:
+                from datasets import load_dataset
+
+                ds = load_dataset(
+                    repo_id, name=config_name, split="train", token=token,
+                    revision=revision,
+                )
+                df = ds.to_pandas()
         df.attrs["iwac_source_revision"] = revision
     else:
-        raise ValueError(f"Unknown source '{source}' (expected 'hub' or 'csv').")
+        raise ValueError(f"Unknown source '{source}' (expected 'hub', 'local' or 'csv').")
 
     if "o:id" in df.columns:
         df["o:id"] = df["o:id"].astype(str)
     console.print(f"[green]✓[/green] Loaded {len(df):,} rows ({config_name}, source={source})")
     return df
+
+
+def _git_state() -> Dict[str, Any]:
+    """Code SHA and dirty flag of the checkout, or ``None`` values outside git."""
+    import subprocess
+
+    def run(*argv: str) -> Optional[str]:
+        try:
+            out = subprocess.run(
+                ["git", *argv], cwd=REPO_ROOT, capture_output=True, text=True,
+                timeout=10, check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout.strip()
+
+    sha = run("rev-parse", "HEAD")
+    status = run("status", "--porcelain")
+    return {"sha": sha, "dirty": None if status is None else bool(status)}
+
+
+def _package_versions(names: List[str]) -> Dict[str, Optional[str]]:
+    from importlib import metadata
+
+    versions: Dict[str, Optional[str]] = {}
+    for name in names:
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+def write_run_manifest(
+    output_dir: Path,
+    *,
+    script: str,
+    repo_id: Optional[str],
+    revision: Optional[str],
+    args: Any = None,
+    outputs: List[Path] = (),
+    inputs: Optional[Dict[str, Any]] = None,
+) -> Path:
+    """Record how a report-only run produced its outputs.
+
+    Written beside the outputs as ``<script>.manifest.json`` (the latest run)
+    and copied to ``runs/<script>_<UTC timestamp>.json`` so earlier runs stay
+    traceable although their CSVs are overwritten. Records the code SHA and
+    whether the checkout was dirty, the dataset repository and revision, the
+    command arguments, Python and key library versions, extra ``inputs`` (a
+    model directory, parameters), and the SHA-256 of every output file — what a
+    figure in a paper needs to be reproducible, which a seed alone is not.
+    """
+    import hashlib
+    import json
+    import platform
+    from datetime import datetime, timezone
+
+    def sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    now = datetime.now(timezone.utc)
+    manifest = {
+        "script": script,
+        "generated_at": now.isoformat(),
+        "code": _git_state(),
+        "dataset": {"repository": repo_id, "revision": revision},
+        "arguments": vars(args) if hasattr(args, "__dict__") else args,
+        "python": platform.python_version(),
+        "packages": _package_versions([
+            "iwac-hugging-face", "pandas", "numpy", "pyarrow", "datasets",
+            "gensim", "scipy", "spacy",
+        ]),
+        "inputs": inputs or {},
+        "outputs": {
+            Path(p).name: {"sha256": sha256(Path(p)), "bytes": Path(p).stat().st_size}
+            for p in outputs if Path(p).exists()
+        },
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(manifest, ensure_ascii=False, indent=2, default=str) + "\n"
+    latest = output_dir / f"{script}.manifest.json"
+    latest.write_text(text, encoding="utf-8")
+    runs = output_dir / "runs"
+    runs.mkdir(exist_ok=True)
+    (runs / f"{script}_{now.strftime('%Y%m%dT%H%M%SZ')}.json").write_text(text, encoding="utf-8")
+    return latest
 
 
 def ensure_hf_token(console: Optional[Console] = None) -> str:
@@ -394,6 +517,7 @@ def map_with_progress(
     batch_size: int = 1000,
     description: str = "[cyan]Processing",
     console: Optional[Console] = None,
+    output_types: Optional[Dict[str, Any]] = None,
 ):
     """``ds.map(batched=True)`` with a Rich progress bar and cache-busting.
 
@@ -401,6 +525,12 @@ def map_with_progress(
     plus a fresh ``new_fingerprint``) so re-runs never resurface stale computed
     columns. ``batch_fn`` takes and returns a batch dict, exactly like a plain
     ``.map`` callable.
+
+    ``output_types`` declares the ``datasets`` feature of each column the batch
+    function writes (e.g. ``{"nb_mots": Value("int64")}``). Declare them: without
+    it the writer infers the type from the first batch, so a first batch that is
+    all ``None`` fixes the column as ``null`` and the next batch fails with
+    "Couldn't cast array of type int64 to null".
     """
     console = console or Console()
     with Progress(
@@ -419,6 +549,10 @@ def map_with_progress(
             progress.update(task, advance=len(first) if first is not None else 0)
             return result
 
+        features = None
+        if output_types:
+            features = ds.features.copy()
+            features.update(output_types)
         mapped = ds.map(
             _with_progress,
             batched=True,
@@ -426,6 +560,7 @@ def map_with_progress(
             desc=None,
             load_from_cache_file=False,
             new_fingerprint=str(uuid.uuid4()),
+            features=features,
         )
         if hasattr(ds, "_iwac_source_revision"):
             setattr(mapped, "_iwac_source_revision", ds._iwac_source_revision)
@@ -521,6 +656,7 @@ def print_dry_run_panel(
 
 
 __all__ = [
+    "write_run_manifest",
     "ensure_hf_token",
     "get_available_configs",
     "choose_config",

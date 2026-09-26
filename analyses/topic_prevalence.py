@@ -59,7 +59,12 @@ sys.path.insert(0, str(REPO_ROOT / "post-processing"))
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # analyses/ for _stats
 
-from _common import ensure_hf_token, load_subset_dataframe, PRIVATE_REPO_ID  # noqa: E402
+from _common import (  # noqa: E402
+    PRIVATE_REPO_ID,
+    ensure_hf_token,
+    load_subset_dataframe,
+    write_run_manifest,
+)
 from _stats import (  # noqa: E402
     bh_adjust,
     bootstrap_mean_ci,
@@ -126,6 +131,7 @@ def main() -> None:
         columns=["o:id", "lemma_nostop", "language", "pub_date", "country"],
         console=console,
     )
+    source_revision = df.attrs.get("iwac_source_revision")
 
     years = pd.to_numeric(df["pub_date"].astype(str).str[:4], errors="coerce")
     is_french = df["language"].isna() | (df["language"] == "Français")
@@ -314,6 +320,23 @@ def main() -> None:
             "Declining topics (significant, BH q < 0.05)",
             sig.nsmallest(5, "slope_per_decade_pp"), show_q=True,
         ))
+    params = model_dir / "training_parameters.json"
+    write_run_manifest(
+        OUTPUT_DIR, script="topic_prevalence", repo_id=args.repo,
+        revision=source_revision, args=args,
+        inputs={
+            "model_dir": str(model_dir),
+            "training_parameters": (
+                json.loads(params.read_text(encoding="utf-8")) if params.exists() else None
+            ),
+        },
+        outputs=[
+            OUTPUT_DIR / "topic_prevalence_year.csv",
+            OUTPUT_DIR / "topic_prevalence_year_country.csv",
+            OUTPUT_DIR / "topic_labels.csv",
+            OUTPUT_DIR / "topic_prevalence_summary.json",
+        ],
+    )
     console.print(f"\n[green]✓[/green] Outputs in [cyan]{OUTPUT_DIR}[/cyan]")
 
 

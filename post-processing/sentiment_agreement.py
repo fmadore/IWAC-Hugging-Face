@@ -71,6 +71,7 @@ from _common import (  # noqa: E402
     load_hub_dataset,
     load_subset_dataframe,
     push_dataset,
+    write_run_manifest,
 )
 from iwac_common.sentiment_panel import (  # noqa: E402
     PANEL,
@@ -333,7 +334,9 @@ def main() -> int:
     token = ensure_hf_token(console=console) if (args.source == "hub" or args.push) else None
     df = load_subset_dataframe(
         args.repo, args.config, token=token, source=args.source,
-        columns=needed if args.source == "csv" else None, console=console,
+        # Only the panel columns travel (column-pruned on the Hub too); the
+        # --push path reloads the full subset separately.
+        columns=needed, console=console,
     )
     source_revision = df.attrs.get("iwac_source_revision")
     missing_cols = [c for c in sentiment_cols if c not in df.columns]
@@ -476,6 +479,10 @@ def main() -> int:
     pd.concat([df[["o:id"]], consensus_frame], axis=1).to_csv(out_csv, index=False, encoding="utf-8")
     console.print(f"[green]✓[/green] Report: [cyan]{out_json}[/cyan]")
     console.print(f"[green]✓[/green] Consensus columns: [cyan]{out_csv}[/cyan]")
+    write_run_manifest(
+        OUTPUT_DIR, script=f"sentiment_agreement_{args.config}", repo_id=args.repo,
+        revision=source_revision, args=args, outputs=[out_json, out_csv],
+    )
 
     # --- optional push ---
     if not args.push:

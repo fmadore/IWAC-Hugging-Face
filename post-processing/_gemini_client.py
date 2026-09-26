@@ -19,13 +19,15 @@ from typing import Any, Callable, Dict, List, Sequence
 
 import pyarrow as pa
 
-from _embedding_utils import is_empty_embedding
+from _embedding_utils import cached_value, is_empty_embedding
 
 logger = logging.getLogger(__name__)
 
 # --- Retry ladder (identical across text and image embedding) ---
 MAX_RETRIES = 6
 BASE_RETRY_DELAY = 5  # seconds
+# google-genai's APIError carries the HTTP status as ``.code``.
+PERMANENT_STATUS_CODES = frozenset({400, 401, 403, 404})
 
 
 def call_with_retry(embed_call: Callable[[], List[List[float]]]) -> List[List[float]]:
@@ -42,6 +44,10 @@ def call_with_retry(embed_call: Callable[[], List[List[float]]]) -> List[List[fl
             return embed_call()
         except Exception as e:  # noqa: BLE001
             error_str = str(e)
+            # A bad key, a forbidden model or a malformed request fails the
+            # same way on every attempt; the ladder would only add ~2.5 min.
+            if getattr(e, "code", None) in PERMANENT_STATUS_CODES:
+                raise
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
                 wait = BASE_RETRY_DELAY * (2 ** attempt)
                 logger.warning(f"Rate limited (attempt {attempt + 1}/{MAX_RETRIES}), waiting {wait}s...")
@@ -59,30 +65,37 @@ def restore_from_cache(
     all_embeddings: List[Any],
     row_ids: Sequence[Any],
     cache: Dict[str, Any],
+    fingerprints: Sequence[str],
 ) -> int:
-    """Overwrite rows whose ``o:id`` has a cached vector; return the count.
+    """Overwrite rows whose cached vector was computed from their current
+    input; return the count.
 
-    Mutates ``all_embeddings`` in place. Cache keys are stringified row ids
-    (the resume caches written by ``_embedding_utils.save_cache``).
+    Mutates ``all_embeddings`` in place. Cache keys are stringified row ids and
+    entries carry an input fingerprint (``_embedding_utils.make_entry``). An
+    entry for text that has changed since — or a legacy entry with no
+    fingerprint — is not restored, so the row is embedded afresh instead of
+    receiving a vector of some earlier version of its text.
     """
     restored = 0
-    for i, oid in enumerate(row_ids):
-        oid_str = str(oid)
-        if oid_str in cache:
-            all_embeddings[i] = cache[oid_str]
+    for i, (oid, fingerprint) in enumerate(zip(row_ids, fingerprints)):
+        vector = cached_value(cache, oid, fingerprint)
+        if vector is not None:
+            all_embeddings[i] = vector
             restored += 1
     return restored
 
 
 def build_embedding_array(all_embeddings: List[Any]) -> pa.Array:
-    """Typed ``list<float64>`` array with ``None`` for empty embeddings.
+    """Typed ``list<float32>`` array with ``None`` for empty embeddings.
 
     Building the column explicitly avoids PyArrow type-inference issues when
-    embeddings are sparse (all-null or mixed null/list columns).
+    embeddings are sparse (all-null or mixed null/list columns). float32 is the
+    canonical storage type (``iwac_common.schema.EMBEDDING_VALUE_TYPE``); the
+    write gateway would cast to it anyway.
     """
     return pa.array(
         [None if is_empty_embedding(e) else e for e in all_embeddings],
-        type=pa.list_(pa.float64()),
+        type=pa.list_(pa.float32()),
     )
 
 
@@ -97,6 +110,7 @@ def set_embedding_column(ds, column: str, all_embeddings: List[Any]):
 __all__ = [
     "MAX_RETRIES",
     "BASE_RETRY_DELAY",
+    "PERMANENT_STATUS_CODES",
     "call_with_retry",
     "restore_from_cache",
     "build_embedding_array",

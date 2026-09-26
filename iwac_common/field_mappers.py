@@ -9,7 +9,8 @@ their original scripts.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
 logger = logging.getLogger(__name__)
@@ -173,6 +174,174 @@ def is_content_public(item: Dict[str, Any], field: str = "bibo:content") -> bool
     return bool(text_vals) and all(v.get("is_public") is True for v in text_vals)
 
 
+def _values(item: Dict[str, Any], field: str) -> List[Dict[str, Any]]:
+    """The property's value dicts, whatever shape Omeka returned."""
+    val = item.get(field)
+    if isinstance(val, dict):
+        return [val]
+    if isinstance(val, list):
+        return [v for v in val if isinstance(v, dict)]
+    return []
+
+
+def get_display_titles(item: Dict[str, Any], field: str) -> str:
+    """Pipe-joined ``display_title`` of a property's linked resources.
+
+    Unlike :func:`get_value`, literal values are ignored. This replaces three
+    diverging local copies (index, audiovisual, images); one of them wrote the
+    string ``"None"`` for a null title, another crashed on a non-dict value.
+    """
+    return "|".join(
+        str(v["display_title"]) for v in _values(item, field) if v.get("display_title")
+    )
+
+
+def get_literal_values(item: Dict[str, Any], field: str) -> str:
+    """Pipe-joined ``@value`` literals of a property (linked values ignored)."""
+    return "|".join(
+        str(v["@value"]) for v in _values(item, field)
+        if v.get("@value") not in (None, "")
+    )
+
+
+def get_resource_ids(item: Dict[str, Any], field: str) -> str:
+    """Pipe-joined Omeka ids (``value_resource_id``) of a property's linked items.
+
+    The companion to the label columns (``subject``, ``spatial``, ``author``…),
+    which carry only display titles. Joining a label column to ``index.Titre``
+    merges homonyms, misses a renamed authority until every content subset is
+    re-uploaded, and cannot tell a linked authority from a free-text literal;
+    joining these ids to ``index.o:id`` does none of that. Literals have no id
+    and are skipped, so the list is not positionally aligned with the labels.
+    """
+    ids = []
+    for v in _values(item, field):
+        rid = v.get("value_resource_id")
+        if rid is None or rid == "":
+            continue
+        ids.append(str(rid))
+    return "|".join(dict.fromkeys(ids))
+
+
+def split_by_language(
+    item: Dict[str, Any], field: str, language: str = "en"
+) -> Tuple[str, str]:
+    """``(primary, <language>)`` literals of a property that may be bilingual.
+
+    For free-text fields whose values arrive as one literal per language
+    (``dcterms:abstract`` on references: a French abstract and its English
+    translation, which :func:`get_value` pipe-joined into one string):
+
+    - the second element is the first value tagged ``language``;
+    - the first element is every *other* value, pipe-joined exactly as before
+      (untagged values stay there: their language is unknown, and splitting
+      them would be a guess), or — when ``language`` is the only language
+      present — that same value, so the primary column never loses an
+      abstract that happens to be English-only.
+    """
+    literals = [
+        (str(v["@value"]), str(v.get("@language") or "").lower())
+        for v in _values(item, field) if v.get("@value") not in (None, "")
+    ]
+    wanted = language.lower()
+    tagged = [text for text, lang in literals if lang == wanted]
+    others = [text for text, lang in literals if lang != wanted]
+    secondary = tagged[0] if tagged else ""
+    if len(tagged) > 1:
+        logger.warning(
+            "Item %s has %d '%s' values for %s; keeping the first",
+            item.get("o:id"), len(tagged), language, field,
+        )
+    primary = "|".join(others) if others else secondary
+    return primary, secondary
+
+
+def countries_from_item_sets(
+    item: Dict[str, Any], mapping: Mapping[int, str], *, first_only: bool = True
+) -> str:
+    """Country label(s) from an item's membership in country-specific item sets.
+
+    ``first_only`` returns the first match (subsets where an item belongs to one
+    country collection); otherwise every match, pipe-joined in item-set order.
+    """
+    countries: List[str] = []
+    for item_set in item.get("o:item_set") or []:
+        if not isinstance(item_set, dict):
+            continue
+        country = mapping.get(item_set.get("o:id"))
+        if country and country not in countries:
+            countries.append(country)
+            if first_only:
+                break
+    return "|".join(countries)
+
+
+_ISO_DATE_RE = re.compile(r"^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$")
+
+
+def _iso_date(text: str) -> Optional[Tuple[int, Optional[int], Optional[int]]]:
+    match = _ISO_DATE_RE.match(text.strip())
+    if not match:
+        return None
+    year = int(match.group(1))
+    month = int(match.group(2)) if match.group(2) else None
+    day = int(match.group(3)) if match.group(3) else None
+    if month is not None and not 1 <= month <= 12:
+        return None
+    if day is not None and not 1 <= day <= 31:
+        return None
+    return year, month, day
+
+
+def parse_pub_date(value: Any) -> Tuple[Optional[int], str]:
+    """``(pub_year, pub_date_precision)`` for a raw ``dcterms:date`` string.
+
+    ``pub_date`` stays verbatim; these are its analysable companions, because
+    the collection mixes ``YYYY-MM-DD``, ``YYYY-MM``, bare years and
+    ``YYYY-MM/YYYY-MM`` ranges, which neither sort nor bin reliably as text.
+
+    Precision is one of ``day``, ``month``, ``year``, ``range`` (the year is
+    the range's start), ``other`` (a value this parser does not recognise —
+    no year is guessed) or ``""`` (no date).
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None, ""
+    parts = text.split("/")
+    if len(parts) == 2:
+        start, end = _iso_date(parts[0]), _iso_date(parts[1])
+        if start and end:
+            return start[0], "range"
+        return None, "other"
+    parsed = _iso_date(text)
+    if parsed is None:
+        return None, "other"
+    year, month, day = parsed
+    return year, ("day" if day else "month" if month else "year")
+
+
+def parse_coordinates(value: Any) -> Tuple[Optional[float], Optional[float]]:
+    """``(latitude, longitude)`` from a ``"lat, lng"`` string, else ``(None, None)``.
+
+    ``curation:coordinates`` is stored as one string; several values, a
+    malformed pair or an out-of-range coordinate yield nulls rather than a
+    guess.
+    """
+    text = str(value or "").strip()
+    if not text or "|" in text:
+        return None, None
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) != 2:
+        return None, None
+    try:
+        lat, lng = float(parts[0]), float(parts[1])
+    except ValueError:
+        return None, None
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0):
+        return None, None
+    return lat, lng
+
+
 def get_media_ids(item: Dict[str, Any]) -> str:
     """Pipe-joined ``o:media`` IDs, or ``""`` if none."""
     if "o:media" in item and isinstance(item["o:media"], list):
@@ -224,6 +393,13 @@ def extract_added_date(item: Dict[str, Any]) -> str:
 
 __all__ = [
     "get_value",
+    "get_display_titles",
+    "get_literal_values",
+    "get_resource_ids",
+    "split_by_language",
+    "countries_from_item_sets",
+    "parse_pub_date",
+    "parse_coordinates",
     "get_value_by_language",
     "get_uri_value",
     "get_rights_label",

@@ -45,6 +45,7 @@ from _common import (  # noqa: E402
     load_hub_dataset,
     load_subset_dataframe,
     push_dataset,
+    write_run_manifest,
 )
 
 from rich import box
@@ -215,6 +216,10 @@ def main() -> int:
     out_path = OUTPUT_DIR / f"related_articles_{args.config}.parquet"
     out_frame.to_parquet(out_path, index=False)
     console.print(f"[green]✓[/green] Column saved: [cyan]{out_path}[/cyan]")
+    write_run_manifest(
+        OUTPUT_DIR, script=f"related_articles_{args.config}", repo_id=args.repo,
+        revision=source_revision, args=args, outputs=[out_path],
+    )
 
     if not args.push:
         console.print("[yellow]ℹ[/yellow] Report-only run. Use [bold]--push[/bold] to add "

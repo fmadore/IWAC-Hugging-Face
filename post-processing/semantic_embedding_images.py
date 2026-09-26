@@ -66,9 +66,13 @@ from _common import (  # noqa: E402
 from iwac_common.schema import SUBSETS  # noqa: E402
 from _embedding_utils import (  # noqa: E402
     cache_fingerprint,
+    cached_value,
     delete_cache,
+    input_fingerprint,
     is_empty_embedding,
     load_cache,
+    make_entry,
+    repo_slug,
     save_cache,
 )
 from _gemini_client import (  # noqa: E402
@@ -247,8 +251,11 @@ def main() -> int:
     # at one embedding configuration can never be restored into a run with
     # different parameters. Old un-fingerprinted cache files
     # ("image_embeddings.json.gz") are simply ignored (fresh start), not migrated.
+    # The repository is part of the name, and each entry carries a hash of the
+    # image URL and downscale size it was computed from.
     cache_file = CACHE_DIR / (
-        f"{CACHE_STEM}_{cache_fingerprint(MODEL_NAME, dimensionality, 'image')}.json.gz"
+        f"{CACHE_STEM}_{repo_slug(repo_id)}_"
+        f"{cache_fingerprint(MODEL_NAME, dimensionality, 'image')}.json.gz"
     )
 
     # 'all' means recompute everything: start from a fresh cache unless the
@@ -320,7 +327,8 @@ def main() -> int:
     cache = load_cache(cache_file)
     if cache:
         console.print(f"[green]✓[/green] Resuming with [cyan]{len(cache)}[/cyan] cached embeddings")
-    restored = restore_from_cache(all_embeddings, row_ids, cache)
+    fingerprints = [input_fingerprint(row_url(i), max_side) for i in range(len(ds))]
+    restored = restore_from_cache(all_embeddings, row_ids, cache, fingerprints)
     if restored:
         console.print(f"[green]✓[/green] Restored [cyan]{restored}[/cyan] embeddings from cache")
 
@@ -341,7 +349,7 @@ def main() -> int:
             no_url += 1
             continue
         if update_mode == "all":
-            if str(row_ids[i]) not in cache:
+            if cached_value(cache, row_ids[i], fingerprints[i]) is None:
                 to_process.append(i)
         else:  # missing
             if is_empty_embedding(all_embeddings[i]):
@@ -385,7 +393,7 @@ def main() -> int:
                     vecs = embed_images_with_retry(client, [b for _, b in chunk], dimensionality)
                     for (idx, _), vec in zip(chunk, vecs):
                         all_embeddings[idx] = vec
-                        cache[str(row_ids[idx])] = vec
+                        cache[str(row_ids[idx])] = make_entry(vec, fingerprints[idx])
                 except Exception as e:  # noqa: BLE001
                     logger.error(f"Batch failed (rows {start}-{start + len(chunk) - 1}): {e}")
                     failed_emb += len(chunk)

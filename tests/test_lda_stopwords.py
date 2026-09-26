@@ -191,3 +191,33 @@ class TestConfigPresets:
         self._resolve("references", "Anglais")
         assert CONFIG_PRESETS["references"]["model_path"] == "lda_model_references"
         assert CONFIG_PRESETS["references"]["num_topics"] == 16
+
+
+class TestTopicTableAndVersion:
+    def test_topic_table_is_written_beside_the_model(self, tmp_path):
+        import csv
+
+        from gensim.corpora import Dictionary
+        from gensim.models import LdaModel
+
+        from lda_topic_modeling.modeling import export_topic_table
+
+        docs = [["ramadan", "mosquee", "imam"], ["tabaski", "mouton", "fete"],
+                ["ramadan", "jeune", "imam"], ["tabaski", "fete", "priere"]]
+        dictionary = Dictionary(docs)
+        corpus = [dictionary.doc2bow(d) for d in docs]
+        model = LdaModel(corpus, id2word=dictionary, num_topics=2, random_state=42, passes=2)
+        path = export_topic_table(model, tmp_path, model_name="lda_model_toy",
+                                  counts={0: 3, 1: 1}, top_words=3)
+        rows = list(csv.DictReader(path.open(encoding="utf-8")))
+        assert [r["lda_topic_id"] for r in rows] == ["0", "1"]
+        assert rows[0]["lda_model_name"] == "lda_model_toy"
+        assert rows[0]["n_documents"] == "3" and rows[0]["share"] == "0.7500"
+        assert rows[0]["top_words"].count("|") == 2
+
+    def test_pipeline_version_is_the_package_version(self):
+        from importlib import metadata
+
+        from lda_topic_modeling.modeling import pipeline_version
+
+        assert pipeline_version() == metadata.version("iwac-hugging-face")
