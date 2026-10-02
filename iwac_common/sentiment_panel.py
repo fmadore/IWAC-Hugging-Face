@@ -52,7 +52,9 @@ failure a panel exists to avoid.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import asdict, dataclass
 from typing import Dict, Optional, Tuple
 
 #: The six per-model fields, as ``(column suffix, Omeka property suffix)``.
@@ -417,7 +419,41 @@ def label_subjectivite_columns() -> Tuple[str, ...]:
     return tuple(m.subjectivite_column for m in PANEL if m.subjectivite_is_label)
 
 
+CONSENSUS_RULE_VERSION = "strict-majority-min2;subjectivity-median-min2:v1"
+
+
+def instrument_id(gen: int) -> str:
+    """Content-addressed identity of one panel, prompt and consensus rule.
+
+    The fingerprint changes if a model, campaign, prompt or sampling setting
+    changes, including revisions within a numbered generation.
+    """
+    members = generation(gen)
+    if not members:
+        raise ValueError(f"Unknown sentiment generation: {gen}")
+    payload = {"generation": gen, "rule": CONSENSUS_RULE_VERSION,
+               "models": [asdict(m) for m in members]}
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return "sentiment-sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def consensus_columns(gen: int) -> Dict[str, str]:
+    """Generation-specific names; a historical run cannot overwrite live values."""
+    if not generation(gen):
+        raise ValueError(f"Unknown sentiment generation: {gen}")
+    return {
+        "consensus_polarite": f"consensus_g{gen}_polarite",
+        "consensus_centralite": f"consensus_g{gen}_centralite",
+        "consensus_subjectivite_score": f"consensus_g{gen}_subjectivite_score",
+        "sentiment_disagreement": f"sentiment_g{gen}_disagreement",
+        "instrument_id": f"consensus_g{gen}_instrument_id",
+    }
+
+
 __all__ = [
+    "CONSENSUS_RULE_VERSION",
+    "consensus_columns",
+    "instrument_id",
     "DIMENSION_FIELDS",
     "JUSTIFICATION_SUFFIXES",
     "SUBJECTIVITE_SUFFIX",

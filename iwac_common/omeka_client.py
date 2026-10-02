@@ -40,6 +40,9 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
+from .settings import initialize_environment
+
+initialize_environment()
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +73,15 @@ class Config:
     )
     CACHE_DIR: str = ".cache_omk"
     CACHE_HOURS: int = 24
+
+    def require_full_access_credentials(self) -> None:
+        """A full refresh must never silently switch to anonymous records."""
+        if not self.API_KEY_IDENTITY.strip() or not self.API_KEY_CREDENTIAL.strip():
+            raise ValueError(
+                "Full Omeka refresh requires OMEKA_KEY_IDENTITY and "
+                "OMEKA_KEY_CREDENTIAL. Anonymous responses omit private "
+                "items and values and cannot replace the complete mirror."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +557,10 @@ async def fetch_primary_media_url(
     try:
         media_id = str(primary["@id"]).rstrip("/").split("/")[-1]
         media = await api.fetch_media_data(media_id)
+        # Keep the URL in the complete mirror, but prevent a private media
+        # resource from becoming public through a parent item's projection.
+        if media.get("o:is_public") is not True:
+            item["_iwac_private_media"] = True
         # ``or ""`` rather than a dict default: a media that stores no original
         # returns the key with a *null* value, and ``str(None)`` would write the
         # literal string "None" into PDF/image_url. Every YouTube media is this

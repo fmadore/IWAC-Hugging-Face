@@ -6,6 +6,7 @@ LDA model creation, training, loading, and inference utilities using gensim.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -325,6 +326,9 @@ def load_lda_model(
     logger: logging.Logger | None = None,
 ) -> Tuple[LdaModel, Dictionary, Tuple[Phraser, Phraser] | None]:
     """Load a previously saved LDA model, dictionary and optional phrasers."""
+    from .artifacts import resolve_bundle
+
+    model_dir, _ = resolve_bundle(model_dir)
     log = logger or logging.getLogger(__name__)
     model_path = model_dir / "lda_model"
     dict_path = model_dir / "dictionary"
@@ -507,6 +511,32 @@ def get_topic_label(
     return " - ".join(selected_words) if selected_words else f"Topic_{topic_id}"
 
 
+def _infer_distribution(model, dictionary, tokens, chunk_words):
+    """Initialize each document independently of processing order/cache hits.
+
+Gensim draws the variational initialization from a mutable model RNG. A
+document-derived seed and restoration of that RNG make partial theta reuse
+produce exactly the same distributions as fresh inference for every row.
+"""
+    seed = int.from_bytes(hashlib.sha256("\0".join(tokens).encode()).digest()[:4], "little")
+    original_rng = model.random_state
+    model.random_state = np.random.RandomState(seed)
+    try:
+        dist = np.zeros(model.num_topics)
+        total_weight = 0
+        chunks = chunk_tokens(tokens, chunk_words) if chunk_words else [tokens]
+        for chunk in chunks:
+            bow = dictionary.doc2bow(chunk)
+            if not bow:
+                continue
+            for tid, prob in model.get_document_topics(bow, minimum_probability=0.0):
+                dist[int(tid)] += float(prob) * len(chunk)
+            total_weight += len(chunk)
+        return dist / total_weight if total_weight else None
+    finally:
+        model.random_state = original_rng
+
+
 def predict_document(
     model: LdaModel,
     dictionary: Dictionary,
@@ -517,6 +547,7 @@ def predict_document(
     lambda_relevance: float | None = None,
     word_probs: np.ndarray | None = None,
     return_distribution: bool = False,
+    topic_labels: Dict[int, str] | None = None,
 ) -> Tuple[Any, ...]:
     """Predict topics for a single tokenized document.
 
@@ -541,34 +572,13 @@ def predict_document(
     if not tokens:
         return empty
 
-    if chunk_words:
-        dist = np.zeros(model.num_topics)
-        total_weight = 0
-        for chunk in chunk_tokens(tokens, chunk_words):
-            bow = dictionary.doc2bow(chunk)
-            if not bow:
-                continue
-            for tid, prob in model.get_document_topics(bow, minimum_probability=0.0):
-                dist[int(tid)] += float(prob) * len(chunk)
-            total_weight += len(chunk)
-        if total_weight == 0:
-            return empty
-        dist /= total_weight
-        ranked = [(int(tid), float(dist[tid])) for tid in np.argsort(dist)[::-1]]
-    else:
-        bow = dictionary.doc2bow(tokens)
-        if not bow:
-            return empty
-        topic_distribution = model.get_document_topics(bow, minimum_probability=0.0)
-        if not topic_distribution:
-            return empty
-        dist = np.zeros(model.num_topics)
-        for tid, prob in topic_distribution:
-            dist[int(tid)] = float(prob)
-        ranked = sorted(topic_distribution, key=lambda x: x[1], reverse=True)
+    dist = _infer_distribution(model, dictionary, tokens, chunk_words)
+    if dist is None:
+        return empty
+    ranked = [(int(tid), float(dist[tid])) for tid in np.argsort(dist)[::-1]]
 
     best_topic_id, best_prob = ranked[0]
-    label = get_topic_label(
+    label = topic_labels[int(best_topic_id)] if topic_labels is not None else get_topic_label(
         model, best_topic_id,
         lambda_relevance=lambda_relevance, word_probs=word_probs,
     )
@@ -636,6 +646,10 @@ def predict_batch(
     theta_col: str | None = None,
     lambda_relevance: float | None = None,
     word_probs: np.ndarray | None = None,
+    custom_collocations: List[Tuple[str, ...]] | None = None,
+    fragment_stopwords: set[str] | None = None,
+    topic_labels: Dict[int, str] | None = None,
+    include_unknown_language: bool = False,
 ) -> Dict[str, List[Any]]:
     """Predict topics for a HuggingFace dataset batch (batched map function).
 
@@ -679,20 +693,27 @@ def predict_batch(
 
     for i, text in enumerate(texts):
         lang = languages[i] if i < len(languages) else None
-        if lang is not None and lang != language:
+        unknown = lang is None or not str(lang).strip()
+        if (unknown and not include_unknown_language) or (not unknown and lang != language):
             continue
         if not text or not str(text).strip():
+            # A removed source text must not retain an old topic assignment.
+            topics[i] = probabilities[i] = labels[i] = topks[i] = model_names[i] = None
             continue
 
-        tokens = tokenize_for_prediction(text, sw, phraser, min_token_length)
+        tokens = tokenize_for_prediction(
+            text, sw, phraser, min_token_length,
+            custom_collocations=custom_collocations, fragment_stopwords=fragment_stopwords,
+        )
         tid, prob, label, topk_str, theta = predict_document(
             model, dictionary, tokens, topk=topk, chunk_words=chunk_words,
             lambda_relevance=lambda_relevance, word_probs=word_probs,
             return_distribution=True,
+            topic_labels=topic_labels,
         )
         topics[i] = tid
         probabilities[i] = prob
-        labels[i] = label
+        labels[i] = topic_labels.get(tid, label) if topic_labels is not None else label
         topks[i] = topk_str
         model_names[i] = model_name
         thetas[i] = theta
@@ -778,6 +799,7 @@ def export_topic_table(
     top_words: int = 15,
     lambda_relevance: float | None = None,
     word_probs: np.ndarray | None = None,
+    labels: Dict[int, str] | None = None,
 ) -> Path:
     """Write ``<model_dir>/topics.csv``: one row per topic of this model.
 
@@ -799,7 +821,7 @@ def export_topic_table(
             "n_documents", "share",
         ])
         for tid in range(model.num_topics):
-            label = get_topic_label(
+            label = labels[tid] if labels is not None else get_topic_label(
                 model, tid, top_n=top_n, lambda_relevance=lambda_relevance,
                 word_probs=word_probs,
             )
@@ -830,6 +852,8 @@ def save_model_parameters(
     alpha: str = "auto",
     lambda_relevance: float | None = None,
     evaluation: Dict[str, Any] | None = None,
+    preprocessing: Dict[str, Any] | None = None,
+    topic_labels: Dict[int, str] | None = None,
 ) -> Path:
     """Save training parameters to JSON for reproducibility.
 
@@ -872,6 +896,10 @@ def save_model_parameters(
 
     if evaluation:
         params["evaluation"] = evaluation
+    if preprocessing is not None:
+        params["preprocessing"] = preprocessing
+    if topic_labels is not None:
+        params["topic_labels"] = topic_labels
     if coherence_metrics:
         params["coherence_metrics"] = coherence_metrics
     if extra_info:
@@ -957,8 +985,8 @@ def find_optimal_topics(
 ) -> Tuple[int, List[Dict[str, Any]]]:
     """Sweep a range of topic counts and return the k with highest C_v.
 
-    This is standard DH practice (Mimno et al.): train LDA at several k
-    values, compute C_v coherence for each, and pick the peak.
+    Coherence is a diagnostic selection rule, not evidence of historical
+    validity. Compare the full curve, seed stability and reviewed documents.
 
     Sweep models train at reduced settings (*sweep_passes* /
     *sweep_iterations*) — enough for a stable *relative* C_v ranking; the
@@ -996,6 +1024,8 @@ def find_optimal_topics(
     )
 
     results: List[Dict[str, Any]] = []
+    if not candidates:
+        raise ValueError("Topic sweep must contain at least one candidate")
     best_k = candidates[0]
     best_cv = -1.0
 
@@ -1027,6 +1057,8 @@ def find_optimal_topics(
                     dictionary=dictionary, coherence="c_v",
                 )
                 cv = float(cm_cv.get_coherence())
+                if not np.isfinite(cv):
+                    raise ValueError("Coherence is nonfinite")
                 cv_per_seed.append(cv)
                 log.info(f"  k={k} seed={seed}  C_v={cv:.4f}")
             except Exception as e:
@@ -1036,7 +1068,10 @@ def find_optimal_topics(
             # Held-out log-perplexity (per-word bound; higher = better)
             if holdout_corpus:
                 try:
-                    perplexities.append(float(model.log_perplexity(holdout_corpus)))
+                    value = float(model.log_perplexity(holdout_corpus))
+                    if not np.isfinite(value):
+                        raise ValueError("Held-out log-perplexity is nonfinite")
+                    perplexities.append(value)
                 except Exception as e:
                     log.warning(f"  k={k} seed={seed}  log_perplexity failed: {e}")
 
@@ -1077,7 +1112,8 @@ def find_optimal_topics(
                 model=first_model, texts=tokenized_docs,
                 dictionary=dictionary, coherence="c_npmi",
             )
-            entry["c_npmi"] = float(cm_npmi.get_coherence())
+            value = float(cm_npmi.get_coherence())
+            entry["c_npmi"] = value if np.isfinite(value) else None
         except Exception:
             entry["c_npmi"] = None
 
@@ -1086,17 +1122,15 @@ def find_optimal_topics(
                 model=first_model, corpus=corpus,
                 dictionary=dictionary, coherence="u_mass",
             )
-            entry["u_mass"] = float(cm_umass.get_coherence())
+            value = float(cm_umass.get_coherence())
+            entry["u_mass"] = value if np.isfinite(value) else None
         except Exception:
             entry["u_mass"] = None
 
         results.append(entry)
 
     if all(r.get("c_v") is None for r in results):
-        log.error(
-            "Every C_v coherence computation failed — model selection did not run; "
-            f"returning k={best_k} (the smallest candidate), NOT a data-driven choice."
-        )
+        raise RuntimeError("Every C_v coherence computation failed; no model was selected")
     else:
         label = "mean C_v" if n_seeds > 1 else "C_v"
         log.info(f"Best num_topics by {label}: {best_k} ({label}={best_cv:.4f})")

@@ -45,13 +45,14 @@ Dependencies
 from __future__ import annotations
 
 import argparse
+from importlib.metadata import version
+import hashlib
 import io
 import logging
 import os
 import sys
 import time
 import urllib.request
-from pathlib import Path
 from typing import Any, List, Optional
 
 from dotenv import load_dotenv
@@ -64,6 +65,8 @@ from _common import (  # noqa: E402
     push_dataset,
 )
 from iwac_common.schema import SUBSETS  # noqa: E402
+from iwac_common.paths import workspace_root  # noqa: E402
+from iwac_common.enrichment import config_fingerprint, provenance_columns, set_provenance  # noqa: E402
 from _embedding_utils import (  # noqa: E402
     cache_fingerprint,
     cached_value,
@@ -77,14 +80,14 @@ from _embedding_utils import (  # noqa: E402
 )
 from _gemini_client import (  # noqa: E402
     call_with_retry,
-    restore_from_cache,
     set_embedding_column,
+    validate_response,
 )
 from google import genai  # noqa: E402
 from google.genai import types  # noqa: E402
-from PIL import Image  # noqa: E402
+from PIL import Image, ImageOps  # noqa: E402
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(workspace_root() / ".env")
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 from rich.console import Console  # noqa: E402
@@ -121,7 +124,7 @@ IMAGE_BATCH_LIMIT = 6
 DEFAULT_BATCH_SIZE = 6
 # Retry ladder (MAX_RETRIES / BASE_RETRY_DELAY) is shared with the text
 # embedding script and lives in _gemini_client.call_with_retry.
-CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache_embeddings"
+CACHE_DIR = workspace_root() / ".cache_embeddings"
 # Resume cache stem; the full filename embeds cache_fingerprint(model, dim,
 # task) so a cache written at one embedding configuration is never restored
 # into a run with different parameters. No task_type is sent for image
@@ -129,6 +132,8 @@ CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache_embeddings"
 CACHE_STEM = "image_embeddings"
 CHECKPOINT_EVERY = 3  # save cache every N API batches
 DOWNLOAD_TIMEOUT = 30
+MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024
+IMAGE_PROCESSING_VERSION = 2
 
 
 def download_image_bytes(url: str, max_side: int) -> Optional[bytes]:
@@ -141,8 +146,10 @@ def download_image_bytes(url: str, max_side: int) -> Optional[bytes]:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "iwac-embed/1.0"})
         with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
-            raw = resp.read()
-        im = Image.open(io.BytesIO(raw)).convert("RGB")
+            raw = resp.read(MAX_DOWNLOAD_BYTES + 1)
+            if len(raw) > MAX_DOWNLOAD_BYTES:
+                raise ValueError("Image download exceeds 32 MiB")
+        im = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
         im.thumbnail((max_side, max_side))
         buf = io.BytesIO()
         im.save(buf, format="JPEG", quality=90)
@@ -175,7 +182,7 @@ def embed_images_with_retry(
             contents=contents,
             config=types.EmbedContentConfig(output_dimensionality=dimensionality),
         )
-        return [emb.values for emb in response.embeddings]
+        return validate_response(response, len(images), dimensionality)
 
     return call_with_retry(_call)
 
@@ -233,6 +240,8 @@ def main() -> int:
                         help="Push despite download/embedding failures. By default "
                              "the cache is kept and the Hub is left untouched.")
     args = parser.parse_args()
+    if args.batch_size < 1 or args.max_image_side < 1 or args.delay < 0:
+        parser.error("Batch size/image side must be positive; delay must be nonnegative")
 
     repo_id = args.repo
     dimensionality = args.dimensionality
@@ -241,6 +250,13 @@ def main() -> int:
     delay = args.delay
     update_mode = args.update_mode
     dry_run = args.dry_run
+    configuration_settings = {
+        "model": MODEL_NAME, "dimension": dimensionality, "max_side": max_side,
+        "processing_version": IMAGE_PROCESSING_VERSION, "jpeg_quality": 90,
+        "google_genai": version("google-genai"),
+        "pillow": version("Pillow"),
+    }
+    configuration = config_fingerprint(configuration_settings)
     expected_dimension = (SUBSETS[CONFIG_NAME].embedding_columns or {})[EMBEDDING_COLUMN]
     if dimensionality != expected_dimension:
         parser.error(
@@ -255,7 +271,7 @@ def main() -> int:
     # image URL and downscale size it was computed from.
     cache_file = CACHE_DIR / (
         f"{CACHE_STEM}_{repo_slug(repo_id)}_"
-        f"{cache_fingerprint(MODEL_NAME, dimensionality, 'image')}.json.gz"
+        f"{cache_fingerprint(MODEL_NAME, dimensionality, 'image')}_{configuration[:16]}.sqlite3"
     )
 
     # 'all' means recompute everything: start from a fresh cache unless the
@@ -289,7 +305,8 @@ def main() -> int:
             model=MODEL_NAME, contents=["test"],
             config=types.EmbedContentConfig(output_dimensionality=dimensionality),
         )
-        actual_dim = len(test.embeddings[0].values)
+        validate_response(test, 1, dimensionality)
+        actual_dim = dimensionality
         console.print(f"[green]✓[/green] Gemini client ready. Model: [cyan]{MODEL_NAME}[/cyan] (dim={actual_dim})")
     except Exception as e:  # noqa: BLE001
         console.print(f"[red]✗[/red] Failed to initialize Gemini client: {e}")
@@ -320,92 +337,64 @@ def main() -> int:
         f = fallbacks[i]
         return str(f) if f is not None and str(f).strip() else ""
 
-    # --- Existing embeddings + cache ---
-    existing = ds[EMBEDDING_COLUMN] if EMBEDDING_COLUMN in ds.column_names else [[] for _ in range(len(ds))]
-    all_embeddings: List[Any] = [e if e is not None else [] for e in existing]
-
+    # Check actual processed image bytes on every run: a URL can retain its
+    # name while its image changes. Only API inference is skipped on a proven
+    # match. Downloads and embedding are streamed in bounded batches.
+    existing = list(ds[EMBEDDING_COLUMN]) if EMBEDDING_COLUMN in ds.column_names else [None] * len(ds)
+    input_col, config_col = provenance_columns(EMBEDDING_COLUMN)
+    old_inputs = list(ds[input_col]) if input_col in ds.column_names else [None] * len(ds)
+    old_configs = list(ds[config_col]) if config_col in ds.column_names else [None] * len(ds)
+    all_embeddings: List[Any] = [[] for _ in range(len(ds))]
+    fingerprints = [""] * len(ds)
     cache = load_cache(cache_file)
-    if cache:
-        console.print(f"[green]✓[/green] Resuming with [cyan]{len(cache)}[/cyan] cached embeddings")
-    fingerprints = [input_fingerprint(row_url(i), max_side) for i in range(len(ds))]
-    restored = restore_from_cache(all_embeddings, row_ids, cache, fingerprints)
-    if restored:
-        console.print(f"[green]✓[/green] Restored [cyan]{restored}[/cyan] embeddings from cache")
-
-    # Validate dimensionality consistency for pre-existing embeddings.
-    for e in all_embeddings:
-        if not is_empty_embedding(e) and len(e) != actual_dim:
-            console.print(f"[red]✗[/red] Existing embeddings have dim {len(e)} ≠ target {actual_dim}. "
-                          f"Use --update-mode all to recompute.")
-            if update_mode != "all":
-                return 1
-            break
-
-    # --- Determine rows to process ---
-    to_process: List[int] = []
-    no_url = 0
-    for i in range(len(ds)):
-        if not row_url(i):
-            no_url += 1
-            continue
-        if update_mode == "all":
-            if cached_value(cache, row_ids[i], fingerprints[i]) is None:
-                to_process.append(i)
-        else:  # missing
-            if is_empty_embedding(all_embeddings[i]):
-                to_process.append(i)
-    if no_url:
-        console.print(f"[yellow]ℹ[/yellow] {no_url} row(s) have no image URL — skipped.")
-
     failed_dl = 0
     failed_emb = 0
-    if not to_process:
-        console.print(Panel("[green]All image embeddings are already computed![/green]",
-                            title="Nothing to do", border_style="green"))
-    else:
-        console.print(f"[blue]→[/blue] [cyan]{len(to_process)}[/cyan] photos to embed")
+    pending: List[tuple[int, bytes]] = []
 
-        # --- Step 4: Download images ---
-        console.print(f"\n[bold cyan]Step 4:[/bold cyan] Downloading + downscaling images...")
-        downloaded: List[tuple[int, bytes]] = []
-        with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}"), BarColumn(),
-                      TaskProgressColumn(), TimeElapsedColumn(), console=console) as progress:
-            task = progress.add_task("[cyan]Downloading", total=len(to_process))
-            for idx in to_process:
-                img = download_image_bytes(row_url(idx), max_side)
-                if img is not None:
-                    downloaded.append((idx, img))
-                else:
+    def flush_batch() -> None:
+        nonlocal failed_emb
+        if not pending:
+            return
+        try:
+            vectors = embed_images_with_retry(client, [data for _, data in pending], dimensionality)
+        except Exception as exc:
+            logger.error("Image batch failed: %s", exc)
+            failed_emb += len(pending)
+        else:
+            completed = {}
+            for (idx, _), vector in zip(pending, vectors, strict=True):
+                all_embeddings[idx] = vector
+                entry = make_entry(vector, fingerprints[idx])
+                cache[str(row_ids[idx])] = entry
+                completed[str(row_ids[idx])] = entry
+            save_cache(completed, cache_file)
+        pending.clear()
+        if delay:
+            time.sleep(delay)
+
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}"), BarColumn(),
+                  TaskProgressColumn(), TimeElapsedColumn(), console=console) as progress:
+        task = progress.add_task("[cyan]Checking and embedding images", total=len(ds))
+        for idx in range(len(ds)):
+            url = row_url(idx)
+            if url:
+                data = download_image_bytes(url, max_side)
+                if data is None:
                     failed_dl += 1
-                progress.update(task, advance=1)
-        console.print(f"[green]✓[/green] Downloaded {len(downloaded)} images"
-                      + (f" ([red]{failed_dl} failed[/red])" if failed_dl else ""))
-
-        # --- Step 5: Embed in batches ---
-        console.print(f"\n[bold cyan]Step 5:[/bold cyan] Embedding images via Gemini API...")
-        with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}"), BarColumn(),
-                      TaskProgressColumn(), TimeElapsedColumn(), console=console) as progress:
-            task = progress.add_task("[cyan]Embedding photos", total=len(downloaded))
-            batch_count = 0
-            for start in range(0, len(downloaded), batch_size):
-                chunk = downloaded[start:start + batch_size]
-                try:
-                    vecs = embed_images_with_retry(client, [b for _, b in chunk], dimensionality)
-                    for (idx, _), vec in zip(chunk, vecs):
-                        all_embeddings[idx] = vec
-                        cache[str(row_ids[idx])] = make_entry(vec, fingerprints[idx])
-                except Exception as e:  # noqa: BLE001
-                    logger.error(f"Batch failed (rows {start}-{start + len(chunk) - 1}): {e}")
-                    failed_emb += len(chunk)
-                progress.update(task, advance=len(chunk))
-                batch_count += 1
-                if batch_count % CHECKPOINT_EVERY == 0:
-                    save_cache(cache, cache_file)
-                if delay > 0 and start + batch_size < len(downloaded):
-                    time.sleep(delay)
-        save_cache(cache, cache_file)
-        console.print("[green]✓[/green] Embedding computation complete."
-                      + (f" [yellow]{failed_emb} failed[/yellow]" if failed_emb else ""))
+                else:
+                    fingerprints[idx] = input_fingerprint(hashlib.sha256(data).hexdigest(), url)
+                    cached = cached_value(cache, row_ids[idx], fingerprints[idx])
+                    if cached is not None:
+                        all_embeddings[idx] = cached
+                    elif (update_mode == "missing" and old_inputs[idx] == fingerprints[idx]
+                          and old_configs[idx] == configuration and not is_empty_embedding(existing[idx])):
+                        all_embeddings[idx] = existing[idx]
+                    else:
+                        pending.append((idx, data))
+                        if len(pending) >= batch_size:
+                            flush_batch()
+            progress.update(task, advance=1)
+        flush_batch()
 
     if (failed_dl or failed_emb) and not args.allow_partial:
         console.print(Panel(
@@ -420,6 +409,8 @@ def main() -> int:
     # --- Step 6: Update dataset ---
     console.print(f"\n[bold cyan]Step 6:[/bold cyan] Updating dataset...")
     ds_out = set_embedding_column(ds, EMBEDDING_COLUMN, all_embeddings)
+    ds_out = set_provenance(ds_out, EMBEDDING_COLUMN, fingerprints, configuration,
+                            [not is_empty_embedding(e) for e in all_embeddings], settings=configuration_settings)
 
     # Place the embedding column right after the image URL column.
     cols = list(ds_out.column_names)

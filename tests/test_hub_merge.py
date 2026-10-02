@@ -224,11 +224,14 @@ class TestDuplicateIds:
 
 
 class TestOuterMergeStaleRows:
-    def test_stale_rows_kept_by_default(self, hub):
+    def test_stale_rows_kept_only_on_explicit_request(self, hub):
         hub(_existing(20))
-        out = merge_with_hub_dataset(_new(20).iloc[:19], "repo", "references", how="outer")
+        out = merge_with_hub_dataset(_new(20).iloc[:19], "repo", "references", how="outer", stale_rows="keep")
         assert len(out) == 20  # deleted Omeka item survives
         assert "20" in set(out["o:id"])
+        deleted = out.set_index("o:id").loc["20"]
+        assert deleted["title"] == "t20"
+        assert not deleted["item_is_public"]
 
     def test_stale_rows_dropped_on_request(self, hub):
         hub(_existing(20))
@@ -331,8 +334,8 @@ class TestStaleDerivedValues:
             self._fresh(), "repo", "articles", derived_from=self.DERIVED, stale_out=stale,
         )
         assert stale == {"OCR": {"ids": ["2"], "derived": ["embedding_OCR", "lemma_text"]}}
-        # Default keeps the values (reported only).
-        assert out.set_index("o:id").loc["2", "lemma_text"] == "deux"
+        # Default invalidates stale output.
+        assert pd.isna(out.set_index("o:id").loc["2", "lemma_text"])
 
     def test_invalidation_clears_only_the_changed_rows(self, hub):
         hub(self._existing())
@@ -369,3 +372,85 @@ class TestStaleDerivedValues:
         for config, mapping in DERIVED_FROM.items():
             for source, derived in mapping.items():
                 assert source not in derived, (config, source)
+
+    def test_language_change_invalidates_lemmas_and_provenance(self, hub):
+        from iwac_common.schema import DERIVED_FROM
+
+        hub(pd.DataFrame({
+            "o:id": ["1"], "OCR": ["same text"], "language": ["English"],
+            "lemma_text": ["text"], "lemma_text_input_hash": ["oldhash"],
+            "lemma_text_config_hash": ["config"], "embedding_OCR": [[0.1]],
+        }))
+        out = merge_with_hub_dataset(pd.DataFrame({
+            "o:id": ["1"], "OCR": ["same text"], "language": ["Français"],
+        }), "repo", "articles", derived_from=DERIVED_FROM["articles"]).iloc[0]
+        assert pd.isna(out["lemma_text"])
+        assert pd.isna(out["lemma_text_input_hash"])
+        assert pd.isna(out["lemma_text_config_hash"])
+        assert list(out["embedding_OCR"]) == [0.1]
+
+    def test_media_recovery_keeps_dependent_urls_and_restrictions(self, hub):
+        hub(pd.DataFrame({
+            "o:id": ["1"], "PDF": ["old.pdf"], "thumbnail": ["old.jpg"],
+            "iiif_manifest": ["old.json"], "private_fields": [["PDF", "thumbnail"]],
+        }))
+        out = merge_with_hub_dataset(pd.DataFrame({
+            "o:id": ["1"], "PDF": [""], "thumbnail": [""], "iiif_manifest": [""],
+            "private_fields": [[]],
+        }), "repo", "articles", preserve_fields_by_id={
+            "1": ["PDF", "thumbnail", "iiif_manifest"],
+        }).iloc[0]
+        assert out["PDF"] == "old.pdf"
+        assert out["thumbnail"] == "old.jpg"
+        assert out["iiif_manifest"] == "old.json"
+        assert out["private_fields"] == ["PDF", "iiif_manifest", "thumbnail"]
+
+    def test_frozen_annotations_keep_known_private_field_policy(self, hub):
+        hub(pd.DataFrame({
+            "o:id": ["1"], "title": ["old"], "frozen_justification": ["private"],
+            "private_fields": [["title", "frozen_justification"]],
+        }))
+        out = merge_with_hub_dataset(pd.DataFrame({
+            "o:id": ["1"], "title": ["now public"], "private_fields": [[]],
+        }), "repo", "articles").iloc[0]
+        assert out["private_fields"] == ["frozen_justification"]
+
+    def test_changed_model_label_invalidates_only_its_generation(self, hub):
+        from iwac_common.schema import DERIVED_FROM
+        from iwac_common.sentiment_panel import active_models, consensus_columns
+
+        model = active_models()[0]
+        own = consensus_columns(model.generation)
+        source = model.column("polarite")
+        baseline = {
+            "o:id": ["1"], source: ["Positif"],
+            own["consensus_polarite"]: ["Positif"],
+            own["consensus_centralite"]: ["Central"],
+            own["sentiment_disagreement"]: [0.5],
+            own["instrument_id"]: ["instrument"],
+            "consensus_polarite": ["Positif"], "consensus_g1_polarite": ["Négatif"],
+        }
+        hub(pd.DataFrame(baseline))
+        out = merge_with_hub_dataset(pd.DataFrame({"o:id": ["1"], source: ["Négatif"]}),
+                                     "repo", "articles", derived_from=DERIVED_FROM["articles"]).iloc[0]
+        assert pd.isna(out[own["consensus_polarite"]])
+        assert pd.isna(out[own["sentiment_disagreement"]])
+        assert pd.isna(out[own["instrument_id"]])
+        assert pd.isna(out["consensus_polarite"])
+        assert out[own["consensus_centralite"]] == "Central"
+        assert out["consensus_g1_polarite"] == "Négatif"
+
+    @pytest.mark.parametrize("change", ["text", "membership"])
+    def test_neighbor_candidates_change_invalidates_every_query(self, hub, change):
+        from iwac_common.schema import DERIVED_FROM
+
+        hub(pd.DataFrame({
+            "o:id": ["1", "2"], "OCR": ["one", "two"],
+            "embedding_OCR": [[0.1], [0.2]], "related_articles": ["2:0.9", "1:0.9"],
+        }))
+        fresh = pd.DataFrame({"o:id": ["1", "2"], "OCR": ["changed", "two"]})
+        if change == "membership":
+            fresh = pd.DataFrame({"o:id": ["1"], "OCR": ["one"]})
+        out = merge_with_hub_dataset(fresh, "repo", "articles", allow_shrink=True,
+                                     derived_from=DERIVED_FROM["articles"])
+        assert out["related_articles"].isna().all()

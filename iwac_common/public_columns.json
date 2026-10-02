@@ -10,6 +10,8 @@
   ],
   "articles": [
     "o:id",
+    "private_fields",
+    "item_is_public",
     "identifier",
     "added_date",
     "iwac_url",
@@ -103,10 +105,22 @@
     "consensus_centralite",
     "consensus_subjectivite_score",
     "sentiment_disagreement",
-    "related_articles"
+    "related_articles",
+    "consensus_g1_polarite",
+    "consensus_g1_centralite",
+    "consensus_g1_subjectivite_score",
+    "consensus_g1_instrument_id",
+    "sentiment_g1_disagreement",
+    "consensus_g2_polarite",
+    "consensus_g2_centralite",
+    "consensus_g2_subjectivite_score",
+    "consensus_g2_instrument_id",
+    "sentiment_g2_disagreement"
   ],
   "audiovisual": [
     "o:id",
+    "private_fields",
+    "item_is_public",
     "identifier",
     "added_date",
     "iwac_url",
@@ -151,6 +165,8 @@
   ],
   "documents": [
     "o:id",
+    "private_fields",
+    "item_is_public",
     "identifier",
     "added_date",
     "iwac_url",
@@ -187,6 +203,8 @@
   ],
   "images": [
     "o:id",
+    "private_fields",
+    "item_is_public",
     "identifier",
     "added_date",
     "iwac_url",
@@ -217,6 +235,8 @@
   ],
   "index": [
     "o:id",
+    "private_fields",
+    "item_is_public",
     "identifier",
     "added_date",
     "iwac_url",
@@ -246,6 +266,8 @@
   ],
   "publications": [
     "o:id",
+    "private_fields",
+    "item_is_public",
     "identifier",
     "added_date",
     "iwac_url",
@@ -288,6 +310,8 @@
   ],
   "references": [
     "o:id",
+    "private_fields",
+    "item_is_public",
     "iwac_url",
     "identifier",
     "added_date",

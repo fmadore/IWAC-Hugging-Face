@@ -1,100 +1,94 @@
-"""Thin installed CLI wrappers around the repository's maintained scripts.
-
-**This is a bridge, not the end state.** The seven upload scripts still live at
-their historical paths and are loaded here by file path via ``importlib``,
-because they are scripts rather than importable modules — ``articles/`` and
-``islamic-publications/`` are not packages, and the latter is not even a legal
-module name. So this layer buys entry points and one documented invocation, and
-it deliberately reaches into two attributes only: ``SPEC`` for the uploads and
-``main`` for the mirror/publisher.
-
-Turning the scripts into real modules (``iwac_pipeline.uploads.articles``
-exporting its ``UploadSpec``) would delete ``_load_script`` entirely. Until
-then, treat the mapping below as the coupling point: moving or renaming a
-script breaks the console entry points, and ``tests/test_cli.py`` is what
-catches it.
-"""
+"""Installed commands dispatch to importable modules, in a wheel or checkout."""
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import importlib
 import sys
-from pathlib import Path
-from types import ModuleType
 from typing import Sequence
 
 from iwac_common.schema import ALL_CONFIGS
 from iwac_common.upload_runner import run_upload
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
-UPLOAD_SCRIPTS = {
-    "articles": "articles/upload_newspaper_hf.py",
-    "publications": "islamic-publications/upload_Islamic_publications_hf.py",
-    "documents": "document/upload_documents_hf.py",
-    "references": "reference/upload_reference_hf.py",
-    "index": "index/upload_index_hf.py",
-    "audiovisual": "audiovisual/upload_audiovisual_hf.py",
-    "images": "images/upload_image_hf.py",
+UPLOAD_MODULES = {
+    "articles": "iwac_pipeline.uploads.articles.upload_newspaper_hf",
+    "publications": "iwac_pipeline.uploads.publications.upload_Islamic_publications_hf",
+    "documents": "iwac_pipeline.uploads.documents.upload_documents_hf",
+    "references": "iwac_pipeline.uploads.references.upload_reference_hf",
+    "index": "iwac_pipeline.uploads.index.upload_index_hf",
+    "images": "iwac_pipeline.uploads.images.upload_image_hf",
+    "audiovisual": "iwac_pipeline.uploads.audiovisual.upload_audiovisual_hf",
+}
+PROCESS_MODULES = {
+    "embeddings": "iwac_pipeline.processing.semantic_embedding",
+    "image-embeddings": "iwac_pipeline.processing.semantic_embedding_images",
+    "lemmas": "lemmatize_update_hf",
+    "lexical": "iwac_pipeline.processing.calculate_lexical_richness",
+    "word-count": "iwac_pipeline.processing.calculate_word_count",
+    "hijri": "iwac_pipeline.processing.calculate_hijri_dates",
+    "lda": "iwac_pipeline.processing.lda_topic_modeling.lda_topic_modeling",
+    "sentiment-agreement": "iwac_pipeline.processing.sentiment_agreement",
+    "related": "iwac_pipeline.processing.related_articles",
+}
+ANALYSIS_MODULES = {
+    "topics": "iwac_pipeline.analyses.topic_prevalence",
+    "topic-sentiment": "iwac_pipeline.analyses.topic_sentiment",
+    "keyness": "iwac_pipeline.analyses.keyness_bursts",
+    "entities": "iwac_pipeline.analyses.entity_networks",
+    "coverage": "iwac_pipeline.analyses.corpus_coverage",
+    "annotation-review": "iwac_pipeline.analyses.annotation_review",
+    "reprints": "iwac_pipeline.analyses.reprint_candidates",
+    "topic-review": "iwac_pipeline.analyses.topic_review",
 }
 
 
-def _load_script(relative_path: str, module_name: str) -> ModuleType:
-    path = REPO_ROOT / relative_path
-    if not path.is_file():
-        raise RuntimeError(f"Pipeline script is missing: {path}")
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load pipeline script: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
+def _dispatch_args(prog: str, choices, argv: Sequence[str] | None):
+    parser = argparse.ArgumentParser(prog=prog)
+    parser.add_argument("command", choices=choices)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    # Subcommand --help belongs to the subcommand's parser.
+    args = parser.parse_args(arguments[:1])
+    return args.command, arguments[1:]
+
+
+def _run_module(module_name: str, argv: Sequence[str]) -> int:
+    module = importlib.import_module(module_name)
+    previous = sys.argv
     try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(module_name, None)
-        raise
-    return module
+        sys.argv = [module_name, *argv]
+        return int(module.main() or 0)
+    finally:
+        sys.argv = previous
 
 
 def upload_main(argv: Sequence[str] | None = None) -> int:
-    """Run one of the seven Omeka-to-Hub upload pipelines."""
-    parser = argparse.ArgumentParser(
-        prog="iwac-upload",
-        description="Refresh one IWAC subset from Omeka into the private Hub mirror.",
-    )
-    parser.add_argument("subset", choices=ALL_CONFIGS)
-    # Parse only the dispatch argument: otherwise argparse consumes --help
-    # even after a subset and hides the subset's own options.
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    args = parser.parse_args(arguments[:1])
-    remaining = arguments[1:]
-    module = _load_script(
-        UPLOAD_SCRIPTS[args.subset], f"_iwac_upload_{args.subset}"
-    )
-    spec = getattr(module, "SPEC", None)
-    if spec is None:
-        raise RuntimeError(f"{UPLOAD_SCRIPTS[args.subset]} does not declare SPEC")
-    return run_upload(spec, remaining)
+    """Refresh one subset from Omeka into a verified private destination."""
+    command, remaining = _dispatch_args("iwac-upload", ALL_CONFIGS, argv)
+    module = importlib.import_module(UPLOAD_MODULES[command])
+    return run_upload(module.SPEC, remaining)
+
+
+def process_main(argv: Sequence[str] | None = None) -> int:
+    """Run an enrichment; install the nlp/analysis extras for its dependencies."""
+    command, remaining = _dispatch_args("iwac-process", PROCESS_MODULES, argv)
+    return _run_module(PROCESS_MODULES[command], remaining)
+
+
+def analyze_main(argv: Sequence[str] | None = None) -> int:
+    """Run an analysis or prepare a source-linked research validation report."""
+    command, remaining = _dispatch_args("iwac-analyze", ANALYSIS_MODULES, argv)
+    return _run_module(ANALYSIS_MODULES[command], remaining)
 
 
 def mirror_main(argv: Sequence[str] | None = None) -> int:
-    """Create a verified local CSV mirror."""
     parser = argparse.ArgumentParser(prog="iwac-mirror")
     parser.add_argument("--dataset", choices=["private", "public"], default=None)
-    parser.add_argument("--format", choices=["parquet", "csv"], default="parquet",
-                        help="Mirror file format (default: parquet)")
+    parser.add_argument("--format", choices=["parquet", "csv"], default="parquet")
     args = parser.parse_args(argv)
-    module = _load_script("data/fetch_datasets.py", "_iwac_mirror")
+    module = importlib.import_module("iwac_pipeline.mirror.fetch_datasets")
     repo_id, label = module.choose_dataset(args.dataset)
     return int(module.main(dataset_id=repo_id, label=label, fmt=args.format))
 
 
-def publish_public_main() -> int:
-    """Project the private mirror to the rights-filtered public dataset."""
-    module = _load_script("post-processing/publish_public.py", "_iwac_publish_public")
-    result = module.main()
-    return int(result or 0)
-
-
-__all__ = ["UPLOAD_SCRIPTS", "upload_main", "mirror_main", "publish_public_main"]
+def publish_public_main(argv: Sequence[str] | None = None) -> int:
+    return _run_module("iwac_pipeline.processing.publish_public", sys.argv[1:] if argv is None else argv)

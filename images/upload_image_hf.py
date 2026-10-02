@@ -38,7 +38,6 @@ from typing import Dict, Any
 # Add parent directory to path for iwac_common import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dotenv import load_dotenv
 from iwac_common.omeka_client import (
     OmekaApiClient,
     conn_manager,
@@ -48,6 +47,7 @@ from iwac_common.omeka_client import (
     item_page_url,
 )
 from iwac_common.field_mappers import (
+    visibility_metadata,
     countries_from_item_sets,
     extract_added_date,
     get_display_titles,
@@ -61,7 +61,6 @@ from iwac_common.field_mappers import (
 from iwac_common.upload_runner import UploadSpec, run_upload
 from iwac_common.schema import COUNTRY_ITEM_SETS, SUBSETS
 
-load_dotenv()
 
 
 # Orchestration + CLI + Rich console/logging live in
@@ -89,7 +88,7 @@ async def map_image_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
     image_url = await fetch_primary_media_url(
         item,
         api,
-        affected_fields=("image_url",),
+        affected_fields=("image_url", "thumbnail", "iiif_manifest"),
     )
 
     pub_date = get_value(item, "dcterms:date")
@@ -111,6 +110,7 @@ async def map_image_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
 
     return {
         "o:id": item["o:id"],
+        **visibility_metadata(item, "images"),
         "identifier": get_value(item, "dcterms:identifier"),
         "added_date": extract_added_date(item),
         "iwac_url": item_page_url(item["o:id"]),

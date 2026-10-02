@@ -20,9 +20,10 @@ scratch repo): ``IWAC_HF_PRIVATE_REPO`` / ``IWAC_HF_PUBLIC_REPO``.
 import os
 
 from .schema import CONTENT_COLUMNS
+from .settings import get_private_repo_id, get_public_repo_id
 
-PUBLIC_REPO_ID = os.getenv("IWAC_HF_PUBLIC_REPO", "fmadore/islam-west-africa-collection")
-PRIVATE_REPO_ID = os.getenv("IWAC_HF_PRIVATE_REPO", "fmadore/islam-west-africa-collection-full")
+PUBLIC_REPO_ID = get_public_repo_id()
+PRIVATE_REPO_ID = get_private_repo_id()
 
 # Full-text-derived columns, per subset. These are NOT dropped wholesale:
 # publish_public.py masks them PER ROW by the ``OCR_is_public`` flag — the
@@ -56,4 +57,6 @@ __all__ = [
     "PRIVATE_COLUMNS",
     "PUBLIC_COLUMNS_FILE",
     "load_public_columns",
+    "get_private_repo_id",
+    "get_public_repo_id",
 ]

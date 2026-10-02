@@ -48,13 +48,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from iwac_common.hub import get_repo_revision  # noqa: E402
+from iwac_common.paths import workspace_root  # noqa: E402
 from iwac_common.repos import PRIVATE_REPO_ID, PUBLIC_REPO_ID  # noqa: E402
 from iwac_common.schema import ALL_CONFIGS  # noqa: E402
 
+REPO_ROOT = workspace_root()
 load_dotenv(REPO_ROOT / ".env")
 
 console = Console()
-DATA_DIR = Path(__file__).resolve().parent
+DATA_DIR = REPO_ROOT / "data"
 MANIFEST_NAME = "mirror_manifest.json"
 
 
@@ -137,6 +139,7 @@ def main(
     ))
 
     results: list[dict] = []
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     try:
         with tempfile.TemporaryDirectory(prefix=".iwac-mirror-", dir=DATA_DIR) as tmp:
             staging = Path(tmp)

@@ -1,5 +1,3 @@
 -r requirements.txt
 
-pytest
-pytest-cov
-ruff
+-r requirements-tools.txt

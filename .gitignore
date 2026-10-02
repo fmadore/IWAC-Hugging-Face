@@ -27,3 +27,7 @@ logs/
 .iwac_state/
 .coverage
 coverage.xml
+coverage.json
+build/
+dist/
+*.whl

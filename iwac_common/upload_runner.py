@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +58,7 @@ from .hub import (
     HubBaselineUnavailableError,
     HubWriteError,
     HubWriteLockedError,
+    hub_write_lock,
     push_dataset_verified,
     resolve_hf_token,
 )
@@ -73,7 +75,7 @@ from .omeka_client import (
     conn_manager,
     media_stats,
 )
-from .repos import PRIVATE_REPO_ID
+from .repos import get_private_repo_id
 from .schema import (
     DERIVED_FROM,
     DataContractError,
@@ -119,7 +121,38 @@ def _state_root() -> Path:
     configured = os.getenv("IWAC_STATE_DIR")
     if configured:
         return Path(configured)
-    return Path(__file__).resolve().parent.parent / ".iwac_state"
+    from .paths import workspace_root
+
+    return workspace_root() / ".iwac_state"
+
+
+def stale_worklist_path(repo: str, config_name: str) -> Path:
+    return _state_root() / "stale_derived" / f"{repo.replace('/', '__')}__{config_name}.json"
+
+
+def load_stale_derived(repo: str, config_name: str) -> dict[str, list[str]]:
+    """Read a durable worklist, refusing corrupt or misdirected recovery state."""
+    path = stale_worklist_path(repo, config_name)
+    if not path.exists():
+        return {}
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if record.get("repository") != repo or record.get("config") != config_name:
+        raise ValueError(f"Stale-derived worklist identity mismatch: {path}")
+    columns = record.get("columns")
+    if not isinstance(columns, dict) or any(
+        not isinstance(ids, list) or any(not isinstance(i, str) for i in ids)
+        for ids in columns.values()
+    ):
+        raise ValueError(f"Invalid stale-derived worklist: {path}")
+    return columns
+
+
+def replay_stale_derived(df: pd.DataFrame, columns: Dict[str, list[str]]) -> pd.DataFrame:
+    """Clear previously recorded stale cells even after source changes landed."""
+    for column, ids in columns.items():
+        if column in df.columns:
+            df.loc[df["o:id"].isin(ids), column] = None
+    return df
 
 
 def record_stale_derived(
@@ -139,19 +172,26 @@ def record_stale_derived(
         return None
     root = _state_root() / "stale_derived"
     root.mkdir(parents=True, exist_ok=True)
-    path = root / f"{repo.replace('/', '__')}__{config_name}.json"
-    try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        record = {"repository": repo, "config": config_name, "columns": {}}
-    columns = record.setdefault("columns", {})
+    path = stale_worklist_path(repo, config_name)
+    columns = load_stale_derived(repo, config_name)
+    record = {"repository": repo, "config": config_name, "columns": columns}
     for info in stale.values():
         for column in info["derived"]:
             ids = set(columns.get(column, [])) | set(info["ids"])
             columns[column] = sorted(ids, key=lambda v: (len(v), v))
     record["updated_at"] = datetime.now(timezone.utc).isoformat()
     record["last_revision_before_push"] = revision
-    path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # Stage before the remote write: a crash after a successful commit must
+    # not discard the only evidence that preserved enrichments went stale.
+    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return path
 
 
@@ -225,12 +265,18 @@ def _display_config_panel(
 
 
 async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, logger: logging.Logger) -> int:
-    cfg = Config(CACHE_DIR=spec.cache_dir)
+    from .paths import workspace_root
+
+    cache_dir = Path(spec.cache_dir).expanduser()
+    if not cache_dir.is_absolute():
+        cache_dir = workspace_root() / cache_dir
+    cfg = Config(CACHE_DIR=str(cache_dir))
     _display_config_panel(console, spec, cfg, args)
     api = OmekaApiClient(cfg, use_cache=not args.no_cache, console=console)
     media_stats.reset()
 
     try:
+        cfg.require_full_access_credentials()
         # 1. Fetch. A failed or truncated class fetch aborts the whole run:
         # continuing with a partial item list guarantees rows disappear from
         # the Hub (or trips the shrink guard later with wasted work).
@@ -357,7 +403,7 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
             columns_to_exclude=spec.columns_to_exclude,
             console=console,
             allow_shrink=args.force_shrink,
-            stale_rows=getattr(args, "stale_rows", "keep"),
+            stale_rows=getattr(args, "stale_rows", "drop"),
             allow_initialize=args.initialize,
             preserve_existing_ids=(
                 [item_id for item_id, _ in mapping_errors]
@@ -372,6 +418,11 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
             invalidate_derived=args.invalidate_derived,
             stale_out=stale,
         )
+
+        pending = load_stale_derived(args.repo, spec.config_name)
+        if args.invalidate_derived and pending:
+            final_df = replay_stale_derived(final_df, pending)
+            console.print("[yellow]⚠[/yellow] Replayed pending stale-derived worklist.")
 
         if spec.post_merge is not None:
             final_df = spec.post_merge(final_df)
@@ -417,6 +468,9 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
 
         ds = Dataset.from_pandas(final_df, preserve_index=False)
         try:
+            worklist = record_stale_derived(
+                args.repo, spec.config_name, stale, revision.get("revision")
+            )
             with console.status("[bold green]Pushing dataset to Hugging Face Hub...", spinner="dots"):
                 push_dataset_verified(
                     ds,
@@ -430,13 +484,12 @@ async def _run(spec: UploadSpec, args: argparse.Namespace, console: Console, log
                     expected_columns=list(final_df.columns),
                     expected_ids=final_df["o:id"].tolist(),
                 )
-            if stale and not args.invalidate_derived:
-                worklist = record_stale_derived(
-                    args.repo, spec.config_name, stale, revision.get("revision")
-                )
+            if args.invalidate_derived:
+                stale_worklist_path(args.repo, spec.config_name).unlink(missing_ok=True)
+            elif worklist or pending:
                 console.print(
                     f"[yellow]⚠[/yellow] Rows with stale derived values recorded in "
-                    f"[cyan]{worklist}[/cyan]."
+                    f"[cyan]{stale_worklist_path(args.repo, spec.config_name)}[/cyan]."
                 )
             console.print(Panel(
                 f"[bold green]✓ Dataset successfully published![/bold green]\n\n"
@@ -513,7 +566,7 @@ def build_parser(spec: UploadSpec) -> argparse.ArgumentParser:
         description=spec.description or f"Upload the IWAC '{spec.config_name}' subset to the HF Hub"
     )
     parser.add_argument(
-        "--repo", default=PRIVATE_REPO_ID,
+        "--repo", default=get_private_repo_id(),
         help="Target Hugging Face repository (default: private full mirror)",
     )
     parser.add_argument(
@@ -549,13 +602,19 @@ def build_parser(spec: UploadSpec) -> argparse.ArgumentParser:
         "--map-concurrency", type=int, default=8,
         help="Maximum concurrent Omeka item mappers (default: 8)",
     )
-    parser.add_argument(
-        "--invalidate-derived", action="store_true",
+    derived_group = parser.add_mutually_exclusive_group()
+    derived_group.add_argument(
+        "--invalidate-derived", action="store_true", default=True,
         help="Where a row's source text (OCR, table of contents, image URL, "
              "date) changed since the Hub copy, clear its preserved derived "
              "values (embeddings, lemmas, metrics, topics, Hijri date) so each "
-             "stage's 'missing' mode recomputes them. Without it the stale rows "
-             "are reported and recorded in .iwac_state/, but kept.",
+             "stage's 'missing' mode recomputes them (default). Also replays "
+             "any pending stale-derived worklist from a previous run.",
+    )
+    derived_group.add_argument(
+        "--preserve-derived", action="store_false", dest="invalidate_derived",
+        help="Explicitly retain stale derived values and stage a durable worklist "
+             "before pushing. The next default upload clears those recorded cells.",
     )
     parser.add_argument(
         "--initialize", action="store_true",
@@ -564,9 +623,10 @@ def build_parser(spec: UploadSpec) -> argparse.ArgumentParser:
     )
     if spec.supports_stale_rows:
         parser.add_argument(
-            "--stale-rows", choices=["keep", "drop"], default="keep",
+            "--stale-rows", choices=["keep", "drop"], default="drop",
             help="Hub-only rows (items deleted on Omeka) after the outer merge: "
-                 "keep them with empty Omeka fields (default) or drop them",
+                 "drop them (default), or retain complete historical rows in the "
+                 "private mirror with item_is_public=False",
         )
     return parser
 
@@ -579,7 +639,18 @@ def run_upload(spec: UploadSpec, argv: Optional[Sequence[str]] = None) -> int:
         console.print("[red]--map-concurrency must be at least 1.[/red]")
         return 2
     try:
-        return asyncio.run(_run(spec, args, console, logger))
+        # Separate from the gateway's short repo-write lock: this serializes
+        # read/replay/stage/write/ack of the recovery queue for the entire
+        # subset run. Otherwise an earlier writer could delete a later
+        # writer's newly staged worklist after releasing the gateway lock.
+        with hub_write_lock(
+            f"ingest-state::{args.repo}::{spec.config_name}", console=console,
+            root_dir=_state_root() / "locks",
+        ):
+            return asyncio.run(_run(spec, args, console, logger))
+    except HubWriteLockedError as exc:
+        console.print(f"[red]Upload state is locked:[/red] {exc}")
+        return 1
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user.[/yellow]")
         return 130
@@ -591,4 +662,7 @@ __all__ = [
     "build_parser",
     "report_unmapped_values",
     "record_stale_derived",
+    "load_stale_derived",
+    "replay_stale_derived",
+    "stale_worklist_path",
 ]

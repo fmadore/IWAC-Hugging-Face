@@ -29,11 +29,13 @@ Metrics reported per dimension:
 - Krippendorff's alpha (nominal + interval), N raters, missing-tolerant
 - Exact agreement rates (unanimous / pairwise)
 
-Columns added with --push:
+Columns added with --push are generation-specific (``consensus_g2_*`` and
+``sentiment_g2_disagreement`` for generation 2), plus an instrument fingerprint.
+The unqualified names below describe the fields; they are not overwritten:
 - consensus_polarite            strict-majority label (> half the models that
                                 voted, min 2 voters), else ""
 - consensus_centralite          strict-majority label, same rule
-- consensus_subjectivite_score  median of available scores (float; with
+- consensus_subjectivite_score  median of at least 2 scores (float; with
                                 exactly two raters the median is their mean,
                                 so .5 values appear by design)
 - sentiment_disagreement        pipe-joined dimensions in dispute
@@ -45,7 +47,7 @@ Usage
     python post-processing/sentiment_agreement.py [--source hub|csv] [--push]
 
 The default run is report-only: metrics are printed and saved to
-``analyses/output/sentiment_agreement_<config>.json``. Nothing is pushed
+``analyses/output/sentiment_agreement_<config>_g<generation>.json``. Nothing is pushed
 to the Hub unless --push is given.
 """
 from __future__ import annotations
@@ -63,19 +65,34 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import (  # noqa: E402
-    PRIVATE_REPO_ID,
-    REPO_ROOT,
-    add_columns_by_id,
-    ensure_hf_token,
-    load_hub_dataset,
-    load_subset_dataframe,
-    push_dataset,
-    write_run_manifest,
-)
+try:
+    from iwac_pipeline.processing._common import (  # noqa: E402
+        PRIVATE_REPO_ID,
+        REPO_ROOT,
+        add_columns_by_id,
+        ensure_hf_token,
+        load_hub_dataset,
+        load_subset_dataframe,
+        push_dataset,
+        write_run_manifest,
+    )
+except ModuleNotFoundError:  # source scripts before editable installation
+    from _common import (  # noqa: E402
+        PRIVATE_REPO_ID,
+        REPO_ROOT,
+        add_columns_by_id,
+        ensure_hf_token,
+        load_hub_dataset,
+        load_subset_dataframe,
+        push_dataset,
+        write_run_manifest,
+    )
+
 from iwac_common.sentiment_panel import (  # noqa: E402
     PANEL,
     SUBJECTIVITE_ORDER,
+    consensus_columns,
+    instrument_id,
     generation as panel_generation,
     latest_generation,
 )
@@ -141,7 +158,9 @@ DIMENSIONS = [
     ("subjectivite", "{m}_subjectivite_score", None),
 ]
 
-OUTPUT_DIR = REPO_ROOT / "analyses" / "output"
+from iwac_common.paths import workspace_root
+
+OUTPUT_DIR = workspace_root() / "analyses" / "output"
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +193,7 @@ def cohen_kappa(
         return None
     cats = sorted(scale) if scale is not None else sorted(set(a) | set(b))
     if len(cats) == 1:
-        return 1.0  # both raters constant and identical
+        return None  # zero expected disagreement: coefficient is undefined
     idx = {c: i for i, c in enumerate(cats)}
     k = len(cats)
     obs = np.zeros((k, k))
@@ -190,7 +209,7 @@ def cohen_kappa(
         w = 1.0 - np.eye(k)
     do, de = (w * obs).sum(), (w * exp).sum()
     if de == 0:
-        return 1.0
+        return None
     return float(1.0 - do / de)
 
 
@@ -200,6 +219,8 @@ def krippendorff_alpha(units: List[List[float]], metric: str = "interval") -> Op
     ``units`` is a list of per-item rating lists (missing already removed);
     items with fewer than 2 ratings are ignored, as per the method.
     """
+    if metric not in {"interval", "nominal"}:
+        raise ValueError("metric must be interval or nominal")
     coincidence: Counter = Counter()
     values: set = set()
     for vals in units:
@@ -229,7 +250,7 @@ def krippendorff_alpha(units: List[List[float]], metric: str = "interval") -> Op
         n_c[c] * n_c[k] * delta(c, k) for c in vals_sorted for k in vals_sorted
     ) / (n_total * (n_total - 1))
     if d_exp == 0:
-        return 1.0
+        return None
     return float(1.0 - d_obs / d_exp)
 
 
@@ -256,7 +277,8 @@ def subjectivite_ordinal(series: pd.Series) -> pd.Series:
     """
     numeric = pd.to_numeric(series, errors="coerce")
     labels = to_ordinal(series, SUBJECTIVITE_ORDER)
-    return numeric.where(numeric.notna(), labels)
+    values = numeric.where(numeric.notna(), labels)
+    return values.where(values.isin(SUBJECTIVITY_SCALE))
 
 
 def label_votes(row: pd.Series, cols: List[str]) -> List[str]:
@@ -318,6 +340,10 @@ def main() -> int:
 
     gen = None if args.generation == "all" else int(args.generation)
     models = models_for(gen)
+    if args.push and gen is None:
+        parser.error("--push cannot combine generations; select one instrument with --generation")
+    if args.push and args.source != "hub":
+        parser.error("--push requires --source hub")
 
     console.print(Panel.fit(
         "[bold cyan]AI Sentiment Inter-Model Agreement[/bold cyan]\n"
@@ -351,6 +377,8 @@ def main() -> int:
         "source": args.source,
         "n_rows": int(len(df)),
         "generation": args.generation,
+        "instrument_id": instrument_id(gen) if gen is not None else None,
+        "interpretation": "Model agreement is not external validation. Coefficients with zero expected disagreement are undefined (null). Interval and quadratic statistics assume equal category spacing.",
         "models": models,
         "prompt_fingerprints": {
             m.prefix: (m.prompt_fingerprint or "pre-fingerprint (commit 84bf993)")
@@ -400,6 +428,8 @@ def main() -> int:
         # Keys say "all", not "all_3": the panel is no longer fixed at three.
         report["dimensions"][dim_key] = {
             "n_rated_by_all": n_full,
+            "n_missing_by_model": {m: int(ordinal[m].isna().sum()) for m in models},
+            "n_less_than_two_ratings": int((ordinal.notna().sum(axis=1) < 2).sum()),
             "n_rated_by_2plus": n_any2,
             "exact_agreement_all": all3,
             "krippendorff_alpha_interval": alpha_interval,
@@ -409,7 +439,10 @@ def main() -> int:
 
         # --- consensus columns ---
         if mapping is not None:
-            raw_votes = df[cols].apply(lambda r: label_votes(r, cols), axis=1)
+            valid_labels = {*mapping, "Non applicable"}
+            raw_votes = df[cols].apply(
+                lambda r: [v for v in label_votes(r, cols) if v in valid_labels], axis=1
+            )
             consensus_frame[f"consensus_{dim_key}"] = raw_votes.apply(majority)
             disagreement_flags[dim_key] = raw_votes.apply(lambda v: len(v) >= 2) & (
                 consensus_frame[f"consensus_{dim_key}"] == ""
@@ -418,7 +451,7 @@ def main() -> int:
             # Median of the available scores. With exactly two raters the
             # median is the mean of the two values, so half-point scores
             # (e.g. 2.5, 3.5) appear by design — they are not an error.
-            consensus_frame["consensus_subjectivite_score"] = ordinal.median(axis=1, skipna=True)
+            consensus_frame["consensus_subjectivite_score"] = ordinal.median(axis=1, skipna=True).where(ordinal.notna().sum(axis=1) >= 2)
             spread = ordinal.max(axis=1) - ordinal.min(axis=1)
             disagreement_flags[dim_key] = (ordinal.notna().sum(axis=1) >= 2) & (spread >= 2)
 
@@ -451,6 +484,13 @@ def main() -> int:
     consensus_frame["sentiment_disagreement"] = disagreement.str.lstrip("|")
 
     n_disputed = int((consensus_frame["sentiment_disagreement"] != "").sum())
+    if gen is not None:
+        consensus_frame["instrument_id"] = instrument_id(gen)
+        consensus_frame = consensus_frame.rename(columns=consensus_columns(gen))
+    else:
+        # Cross-generation comparison is report-only and explicitly identified.
+        consensus_frame["instrument_id"] = "cross-generation-comparison"
+
     report["consensus"] = {
         "columns": list(consensus_frame.columns),
         "rows_with_any_disagreement": n_disputed,
@@ -462,7 +502,7 @@ def main() -> int:
 
     console.print(Panel(
         f"Rows with at least one disputed dimension: [bold]{n_disputed:,}[/bold] "
-        f"({n_disputed / len(df):.1%})\n"
+        f"({n_disputed / len(df) if len(df) else 0:.1%})\n"
         + "\n".join(
             f"  [cyan]{dim}[/cyan]: {int(disagreement_flags[dim].sum()):,} disputed"
             for dim, _, _ in DIMENSIONS
@@ -472,10 +512,10 @@ def main() -> int:
 
     # --- save report ---
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_json = OUTPUT_DIR / f"sentiment_agreement_{args.config}.json"
+    out_json = OUTPUT_DIR / f"sentiment_agreement_{args.config}_g{args.generation}.json"
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
-    out_csv = OUTPUT_DIR / f"sentiment_consensus_{args.config}.csv"
+    out_csv = OUTPUT_DIR / f"sentiment_consensus_{args.config}_g{args.generation}.csv"
     pd.concat([df[["o:id"]], consensus_frame], axis=1).to_csv(out_csv, index=False, encoding="utf-8")
     console.print(f"[green]✓[/green] Report: [cyan]{out_json}[/cyan]")
     console.print(f"[green]✓[/green] Consensus columns: [cyan]{out_csv}[/cyan]")

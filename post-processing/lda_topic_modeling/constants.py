@@ -440,9 +440,9 @@ DEFAULT_HOLDOUT_FRACTION = 0.0
 # runs the recommended recipe. Resolution order:
 #   explicit CLI > training_parameters.json (predict mode) > preset > defaults.
 #
-# "num_topics" pins k. That matters more than it looks: k is baked into the
-# meaning of the lda_topic_id column, so a preset that re-derives it lets an
-# ordinary re-fit silently renumber every topic in the dataset.
+# "num_topics" pins the intended granularity, not topic identity. Even at
+# fixed k, re-fitting can reorder or change topics. Immutable artifact IDs
+# disambiguate every fitted model; downstream keys are (model_id, topic_id).
 # "optimize_topics" re-derives it on every fit and only kicks in when
 # --num-topics is not given; --optimize-topics still forces a sweep.
 #
@@ -453,7 +453,7 @@ DEFAULT_HOLDOUT_FRACTION = 0.0
 CONFIG_PRESETS: dict[str, dict] = {
     "articles": {
         # Whole-document model (press articles are short). k pinned, not
-        # swept, to protect the existing column semantics on re-fit.
+        # swept, to retain the chosen granularity (not topic identity).
         "model_path": "lda_model",
         "language": "Français",
         "num_topics": 30,

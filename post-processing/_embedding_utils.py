@@ -1,5 +1,5 @@
 """Pure helpers for embedding workflows: chunking, mean-pooling, and a
-generic gzipped on-disk JSON cache keyed by ``o:id``, whose entries carry a
+JSON/transactional SQLite cache keyed by ``o:id``, whose entries carry a
 hash of the input they were computed from.
 
 Extracted from ``semantic_embedding.py`` to keep that script focused on
@@ -19,6 +19,7 @@ import gzip
 import hashlib
 import json
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
@@ -82,13 +83,18 @@ def cached_value(cache: Dict[str, Any], key: Any, fingerprint: str) -> Any:
 
 
 def load_cache(cache_file: Path) -> Dict[str, Any]:
-    """Load a gzipped JSON cache.
+    """Load a legacy gzipped JSON cache or transactional SQLite cache.
 
     Returns an empty dict if the file is missing or unreadable.
     """
     if not cache_file.exists():
         return {}
     try:
+        if cache_file.suffix == ".sqlite3":
+            with sqlite3.connect(cache_file) as connection:
+                return {key: json.loads(value) for key, value in connection.execute(
+                    "SELECT key, value FROM entries"
+                )}
         with gzip.open(cache_file, "rt", encoding="utf-8") as f:
             data = json.load(f)
         logger.info(f"Loaded {len(data)} cached embeddings from {cache_file}")
@@ -99,12 +105,22 @@ def load_cache(cache_file: Path) -> Dict[str, Any]:
 
 
 def save_cache(cache: Dict[str, Any], cache_file: Path) -> None:
-    """Atomically write the cache to a gzipped JSON file.
+    """Atomically checkpoint entries (SQLite), or replace a legacy gzip file.
 
     Creates the parent directory if needed; writes to a ``.tmp.gz`` sibling
     and renames on success so a crash mid-write doesn't corrupt the cache.
     """
     cache_file.parent.mkdir(parents=True, exist_ok=True)
+    if cache_file.suffix == ".sqlite3":
+        # The caller supplies only newly completed entries. Transactions make
+        # each checkpoint atomic without reserializing every previous vector.
+        with sqlite3.connect(cache_file) as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS entries (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.executemany(
+                "INSERT OR REPLACE INTO entries(key, value) VALUES (?, ?)",
+                ((str(key), json.dumps(value, allow_nan=False)) for key, value in cache.items()),
+            )
+        return
     tmp = cache_file.with_suffix(".tmp.gz")
     try:
         with gzip.open(tmp, "wt", encoding="utf-8") as f:

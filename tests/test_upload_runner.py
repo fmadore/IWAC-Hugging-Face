@@ -13,6 +13,13 @@ import iwac_common.hub_merge as hub_merge
 from iwac_common.upload_runner import UploadSpec, build_parser
 
 
+@pytest.fixture(autouse=True)
+def source_credentials(monkeypatch, tmp_path):
+    monkeypatch.setenv("OMEKA_KEY_IDENTITY", "synthetic-identity")
+    monkeypatch.setenv("OMEKA_KEY_CREDENTIAL", "synthetic-credential")
+    monkeypatch.setenv("IWAC_STATE_DIR", str(tmp_path / "state"))
+
+
 class _FakeDS:
     def __init__(self, df):
         self._df = df
@@ -155,3 +162,97 @@ class TestParser:
         help_text = build_parser(_spec()).format_help()
         for flag in ("--repo", "--max-shard-size", "--no-cache", "--dry-run", "--force-shrink"):
             assert flag in help_text
+
+    def test_invalidation_is_default_and_preservation_explicit(self):
+        parser = build_parser(_spec())
+        assert parser.parse_args([]).invalidate_derived is True
+        assert parser.parse_args(["--preserve-derived"]).invalidate_derived is False
+        assert build_parser(_spec(supports_stale_rows=True)).parse_args([]).stale_rows == "drop"
+
+
+def test_missing_source_credentials_abort_before_fetch(monkeypatch):
+    monkeypatch.delenv("OMEKA_KEY_CREDENTIAL")
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("must not fetch anonymous data")
+
+    monkeypatch.setattr(ur.OmekaApiClient, "fetch_items", forbidden)
+    assert _run(_spec(), ["--dry-run", "--no-cache"]) == 1
+
+
+def test_preserved_stale_worklist_is_staged_before_write_and_replayed(
+    stub_omeka, stub_hub, monkeypatch,
+):
+    stub_omeka({36: [{"o:id": 1, "title": "a"}]})
+    baseline = pd.DataFrame({"o:id": ["1"], "OCR": ["before"], "lemma_text": ["old"]})
+    stub_hub(baseline)
+
+    async def mapper(item, api):
+        return {"o:id": item["o:id"], "OCR": "after"}
+
+    writes = []
+
+    def push(ds, **kwargs):
+        assert ur.load_stale_derived(kwargs["repo_id"], "articles") == {"lemma_text": ["1"]}
+        writes.append(ds.to_pandas())
+
+    monkeypatch.setattr(ur, "push_dataset_verified", push)
+    argv = ["--no-cache", "--repo", "scratch/full"]
+    assert _run(_spec(map_item=mapper), [*argv, "--preserve-derived"]) == 0
+    assert writes[-1].iloc[0]["lemma_text"] == "old"
+    # The source change is already in the Hub. Comparison alone sees nothing;
+    # durable recovery must still clear the stale enrichment on a later run.
+    stub_hub(writes[-1])
+    assert _run(_spec(map_item=mapper), argv) == 0
+    assert pd.isna(writes[-1].iloc[0]["lemma_text"])
+    assert not ur.stale_worklist_path("scratch/full", "articles").exists()
+
+
+def test_failed_push_does_not_erase_stale_worklist(stub_omeka, stub_hub, monkeypatch):
+    stub_omeka({36: [{"o:id": 1, "title": "a"}]})
+    stub_hub(pd.DataFrame({"o:id": ["1"], "OCR": ["old"], "lemma_text": ["old"]}))
+
+    async def mapper(item, api):
+        return {"o:id": 1, "OCR": "changed"}
+
+    def push(*args, **kwargs):
+        raise RuntimeError("simulated interruption")
+
+    monkeypatch.setattr(ur, "push_dataset_verified", push)
+    assert _run(_spec(map_item=mapper), ["--no-cache", "--repo", "scratch/full"]) == 1
+    assert ur.load_stale_derived("scratch/full", "articles") == {"lemma_text": ["1"]}
+
+
+def test_corrupt_worklist_fails_closed(monkeypatch, tmp_path):
+    path = ur.stale_worklist_path("scratch/full", "articles")
+    path.parent.mkdir(parents=True)
+    path.write_text('{"repository":"different","config":"articles","columns":{}}')
+    with pytest.raises(ValueError, match="identity mismatch"):
+        ur.load_stale_derived("scratch/full", "articles")
+
+
+def test_another_ingest_cannot_mutate_same_recovery_queue(monkeypatch):
+    ur.record_stale_derived("scratch/full", "articles", {
+        "OCR": {"ids": ["1"], "derived": ["lemma_text"]},
+    }, "old-revision")
+    path = ur.stale_worklist_path("scratch/full", "articles")
+    snapshot = path.read_bytes()
+    with ur.hub_write_lock("ingest-state::scratch/full::articles", root_dir=ur._state_root() / "locks"):
+        assert _run(_spec(), ["--no-cache", "--repo", "scratch/full"]) == 1
+    assert path.read_bytes() == snapshot
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_cache_respects_workspace_and_explicit_absolute_path(monkeypatch, tmp_path, absolute):
+    workspace = tmp_path / "research"
+    monkeypatch.setenv("IWAC_WORK_DIR", str(workspace))
+    cache = tmp_path / "separate-cache" if absolute else ".cache_subset"
+    seen = []
+
+    async def empty_fetch(self, rcid, verify_total=True):
+        seen.append(self.cfg.CACHE_DIR)
+        return []
+
+    monkeypatch.setattr(ur.OmekaApiClient, "fetch_items", empty_fetch)
+    assert _run(_spec(cache_dir=str(cache)), ["--dry-run", "--no-cache"]) == 0
+    assert seen == [str(cache if absolute else workspace / cache)]

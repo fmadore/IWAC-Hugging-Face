@@ -114,8 +114,10 @@ def test_lemma_cache_is_not_restored_for_changed_text(tmp_path):
         ds, nlp, text_col="OCR", lemma_col="lemma_text", clean_col="lemma_nostop",
         process_choice="all", cache_file=cache_file,
     )
-    assert out["lemma_text"][:] == ["nouveau texte corrigé", "kept"]
-    assert load_cache(cache_file)["1"]["h"] == input_fingerprint("nouveau texte corrigé")
+    assert out["lemma_text"][:] == ["nouveau texte corrigé", "texte inchangé"]
+    # Both legacy entries lack configuration provenance and must be recomputed.
+    assert load_cache(cache_file)["1"]["h"] == input_fingerprint(
+        input_fingerprint("nouveau texte corrigé"), out["lemma_text_config_hash"][0])
 
 
 def test_batched_lemmatisation_matches_the_per_text_path(monkeypatch):

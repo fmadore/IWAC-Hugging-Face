@@ -22,10 +22,12 @@ from OCR, so they follow the same per-row mask.
 A subset that has content columns but no ``OCR_is_public`` flag aborts the
 push (run the upload scripts / backfill first) — never silently leaks.
 
-What always stays public: metadata, embeddings (not invertible to text), LDA
-topic columns, AI sentiment (scores + justifications), descriptionAI,
-abstract, tableOfContents, lexical metrics, word counts, and the
-``OCR_is_public`` flag itself.
+Private parent items are excluded entirely. Direct source fields marked private
+are masked, including private AI summaries or sentiment justifications. The
+existing reviewed policy retains computed embeddings, topics and metrics for
+public items whose OCR is private; this is a disclosure decision, not a claim
+that embeddings cannot reveal text. Private input/configuration hashes are
+removed. Missing item/property visibility metadata requires an Omeka refresh.
 
 Two guards protect against NEW full-text columns slipping through:
 
@@ -36,13 +38,10 @@ Two guards protect against NEW full-text columns slipping through:
    column with prose-length values aborts the push unless it is a known
    content column or allow-listed here.
 
-Both run BEFORE the push. A third check runs after it: ``sync_card_features``
-(iwac_common/card_sync.py) verifies that the dataset card declares the schema
-that was actually pushed, because ``push_to_hub`` refreshes the card's byte sizes
-but not its feature list — which on 2026-08-06 left this very dataset raising
-``CastError`` on ``load_dataset``. It repairs the card rather than aborting: the
-push has already landed by then, so stopping would leave the citable dataset
-broken.
+All selected subsets and their exact card metadata commit atomically with a
+server-enforced parent revision. Both guards run before the commit. Verification
+then checks every Parquet shard's complete schema and the published row IDs at
+that immutable revision; no separately published schema-repair step is needed.
 
 Usage
 -----
@@ -79,8 +78,7 @@ from iwac_common.hub import (  # noqa: E402
     HubWriteError,
     HubWriteLockedError,
     get_repo_revision,
-    hub_write_lock,
-    push_dataset_verified,
+    push_datasets_verified,
 )
 from iwac_common.repos import (  # noqa: E402
     CONTENT_COLUMNS,
@@ -89,6 +87,10 @@ from iwac_common.repos import (  # noqa: E402
 )
 from iwac_common.sentiment_panel import all_justification_columns  # noqa: E402
 from iwac_common.schema import ALL_CONFIGS  # noqa: E402
+from iwac_common.write_policy import (  # noqa: E402
+    PublicationPolicyError,
+    prepare_public_projection,
+)
 
 from dotenv import load_dotenv
 from pathlib import Path
@@ -346,7 +348,11 @@ def main() -> None:
     if any(a == "--configs" or a.startswith("--configs=") for a in sys.argv[1:]):
         console.print("[yellow]⚠[/yellow] --configs is deprecated; use --config.")
 
-    configs = [c.strip() for c in args.config.split(",") if c.strip()]
+    if args.repo_private == args.repo_public:
+        parser.error("Source and target repositories must differ")
+    configs = list(dict.fromkeys(c.strip() for c in args.config.split(",") if c.strip()))
+    if not configs:
+        parser.error("Choose at least one subset")
     unknown = [c for c in configs if c not in ALL_CONFIGS]
     if unknown:
         console.print(f"[red]✗[/red] Unknown config(s): {unknown}. Valid: {ALL_CONFIGS}")
@@ -385,11 +391,18 @@ def main() -> None:
                 token=token,
                 revision=source_revision,
             )
-        public_df = ds.to_pandas()
+        try:
+            public_df, excluded_items = prepare_public_projection(ds.to_pandas(), cfg)
+        except PublicationPolicyError as exc:
+            console.print(f"[red]✗[/red] {exc}")
+            sys.exit(1)
+        if excluded_items:
+            console.print(f"[yellow]ℹ[/yellow] {cfg}: excluded {excluded_items:,} non-public items")
         # The pandas hop below is only for masking and the prose heuristics;
         # the private schema is restored exactly when the frame goes back to
         # Arrow (a bare from_pandas turns nullable ints into float64).
-        features = ds.features
+        from datasets import Features
+        features = Features({column: ds.features[column] for column in public_df.columns})
 
         # Primary guard: every column must be explicitly allow-listed.
         approved_by_config[cfg] = check_column_allowlist(cfg, public_df, approve)
@@ -457,57 +470,31 @@ def main() -> None:
     from datasets import Dataset
 
     try:
-        # One lock spans the complete projection, preventing two local runs
-        # from interleaving different subset revisions.
-        with hub_write_lock(args.repo_public):
-            target_revision = get_repo_revision(args.repo_public, token=token)
-            for cfg, content_cols, kept, blanked, public_df, features in plans:
-                # to_pandas returns embeddings as np.ndarray; from_pandas infers
-                # list types more reliably from plain Python lists.
-                for col in public_df.columns:
-                    if col.startswith("embedding"):
-                        public_df[col] = public_df[col].map(
-                            lambda v: v.tolist() if isinstance(v, np.ndarray) else v
-                        )
-                with console.status(
-                    f"[bold green]Pushing '{cfg}' to {args.repo_public}...",
-                    spinner="dots",
-                ):
-                    pub_ds = Dataset.from_pandas(
-                        public_df, preserve_index=False, features=features
+        prepared = {}
+        for cfg, content_cols, kept, blanked, public_df, features in plans:
+            for col in public_df.columns:
+                if col.startswith("embedding"):
+                    public_df[col] = public_df[col].map(
+                        lambda v: v.tolist() if isinstance(v, np.ndarray) else v
                     )
-                    result = push_dataset_verified(
-                        pub_ds,
-                        repo_id=args.repo_public,
-                        config_name=cfg,
-                        token=token,
-                        max_shard_size=args.max_shard_size,
-                        # The private source revision rides in the commit
-                        # message, so each public commit names exactly the
-                        # snapshot it was projected from.
-                        commit_message=(
-                            f"Public projection of '{cfg}' from private mirror "
-                            f"@ {source_revision}"
-                            + (
-                                f" ({blanked:,} private-content rows masked)"
-                                if content_cols else ""
-                            )
-                        ),
-                        expected_revision=target_revision,
-                        expected_columns=list(public_df.columns),
-                        expected_ids=public_df["o:id"].tolist(),
-                        console=console,
-                        acquire_lock=False,
-                    )
-                    target_revision = result.after_revision
-                console.print(
-                    f"[green]✓[/green] {cfg}: {len(public_df):,} rows, "
-                    f"{len(public_df.columns)} cols pushed"
-                    + (
-                        f" — OCR kept for {kept:,}, blanked {blanked:,}"
-                        if content_cols else ""
-                    )
-                )
+            prepared[cfg] = Dataset.from_pandas(
+                public_df, preserve_index=False, features=features
+            )
+        target_revision = get_repo_revision(args.repo_public, token=token)
+        with console.status("[bold green]Publishing all selected subsets atomically...", spinner="dots"):
+            result = push_datasets_verified(
+                prepared,
+                repo_id=args.repo_public,
+                token=token,
+                max_shard_size=args.max_shard_size,
+                commit_message=f"Public projection of {','.join(prepared)} from private mirror @ {source_revision}",
+                expected_revision=target_revision,
+                mode="public_projection",
+                console=console,
+            )
+        console.print(
+            f"[green]✓[/green] Published {len(prepared)} subset(s) together at {result.after_revision}"
+        )
     except (
         HubBaselineUnavailableError,
         ConcurrentHubWriteError,

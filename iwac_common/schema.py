@@ -23,7 +23,7 @@ from typing import Mapping
 
 import pandas as pd
 
-from .sentiment_panel import numeric_subjectivite_columns
+from .sentiment_panel import PANEL, consensus_columns, numeric_subjectivite_columns
 
 #: Stored element type of every embedding vector. Gemini returns values of
 #: float32 precision; storing them as float64 doubled the bytes of the largest
@@ -99,35 +99,122 @@ _LDA = ("lda_topic_id", "lda_topic_prob", "lda_topic_label", "lda_topic_topk",
 #: The upload compares each source column with the Hub copy; where a row's
 #: source changed, its derived values describe an older version of the item.
 #: Only Hub-only (post-processed) columns are ever affected — a column the
-#: mapper produces is fresh by construction. Sentiment is deliberately absent:
-#: it is read from Omeka (and generation 1 is frozen history), not computed
-#: from OCR here.
+#: mapper produces is fresh by construction. Raw sentiment annotations are
+#: read from Omeka (generation 1 is frozen history), not recomputed from OCR.
+#: Their consensus descendants do depend on changed raw annotation labels.
 DERIVED_FROM: dict[str, dict[str, tuple[str, ...]]] = {
     "articles": {
         "OCR": ("embedding_OCR", *_LEMMAS, *_OCR_METRICS, *_LDA, "related_articles"),
+        "title": ("embedding_OCR", "related_articles"),
+        "language": (*_LEMMAS, "Richesse_Lexicale_OCR", "Lisibilite_OCR", *_LDA),
         "pub_date": _HIJRI,
     },
     "publications": {
         "OCR": (*_LEMMAS, *_OCR_METRICS, *_LDA),
+        "title": ("embedding_tableOfContents", "related_articles"),
+        "language": (*_LEMMAS, "Richesse_Lexicale_OCR", "Lisibilite_OCR", *_LDA),
         "tableOfContents": ("embedding_tableOfContents", "related_articles"),
         "pub_date": _HIJRI,
     },
     "references": {
         "OCR": ("embedding_OCR", *_LEMMAS, *_OCR_METRICS, *_LDA),
+        "title": ("embedding_OCR",),
+        "language": (*_LEMMAS, "Richesse_Lexicale_OCR", "Lisibilite_OCR", *_LDA),
     },
     "documents": {
         "OCR": (*_LEMMAS, *_OCR_METRICS),
+        "language": (*_LEMMAS, "Richesse_Lexicale_OCR", "Lisibilite_OCR"),
         "pub_date": _HIJRI,
     },
     "audiovisual": {
         "OCR": _OCR_METRICS,
+        "language": ("Richesse_Lexicale_OCR", "Lisibilite_OCR"),
         "pub_date": _HIJRI,
     },
     "images": {
         "image_url": ("embedding_image",),
+        "thumbnail": ("embedding_image",),
         "pub_date": _HIJRI,
     },
     "index": {},
+}
+
+# Consensus depends on the annotation instrument's actual label inputs, even
+# when OCR itself did not change. The frozen generation remains independent.
+# Legacy generic columns have no trustworthy generation marker, so any changed
+# model input invalidates the corresponding legacy dimension conservatively.
+for _model in PANEL:
+    _consensus = consensus_columns(_model.generation)
+    for _suffix, _legacy in (
+        ("polarite", "consensus_polarite"),
+        ("centralite_islam_musulmans", "consensus_centralite"),
+        ("subjectivite_score", "consensus_subjectivite_score"),
+    ):
+        DERIVED_FROM["articles"][_model.column(_suffix)] = (
+            _consensus[_legacy], _consensus["sentiment_disagreement"],
+            _consensus["instrument_id"], _legacy, "sentiment_disagreement",
+        )
+
+# Provenance cannot remain attached to an invalidated output. Keep these
+# dependencies here so every upload adapter has the same invalidation rule.
+for _sources in DERIVED_FROM.values():
+    for _source, _outputs in list(_sources.items()):
+        _sources[_source] = tuple(dict.fromkeys([
+            *_outputs,
+            *(f"{column}_{suffix}" for column in _outputs
+              for suffix in ("input_hash", "config_hash", "config_json")),
+        ]))
+
+# Omeka value properties -> flat columns containing or exposing those values.
+# Privacy is conservative for joined multilingual/multivalued properties: if
+# any nonempty value is private (or lacks a flag), all mapped columns are
+# marked private. The full mirror keeps all values; the public projector masks
+# the named columns. These source mappings deliberately do not decide whether
+# non-reconstructive computed derivatives are approved for publication.
+SOURCE_FIELD_COLUMNS = {
+    "dcterms:identifier": ("identifier",),
+    "dcterms:title": ("title", "Titre"),
+    "dcterms:creator": ("author", "author_ids", "creator", "creator_ids"),
+    "dcterms:publisher": ("newspaper", "newspaper_ids", "publisher", "publisher_ids"),
+    "dcterms:date": ("pub_date", "pub_year", "pub_date_precision", "date", *_HIJRI),
+    "bibo:shortDescription": ("descriptionAI", "descriptionAI_en"),
+    "dcterms:subject": ("subject", "subject_ids"),
+    "dcterms:spatial": ("spatial", "spatial_ids"),
+    "dcterms:language": ("language",),
+    "bibo:numPages": ("nb_pages",),
+    "fabio:hasURL": ("URL",),
+    "dcterms:source": ("source",),
+    "bibo:content": ("OCR",),
+    "bibo:issue": ("issue",),
+    "dcterms:tableOfContents": ("tableOfContents",),
+    "dcterms:contributor": ("contributor",),
+    "dcterms:type": ("type",),
+    "dcterms:rights": ("rights",),
+    "dcterms:description": ("description", "Description"),
+    "bibo:volume": ("volume",),
+    "dcterms:isPartOf": ("is_part_of", "Partie de"),
+    "dcterms:extent": ("extent", "duration_seconds"),
+    "dcterms:medium": ("medium",),
+    "bibo:authorList": ("author", "author_ids"),
+    "bibo:editorList": ("editor", "editor_ids"),
+    "bibo:reviewOf": ("review_of",),
+    "dcterms:alternative": ("book_title", "Titre alternatif"),
+    "bibo:chapter": ("chapter",),
+    "dcterms:abstract": ("abstract", "abstract_en"),
+    "bibo:edition": ("edition",),
+    "bibo:pageStart": ("page_start",),
+    "bibo:pageEnd": ("page_end",),
+    "dcterms:provenance": ("provenance",),
+    "bibo:doi": ("doi", "URL"),
+    "curation:coordinates": ("coordinates", "Coordonnées", "latitude", "longitude"),
+    "dcterms:created": ("Date création",),
+    "dcterms:relation": ("Relation",),
+    "dcterms:isReplacedBy": ("Remplacé par",),
+    "dcterms:hasPart": ("A une partie",),
+    "foaf:firstName": ("Prénom",),
+    "foaf:lastName": ("Nom",),
+    "foaf:gender": ("Genre",),
+    "foaf:birthday": ("Naissance",),
 }
 
 #: Country-specific Omeka item sets, per subset → the canonical country label
@@ -410,6 +497,40 @@ def _to_embedding_list(values, config_name: str, column: str):
     )
 
 
+def _to_metadata_type(values, config_name: str, column: str):
+    """Stabilize privacy/provenance types even when all values are empty."""
+    import pyarrow as pa
+
+    target = (pa.bool_() if column == "item_is_public" else
+              pa.list_(pa.string()) if column == "private_fields" else pa.string())
+    if values.type == target:
+        return values
+    kind = values.type
+    if column == "item_is_public":
+        compatible = pa.types.is_null(kind) or pa.types.is_boolean(kind)
+    elif column == "private_fields":
+        compatible = pa.types.is_null(kind) or (
+            (pa.types.is_list(kind) or pa.types.is_large_list(kind)
+             or pa.types.is_fixed_size_list(kind))
+            and (pa.types.is_string(kind.value_type) or pa.types.is_large_string(kind.value_type)
+                 or pa.types.is_null(kind.value_type))
+        )
+    else:
+        compatible = (pa.types.is_null(kind) or pa.types.is_string(kind)
+                      or pa.types.is_large_string(kind))
+    if not compatible:
+        raise DataContractError(
+            f"{config_name}.{column} has incompatible privacy/provenance type {kind}; "
+            "refusing to coerce visibility evidence"
+        )
+    try:
+        return values.cast(target)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as exc:
+        raise DataContractError(
+            f"{config_name}.{column} has incompatible privacy/provenance type {values.type}"
+        ) from exc
+
+
 def conform_dataset(ds, config_name: str):
     """Return ``ds`` with the subset's canonical column types applied.
 
@@ -429,6 +550,11 @@ def conform_dataset(ds, config_name: str):
         (c, _to_embedding_list)
         for c in (spec.embedding_columns or {})
         if c in ds.column_names
+    ]
+    plan += [
+        (c, _to_metadata_type) for c in ds.column_names
+        if c in ("item_is_public", "private_fields")
+        or c.endswith(("_input_hash", "_config_hash", "_config_json"))
     ]
     replacements = {}
     for column, convert in plan:
@@ -484,6 +610,7 @@ __all__ = [
     "CONTENT_COLUMNS",
     "COUNTRY_ITEM_SETS",
     "DERIVED_FROM",
+    "SOURCE_FIELD_COLUMNS",
     "EMBEDDING_VALUE_TYPE",
     "DataContractError",
     "validate_ids",

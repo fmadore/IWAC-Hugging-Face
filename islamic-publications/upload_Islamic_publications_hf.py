@@ -37,7 +37,6 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(script_dir)
 sys.path.insert(0, parent_dir)
 
-from dotenv import load_dotenv
 from country_mapper import get_country_from_newspaper
 from iwac_common.omeka_client import (
     OmekaApiClient,
@@ -48,6 +47,7 @@ from iwac_common.omeka_client import (
     item_page_url,
 )
 from iwac_common.field_mappers import (
+    visibility_metadata,
     extract_added_date,
     get_resource_ids,
     get_uri_value,
@@ -59,9 +59,6 @@ from iwac_common.field_mappers import (
 from iwac_common.upload_runner import UploadSpec, report_unmapped_values, run_upload
 from iwac_common.schema import SUBSETS
 
-# Specify the path to .env in the parent directory
-dotenv_path = os.path.join(parent_dir, '.env')
-load_dotenv(dotenv_path=dotenv_path)
 
 
 # Orchestration (fetch → map loop → merge → validate → push), the CLI
@@ -79,7 +76,7 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
     """Transforme un item Omeka (publication islamique) en dict plat pour HF datasets."""
 
     primary_url = await fetch_primary_media_url(
-        item, api, affected_fields=("PDF",)
+        item, api, affected_fields=("PDF", "thumbnail", "iiif_manifest")
     )
 
 
@@ -98,6 +95,7 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
 
     return {
         "o:id": item["o:id"],
+        **visibility_metadata(item, "publications"),
         "identifier": get_value(item, "dcterms:identifier"),
         "added_date": extract_added_date(item),  # Date when item was added to Omeka
         "iwac_url": item_page_url(item["o:id"]),

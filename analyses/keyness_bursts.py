@@ -23,7 +23,7 @@ Two classic corpus-DH analyses over the `articles` subset:
    smoothing), capped at ``--top-n``.
 
 2. **Burst detection (Kleinberg 2-state automaton)** — periods when a
-   ``subject`` term (controlled vocabulary, joins to the index subset)
+   authority ID (``subject_ids``, joined to the index subset)
    appears far above its corpus base rate: coverage spikes around events.
    Subjects are deduplicated per document (a document listing the same
    subject twice counts once), and the year axis is a contiguous calendar
@@ -33,7 +33,8 @@ Two classic corpus-DH analyses over the `articles` subset:
 Outputs (analyses/output/):
 - keyness_country.csv    country, rank, token, log_ratio, g2, p_value, q_value, count, rate_ratio
 - keyness_decade.csv     decade, rank, token, log_ratio, g2, p_value, q_value, count, rate_ratio
-- subject_bursts.csv     subject, start, end, weight, mentions_in_burst, total
+- subject_bursts.csv     authority ID/label, start/end, weight, mentions, exposure
+- subject_burst_exposure.csv yearly corpus/tagged counts and denominator
 - keyness_bursts_summary.json
 
 Usage
@@ -58,19 +59,37 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "post-processing"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # analyses/ for _stats
 
-from _common import (  # noqa: E402
-    PRIVATE_REPO_ID,
-    ensure_hf_token,
-    load_subset_dataframe,
-    write_run_manifest,
-)
+try:
+    from iwac_pipeline.processing._common import (  # noqa: E402
+        PRIVATE_REPO_ID,
+        ensure_hf_token,
+        load_subset_dataframe,
+        write_run_manifest,
+    )
+except ModuleNotFoundError:  # source scripts before editable installation
+    from _common import (  # noqa: E402
+        PRIVATE_REPO_ID,
+        ensure_hf_token,
+        load_subset_dataframe,
+        write_run_manifest,
+    )
+
 from iwac_common.text_utils import simple_tokenize  # noqa: E402
-from lda_topic_modeling.constants import (  # noqa: E402
-    DOMAIN_STOPWORDS,
-    FRAGMENT_STOPWORDS,
-    LDA_GEO_STOPWORDS,
-    LDA_GENERIC_STOPWORDS,
-)
+try:
+    from iwac_pipeline.processing.lda_topic_modeling.constants import (  # noqa: E402
+        DOMAIN_STOPWORDS,
+        FRAGMENT_STOPWORDS,
+        LDA_GEO_STOPWORDS,
+        LDA_GENERIC_STOPWORDS,
+    )
+except ModuleNotFoundError:  # source scripts before editable installation
+    from lda_topic_modeling.constants import (  # noqa: E402
+        DOMAIN_STOPWORDS,
+        FRAGMENT_STOPWORDS,
+        LDA_GEO_STOPWORDS,
+        LDA_GENERIC_STOPWORDS,
+    )
+
 
 from rich import box
 from rich.console import Console
@@ -78,7 +97,9 @@ from rich.panel import Panel
 from rich.table import Table
 
 console = Console()
-OUTPUT_DIR = REPO_ROOT / "analyses" / "output"
+from iwac_common.paths import workspace_root
+
+OUTPUT_DIR = workspace_root() / "analyses" / "output"
 
 # FDR threshold for the keyness report (Benjamini–Hochberg q-values).
 ALPHA = 0.05
@@ -91,7 +112,12 @@ ALPHA = 0.05
 
 # bh_adjust lives in analyses/_stats.py (shared with topic_prevalence.py);
 # re-exported here so existing references keep working.
-from _stats import bh_adjust  # noqa: E402,F401
+try:
+    from iwac_pipeline.analyses.entity_networks import authority_lookups, resolve_entities
+    from iwac_pipeline.analyses._stats import french_language_mask, bh_adjust
+except ModuleNotFoundError:  # source scripts before editable installation
+    from entity_networks import authority_lookups, resolve_entities
+    from _stats import french_language_mask, bh_adjust
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +274,15 @@ def kleinberg_bursts(
     d[t] = 0 are handled: sigma() emits zero cost for either state, so burst
     intervals can legitimately span truly empty years.
     """
+    r, d, years = np.asarray(r), np.asarray(d), np.asarray(years)
+    if r.ndim != 1 or d.shape != r.shape or years.shape != r.shape:
+        raise ValueError("Counts, exposure and years must be aligned vectors")
+    if not np.isfinite(r).all() or not np.isfinite(d).all() or (r < 0).any() or (d < r).any():
+        raise ValueError("Require finite counts with 0 <= mentions <= exposure")
+    if s <= 1 or gamma < 0:
+        raise ValueError("Require s > 1 and gamma >= 0")
+    if len(years) > 1 and not (np.diff(years) == 1).all():
+        raise ValueError("years must be a contiguous calendar range")
     T = len(r)
     R, D = float(r.sum()), float(d.sum())
     if T < 2 or R == 0 or D == 0:
@@ -315,7 +350,7 @@ def unique_subjects(raw) -> set[str]:
     per-year mention count (r[t] counts *documents*, not repetitions).
     Missing/NaN fields yield the empty set.
     """
-    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+    if raw is None or pd.isna(raw):
         return set()
     return {s.strip() for s in str(raw).split("|") if s.strip()}
 
@@ -328,7 +363,45 @@ def contiguous_year_index(observed_years) -> np.ndarray:
     interval bookkeeping see the real calendar span.
     """
     ys = np.asarray(list(observed_years), dtype=int)
-    return np.arange(int(ys.min()), int(ys.max()) + 1)
+    return np.arange(int(ys.min()), int(ys.max()) + 1) if len(ys) else np.array([], dtype=int)
+
+
+
+def keyness_rows(df: pd.DataFrame, year_min: int, year_max: int, *, include_unknown=False):
+    """One eligibility rule for country and decade keyness."""
+    years = pd.to_numeric(df["pub_date"].astype("string").str.strip().str[:4], errors="coerce")
+    language = df.get("language", pd.Series(pd.NA, index=df.index))
+    text = df["lemma_nostop"].astype("string").fillna("").str.strip().ne("")
+    keep = years.between(year_min, year_max) & text & french_language_mask(language, include_unknown=include_unknown)
+    return df.loc[keep].assign(year=years.loc[keep])
+
+
+def subject_exposure(df: pd.DataFrame, index: pd.DataFrame, *, denominator="all"):
+    """Authority-ID document counts and an explicit exposure universe.
+
+    Tagged means at least one resolved authority ID. All includes untagged
+    articles, while the coverage output makes changing cataloguing visible.
+    """
+    if denominator not in {"all", "tagged"}:
+        raise ValueError("denominator must be all or tagged")
+    titles, _, fallback = authority_lookups(index)
+    subjects = [resolve_entities(row, titles, fallback)[0] for row in df.to_dict("records")]
+    years = df["year"].astype(int).to_numpy()
+    all_counts = Counter(int(y) for y in years)
+    tagged_counts = Counter(int(y) for y, entities in zip(years, subjects) if entities)
+    mentions = defaultdict(Counter)
+    for year, entities in zip(years, subjects):
+        for entity in entities:
+            mentions[entity][int(year)] += 1
+    year_index = contiguous_year_index(years)
+    exposure = all_counts if denominator == "all" else tagged_counts
+    d_arr = np.array([exposure[int(y)] for y in year_index], dtype=float)
+    coverage = pd.DataFrame([{"year": int(y), "n_articles": all_counts[int(y)],
+                              "n_tagged": tagged_counts[int(y)], "exposure": exposure[int(y)],
+                              "tagged_share": tagged_counts[int(y)] / all_counts[int(y)] if all_counts[int(y)] else None}
+                             for y in year_index],
+                            columns=["year", "n_articles", "n_tagged", "exposure", "tagged_share"])
+    return mentions, titles, year_index, d_arr, coverage
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +422,13 @@ def main() -> None:
     parser.add_argument("--burst-gamma", type=float, default=1.0, help="Kleinberg entry cost factor")
     parser.add_argument("--year-min", type=int, default=1900)
     parser.add_argument("--year-max", type=int, default=2030)
+    parser.add_argument("--include-unknown-language", action="store_true",
+                        help="Explicitly include missing/blank language as presumed French")
+    parser.add_argument("--burst-denominator", choices=["all", "tagged"], default="all",
+                        help="Exposure universe: all dated articles or only authority-tagged articles")
     args = parser.parse_args()
+    if args.year_min > args.year_max:
+        parser.error("--year-min cannot exceed --year-max")
 
     console.print(Panel.fit(
         "[bold cyan]Keyness & Burst Detection[/bold cyan]\n"
@@ -360,7 +439,7 @@ def main() -> None:
     token = ensure_hf_token(console=console) if args.source == "hub" else None
     df = load_subset_dataframe(
         args.repo, args.config, token=token, source=args.source,
-        columns=["o:id", "lemma_nostop", "pub_date", "country", "subject", "language"],
+        columns=["o:id", "lemma_nostop", "pub_date", "country", "subject", "subject_ids", "language"],
         console=console,
     )
     source_revision = df.attrs.get("iwac_source_revision")
@@ -377,8 +456,8 @@ def main() -> None:
     )
 
     # ---------------- Keyness ----------------
-    is_french = df["language"].isna() | (df["language"] == "Français")
-    text_rows = df[is_french & df["lemma_nostop"].notna()]
+    text_rows = keyness_rows(df, args.year_min, args.year_max,
+                            include_unknown=args.include_unknown_language)
     console.print(f"[blue]→[/blue] Keyness corpus: {len(text_rows):,} French articles")
 
     country_tokens: dict[str, Counter] = defaultdict(Counter)
@@ -400,27 +479,13 @@ def main() -> None:
     keyness_decade = keyness_for_slices(decade_tokens, args.top_n, args.min_count)
 
     # ---------------- Bursts ----------------
-    subj_rows = df[valid_year & df["subject"].notna()]
-    per_year_docs = subj_rows.groupby(subj_rows["year"].astype(int)).size()
-    # Contiguous calendar range: zero-fill missing years so gaps don't
-    # collapse (log(T) and burst intervals see the true calendar span).
-    year_index = contiguous_year_index(per_year_docs.index)
-    d_arr = per_year_docs.reindex(year_index, fill_value=0).to_numpy(dtype=float)
+    index = load_subset_dataframe(args.repo, "index", token=token, source=args.source,
+                                  columns=["o:id", "Titre", "Type"], console=console, revision=source_revision)
+    subject_year, subject_titles, year_index, d_arr, coverage = subject_exposure(
+        df.loc[valid_year], index, denominator=args.burst_denominator)
     n_gap_years = int((d_arr == 0).sum())
-
-    subject_year: dict[str, Counter] = defaultdict(Counter)
-    for _, row in subj_rows.iterrows():
-        y = int(row["year"])
-        # Dedup per document: the same subject listed twice counts once.
-        for s_term in unique_subjects(row["subject"]):
-            subject_year[s_term][y] += 1
-
-    console.print(
-        f"[blue]→[/blue] Burst detection: {len(subject_year):,} subjects, "
-        f"{year_index.min()}–{year_index.max()} "
-        f"({n_gap_years} empty calendar years zero-filled; "
-        f"threshold: ≥{args.min_subject_total} total mentions)"
-    )
+    console.print(f"[blue]→[/blue] Burst detection: {len(subject_year):,} authority IDs; "
+                  f"exposure={args.burst_denominator}; {n_gap_years} zero-exposure years")
 
     burst_rows = []
     for subject, counts in subject_year.items():
@@ -429,8 +494,9 @@ def main() -> None:
             continue
         r_arr = np.array([counts.get(int(y), 0) for y in year_index], dtype=float)
         for b in kleinberg_bursts(r_arr, d_arr, year_index, s=args.burst_s, gamma=args.burst_gamma):
-            burst_rows.append({"subject": subject, **b, "total_mentions": total})
-    bursts_df = pd.DataFrame(burst_rows).sort_values("weight", ascending=False) if burst_rows else pd.DataFrame()
+            burst_rows.append({"subject_id": subject, "subject": subject_titles[subject], **b, "total_mentions": total,
+                               "exposure_in_burst": int(d_arr[(year_index >= b["start"]) & (year_index <= b["end"])].sum())})
+    bursts_df = pd.DataFrame(burst_rows).sort_values("weight", ascending=False) if burst_rows else pd.DataFrame(columns=["subject_id", "subject", "start", "end", "weight", "mentions_in_burst", "total_mentions", "exposure_in_burst"])
 
     # ---------------- Outputs ----------------
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -438,12 +504,16 @@ def main() -> None:
     keyness_decade.to_csv(OUTPUT_DIR / "keyness_decade.csv", index=False, encoding="utf-8")
     bursts_df.to_csv(OUTPUT_DIR / "subject_bursts.csv", index=False, encoding="utf-8")
 
+    coverage.to_csv(OUTPUT_DIR / "subject_burst_exposure.csv", index=False, encoding="utf-8")
     summary = {
         "generated_at": datetime.now().isoformat(),
         "config": args.config,
         "source": args.source,
         "keyness": {
             "countries": sorted(country_tokens),
+            "year_range": [args.year_min, args.year_max],
+            "include_unknown_language": args.include_unknown_language,
+            "n_eligible_articles": len(text_rows),
             "decades": sorted(decade_tokens),
             "stopword_count": len(stopwords),
             "top_n": args.top_n,
@@ -451,17 +521,19 @@ def main() -> None:
             "note": ("p = chi2.sf(G², df=1), Benjamini–Hochberg within each "
                      "slice's tested token family; only q < alpha reported, "
                      "ranked by log_ratio effect size (G² conflates effect "
-                     "and sample size)."),
+                     "and sample size). Token independence is an approximation: these are exploratory corpus-conditional diagnostics, not population inference; repeated articles and outlet clustering can inflate significance."),
         },
         "bursts": {
             "subjects_tested": sum(1 for c in subject_year.values() if sum(c.values()) >= args.min_subject_total),
             "bursts_found": int(len(bursts_df)),
             "s": args.burst_s, "gamma": args.burst_gamma,
-            "year_range": [int(year_index.min()), int(year_index.max())],
+            "year_range": [int(year_index.min()), int(year_index.max())] if len(year_index) else [],
+            "denominator": args.burst_denominator,
+            "identity": "authority o:id; ambiguous title fallbacks excluded",
             "empty_years_zero_filled": n_gap_years,
             "note": ("Subjects deduplicated per document; calendar gaps "
                      "zero-filled, so burst intervals can span truly empty "
-                     "years."),
+                     "years; zero-exposure gaps provide no evidence of a continuing event. Interpret spikes against the exported tagging coverage and corpus exposure."),
         },
     }
     with open(OUTPUT_DIR / "keyness_bursts_summary.json", "w", encoding="utf-8") as f:
@@ -502,6 +574,7 @@ def main() -> None:
             OUTPUT_DIR / "keyness_country.csv",
             OUTPUT_DIR / "keyness_decade.csv",
             OUTPUT_DIR / "subject_bursts.csv",
+            OUTPUT_DIR / "subject_burst_exposure.csv",
             OUTPUT_DIR / "keyness_bursts_summary.json",
         ],
     )

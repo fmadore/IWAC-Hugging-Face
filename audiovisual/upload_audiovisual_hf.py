@@ -53,7 +53,6 @@ from typing import Dict, Any, Optional
 # Add parent directory to path for iwac_common import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dotenv import load_dotenv
 from iwac_common.omeka_client import (
     OmekaApiClient,
     conn_manager,
@@ -63,6 +62,7 @@ from iwac_common.omeka_client import (
     item_page_url,
 )
 from iwac_common.field_mappers import (
+    visibility_metadata,
     extract_added_date,
     get_display_titles,
     get_literal_values,
@@ -79,7 +79,6 @@ from iwac_common.upload_runner import UploadSpec, run_upload
 from iwac_common.schema import COUNTRY_ITEM_SETS, SUBSETS
 from country_mapper import get_country_from_newspaper
 
-load_dotenv()
 
 
 # Resource template that marks an embedded YouTube video. Class 38 alone no
@@ -205,7 +204,7 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
     """Transforme un item Omeka audiovisuel en dict plat pour HF datasets."""
 
     primary_url = await fetch_primary_media_url(
-        item, api, affected_fields=("PDF",)
+        item, api, affected_fields=("PDF", "thumbnail", "iiif_manifest")
     )
 
     publisher = get_display_titles(item, "dcterms:publisher")
@@ -244,6 +243,7 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
 
     return {
         "o:id": item["o:id"],
+        **visibility_metadata(item, "audiovisual"),
         "identifier": get_value(item, "dcterms:identifier"),
         "added_date": added_date,
         "iwac_url": item_page_url(item["o:id"]),

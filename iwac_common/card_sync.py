@@ -1,5 +1,9 @@
-"""Post-push guard: keep the Hub dataset card's declared schema in step with the
-parquet that was actually pushed.
+"""Verify the complete card/Parquet schema at one immutable Hub revision.
+
+The normal write gateway now stages the card and Parquet in one atomic commit.
+This utility verifies that result without mutation (``repair=False``). Explicit
+repair remains available for legacy inconsistent cards, using a parent-commit
+precondition so it cannot overwrite a concurrent card edit.
 
 **Why this exists.** ``push_to_hub`` rewrites the card's ``dataset_info`` byte
 sizes for the config it just pushed but, observed twice on 2026-08-06 with
@@ -31,10 +35,10 @@ from typing import List, Optional, Sequence
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from huggingface_hub import DatasetCard, HfApi, HfFileSystem
+from huggingface_hub import DatasetCard, HfApi, HfFileSystem, hf_hub_download
 from rich.console import Console
 
-from .hub import resolve_hf_token
+from .hub import get_repo_revision, resolve_hf_token
 
 
 class CardSchemaError(RuntimeError):
@@ -54,21 +58,52 @@ def _narrow(dtype: pa.DataType) -> pa.DataType:
         return pa.string()
     if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
         return pa.list_(_narrow(dtype.value_type))
+    if pa.types.is_fixed_size_list(dtype):
+        return pa.list_(_narrow(dtype.value_type), dtype.list_size)
+    if pa.types.is_struct(dtype):
+        return pa.struct([pa.field(f.name, _narrow(f.type)) for f in dtype])
     return dtype
 
 
-def _parquet_schema(repo: str, config_name: str, token: Optional[str]) -> pa.Schema:
+def _parquet_schema(repo: str, config_name: str, token: Optional[str], revision: Optional[str] = None) -> pa.Schema:
     """Arrow schema of the config's parquet on the Hub, read from the footer only
     (no shard download). All shards of a config share one schema."""
     fs = HfFileSystem(token=token)
-    shards = sorted(fs.glob(f"datasets/{repo}/{config_name}/*.parquet"))
+    location = f"{repo}@{revision}" if revision else repo
+    shards = sorted(fs.glob(f"datasets/{location}/{config_name}/*.parquet"))
     if not shards:
         raise CardSchemaError(
             f"No parquet found for '{config_name}' in {repo}; cannot verify the card."
         )
-    with fs.open(shards[0], "rb") as handle:
-        schema = pq.ParquetFile(handle).schema_arrow
+    schema = None
+    for shard in shards:
+        with fs.open(shard, "rb") as handle:
+            current = _normalize_schema(pq.ParquetFile(handle).schema_arrow)
+        if schema is not None and not schema.equals(current):
+            raise CardSchemaError(f"Inconsistent Parquet schemas in '{config_name}' at {revision}")
+        schema = current
+    return schema
+
+
+def _normalize_schema(schema: pa.Schema) -> pa.Schema:
     return pa.schema([pa.field(f.name, _narrow(f.type)) for f in schema])
+
+
+def _load_card(repo: str, token: Optional[str], revision: str) -> DatasetCard:
+    """Read README at the same immutable revision as its Parquet shards."""
+    from pathlib import Path
+
+    path = hf_hub_download(repo, "README.md", repo_type="dataset", token=token, revision=revision)
+    return DatasetCard(Path(path).read_text(encoding="utf-8"))
+
+
+def _declared_schema(entry: dict) -> pa.Schema:
+    from datasets import Features
+
+    try:
+        return _normalize_schema(Features._from_yaml_list(entry["features"]).arrow_schema)
+    except Exception as exc:
+        raise CardSchemaError(f"Invalid declared feature types: {exc}") from exc
 
 
 def _features_yaml(schema: pa.Schema) -> List[dict]:
@@ -112,6 +147,8 @@ def sync_card_features(
     console: Optional[Console] = None,
     repair: bool = True,
     expected_columns: Optional[Sequence[str]] = None,
+    expected_schema: Optional[pa.Schema] = None,
+    revision: Optional[str] = None,
 ) -> bool:
     """Verify — and by default repair — the card's declared features for one config.
 
@@ -126,7 +163,10 @@ def sync_card_features(
     console = console or Console()
     token = resolve_hf_token(token)
 
-    schema = _parquet_schema(repo, config_name, token)
+    revision = revision or get_repo_revision(repo, token=token)
+    schema = _parquet_schema(repo, config_name, token, revision)
+    if expected_schema is not None and not schema.equals(_normalize_schema(expected_schema)):
+        raise CardSchemaError(f"{repo}/{config_name}: published schema differs from the prepared dataset")
     actual = list(schema.names)
     if expected_columns is not None and actual != list(expected_columns):
         missing = [c for c in expected_columns if c not in actual]
@@ -137,7 +177,7 @@ def sync_card_features(
             f"{extra or 'none'}). Do not re-push blindly; inspect the repo."
         )
 
-    card = DatasetCard.load(repo, repo_type="dataset", token=token)
+    card = _load_card(repo, token, revision)
     entry = _declared(card, config_name)
     if entry is None or not entry.get("features"):
         console.print(
@@ -147,7 +187,7 @@ def sync_card_features(
         return True
 
     declared = [f.get("name") for f in entry["features"]]
-    if declared == actual:
+    if _declared_schema(entry).equals(schema):
         console.print(
             f"[green]✓[/green] Card schema matches the pushed parquet "
             f"({len(actual)} columns)."
@@ -162,7 +202,7 @@ def sync_card_features(
         + (f"; undeclared: {', '.join(added)}" if added else "")
         + (f"; declared but absent: {', '.join(removed)}" if removed else "")
         + (
-            "; same columns in a different order"
+            "; column order or data types differ"
             if not added and not removed
             else ""
         )
@@ -189,11 +229,12 @@ def sync_card_features(
             f"refusing to write the card."
         )
 
-    HfApi(token=token).upload_file(
+    commit = HfApi(token=token).upload_file(
         path_or_fileobj=card.content.encode("utf-8"),
         path_in_repo="README.md",
         repo_id=repo,
         repo_type="dataset",
+        parent_commit=revision,
         commit_message=(
             f"Card: declare the {config_name} schema pushed in the preceding commit "
             f"({len(actual)} columns) — fixes load_dataset CastError"
@@ -202,10 +243,10 @@ def sync_card_features(
 
     # Re-verify against the Hub rather than trusting the local object.
     reloaded = _declared(
-        DatasetCard.load(repo, repo_type="dataset", token=token), config_name
+        _load_card(repo, token, commit.oid), config_name
     )
     names = [f.get("name") for f in (reloaded or {}).get("features", [])]
-    if names != actual:
+    if not reloaded or not _declared_schema(reloaded).equals(schema):
         raise CardSchemaError(
             f"{detail}. The card was rewritten but still does not match "
             f"({len(names)} columns declared). Fix it by hand before anyone loads "
