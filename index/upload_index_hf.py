@@ -10,7 +10,7 @@ sur le Hugging Face Hub.
 Usage
 -----
     python upload_index_hf.py \
-        --repo fmadore/islam-west-africa-collection \
+        --repo fmadore/islam-west-africa-collection-full \
         --max-shard-size 1GB
 
 Variables d'environnement
@@ -33,7 +33,6 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
-from dotenv import load_dotenv
 from rich.console import Console
 from iwac_common.omeka_client import (
     OmekaApiClient,
@@ -42,6 +41,7 @@ from iwac_common.omeka_client import (
     item_page_url,
 )
 from iwac_common.field_mappers import (
+    visibility_metadata,
     extract_added_date,
     get_display_titles,
     get_literal_values,
@@ -62,7 +62,6 @@ from iwac_common.hub import (
 logger = logging.getLogger("upload")
 console = Console()
 
-load_dotenv()
 
 
 # Orchestration + CLI + Rich console/logging live in
@@ -121,6 +120,7 @@ async def map_index_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
 
     return {
         "o:id": item["o:id"],
+        **visibility_metadata(item, "index"),
         "identifier": get_literal_values(item, "dcterms:identifier"),
         "added_date": extract_added_date(item),  # Date when item was added to Omeka
         "iwac_url": item_page_url(item["o:id"]),

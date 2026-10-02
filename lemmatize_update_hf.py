@@ -52,24 +52,46 @@ import unicodedata
 
 from datasets import Dataset
 import spacy
+from iwac_common.enrichment import compatible_rows, config_fingerprint, provenance_columns, invalidate_columns, config_json
+from iwac_common.text_utils import language_labels
+from iwac_common.paths import workspace_root
 
 # Make ``post-processing/_common.py`` and ``_embedding_utils.py`` importable.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "post-processing"))
-from _common import (  # noqa: E402
-    PRIVATE_REPO_ID,
-    ensure_hf_token,
-    load_hub_dataset,
-    push_dataset,
-)
-from _embedding_utils import (  # noqa: E402
-    cached_value,
-    delete_cache,
-    input_fingerprint,
-    load_cache,
-    make_entry,
-    repo_slug,
-    save_cache,
-)
+try:
+    from iwac_pipeline.processing._common import (
+        PRIVATE_REPO_ID,
+        ensure_hf_token,
+        load_hub_dataset,
+        push_dataset,
+    )
+    from iwac_pipeline.processing._embedding_utils import (
+        cached_value,
+        delete_cache,
+        input_fingerprint,
+        load_cache,
+        make_entry,
+        repo_slug,
+        save_cache,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name not in {"iwac_pipeline", "iwac_pipeline.processing"}:
+        raise
+    from _common import (
+        PRIVATE_REPO_ID,
+        ensure_hf_token,
+        load_hub_dataset,
+        push_dataset,
+    )
+    from _embedding_utils import (
+        cached_value,
+        delete_cache,
+        input_fingerprint,
+        load_cache,
+        make_entry,
+        repo_slug,
+        save_cache,
+    )
 
 # Rich console imports for beautiful output
 from rich.console import Console
@@ -83,7 +105,7 @@ from dotenv import load_dotenv
 
 # Load .env so a non-interactive run finds HF_TOKEN instead of falling through
 # to an interactive login that cannot read stdin.
-load_dotenv()
+load_dotenv(workspace_root() / ".env")
 
 # Initialize Rich console
 console = Console()
@@ -117,7 +139,7 @@ SPACY_MAX_CHUNK_CHARS = 100_000
 # Crash-resumable cache: freshly computed lemmas are checkpointed here (keyed
 # by o:id) every CHECKPOINT_EVERY rows, reloaded on restart, and deleted after
 # a successful push. Gitignored, like the other .cache_* dirs.
-CACHE_DIR = Path(__file__).resolve().parent / ".cache_lemmas"
+CACHE_DIR = workspace_root() / ".cache_lemmas"
 CHECKPOINT_EVERY = 100
 
 # Bump whenever the lemmatisation OUTPUT changes for the same input text —
@@ -125,7 +147,7 @@ CHECKPOINT_EVERY = 100
 # resume caches by name. Currently 1 = the post-2026-07 logic, where the
 # stop-word check runs on the surface form (token.is_stop) rather than the
 # lemma.
-LEMMA_LOGIC_VERSION = 1
+LEMMA_LOGIC_VERSION = 2
 
 
 def cache_fingerprint(spacy_model: str, model_version: str) -> str:
@@ -139,7 +161,7 @@ def cache_fingerprint(spacy_model: str, model_version: str) -> str:
     two versions of the column. Mirrors ``_embedding_utils.cache_fingerprint``.
     """
     safe_model = spacy_model.replace("/", "-")
-    return f"{safe_model}-{model_version}_v{LEMMA_LOGIC_VERSION}"
+    return f"{safe_model}-{model_version}_spacy{spacy.__version__}_v{LEMMA_LOGIC_VERSION}"
 
 
 def normalize(text: str) -> str:
@@ -192,7 +214,8 @@ def lemmatise_one(nlp, text: str) -> List[tuple]:
     A full periodical issue can top 1M chars; feeding that to spaCy in one go
     builds a huge tok2vec tensor and OOMs on CPU. Splitting into
     SPACY_MAX_CHUNK_CHARS pieces keeps each call small. Parser/NER are
-    disabled, so chunk boundaries do not change the per-token lemmas.
+    disabled, but the retained tagger/lemmatizer is contextual: boundaries
+    can affect nearby lemmas. The chunk policy is persisted in provenance.
     """
     if not text:
         return []
@@ -263,6 +286,8 @@ def lemmatise_dataset(
     language_filter: str | None = None,
     batch_size: int = 32,
     n_process: int = 1,
+    multilingual: str = "skip",
+    configuration: str | None = None,
 ):
     """Add lemma columns to ``ds``, checkpointing to ``cache_file`` for resume.
 
@@ -289,11 +314,12 @@ def lemmatise_dataset(
     texts = ds[text_col]
     existing_lemmas = ds[lemma_col] if lemma_col in ds.column_names else [None] * n
     existing_clean = ds[clean_col] if clean_col in ds.column_names else [None] * n
+    row_languages = [language_labels(value) for value in ds["language"]] if "language" in ds.column_names else [[] for _ in range(n)]
 
     in_scope = [True] * n
     if language_filter:
         if "language" not in ds.column_names:
-            console.print(f"[yellow]⚠[/yellow] --language '{language_filter}' requested but no 'language' column; processing all rows.")
+            raise ValueError(f"Cannot route --language {language_filter!r}: dataset has no language column")
         else:
             # A row is in scope only when its FIRST listed (primary) language
             # matches the filter: bilingual rows ("Français|Anglais") are
@@ -301,8 +327,9 @@ def lemmatise_dataset(
             # regardless of --mode or pass order. Components are stripped so
             # "Français | Anglais" parses correctly.
             in_scope = [
-                str(lang).split("|")[0].strip() == language_filter if lang else False
-                for lang in ds["language"]
+                bool(labels) and labels[0] == language_filter
+                and (multilingual == "primary" or len(labels) == 1)
+                for labels in row_languages
             ]
             console.print(
                 f"[blue]→[/blue] Language filter '{language_filter}': [bold]{sum(in_scope):,}[/bold] of {n:,} rows eligible"
@@ -310,32 +337,60 @@ def lemmatise_dataset(
 
     cache = load_cache(cache_file)
     fingerprints = [input_fingerprint(texts[i] or "") for i in range(n)]
+    meta = getattr(nlp, "meta", {})
+    settings = {
+        "model_name": meta.get("name", "unknown"), "model_version": meta.get("version", "unknown"),
+        "model_language": meta.get("lang", "unknown"), "spacy": spacy.__version__,
+        "logic": LEMMA_LOGIC_VERSION, "language": language_filter,
+        "multilingual": multilingual, "chunk_chars": SPACY_MAX_CHUNK_CHARS,
+        "configuration_tag": configuration,
+    }
+    configuration = config_fingerprint(settings)
+    description = config_json(settings)
+    cache_inputs = [input_fingerprint(source, configuration) for source in fingerprints]
+    compatible = compatible_rows(ds, lemma_col, fingerprints, configuration)
+    input_col, config_col = provenance_columns(lemma_col)
+    final_inputs = list(ds[input_col]) if input_col in ds.column_names else [None] * n
+    final_configs = list(ds[config_col]) if config_col in ds.column_names else [None] * n
+    json_col = f"{lemma_col}_config_json"
+    final_descriptions = list(ds[json_col]) if json_col in ds.column_names else [None] * n
 
     final_lemmas: List[str] = [""] * n
     final_clean: List[str] = [""] * n
     indices_to_process: List[int] = []
     for i in range(n):
         if not in_scope[i]:
+            labels = row_languages[i]
+            if not labels or (multilingual == "skip" and len(labels) > 1):
+                # Unknown/mixed-language rows have no defensible monolingual
+                # output, including one left by an older pipeline version.
+                final_inputs[i] = final_configs[i] = final_descriptions[i] = None
+                continue
             # Out of scope: keep whatever the row already has.
             final_lemmas[i] = existing_lemmas[i] or ""
             final_clean[i] = existing_clean[i] or ""
             continue
+        final_inputs[i] = None
+        final_configs[i] = None
+        final_descriptions[i] = None
+        if not texts[i] or not str(texts[i]).strip():
+            continue
         # Reused only when computed from this exact text: an entry for text
         # that changed since (or a legacy entry without a hash) is redone.
-        cached = cached_value(cache, row_ids[i], fingerprints[i])
+        cached = cached_value(cache, row_ids[i], cache_inputs[i])
         if cached is not None:
             final_lemmas[i], final_clean[i] = cached[0], cached[1]
+            final_inputs[i], final_configs[i], final_descriptions[i] = fingerprints[i], configuration, description
             continue
-        if process_choice == "empty" and existing_lemmas[i] and existing_lemmas[i].strip():
+        if (process_choice == "empty" and compatible[i] and existing_lemmas[i] is not None
+                and existing_clean[i] is not None):
             final_lemmas[i] = existing_lemmas[i]
             final_clean[i] = existing_clean[i] or ""
+            final_inputs[i], final_configs[i], final_descriptions[i] = fingerprints[i], configuration, description
             continue
         if not texts[i] or not str(texts[i]).strip():
             continue  # blank text -> empty lemmas (already "")
         indices_to_process.append(i)
-
-    if not indices_to_process and not cache:
-        return None  # nothing new to compute and nothing cached to flush
 
     console.print(
         f"[blue]→[/blue] [bold]{len(indices_to_process):,}[/bold] of {n:,} rows to lemmatise"
@@ -359,14 +414,15 @@ def lemmatise_dataset(
                 batch_size=batch_size,
                 n_process=n_process,
             )
-            for i, tokens in zip(indices_to_process, token_lists):
+            for i, tokens in zip(indices_to_process, token_lists, strict=True):
                 lemma_text = " ".join(lemma for lemma, _ in tokens)
                 # Stop-word filtering uses token.is_stop on the surface token
                 # (not the lemma vs. the surface-form stop-word list).
                 clean_text = " ".join(lemma for lemma, is_stop in tokens if not is_stop)
                 final_lemmas[i] = lemma_text
                 final_clean[i] = clean_text
-                cache[row_ids[i]] = make_entry([lemma_text, clean_text], fingerprints[i])
+                final_inputs[i], final_configs[i], final_descriptions[i] = fingerprints[i], configuration, description
+                cache[row_ids[i]] = make_entry([lemma_text, clean_text], cache_inputs[i])
                 since_ckpt += 1
                 progress.update(task, advance=1)
                 if since_ckpt >= CHECKPOINT_EVERY:
@@ -380,6 +436,14 @@ def lemmatise_dataset(
             ds = ds.remove_columns([col])
     ds = ds.add_column(lemma_col, final_lemmas)
     ds = ds.add_column(clean_col, final_clean)
+    import pyarrow as pa
+    for col, values in ((input_col, final_inputs), (config_col, final_configs), (json_col, final_descriptions)):
+        if col in ds.column_names:
+            ds = ds.remove_columns(col)
+        ds = ds.add_column(col, pa.array(values, type=pa.string()))
+    changed = [(before or "") != after for before, after in zip(existing_clean, final_clean, strict=True)]
+    ds = invalidate_columns(ds, ["lda_topic_id", "lda_topic_prob", "lda_topic_label",
+                                 "lda_topic_topk", "lda_model_name"], changed)
     return ds
 
 
@@ -432,8 +496,10 @@ def main() -> int:
                              "Preferred spelling; skips the interactive prompt.")
     parser.add_argument("--mode", choices=["all", "empty"], default=None,
                         help="Deprecated alias for --update-mode ('empty' == 'missing').")
-    parser.add_argument("--language", default=None, metavar="LABEL", help="Only lemmatise rows whose PRIMARY (first-listed) 'language' is LABEL (e.g. 'Français', 'Anglais'); picks the matching spaCy model unless --spacy-model is given. Other rows keep their existing values — run one pass per language on mixed subsets like 'references'.")
+    parser.add_argument("--language", default=None, metavar="LABEL", help="Only lemmatise rows whose PRIMARY (first-listed) 'language' is LABEL (e.g. 'Français', 'Anglais'); picks the matching spaCy model unless --spacy-model is given; multilingual rows are skipped unless --multilingual primary is explicit. Other language rows keep their existing values — run one pass per language on mixed subsets like 'references'.")
     parser.add_argument("--french-only", action="store_true", help="Deprecated alias for --language Français")
+    parser.add_argument("--multilingual", choices=["skip", "primary"], default="skip",
+                        help="Skip multilingual records (default), or explicitly use the first metadata language")
     parser.add_argument("--dry-run", action="store_true",
                         help="Lemmatise and report what would change, but do not push to the Hub or delete the cache")
     parser.add_argument("--batch-size", type=int, default=32,
@@ -454,8 +520,13 @@ def main() -> int:
     # The downstream code speaks the legacy vocabulary ('all'/'empty').
     args.mode = None if resolved_mode is None else ("empty" if resolved_mode == "missing" else "all")
 
-    language_filter = args.language or ("Français" if args.french_only else None)
-    spacy_model = args.spacy_model or LANGUAGE_MODEL_DEFAULTS.get(language_filter or "", "fr_core_news_lg")
+    inferred_language = {"fr": "Français", "en": "Anglais"}.get((args.spacy_model or "fr_").split("_")[0])
+    language_filter = args.language or ("Français" if args.french_only else inferred_language)
+    if language_filter is None:
+        parser.error("A custom model needs an explicit --language label")
+    spacy_model = args.spacy_model or LANGUAGE_MODEL_DEFAULTS.get(language_filter)
+    if spacy_model is None:
+        parser.error("This language requires an explicit compatible --spacy-model")
 
     # ------------------------------------------------------------------
     # Resolve which subset to process (interactive menu if --config omitted)
@@ -512,6 +583,9 @@ def main() -> int:
     # lemmatise_one), keeping each spaCy call well under the default 1M-char
     # limit, so nlp.max_length does not need raising.
     console.print(f"[green]✓[/green] Loaded spaCy model '{spacy_model}'")
+    expected_lang = {"Français": "fr", "Anglais": "en"}.get(language_filter)
+    if expected_lang and nlp.lang != expected_lang:
+        parser.error(f"Model language {nlp.lang!r} conflicts with --language {language_filter!r}")
 
     # ------------------------------------------------------------------
     # Lemmatise — crash-resumable: checkpoints to .cache_lemmas, resumes on
@@ -521,7 +595,7 @@ def main() -> int:
     # rows into a resumed French pass (and vice versa). The fingerprint adds
     # the spaCy model + logic version, so a cache left behind by an
     # interrupted run is ignored once either of those changes.
-    cache_suffix = f"_{language_filter}" if language_filter else ""
+    cache_suffix = f"_{language_filter}_{args.multilingual}"
     fingerprint = cache_fingerprint(spacy_model, nlp.meta.get("version", "unknown"))
     # The repository is part of the name (a scratch run must not feed a
     # production one), and each entry carries a hash of its input text.
@@ -550,6 +624,7 @@ def main() -> int:
         language_filter=language_filter,
         batch_size=args.batch_size,
         n_process=args.n_process,
+        multilingual=args.multilingual,
     )
     if result is None:
         console.print("[green]✓[/green] No rows needed lemmatising. Nothing to do.")

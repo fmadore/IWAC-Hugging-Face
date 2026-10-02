@@ -70,6 +70,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from dotenv import load_dotenv
+from iwac_common.paths import workspace_root
 from rich import box
 from rich.console import Console
 from rich.logging import RichHandler
@@ -92,7 +93,7 @@ from _common import (  # noqa: E402
     resolve_config,
 )
 
-load_dotenv()
+load_dotenv(workspace_root() / ".env")
 
 console = Console()
 
@@ -191,7 +192,9 @@ def add_hijri_batch(batch: Dict[str, List[Any]], *, update_mode: str = "all") ->
 
     for i, raw in enumerate(dates):
         prior = existing.get("hijri_year")
-        if prior is not None and i < len(prior) and prior[i] is not None:
+        if (prior is not None and i < len(prior) and prior[i] is not None
+                and all(existing.get(column) is not None and i < len(existing[column])
+                        and existing[column][i] is not None for column in HIJRI_COLUMNS)):
             years.append(prior[i])
             months.append(existing["hijri_month"][i])
             days.append(existing["hijri_day"][i])
@@ -216,7 +219,7 @@ def report(df: pd.DataFrame, config_name: str) -> None:
     total = len(df)
     converted = int(df["hijri_year"].notna().sum())
     parsable = int(df[SOURCE_COLUMN].map(lambda v: parse_gregorian(v) is not None).sum())
-    empty = int(df[SOURCE_COLUMN].isna().sum() + (df[SOURCE_COLUMN].astype("string").fillna("") == "").sum())
+    empty = int(df[SOURCE_COLUMN].astype("string").fillna("").str.strip().eq("").sum())
 
     coverage = Table(title=f"Hijri coverage — {config_name}", box=box.ROUNDED)
     coverage.add_column("Rows", style="cyan")
@@ -238,7 +241,7 @@ def report(df: pd.DataFrame, config_name: str) -> None:
     counts = df["hijri_month"].dropna().astype(int).value_counts().sort_index()
     expected = converted / 12
     peak = counts.max()
-    dist = Table(title="Articles by Hijri month (deviation from an even split)", box=box.ROUNDED)
+    dist = Table(title="Collected items by standardized Hijri month (descriptive counts)", box=box.ROUNDED)
     dist.add_column("#", style="dim", justify="right")
     dist.add_column("Month", style="cyan")
     dist.add_column("Count", style="green", justify="right")
@@ -256,6 +259,9 @@ def report(df: pd.DataFrame, config_name: str) -> None:
             "█" * round(n / (peak / 28)) if peak else "",
         )
     console.print(dist)
+    console.print("[dim]Umm al-Qura is a calendar conversion convention, not a locally attested "
+                  "observance date. Counts reflect collection coverage and publication dates; "
+                  "the even split is descriptive, not an exposure-adjusted baseline.[/dim]")
 
 
 def main() -> int:

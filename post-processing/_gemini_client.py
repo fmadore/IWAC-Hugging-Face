@@ -14,6 +14,7 @@ know about PyArrow and the shape of a ``datasets.Dataset``.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any, Callable, Dict, List, Sequence
 
@@ -49,6 +50,8 @@ def call_with_retry(embed_call: Callable[[], List[List[float]]]) -> List[List[fl
             if getattr(e, "code", None) in PERMANENT_STATUS_CODES:
                 raise
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                if attempt == MAX_RETRIES - 1:
+                    raise
                 wait = BASE_RETRY_DELAY * (2 ** attempt)
                 logger.warning(f"Rate limited (attempt {attempt + 1}/{MAX_RETRIES}), waiting {wait}s...")
                 time.sleep(wait)
@@ -59,6 +62,22 @@ def call_with_retry(embed_call: Callable[[], List[List[float]]]) -> List[List[fl
             else:
                 raise
     raise RuntimeError(f"Failed after {MAX_RETRIES} retries")
+
+
+def validate_response(response, expected_count: int, expected_dim: int) -> List[List[float]]:
+    """Validate an entire API batch before assigning any positional results."""
+    vectors = [embedding.values for embedding in (response.embeddings or [])]
+    if len(vectors) != expected_count:
+        raise ValueError(f"Gemini returned {len(vectors)} vectors for {expected_count} inputs")
+    for index, vector in enumerate(vectors):
+        if vector is None or len(vector) != expected_dim:
+            raise ValueError(f"Gemini vector {index} does not have dimension {expected_dim}")
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(value) for value in vector):
+            raise ValueError(f"Gemini vector {index} contains a non-finite or nonnumeric value")
+        if not any(vector):
+            raise ValueError(f"Gemini vector {index} is all zero")
+    return vectors
 
 
 def restore_from_cache(

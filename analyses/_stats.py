@@ -94,16 +94,38 @@ def weighted_least_squares_slope(
 
 
 def bootstrap_mean_ci(
-    values, n_boot: int, seed: int, lo: float = 2.5, hi: float = 97.5
+    values, n_boot: int, seed: int, lo: float = 2.5, hi: float = 97.5,
+    *, clusters=None
 ) -> Tuple[float, float]:
     """Percentile bootstrap CI for the mean of a 1-D sample (resample rows
     with replacement). ``values`` may be a matrix (rows = observations); the
     mean is taken over rows. Returns ``(nan, nan)`` when n_boot <= 0.
 
     For a matrix input this returns the per-column CI as two arrays; for a
-    vector it returns two floats.
+    vector it returns two floats. ``clusters`` optionally labels the sampling
+    unit (e.g. outlet): sample whole clusters with replacement and recompute
+    the article-weighted mean. At least two distinct clusters are needed.
+    These intervals are conditional on this corpus and the supplied model;
+    neither option estimates archive selection or annotation uncertainty.
     """
     arr = np.asarray(values, dtype=float)
+    if arr.ndim not in (1, 2):
+        raise ValueError("values must be a vector or row-by-feature matrix")
+    if not 0 <= lo < hi <= 100:
+        raise ValueError("percentiles must satisfy 0 <= lo < hi <= 100")
+    groups = None
+    if clusters is not None:
+        import pandas as pd
+        labels = pd.Series(list(clusters), dtype=object)
+        if len(labels) != len(arr):
+            raise ValueError("clusters must align with values")
+        if labels.isna().any() or labels.astype(str).str.strip().eq("").any():
+            raise ValueError("cluster labels cannot be missing")
+        codes, unique = pd.factorize(labels, sort=False)
+        groups = [np.flatnonzero(codes == i) for i in range(len(unique))]
+        if len(groups) < 2:
+            nan = np.full(arr.shape[1:], np.nan) if arr.ndim > 1 else float("nan")
+            return nan, nan
     if n_boot <= 0 or arr.shape[0] == 0:
         nan = np.full(arr.shape[1:], np.nan) if arr.ndim > 1 else float("nan")
         return nan, nan
@@ -111,12 +133,28 @@ def bootstrap_mean_ci(
     n = arr.shape[0]
     means = np.empty((n_boot,) + arr.shape[1:], dtype=float)
     for b in range(n_boot):
-        idx = rng.integers(0, n, size=n)
+        idx = (rng.integers(0, n, size=n) if groups is None else
+               np.concatenate([groups[i] for i in rng.integers(0, len(groups), size=len(groups))]))
         means[b] = arr[idx].mean(axis=0)
     return np.percentile(means, lo, axis=0), np.percentile(means, hi, axis=0)
 
 
+
+def french_language_mask(series, *, include_unknown: bool = False):
+    """Explicit French labels; unknown language is excluded unless requested.
+
+    Empty strings, whitespace and nulls are all unknown. Mixed-language labels
+    are not silently treated as French-only text.
+    """
+    normalized = series.astype("string").str.strip().str.casefold()
+    known = normalized.isin({"français", "francais", "french", "fr", "fra", "fre"})
+    if include_unknown:
+        known |= normalized.isna() | normalized.eq("")
+    return known.fillna(False)
+
+
 __all__ = [
+    "french_language_mask",
     "bh_adjust",
     "mann_kendall",
     "weighted_least_squares_slope",

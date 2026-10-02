@@ -4,6 +4,7 @@ analysable columns, and the public allowlist contract. No network."""
 from __future__ import annotations
 
 import asyncio
+import importlib
 
 import pytest
 
@@ -18,9 +19,10 @@ from iwac_common.field_mappers import (
     split_by_language,
 )
 from iwac_common.repos import load_public_columns
-from iwac_pipeline.cli import UPLOAD_SCRIPTS, _load_script
+from iwac_pipeline.cli import UPLOAD_MODULES
 
 ITEM = {
+    "o:is_public": True,
     "o:id": 501,
     "o:title": "Un titre",
     "o:created": {"@value": "2024-03-14T10:00:00+00:00"},
@@ -52,7 +54,7 @@ ITEM = {
     "fabio:hasURL": [{"@id": "https://example.org/a"}],
 }
 
-SCRIPT_TO_SUBSET = dict(UPLOAD_SCRIPTS)
+SCRIPT_TO_SUBSET = dict(UPLOAD_MODULES)
 
 
 class _Api:
@@ -71,7 +73,7 @@ def mapped(monkeypatch):
     monkeypatch.setattr(omeka_client.conn_manager, "get", no_session)
 
     def run(subset):
-        module = _load_script(SCRIPT_TO_SUBSET[subset], f"_mapper_{subset}")
+        module = importlib.import_module(SCRIPT_TO_SUBSET[subset])
 
         async def no_thumbnail(*args, **kwargs):
             return ""
@@ -82,13 +84,24 @@ def mapped(monkeypatch):
     return run
 
 
-@pytest.mark.parametrize("subset", list(UPLOAD_SCRIPTS))
+@pytest.mark.parametrize("subset", list(UPLOAD_MODULES))
 def test_every_mapped_column_is_publicly_allowlisted(mapped, subset):
     row = mapped(subset)
     assert set(row) <= load_public_columns()[subset]
 
 
-@pytest.mark.parametrize("subset", list(UPLOAD_SCRIPTS))
+@pytest.mark.parametrize("subset", ["articles", "publications", "documents", "images", "audiovisual"])
+def test_primary_media_failure_preserves_all_dependent_pointers(mapped, monkeypatch, subset):
+    monkeypatch.setitem(ITEM, "o:primary_media", {"@id": "https://example.test/api/media/1"})
+    omeka_client.media_stats.reset()
+    mapped(subset)  # _Api intentionally cannot retrieve primary media.
+    pointer = "image_url" if subset == "images" else "PDF"
+    assert omeka_client.media_stats.failed_fields_by_item["501"] == {
+        pointer, "thumbnail", "iiif_manifest",
+    }
+
+
+@pytest.mark.parametrize("subset", list(UPLOAD_MODULES))
 def test_item_urls_follow_the_configured_host(mapped, subset):
     assert mapped(subset)["iwac_url"] == (
         "https://staging.example/s/afrique_ouest/item/501"
@@ -114,7 +127,7 @@ def test_authority_ids_sit_beside_the_labels(mapped, subset, expected):
         assert row[column] == value
 
 
-@pytest.mark.parametrize("subset", [s for s in UPLOAD_SCRIPTS if s != "index"])
+@pytest.mark.parametrize("subset", [s for s in UPLOAD_MODULES if s != "index"])
 def test_publication_year_and_precision(mapped, subset):
     row = mapped(subset)
     assert (row["pub_year"], row["pub_date_precision"]) == (1998, "day")

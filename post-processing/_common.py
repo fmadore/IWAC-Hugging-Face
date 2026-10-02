@@ -45,8 +45,15 @@ from rich import box
 
 _DEFAULT_CONFIGS: List[str] = ["articles", "publications", "documents"]
 
-# Repo root (parent of post-processing/), used to locate the data/ CSV mirrors.
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# Source fallback is only for running the historical scripts without installing.
+_SOURCE_ROOT = Path(__file__).resolve().parent.parent
+try:
+    from iwac_common.paths import workspace_root
+except ImportError:
+    sys.path.insert(0, str(_SOURCE_ROOT))
+    from iwac_common.paths import workspace_root
+
+REPO_ROOT = workspace_root()
 
 # Canonical repo IDs (re-exported so post-processing scripts can use
 # ``from _common import PRIVATE_REPO_ID`` without touching sys.path).
@@ -251,19 +258,22 @@ def write_run_manifest(
     outputs: List[Path] = (),
     inputs: Optional[Dict[str, Any]] = None,
 ) -> Path:
-    """Record how a report-only run produced its outputs.
+    """Archive each complete report run, including the output bytes.
 
-    Written beside the outputs as ``<script>.manifest.json`` (the latest run)
-    and copied to ``runs/<script>_<UTC timestamp>.json`` so earlier runs stay
-    traceable although their CSVs are overwritten. Records the code SHA and
-    whether the checkout was dirty, the dataset repository and revision, the
-    command arguments, Python and key library versions, extra ``inputs`` (a
-    model directory, parameters), and the SHA-256 of every output file — what a
-    figure in a paper needs to be reproducible, which a seed alone is not.
+    The familiar top-level files remain the latest view. Immutable copies,
+    dependency versions, a manifest and (when needed) the tracked code diff live
+    under ``runs/<script>_<unique id>/``. Missing/ambiguous outputs are errors,
+    rather than silently producing incomplete provenance. The returned path is
+    still the latest manifest for backward compatibility.
     """
     import hashlib
     import json
     import platform
+    import re
+    import shutil
+    import subprocess
+    import tempfile
+    from importlib import metadata
     from datetime import datetime, timezone
 
     def sha256(path: Path) -> str:
@@ -273,11 +283,35 @@ def write_run_manifest(
                 digest.update(block)
         return digest.hexdigest()
 
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", script):
+        raise ValueError("Manifest script name must be a simple filename component")
+    paths = [Path(p) for p in outputs]
+    if len({p.name for p in paths}) != len(paths):
+        raise ValueError("Run outputs must have distinct filenames")
+    if {p.name for p in paths} & {"manifest.json", "environment.json", "tracked-code.patch"}:
+        raise ValueError("Run output filename conflicts with archive metadata")
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"Cannot archive missing run output: {path}")
+
     now = datetime.now(timezone.utc)
+    run_id = f"{script}_{now.strftime('%Y%m%dT%H%M%S%fZ')}_{uuid.uuid4().hex[:8]}"
+    output_dir = Path(output_dir)
+    runs = output_dir / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    archive = runs / run_id
+    code_state = _git_state()
+    environment = {
+        dist.metadata["Name"]: dist.version
+        for dist in metadata.distributions() if dist.metadata.get("Name")
+    }
     manifest = {
         "script": script,
         "generated_at": now.isoformat(),
-        "code": _git_state(),
+        "schema_version": 2,
+        "run_id": run_id,
+        "archive": str(Path("runs") / run_id),
+        "code": code_state,
         "dataset": {"repository": repo_id, "revision": revision},
         "arguments": vars(args) if hasattr(args, "__dict__") else args,
         "python": platform.python_version(),
@@ -286,18 +320,41 @@ def write_run_manifest(
             "gensim", "scipy", "spacy",
         ]),
         "inputs": inputs or {},
-        "outputs": {
-            Path(p).name: {"sha256": sha256(Path(p)), "bytes": Path(p).stat().st_size}
-            for p in outputs if Path(p).exists()
-        },
+        "outputs": {},
     }
-    output_dir.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(manifest, ensure_ascii=False, indent=2, default=str) + "\n"
+    # Publish the directory only after every byte and manifest is ready.
+    with tempfile.TemporaryDirectory(prefix=".run-", dir=runs) as temporary:
+        staging = Path(temporary)
+        for path in paths:
+            destination = staging / path.name
+            shutil.copy2(path, destination)
+            manifest["outputs"][path.name] = {
+                "sha256": sha256(destination), "bytes": destination.stat().st_size,
+            }
+        (staging / "environment.json").write_text(
+            json.dumps(environment, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
+        if code_state["dirty"]:
+            diff = subprocess.run(
+                ["git", "diff", "HEAD", "--binary"], cwd=REPO_ROOT,
+                capture_output=True, timeout=30, check=True,
+            )
+            (staging / "tracked-code.patch").write_bytes(diff.stdout)
+            # Names only: do not archive untracked credentials or private data.
+            untracked = subprocess.run(
+                ["git", "ls-files", "--others", "--exclude-standard"],
+                cwd=REPO_ROOT, capture_output=True, text=True, timeout=10, check=True,
+            ).stdout.splitlines()
+            manifest["code"]["untracked_files_not_archived"] = untracked
+        text = json.dumps(manifest, ensure_ascii=False, indent=2, default=str) + "\n"
+        (staging / "manifest.json").write_text(text, encoding="utf-8")
+        staging.rename(archive)
     latest = output_dir / f"{script}.manifest.json"
-    latest.write_text(text, encoding="utf-8")
-    runs = output_dir / "runs"
-    runs.mkdir(exist_ok=True)
-    (runs / f"{script}_{now.strftime('%Y%m%dT%H%M%SZ')}.json").write_text(text, encoding="utf-8")
+    temporary_latest = output_dir / f".{run_id}.json"
+    temporary_latest.write_text(text, encoding="utf-8")
+    os.replace(temporary_latest, latest)
+    # Keep the original manifest-only index usable by existing consumers.
+    (runs / f"{run_id}.json").write_text(text, encoding="utf-8")
     return latest
 
 

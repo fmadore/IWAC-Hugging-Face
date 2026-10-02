@@ -99,21 +99,24 @@ class TestReadabilityLanguageGate:
         )
         return out, counter
 
-    def test_only_primary_french_rows_get_a_score(self):
+    def test_only_monolingual_french_rows_get_a_score(self):
         out, counter = self._run(
             ["Français", "Français|Anglais", "Anglais|Français", "Ewé", "", None]
         )
         scores = out["Lisibilite_OCR"]
-        assert scores[0] is not None and scores[1] is not None
-        assert scores[2:] == [None, None, None, None]
-        assert counter["readability_not_french"] == 4
+        assert scores[0] is not None
+        assert scores[1:] == [None] * 5
+        assert counter["readability_not_french"] == 5
         # MATTR carries no lexicon and is kept for every row.
         assert all(v is not None for v in out["Richesse_Lexicale_OCR"])
 
     def test_missing_mode_clears_an_old_score_on_a_non_french_row(self):
         out, _ = self._run(["Kabiyè", "Français"], update_mode="missing",
                            existing=[12.5, 60.0])
-        assert out["Lisibilite_OCR"] == [None, 60.0]
+        assert out["Lisibilite_OCR"][0] is None
+        # The French row has no persisted provenance, so its legacy value is
+        # recomputed too, even in missing mode.
+        assert out["Lisibilite_OCR"][1] == lex.calculate_readability(self.FRENCH)
 
     def test_without_a_language_column_nothing_is_scored(self):
         lex.textstat.set_lang("fr")

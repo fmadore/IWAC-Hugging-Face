@@ -12,11 +12,12 @@ Supported configurations:
 - **publications**: embeds the 'tableOfContents' column → 'embedding_tableOfContents'
   (rows without tableOfContents are left with empty embeddings)
 
-Long texts exceeding the model's 8192-token limit are split into overlapping
-chunks, each chunk is embedded separately, and the chunk embeddings are
-pooled into a single vector per row with a length-weighted average.
+Texts are split at whitespace into overlapping UTF-8-byte-bounded chunks;
+token-limit responses are split again adaptively. Chunk vectors are pooled
+with a length-weighted average. Documents use Embedding 2's task instructions
+and one Content object per independently embedded chunk.
 
-Progress is checkpointed to a resume cache in ``.cache_embeddings/``. The
+Progress is checkpointed transactionally to SQLite in ``.cache_embeddings/``. The
 cache filename embeds the repository and a fingerprint of (model,
 dimensionality, task type), so a cache written under one embedding
 configuration — or for another repository — is never restored. Each entry
@@ -43,6 +44,7 @@ Dependencies
     pip install google-genai datasets huggingface_hub rich
 """
 import argparse
+from importlib.metadata import version
 import logging
 import os
 import sys
@@ -59,11 +61,12 @@ from _common import (  # noqa: E402
     push_dataset,
 )
 from iwac_common.schema import SUBSETS  # noqa: E402
+from iwac_common.paths import workspace_root  # noqa: E402
+from iwac_common.enrichment import compatible_rows, config_fingerprint, set_provenance, invalidate_columns  # noqa: E402
 from _embedding_utils import (  # noqa: E402
     average_embeddings,
     cache_fingerprint,
     cached_value,
-    chunk_text as _chunk_text_chars,
     delete_cache,
     input_fingerprint,
     is_empty_embedding,
@@ -76,12 +79,13 @@ from _gemini_client import (  # noqa: E402
     call_with_retry,
     restore_from_cache,
     set_embedding_column,
+    validate_response,
 )
 from google import genai
 from google.genai import types
 
 # Load .env from project root
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(workspace_root() / ".env")
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -109,20 +113,17 @@ logger = logging.getLogger(__name__)
 
 # --- Constants ---
 MODEL_NAME = "gemini-embedding-2"
-# Rough estimate: ~3.5 chars/token for French → 8192 tokens ≈ 28K chars
-CHUNK_SIZE = 28_000
-CHUNK_OVERLAP = 2_000
+# Conservative byte-sized chunks avoid assuming a French chars/token ratio
+# for multilingual OCR. Token-overflow responses are split again on demand.
+CHUNK_SIZE = 7_000
+CHUNK_OVERLAP = 400
+FORMAT_VERSION = 2
 DEFAULT_DIMENSIONALITY = 768
-# One text per call: measured 2026-08-27, gemini-embedding-2 answers 200 OK
-# with exactly ONE embedding however many texts a request carries (probed at
-# 1, 2 and 5). A larger batch therefore spends the whole retry ladder before
-# failing the batch outright. Raise this again once the endpoint honours a
-# multi-text request — the length check in embed_texts_with_retry is what
-# tells you it does not.
-DEFAULT_BATCH_SIZE = 1
+# Wrap each document as Content: bare string lists aggregate into one vector.
+DEFAULT_BATCH_SIZE = 16
 # Retry ladder (MAX_RETRIES / BASE_RETRY_DELAY) is shared with the image
 # embedding script and lives in _gemini_client.call_with_retry.
-CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache_embeddings"
+CACHE_DIR = workspace_root() / ".cache_embeddings"
 CHECKPOINT_EVERY = 5  # save cache every N API batches
 
 # Per-config settings: (text_column, embedding_column, cache_stem).
@@ -142,7 +143,26 @@ CONFIG_SETTINGS = {
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-    return _chunk_text_chars(text, chunk_size=chunk_size, overlap=overlap)
+    """Whitespace-aware chunks bounded by UTF-8 bytes, preserving all text."""
+    if chunk_size <= 0 or not 0 <= overlap < chunk_size:
+        raise ValueError("Require chunk_size > 0 and 0 <= overlap < chunk_size")
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + chunk_size)
+        while len(text[start:end].encode("utf-8")) > chunk_size:
+            if end - start == 1:
+                raise ValueError("chunk_size cannot hold one UTF-8 character")
+            end = start + max(1, (end - start) // 2)
+        if end < len(text):
+            boundary = text.rfind(" ", start + (end - start) // 2, end)
+            if boundary > start:
+                end = boundary
+        chunks.append(text[start:end])
+        if end == len(text):
+            break
+        start = max(start + 1, end - min(overlap, (end - start) // 4))
+    return chunks or [text]
 
 
 def choose_config() -> str:
@@ -214,14 +234,16 @@ def embed_texts_with_retry(
     texts: List[str],
     task_type: str,
     dimensionality: int,
+    titles: List[str] | None = None,
 ) -> List[List[float]]:
     """Call Gemini embed_content with the shared 429/backoff retry ladder."""
     def _call() -> List[List[float]]:
         response = client.models.embed_content(
             model=MODEL_NAME,
-            contents=texts,
+            contents=[types.Content(parts=[types.Part.from_text(text=format_embedding_text(
+                text, task_type, title
+            ))]) for text, title in zip(texts, titles or ["none"] * len(texts), strict=True)],
             config=types.EmbedContentConfig(
-                task_type=task_type,
                 output_dimensionality=dimensionality,
             ),
         )
@@ -229,19 +251,38 @@ def embed_texts_with_retry(
         # to raise: the caller fills its slots positionally, so anything it
         # never receives stays None silently — no retry, no log line, and the
         # row is written empty as though nothing had gone wrong.
-        vectors = [emb.values for emb in (response.embeddings or [])]
-        if len(vectors) != len(texts):
-            raise RuntimeError(
-                f"Gemini returned {len(vectors)} embeddings for {len(texts)} texts"
-            )
-        if any(v is None for v in vectors):
-            missing = sum(v is None for v in vectors)
-            raise RuntimeError(
-                f"Gemini returned {missing} null vector(s) in a batch of {len(texts)}"
-            )
-        return vectors
+        return validate_response(response, len(texts), dimensionality)
 
-    return call_with_retry(_call)
+    try:
+        return call_with_retry(_call)
+    except Exception as exc:
+        message = str(exc).lower()
+        if getattr(exc, "code", None) != 400 or "token" not in message or not any(
+            word in message for word in ("exceed", "limit", "maximum", "too long")
+        ):
+            raise
+        # Keep one output per original chunk if the model rejects its size.
+        output = []
+        for text, title in zip(texts, titles or ["none"] * len(texts), strict=True):
+            if len(text) < 2:
+                raise
+            middle = len(text) // 2
+            boundary = text.rfind(" ", len(text) // 4, middle + 1)
+            middle = boundary if boundary > 0 else middle
+            pieces = [text[:middle], text[middle:]]
+            vectors = embed_texts_with_retry(client, pieces, task_type, dimensionality,
+                                             titles=[title, title])
+            output.append(average_embeddings(vectors, weights=[len(piece) for piece in pieces]))
+        return output
+
+
+def format_embedding_text(text: str, task_type: str, title: str = "none") -> str:
+    """Embedding 2 uses text instructions, never EmbedContentConfig.task_type."""
+    if task_type == "RETRIEVAL_DOCUMENT":
+        return f"title: {title or 'none'} | text: {text}"
+    prefixes = {"RETRIEVAL_QUERY": "search result", "SEMANTIC_SIMILARITY": "sentence similarity",
+                "CLASSIFICATION": "classification", "CLUSTERING": "clustering"}
+    return f"task: {prefixes[task_type]} | query: {text}"
 
 
 def display_config_panel(
@@ -263,7 +304,7 @@ def display_config_panel(
     table.add_row("Output Dimensionality", str(dimensionality))
     table.add_row("API Batch Size", str(batch_size))
     table.add_row("Update Mode", update_mode)
-    table.add_row("Chunk Size", f"{CHUNK_SIZE:,} chars")
+    table.add_row("Chunk Budget", f"{CHUNK_SIZE:,} UTF-8 bytes")
     table.add_row("Chunk Overlap", f"{CHUNK_OVERLAP:,} chars")
     table.add_row("Long Text Strategy", "chunk → embed each → average")
     if dry_run:
@@ -324,10 +365,10 @@ def display_embedding_stats(existing_embeddings: List[Any]) -> tuple[int, int]:
     return valid_embeddings, empty_embeddings
 
 
-def text_fingerprint(text: Any) -> str:
+def text_fingerprint(text: Any, title: str = "none") -> str:
     """Input identity of one row's embedding: its text plus the chunking
     settings that shape the pooled vector."""
-    return input_fingerprint(str(text or ""), CHUNK_SIZE, CHUNK_OVERLAP)
+    return input_fingerprint(str(text or ""), title, CHUNK_SIZE, CHUNK_OVERLAP, FORMAT_VERSION)
 
 
 def _save_completed_to_cache(
@@ -338,6 +379,8 @@ def _save_completed_to_cache(
     all_embeddings: List[Any],
     cache_file: Path,
     fingerprints: List[str],
+    state: Dict[str, int] | None = None,
+    processed_chunks: int | None = None,
 ) -> None:
     """Reassemble fully-completed chunk embeddings into row embeddings and save cache.
 
@@ -347,21 +390,28 @@ def _save_completed_to_cache(
     truncated average. Chunk vectors are pooled with a length-weighted mean
     so short tail chunks don't count as much as full-size ones.
     """
-    flat_offset = 0
-    updated = 0
-    for row_idx, chunks in row_chunks:
+    state = state if state is not None else {}
+    flat_offset = state.get("offset", 0)
+    next_row = state.get("row", 0)
+    updated = {}
+    for position in range(next_row, len(row_chunks)):
+        row_idx, chunks = row_chunks[position]
+        if processed_chunks is not None and flat_offset + len(chunks) > processed_chunks:
+            break
         chunk_embs = flat_embeddings[flat_offset:flat_offset + len(chunks)]
-        if all(emb is not None for emb in chunk_embs):
+        if cached_value(cache, row_ids[row_idx], fingerprints[row_idx]) is None and all(emb is not None for emb in chunk_embs):
             averaged = average_embeddings(chunk_embs, weights=[len(c) for c in chunks])
             all_embeddings[row_idx] = averaged
             oid_str = str(row_ids[row_idx])
             fingerprint = fingerprints[row_idx]
             if cached_value(cache, oid_str, fingerprint) is None:
                 cache[oid_str] = make_entry(averaged, fingerprint)
-                updated += 1
+                updated[oid_str] = cache[oid_str]
         flat_offset += len(chunks)
-    if updated > 0:
-        save_cache(cache, cache_file)
+        next_row += 1
+    state.update(offset=flat_offset, row=next_row)
+    if updated:
+        save_cache(updated if cache_file.suffix == ".sqlite3" else cache, cache_file)
         logger.info(f"Checkpoint: saved {len(cache)} total embeddings to cache")
 
 
@@ -437,10 +487,19 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+    if args.batch_size < 1 or args.delay < 0:
+        parser.error("--batch-size must be positive and --delay nonnegative")
 
     repo_id = args.repo
     dimensionality = args.dimensionality
     task_type = args.task_type
+    configuration_settings = {
+        "model": MODEL_NAME, "dimension": dimensionality, "task": task_type,
+        "format_version": FORMAT_VERSION, "chunk_bytes": CHUNK_SIZE,
+        "overlap_chars": CHUNK_OVERLAP, "pooling": "character-weighted-mean",
+        "google_genai": version("google-genai"),
+    }
+    configuration = config_fingerprint(configuration_settings)
     batch_size = args.batch_size
     delay = args.delay
     max_shard_size = args.max_shard_size
@@ -470,7 +529,7 @@ def main() -> int:
     # carry a hash of their input text (see text_fingerprint).
     cache_file = CACHE_DIR / (
         f"{cache_stem}_{repo_slug(repo_id)}_"
-        f"{cache_fingerprint(MODEL_NAME, dimensionality, task_type)}.json.gz"
+        f"{cache_fingerprint(MODEL_NAME, dimensionality, task_type)}_{configuration[:16]}.sqlite3"
     )
 
     # --- Step 1: Authentication ---
@@ -500,7 +559,8 @@ def main() -> int:
             contents=["test"],
             config=types.EmbedContentConfig(output_dimensionality=dimensionality),
         )
-        actual_dim = len(test_response.embeddings[0].values)
+        validate_response(test_response, 1, dimensionality)
+        actual_dim = dimensionality
         console.print(f"[green]✓[/green] Gemini client ready. Model: [cyan]{MODEL_NAME}[/cyan]")
         console.print(f"[blue]→[/blue] Output dimensionality: [cyan]{actual_dim}[/cyan]")
     except Exception as e:
@@ -541,14 +601,7 @@ def main() -> int:
         console.print(f"[yellow]ℹ[/yellow] Available columns: {', '.join(ds.column_names)}")
         return 1
 
-    # --- Dimension consistency check ---
-    if update_mode == "missing" and embedding_column in ds.column_names:
-        try:
-            validate_existing_embeddings(ds, embedding_column, actual_dim)
-            console.print(f"[green]✓[/green] Existing embeddings are compatible (dim={actual_dim}).")
-        except ValueError as e:
-            console.print(f"[red]✗[/red] {e}")
-            return 1
+    # Provenance below establishes compatibility; legacy vectors are recomputed.
 
     if embedding_column in ds.column_names:
         if update_mode == "all":
@@ -572,21 +625,15 @@ def main() -> int:
     # Use [] instead of None for missing embeddings so PyArrow infers a consistent list<float> type
     existing_embeddings = ds[embedding_column] if embedding_column in ds.column_names else [[] for _ in range(len(ds))]
     row_ids = ds["o:id"]  # stable row identifier for cache keys
-    fingerprints = [text_fingerprint(t) for t in texts]  # input identity per row
-
-    if update_mode == "missing" and embedding_column in ds.column_names:
-        valid_count, missing_count = display_embedding_stats(existing_embeddings)
-        if missing_count == 0 and not cache:
-            console.print(Panel(
-                "[green]All embeddings are already computed![/green]\n\nNo processing needed.",
-                title="Nothing to do",
-                border_style="green",
-            ))
-            return 0
-
-    # Build the full embeddings list, pre-filling from cache
-    # Normalize None to [] for consistent PyArrow typing
-    all_embeddings: List[Any] = [emb if emb is not None else [] for emb in existing_embeddings]
+    # Titles affect retrieval input and must participate in invalidation.
+    titles = [str(t or "none")[:200] for t in ds["title"]] if "title" in ds.column_names else ["none"] * len(ds)
+    fingerprints = [text_fingerprint(t, title) for t, title in zip(texts, titles, strict=True)]
+    compatible = compatible_rows(ds, embedding_column, fingerprints, configuration)
+    all_embeddings: List[Any] = [
+        emb if update_mode == "missing" and ok and text is not None and str(text).strip()
+        and not is_empty_embedding(emb) else []
+        for emb, ok, text in zip(existing_embeddings, compatible, texts, strict=True)
+    ]
     cache_hits = restore_from_cache(all_embeddings, row_ids, cache, fingerprints)
 
     if cache_hits > 0:
@@ -633,8 +680,10 @@ def main() -> int:
 
         # Flatten all chunks into a single list for batched API calls.
         flat_chunks: List[str] = []
-        for _, chunks in row_chunks:
+        flat_titles: List[str] = []
+        for row_idx, chunks in row_chunks:
             flat_chunks.extend(chunks)
+            flat_titles.extend([titles[row_idx]] * len(chunks))
 
         console.print(
             f"[blue]→[/blue] {len(flat_chunks)} total chunks from "
@@ -645,6 +694,7 @@ def main() -> int:
         # Embed all chunks in batches
         flat_embeddings: List[Any] = [None] * len(flat_chunks)
         batch_count = 0
+        checkpoint_state: Dict[str, int] = {}
 
         with Progress(
             SpinnerColumn(),
@@ -663,6 +713,7 @@ def main() -> int:
                 try:
                     embeddings = embed_texts_with_retry(
                         client, batch_texts, task_type, dimensionality,
+                        titles=flat_titles[batch_start:batch_end],
                     )
                     for i, emb in enumerate(embeddings):
                         flat_embeddings[batch_start + i] = emb
@@ -677,7 +728,7 @@ def main() -> int:
                 if batch_count % CHECKPOINT_EVERY == 0:
                     _save_completed_to_cache(
                         cache, row_chunks, flat_embeddings, row_ids, all_embeddings,
-                        cache_file, fingerprints,
+                        cache_file, fingerprints, checkpoint_state, batch_end,
                     )
 
                 # Delay between API calls to respect rate limits
@@ -688,7 +739,7 @@ def main() -> int:
         # average (only rows whose chunks ALL succeeded are assembled/cached).
         _save_completed_to_cache(
             cache, row_chunks, flat_embeddings, row_ids, all_embeddings,
-            cache_file, fingerprints,
+            cache_file, fingerprints, checkpoint_state, len(flat_chunks),
         )
 
         # Rows with any failed chunk must end EMPTY — never a truncated
@@ -737,6 +788,15 @@ def main() -> int:
     # Build the column as a typed PyArrow array (nulls + float lists coexist)
     # to avoid type-inference issues with sparse embeddings.
     ds_processed = set_embedding_column(ds, embedding_column, all_embeddings)
+    ds_processed = set_provenance(ds_processed, embedding_column, fingerprints, configuration,
+                                  [not is_empty_embedding(e) for e in all_embeddings], settings=configuration_settings)
+    vector_changed = any(
+        (not is_empty_embedding(old) or not is_empty_embedding(new))
+        and (not ok or update_mode == "all" or is_empty_embedding(new))
+        for old, new, ok in zip(existing_embeddings, all_embeddings, compatible, strict=True)
+    )
+    # A neighbor rank depends on all vectors, not just on its own document.
+    ds_processed = invalidate_columns(ds_processed, ["related_articles"], [vector_changed] * len(ds))
 
     # --- Verify results ---
     console.print("\n[bold]Sample embeddings (first 3 non-empty):[/bold]")

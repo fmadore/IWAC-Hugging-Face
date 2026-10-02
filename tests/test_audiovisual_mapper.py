@@ -38,6 +38,7 @@ av = _load_module()
 # --------------------------------------------------------------------------
 
 YOUTUBE_ITEM = {
+    "o:is_public": True,
     "o:id": 108263,
     "o:title": "FAIB: El Hadj Moussa KOUANDA succède à Imam Aboubacar YUGO.",
     "o:created": {"@value": "2026-08-12T11:24:14+00:00"},

@@ -82,6 +82,10 @@ def parse_embeddings(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
         arr = np.asarray(v, dtype=np.float32)
         if arr.size == 0 or not np.any(arr):
             continue
+        if arr.ndim != 1 or not np.isfinite(arr).all():
+            raise ValueError(f"Embedding at row {pos} must be a finite, flat vector")
+        if vecs and len(arr) != len(vecs[0]):
+            raise ValueError(f"Embedding at row {pos} has a different dimensionality")
         vecs.append(arr)
         positions.append(pos)
     if not vecs:
@@ -91,7 +95,13 @@ def parse_embeddings(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
 
 def topk_neighbors(matrix: np.ndarray, k: int, chunk: int = 2048) -> tuple[np.ndarray, np.ndarray]:
     """Top-k cosine neighbors (indices into `matrix`, self excluded)."""
+    if matrix.ndim != 2 or not np.isfinite(matrix).all() or k < 1 or chunk < 1:
+        raise ValueError("Expected finite 2-D vectors, positive k and positive chunk size")
+    if len(matrix) < 2:
+        return np.empty((len(matrix), 0), dtype=np.int32), np.empty((len(matrix), 0), dtype=np.float32)
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    if np.any(norms == 0):
+        raise ValueError("Zero vectors do not have cosine neighbors")
     norms[norms == 0] = 1.0
     unit = matrix / norms
     n = len(unit)
@@ -100,16 +110,33 @@ def topk_neighbors(matrix: np.ndarray, k: int, chunk: int = 2048) -> tuple[np.nd
     nn_sim = np.zeros((n, k_eff), dtype=np.float32)
     for start in range(0, n, chunk):
         end = min(start + chunk, n)
-        sims = unit[start:end] @ unit.T
+        sims = np.clip(unit[start:end] @ unit.T, -1.0, 1.0)
         for row in range(end - start):
             sims[row, start + row] = -np.inf  # exclude self
         part = np.argpartition(-sims, k_eff - 1, axis=1)[:, :k_eff]
         for row in range(end - start):
-            cand = part[row]
-            order = np.argsort(-sims[row, cand])
+            # Include ties at the k-th boundary before ordering by row index,
+            # otherwise argpartition chooses an arbitrary subset of ties.
+            cutoff = np.min(sims[row, part[row]])
+            cand = np.flatnonzero(sims[row] >= cutoff)
+            order = np.lexsort((cand, -sims[row, cand]))[:k_eff]
             nn_idx[start + row] = cand[order]
             nn_sim[start + row] = sims[row, cand[order]]
     return nn_idx, nn_sim
+
+
+def candidate_pairs(ids: np.ndarray, nn_idx: np.ndarray, nn_sim: np.ndarray) -> pd.DataFrame:
+    """Unique pairs across all top-k neighbors; similarity is not a reprint verdict."""
+    pairs = {}
+    for row, (neighbors, scores) in enumerate(zip(nn_idx, nn_sim, strict=True)):
+        for neighbor, score in zip(neighbors, scores, strict=True):
+            key = tuple(sorted((str(ids[row]), str(ids[int(neighbor)]))))
+            pairs[key] = max(pairs.get(key, -1.0), float(score))
+    return pd.DataFrame(
+        [{"id_a": a, "id_b": b, "cosine_similarity": score}
+         for (a, b), score in sorted(pairs.items(), key=lambda pair: (-pair[1], pair[0]))],
+        columns=["id_a", "id_b", "cosine_similarity"],
+    )
 
 
 def main() -> int:
@@ -127,6 +154,8 @@ def main() -> int:
     parser.add_argument("--topk", type=int, default=10,
                         help="Number of nearest neighbours per row (default: 10).")
     parser.add_argument("--column", default="related_articles", help="Output column name")
+    parser.add_argument("--allow-unverified-embeddings", action="store_true",
+                        help="Allow exploratory analysis of legacy/public vectors without processing provenance")
     parser.add_argument("--push", action="store_true",
                         help="Write mode: add the output column and push to the Hub "
                              "(without this flag the script only reports; nothing is written).")
@@ -146,9 +175,10 @@ def main() -> int:
     token = ensure_hf_token(console=console) if (args.source == "hub" or args.push) else None
     df = load_subset_dataframe(
         args.repo, args.config, token=token, source=args.source,
-        columns=["o:id", emb_col] + context_cols, console=console,
+        columns=["o:id", emb_col, f"{emb_col}_config_hash"] + context_cols, console=console,
     )
     source_revision = df.attrs.get("iwac_source_revision")
+    df = df.sort_values("o:id", kind="stable").reset_index(drop=True)
     if emb_col not in df.columns:
         console.print(f"[red]✗[/red] Embedding column '{emb_col}' not found.")
         return 1
@@ -158,6 +188,20 @@ def main() -> int:
     if len(positions) < 2:
         console.print("[red]✗[/red] Fewer than 2 rows with embeddings; nothing to do.")
         return 1
+    config_col = f"{emb_col}_config_hash"
+    unverified = config_col not in df
+    if config_col in df:
+        configs = df.iloc[positions][config_col].dropna().unique()
+        unverified = df.iloc[positions][config_col].isna().any()
+        if len(configs) > 1:
+            console.print("[red]✗[/red] Embeddings mix processing configurations; recompute before comparing.")
+            return 1
+    if unverified:
+        if not args.allow_unverified_embeddings:
+            console.print("[red]✗[/red] Embedding provenance is missing. Re-embed or explicitly "
+                          "use --allow-unverified-embeddings for exploratory analysis.")
+            return 1
+        console.print("[yellow]Unverified legacy embedding provenance: treat neighbors as exploratory candidates.[/yellow]")
     console.print(
         f"[green]✓[/green] {len(positions):,} rows with embeddings "
         f"(dim={matrix.shape[1]}); {len(df) - len(positions):,} without"
@@ -184,17 +228,15 @@ def main() -> int:
     stats.add_row("Rows with neighbors", f"{len(positions):,}")
     stats.add_row("Median top-1 similarity", f"{np.median(top1):.3f}")
     stats.add_row("Mean top-1 similarity", f"{top1.mean():.3f}")
-    stats.add_row(f"Rows with top-1 ≥ {NEAR_DUP_THRESHOLD} (likely reprint/near-dup)", f"{n_dup:,}")
+    stats.add_row(f"Rows with top-1 ≥ {NEAR_DUP_THRESHOLD} (uncalibrated similarity cutoff)", f"{n_dup:,}")
     console.print(stats)
 
     # Top near-duplicate pairs (deduplicated i<j)
     pairs = {}
     for local_row in range(len(positions)):
-        j, s = int(nn_idx[local_row, 0]), float(nn_sim[local_row, 0])
-        a, b = sorted((local_row, j))
-        key = (a, b)
-        if key not in pairs or s > pairs[key]:
-            pairs[key] = s
+        for neighbor, score in zip(nn_idx[local_row], nn_sim[local_row], strict=True):
+            key = tuple(sorted((local_row, int(neighbor))))
+            pairs[key] = max(pairs.get(key, -1.0), float(score))
     top_pairs = sorted(pairs.items(), key=lambda kv: kv[1], reverse=True)[:10]
 
     def describe(local_row: int) -> str:
@@ -215,10 +257,14 @@ def main() -> int:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUTPUT_DIR / f"related_articles_{args.config}.parquet"
     out_frame.to_parquet(out_path, index=False)
+    pair_path = OUTPUT_DIR / f"related_articles_{args.config}_candidates.parquet"
+    candidate_pairs(valid_ids, nn_idx, nn_sim).to_parquet(pair_path, index=False)
     console.print(f"[green]✓[/green] Column saved: [cyan]{out_path}[/cyan]")
     write_run_manifest(
         OUTPUT_DIR, script=f"related_articles_{args.config}", repo_id=args.repo,
-        revision=source_revision, args=args, outputs=[out_path],
+        revision=source_revision, args=args, outputs=[out_path, pair_path],
+        inputs={"embedding_configuration": list(df[config_col].dropna().unique()) if config_col in df else [],
+                "interpretation": "Similarity candidates require lexical and historical validation"},
     )
 
     if not args.push:

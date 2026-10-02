@@ -206,9 +206,8 @@ class TestCrossGenerationOrdinal:
     def test_unknown_values_are_missing_not_zero(self):
         out = self._fn()(pd.Series(["Non applicable", "objectif?", "7"]))
         # 'Non applicable' is not a point on the subjectivité scale; a stray
-        # numeric string is out of range but parses — neither may become a 0.
-        assert out.isna().tolist() == [True, True, False]
-        assert out.iloc[2] == 7.0
+        # numeric string is out of range and must be missing too.
+        assert out.isna().tolist() == [True, True, True]
 
     def test_agreement_script_defaults_to_one_generation(self):
         import sentiment_agreement as sa

@@ -10,7 +10,7 @@ Hub.
 Usage
 -----
     python articles/upload_newspaper_hf.py \
-        --repo fmadore/islam-west-africa-collection \
+        --repo fmadore/islam-west-africa-collection-full \
         --max-shard-size 1GB
 
 Variables d'environnement
@@ -30,7 +30,6 @@ from typing import Dict, Any, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
-from dotenv import load_dotenv
 from country_mapper import get_country_from_newspaper
 from iwac_common.omeka_client import (
     OmekaApiClient,
@@ -41,6 +40,7 @@ from iwac_common.omeka_client import (
     item_page_url,
 )
 from iwac_common.field_mappers import (
+    visibility_metadata,
     extract_added_date,
     get_resource_ids,
     get_uri_value,
@@ -63,7 +63,6 @@ from iwac_common.sentiment_panel import (
 from iwac_common.upload_runner import UploadSpec, report_unmapped_values, run_upload
 from iwac_common.schema import SUBSETS
 
-load_dotenv()
 
 
 # Orchestration (fetch → map loop → merge → validate → push), the CLI
@@ -111,7 +110,7 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
     """Transforme un item Omeka en dict plat pour HF datasets."""
 
     primary_url = await fetch_primary_media_url(
-        item, api, affected_fields=("PDF",)
+        item, api, affected_fields=("PDF", "thumbnail", "iiif_manifest")
     )
 
     newspaper_name = get_value(item, "dcterms:publisher")
@@ -129,6 +128,7 @@ async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Di
 
     return {
         "o:id": item["o:id"],
+        **visibility_metadata(item, "articles"),
         "identifier": get_value(item, "dcterms:identifier"),
         "added_date": extract_added_date(item),  # Date when item was added to Omeka
         "iwac_url": item_page_url(item["o:id"]),

@@ -18,31 +18,18 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
-
       - name: Install static-check dependencies
-        run: python -m pip install ruff
-
+        run: python -m pip install ruff==0.16.10
       - name: Compile every Python module
-        run: python -m compileall -q . -x '(^|/)(\.venv|\.git|\.cache[^/]*)/'
-
+        run: python -m compileall -q . -x '(^|/)(\.venv|\.git|\.cache[^/]*|build|dist)/'
       - name: Reject undefined names and dead imports
-        # Rules are pinned in pyproject.toml ([tool.ruff.lint]): F821 catches a
-        # refactor that drops an import used inside main() or a rare branch —
-        # which the import-smoke tests cannot see — and F401 stops the dead
-        # imports such a refactor leaves behind from accumulating. Deliberate
-        # availability checks carry `# noqa: F401`, which ruff honours.
         run: ruff check --output-format=github .
 
   tests:
-    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }}, ${{ matrix.dependencies }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     strategy:
@@ -51,50 +38,80 @@ jobs:
         include:
           - os: ubuntu-latest
             python: "3.12"
+            dependencies: locked
             coverage_artifact: true
           - os: ubuntu-latest
             python: "3.13"
+            dependencies: locked
             coverage_artifact: false
           - os: windows-latest
             python: "3.12"
+            dependencies: locked
+            coverage_artifact: false
+          - os: ubuntu-latest
+            python: "3.12"
+            dependencies: latest-supported
             coverage_artifact: false
     env:
       PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v7
-
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
-
-      - name: Install project and test dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
-          python -m pip install -e . --no-deps
-
+          cache-dependency-path: requirements*.txt
+      - name: Install frozen research environment
+        if: matrix.dependencies == 'locked'
+        run: python -m pip install --require-hashes -r requirements-lock.txt
+      - name: Check current supported dependency ranges
+        if: matrix.dependencies == 'latest-supported'
+        run: python -m pip install -r requirements-dev.txt
+      - name: Install project
+        run: python -m pip install -e . --no-deps
       - name: Verify dependency consistency
         run: python -m pip check
-
-      - name: Run unit, contract, and import-smoke tests
+      - name: Run unit, contract, orchestration, and import tests
         run: >-
-          python -m pytest tests -q
-          --cov=iwac_common
-          --cov-report=term-missing:skip-covered
-          --cov-report=xml
-          --cov-fail-under=70
-
-      - name: Upload coverage report
+          python -m pytest tests -q --cov=.
+          --cov-report=term:skip-covered --cov-report=xml --cov-report=json
+      - name: Preserve shared-core coverage gate and report every pipeline area
+        run: python scripts/check_coverage.py coverage.json --core-min 70
+      - name: Upload coverage reports
         if: matrix.coverage_artifact
         uses: actions/upload-artifact@v7
         with:
           name: coverage-python-${{ matrix.python }}
-          path: coverage.xml
+          path: |
+            coverage.xml
+            coverage.json
           if-no-files-found: error
+          retention-days: 14
+
+  wheel:
+    name: Installed wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+      - run: python -m pip install --require-hashes -r requirements-lock.txt
+      - run: python -m build
+      - name: Install wheel without the checkout on Python's path
+        run: |
+          python -m venv /tmp/iwac-wheel
+          /tmp/iwac-wheel/bin/python -m pip install --require-hashes -r requirements-lock.txt
+          /tmp/iwac-wheel/bin/python -m pip install --no-deps dist/*.whl
+          /tmp/iwac-wheel/bin/python -m pip check
+          /tmp/iwac-wheel/bin/python -I scripts/wheel_smoke.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-distributions
+          path: dist/*
           retention-days: 14
 
   dependency-review:

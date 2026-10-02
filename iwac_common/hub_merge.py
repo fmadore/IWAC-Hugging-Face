@@ -139,13 +139,13 @@ def merge_with_hub_dataset(
     console: Optional[Console] = None,
     min_row_ratio: float = 0.95,
     allow_shrink: bool = False,
-    stale_rows: str = "keep",
+    stale_rows: str = "drop",
     allow_initialize: bool = False,
     preserve_existing_ids: Iterable[object] = (),
     preserve_fields_by_id: Optional[Mapping[object, Iterable[str]]] = None,
     revision_out: Optional[MutableMapping[str, str]] = None,
     derived_from: Optional[Mapping[str, Sequence[str]]] = None,
-    invalidate_derived: bool = False,
+    invalidate_derived: bool = True,
     stale_out: Optional[MutableMapping[str, dict]] = None,
 ) -> pd.DataFrame:
     """Merge ``new_df`` with the existing HF Hub config, preserving any
@@ -159,8 +159,8 @@ def merge_with_hub_dataset(
       raises :class:`ShrinkGuardError` unless ``allow_shrink=True`` — a
       truncated Omeka fetch must not silently delete Hub rows;
     - for outer merges, ``stale_rows`` controls Hub-only rows (items deleted
-      on Omeka): ``"keep"`` (historical behavior, logged loudly) or
-      ``"drop"``.
+      on Omeka): ``"drop"`` (default) or ``"keep"`` (complete historical
+      rows marked private so they cannot be republished).
 
     Hub reads fail closed.  A missing config is treated as a first run only
     when ``allow_initialize=True`` and the Hub confirms that the config is not
@@ -276,7 +276,15 @@ def merge_with_hub_dataset(
         mask = new_df["o:id"] == row_id
         for field in fields:
             if field in new_df.columns and field in existing_df.columns:
-                new_df.loc[mask, field] = existing_by_id.at[row_id, field]
+                for index in new_df.index[mask]:
+                    new_df.at[index, field] = existing_by_id.at[row_id, field]
+        # Preserve data in the full mirror, but fail closed for publication:
+        # a fetch failure could be caused by newly restricted upstream media.
+        # Previous visibility is not evidence of current visibility.
+        if "private_fields" in new_df:
+            for index in new_df.index[mask]:
+                new = new_df.at[index, "private_fields"]
+                new_df.at[index, "private_fields"] = sorted(set(new) | fields)
 
     missing_preserved = sorted(preserve_ids - set(new_df["o:id"]))
     if missing_preserved:
@@ -295,6 +303,10 @@ def merge_with_hub_dataset(
         if not missing_preserved:
             return frame
         retained = existing_by_id.loc[missing_preserved].reindex(columns=frame.columns)
+        # A mapper error cannot establish that its source item is still
+        # public. Retain the complete data privately until a successful map.
+        retained = retained.copy()
+        retained["item_is_public"] = False
         combined = pd.concat([frame, retained], ignore_index=True)
         _assert_unique_ids(combined, "merged data plus preserved mapper failures")
         return combined
@@ -338,12 +350,40 @@ def merge_with_hub_dataset(
         if col not in new_df.columns and col not in excluded
     ]
 
+    # Frozen annotations and other preserved columns keep previously known
+    # restrictions even when their source Omeka properties have been retired.
+    if "private_fields" in new_df and "private_fields" in existing_df:
+        for index, row_id in zip(new_df.index, new_df["o:id"]):
+            if row_id not in existing_by_id.index:
+                continue
+            old = existing_by_id.at[row_id, "private_fields"]
+            if hasattr(old, "tolist"):
+                old = old.tolist()
+            if isinstance(old, (list, tuple, set)):
+                new_df.at[index, "private_fields"] = sorted(
+                    set(new_df.at[index, "private_fields"]) | (set(old) & set(extra_cols))
+                )
+
     stale: dict[str, dict] = {}
     if derived_from:
-        for source, ids in detect_source_changes(new_df, existing_df, derived_from).items():
+        changes = detect_source_changes(new_df, existing_df, derived_from)
+        for source, ids in changes.items():
             affected = [c for c in derived_from[source] if c in extra_cols]
             if affected:
                 stale[source] = {"ids": ids, "derived": affected}
+        # Neighbour rankings depend on every candidate vector, not only the
+        # query row. Correcting/removing/adding one article can change another
+        # article's neighbours; retain no apparently fresh cross-row links.
+        embedding_changed = any(
+            any(column.startswith("embedding_") for column in derived_from[source])
+            for source in changes
+        )
+        membership_changed = set(new_df["o:id"]) != set(existing_df["o:id"])
+        if "related_articles" in extra_cols and (embedding_changed or membership_changed):
+            stale["corpus_embeddings"] = {
+                "ids": sorted(set(new_df["o:id"]) | set(existing_df["o:id"])),
+                "derived": ["related_articles"],
+            }
     if stale:
         table = Table(
             title="Source text changed since the Hub copy", box=box.SIMPLE,
@@ -365,7 +405,7 @@ def merge_with_hub_dataset(
             )
         else:
             console.print(
-                "[yellow]⚠[/yellow] Kept as-is. Re-run with --invalidate-derived to "
+                "[yellow]⚠[/yellow] Explicitly preserved. Re-run with --invalidate-derived to "
                 "clear them (then each stage's 'missing' mode recomputes exactly "
                 "those rows), or re-run the stages with --update-mode all."
             )
@@ -406,10 +446,22 @@ def merge_with_hub_dataset(
                 "(items no longer in Omeka; --stale-rows drop)."
             )
         elif hub_only:
+            # Preserve complete source records for deliberate historical use,
+            # while marking absent records ineligible for public projection.
+            # An outer merge of only Hub extras previously fabricated rows
+            # with blank bibliographic metadata.
+            for column in new_df.columns:
+                if column != "o:id" and column in existing_df.columns:
+                    for index in final_df.index[stale_mask]:
+                        row_id = final_df.at[index, "o:id"]
+                        final_df.at[index, column] = existing_by_id.at[row_id, column]
+            if "item_is_public" not in final_df:
+                final_df["item_is_public"] = False
+            final_df.loc[stale_mask, "item_is_public"] = False
             console.print(
                 f"[yellow]⚠[/yellow] {hub_only} row(s) exist on the Hub but not in Omeka "
-                "(deleted items?). They are KEPT with empty Omeka fields and will be "
-                "re-pushed as-is — pass --stale-rows drop to remove them."
+                "(deleted items?). Complete historical rows are KEPT only in "
+                "the private mirror; item_is_public=False excludes them from publication."
             )
         final_df = final_df.drop(columns="_merge")
 

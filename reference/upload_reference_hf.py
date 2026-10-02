@@ -34,10 +34,10 @@ from typing import Dict, Any, List
 # Add parent directory to path to import from root
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dotenv import load_dotenv
 
 from iwac_common.omeka_client import OmekaApiClient, item_page_url
 from iwac_common.field_mappers import (
+    visibility_metadata,
     countries_from_item_sets,
     extract_added_date,
     get_resource_ids,
@@ -51,7 +51,6 @@ from iwac_common.text_utils import count_words
 from iwac_common.upload_runner import UploadSpec, run_upload
 from iwac_common.schema import COUNTRY_ITEM_SETS, SUBSETS
 
-load_dotenv()
 
 # Orchestration (fetch of all 9 reference classes → map loop → outer merge →
 # validate → push), the CLI (--repo/--max-shard-size/--no-cache/--dry-run/
@@ -191,6 +190,7 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
 
     return {
         "o:id": item["o:id"],
+        **visibility_metadata(item, "references"),
         "iwac_url": item_page_url(item["o:id"]),
         "identifier": _get_iwac_identifier(item, "dcterms:identifier"),
         "added_date": extract_added_date(item),
@@ -262,8 +262,9 @@ SPEC = UploadSpec(
     title="📚 IWAC References Upload",
     cache_dir=".cache_omk_references",
     description="Publie les références bibliographiques IWAC sur le Hub HF",
-    # References keep Hub-only rows (deleted Omeka items) via an outer merge,
-    # dropping a few legacy columns; --stale-rows drop removes them.
+    # References expose deliberate historical retention via the outer merge.
+    # Deleted rows are dropped by default; --stale-rows keep retains complete
+    # private historical records.
     merge_how="outer",
     merge_suffixes=("", "_old"),
     columns_to_exclude=("o:item_set", "o:media/file", "iiif_manifest", "thumbnail"),

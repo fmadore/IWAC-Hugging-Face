@@ -1,5 +1,17 @@
 # Publication readiness review
 
+**Implementation update (2026-10-02):** the new hardening branch addresses the
+remaining code-level findings below, including private-destination enforcement,
+parent/property visibility, atomic data/card publication, replayable default
+invalidation, persisted enrichment provenance, immutable model/run artifacts,
+wheel packaging and a hashed research environment. It also corrects holdout and
+analysis methodology and adds empirical-review tools. See
+[the migration guide](hardening-migration.md), [ingestion contract](ingest-contract.md)
+and [research validation protocol](research-validation.md). Historical findings
+and test counts below describe their original review dates; they are retained
+as an audit trail, not a list of current unresolved code defects. Live dataset
+migration and human validation remain separate work.
+
 Reviewed 2026-09-07. Scope: repository structure, installation and CI, shared
 fetch/merge/write infrastructure, rights projection, enrichment and analysis
 code, tests, README, contribution guidance, and citation metadata. This is a

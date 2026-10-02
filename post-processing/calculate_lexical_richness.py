@@ -12,8 +12,7 @@ The user is prompted to choose the dataset configuration. Column names:
 
 Readability is only defined for French. ``Lisibilite_OCR`` applies the
 Kandel–Moles French constants and French syllabification, so it is computed
-only for rows whose PRIMARY ``language`` (first pipe-separated value) is
-``Français``; every other row — English, Arabic, Hausa, Ewé, Kabiyè, Dendi,
+only for rows whose sole ``language`` value is ``Français``; every other row — English, Arabic, Hausa, Ewé, Kabiyè, Dendi,
 or no language at all — is stored as null, in every update mode, so a value
 computed before this rule existed is cleared rather than kept. A French
 formula applied to an African-language source ranks correct text as
@@ -44,6 +43,7 @@ import logging
 import os
 import sys
 import uuid
+from importlib.metadata import version
 from collections import Counter
 from typing import List, Dict, Any, Optional
 
@@ -62,7 +62,8 @@ from _common import (  # noqa: E402
     push_dataset,
     resolve_config,
 )
-from iwac_common.text_utils import tokenize_words  # noqa: E402
+from iwac_common.text_utils import tokenize_words, language_labels, TOKENIZER_VERSION  # noqa: E402
+from iwac_common.enrichment import config_fingerprint, fingerprint, provenance_columns, config_json  # noqa: E402
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -74,10 +75,11 @@ from rich.logging import RichHandler
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich import box
 from dotenv import load_dotenv
+from iwac_common.paths import workspace_root
 
 # Load .env so a non-interactive run finds HF_TOKEN instead of falling through
 # to an interactive login that cannot read stdin.
-load_dotenv()
+load_dotenv(workspace_root() / ".env")
 
 console = Console()
 
@@ -91,7 +93,7 @@ logging.basicConfig(
 logger = logging.getLogger("lexical_richness")
 
 
-def calculate_mattr(text: str, window_size: int = 50) -> Optional[float]:
+def calculate_mattr(text: str, window_size: int = 50, language: str = "Français") -> Optional[float]:
     """Compute Moving Average Type-Token Ratio (MATTR).
 
     Unlike raw TTR, MATTR is not biased by text length because it uses a
@@ -106,10 +108,12 @@ def calculate_mattr(text: str, window_size: int = 50) -> Optional[float]:
     Returns None if the text is missing, has no tokens, or is too short
     for MATTR.
     """
+    if window_size < 1:
+        raise ValueError("MATTR window size must be positive")
     if not text or not isinstance(text, str):
         return None
 
-    tokens = tokenize_words(text)
+    tokens = tokenize_words(text, language=language)
 
     if not tokens:
         return None
@@ -194,7 +198,7 @@ def compute_metrics_batch(
             counts non-empty texts shorter than the MATTR window (stored as
             None by design, not an error); 'readability_failed' counts
             readability computation failures; 'readability_not_french' counts
-            rows nulled because their primary language is not French.
+            rows nulled because their language is unknown, multilingual, or not French.
         language_col: Column holding the pipe-joined ``language`` labels.
             Without it no row can be shown to be French, so readability is
             null throughout.
@@ -210,22 +214,42 @@ def compute_metrics_batch(
 
     richness_results = list(existing_richness)
     readability_results = list(existing_readability)
+    settings = {
+        richness_col: {"metric": "MATTR", "window": window_size, "tokenizer": TOKENIZER_VERSION},
+        readability_col: {"metric": "French Flesch", "language_policy": "monolingual-fr",
+                          "textstat": version("textstat")},
+    }
+    configs = {column: config_fingerprint(value) for column, value in settings.items()}
+    descriptions = {column: config_json(value) for column, value in settings.items()}
+    for column in configs:
+        batch[f"{column}_config_json"] = [None] * len(texts)
+    hashes = {column: provenance_columns(column) for column in configs}
+    previous = {name: list(batch.get(name, [None] * len(texts)))
+                for columns in hashes.values() for name in columns}
+    for name in previous:
+        batch[name] = list(previous[name])
 
     for i, text in enumerate(texts):
         text_str = str(text) if text is not None else ""
         has_content = text is not None and text_str.strip()
-        is_french = primary_language(languages[i]) == READABILITY_LANGUAGE
+        labels = language_labels(languages[i])
+        is_french = labels == [READABILITY_LANGUAGE]
+        input_hash = fingerprint(text_str, labels)
+        readability_failed = False
 
         # Determine whether to process this row
         if update_mode == "missing":
-            richness_needed = existing_richness[i] is None
-            readability_needed = existing_readability[i] is None
+            def needs(column):
+                input_col, config_col = hashes[column]
+                return previous[input_col][i] != input_hash or previous[config_col][i] != configs[column]
+            richness_needed = needs(richness_col)
+            readability_needed = needs(readability_col)
         else:
             richness_needed = True
             readability_needed = True
 
         if richness_needed:
-            result = calculate_mattr(text_str, window_size)
+            result = calculate_mattr(text_str, window_size, language=labels[0] if len(labels) == 1 else "")
             if result is None and has_content:
                 # Non-empty text without a MATTR value means it has fewer
                 # tokens than the window — too short for MATTR, not an error.
@@ -244,7 +268,14 @@ def compute_metrics_batch(
             result = calculate_readability(text_str)
             if result is None and has_content:
                 error_counter["readability_failed"] += 1
+                readability_failed = True
             readability_results[i] = result
+        for column in configs:
+            input_col, config_col = hashes[column]
+            successful = not (column == readability_col and readability_failed)
+            batch[input_col][i] = input_hash if successful else None
+            batch[config_col][i] = configs[column] if successful else None
+            batch[f"{column}_config_json"][i] = descriptions[column] if successful else None
 
     batch[richness_col] = richness_results
     batch[readability_col] = readability_results
@@ -376,6 +407,8 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+    if args.window_size < 1 or args.batch_size < 1:
+        parser.error("--window-size and --batch-size must be positive")
 
     repo_id = args.repo
     text_column_name = "OCR"
@@ -448,14 +481,8 @@ def main() -> int:
             ds, richness_column_name, readability_column_name
         )
 
-        if richness_missing == 0 and readability_missing == 0:
-            console.print(Panel(
-                "[green]All metrics are already computed![/green]\n\n"
-                "No processing needed.",
-                title="Nothing to do",
-                border_style="green"
-            ))
-            return 0
+        # Non-null values alone do not establish current input/configuration
+        # provenance, and legacy non-French readability must still be cleared.
 
     # --- Compute metrics ---
     console.print(f"\n[bold cyan]Step 5:[/bold cyan] Computing lexical metrics...")
@@ -500,6 +527,9 @@ def main() -> int:
         features = ds.features.copy()
         features[richness_column_name] = Value("float64")
         features[readability_column_name] = Value("float64")
+        for column in (richness_column_name, readability_column_name):
+            for name in (*provenance_columns(column), f"{column}_config_json"):
+                features[name] = Value("string")
         ds_processed = ds.map(
             compute_with_progress,
             batched=True,
@@ -587,7 +617,7 @@ def main() -> int:
 
     commit_message = (
         f"Add/update '{richness_column_name}' (MATTR, window={window_size}) and "
-        f"'{readability_column_name}' (French Flesch, primary-French rows only) "
+        f"'{readability_column_name}' (French Flesch, monolingual-French rows only) "
         f"from '{text_column_name}' "
         f"(config: {config_name_choice}, mode: {update_mode})"
     )

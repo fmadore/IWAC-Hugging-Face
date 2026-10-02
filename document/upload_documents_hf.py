@@ -34,7 +34,6 @@ from typing import Dict, Any
 # Add parent directory to path to import from root
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dotenv import load_dotenv
 from iwac_common.omeka_client import (
     OmekaApiClient,
     conn_manager,
@@ -44,6 +43,7 @@ from iwac_common.omeka_client import (
     item_page_url,
 )
 from iwac_common.field_mappers import (
+    visibility_metadata,
     countries_from_item_sets,
     extract_added_date,
     get_resource_ids,
@@ -57,7 +57,6 @@ from iwac_common.field_mappers import (
 from iwac_common.upload_runner import UploadSpec, run_upload
 from iwac_common.schema import COUNTRY_ITEM_SETS, SUBSETS
 
-load_dotenv()
 
 
 # Orchestration (fetch → map loop → merge → validate → push), the CLI
@@ -73,7 +72,7 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
     """Transforme un item Omeka en dict plat pour HF datasets."""
 
     primary_url = await fetch_primary_media_url(
-        item, api, affected_fields=("PDF",)
+        item, api, affected_fields=("PDF", "thumbnail", "iiif_manifest")
     )
     pub_date = get_value(item, "dcterms:date")
     pub_year, pub_date_precision = parse_pub_date(pub_date)
@@ -88,6 +87,7 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
 
     return {
         "o:id": item["o:id"],
+        **visibility_metadata(item, "documents"),
         "identifier": get_value(item, "dcterms:identifier"),
         "added_date": extract_added_date(item),  # Date when item was added to Omeka
         "iwac_url": item_page_url(item["o:id"]),

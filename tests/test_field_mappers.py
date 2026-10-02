@@ -7,9 +7,85 @@ upload rails fire. These tests pin the three value shapes the property actually
 takes, plus the ordering assumption that made the pipe-join look safe.
 """
 
-from iwac_common.field_mappers import get_value, get_value_by_language
+import pytest
+
+from iwac_common.field_mappers import get_value, get_value_by_language, parse_pub_date
 
 FIELD = "bibo:shortDescription"
+
+
+@pytest.mark.parametrize("value", [
+    "2000-02-30", "2001-02-29", "1900-02-29", "2024-04-31",
+    "2000-00", "2000-13", "2000-01-00", "0000", "0000-01", "0000-01-01",
+    "1999/2000-02-30", "0000/2001", "2000-02-30/2001-01-01",
+])
+def test_publication_date_rejects_impossible_calendar_values(value):
+    assert parse_pub_date(value) == (None, "other")
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("2000-02-29", (2000, "day")), ("2024-02-29", (2024, "day")),
+    ("0001-01-01", (1, "day")), ("2000-02", (2000, "month")),
+    ("2000", (2000, "year")), ("2000-02-29/2001-03", (2000, "range")),
+])
+def test_publication_date_preserves_valid_precision(value, expected):
+    assert parse_pub_date(value) == expected
+
+
+def test_parent_item_visibility_is_required_for_public_content():
+    from iwac_common.field_mappers import is_content_public
+
+    item = {"bibo:content": [{"@value": "text", "is_public": True}]}
+    assert is_content_public(item) is False
+    item["o:is_public"] = False
+    assert is_content_public(item) is False
+    item["o:is_public"] = True
+    assert is_content_public(item) is True
+
+
+def test_private_properties_restrict_ids_dates_and_bilingual_columns():
+    from iwac_common.field_mappers import visibility_metadata
+
+    item = {
+        "o:is_public": True,
+        "dcterms:creator": [{"display_title": "A", "value_resource_id": 2, "is_public": False}],
+        "dcterms:date": [{"@value": "2001", "is_public": False}],
+        FIELD: [{"@value": "public", "@language": "fr", "is_public": True},
+                {"@value": "private", "@language": "en", "is_public": False}],
+        "dcterms:title": [{"@value": "public title", "is_public": True}],
+    }
+    metadata = visibility_metadata(item, "articles")
+    assert metadata["item_is_public"] is True
+    assert set(metadata["private_fields"]) == {
+        "author", "author_ids", "pub_date", "pub_year", "pub_date_precision",
+        "hijri_year", "hijri_month", "hijri_day",
+        "descriptionAI", "descriptionAI_en",
+    }
+
+
+def test_unknown_value_visibility_and_live_annotation_are_restricted():
+    from iwac_common.field_mappers import visibility_metadata
+    from iwac_common.sentiment_panel import active_models, DIMENSION_FIELDS
+
+    model = active_models()[0]
+    suffix, omeka_suffix = DIMENSION_FIELDS[1]
+    metadata = visibility_metadata({
+        "o:is_public": True,
+        "dcterms:title": [{"@value": "unknown rights"}],
+        model.omeka_property(omeka_suffix): [{"@value": "private quotation", "is_public": False}],
+    }, "articles")
+    assert "title" in metadata["private_fields"]
+    assert model.column(suffix) in metadata["private_fields"]
+
+
+def test_private_coordinates_restrict_numeric_axes():
+    from iwac_common.field_mappers import visibility_metadata
+
+    metadata = visibility_metadata({
+        "o:is_public": True,
+        "curation:coordinates": [{"@value": "1, 2", "is_public": False}],
+    }, "images")
+    assert set(metadata["private_fields"]) == {"coordinates", "latitude", "longitude"}
 
 
 def _item(*values, oid=1):

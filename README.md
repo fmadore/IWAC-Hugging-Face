@@ -27,15 +27,13 @@ Much of the collection's full text is **private on the Omeka S source** — righ
 | [`fmadore/islam-west-africa-collection-full`](https://huggingface.co/datasets/fmadore/islam-west-africa-collection-full) | Private | Complete superset, full text for all rows. The canonical target of **every** upload and post-processing script. |
 | [`fmadore/islam-west-africa-collection`](https://huggingface.co/datasets/fmadore/islam-west-africa-collection) | Public | The citable projection. Written **only** by `post-processing/publish_public.py`. |
 
-The projection **masks full text per row rather than stripping it wholesale**. `OCR`, `lemma_text`, and `lemma_nostop` survive wherever `OCR_is_public` is true — a flag derived from the per-value `is_public` attribute on Omeka's `bibo:content` field. Measure text availability in the revision you use; it changes as the archive grows and source permissions change. Reviewed derived fields — embeddings, topics, sentiment and its justifications, `descriptionAI`, lexical metrics — are retained. This allowlist is a publication policy, not a guarantee that derived outputs cannot disclose or quote source information.
+Public projection first omits private parent items (`item_is_public`) and masks directly restricted Omeka properties (`private_fields`). For remaining rows, `OCR`, `lemma_text`, and `lemma_nostop` survive only where `OCR_is_public` is true. Missing visibility metadata fails closed; refresh all seven subsets before publishing a legacy mirror. The reviewed policy retains approved computed derivatives such as embeddings, topics and metrics for public parent items, including when their OCR is restricted. This is a publication decision, not a guarantee that derived outputs cannot disclose source information. New columns require review in [`public_columns.json`](iwac_common/public_columns.json).
 
-Because a leak here would be unrecoverable, `publish_public.py` aborts rather than guessing: if a content subset lacks `OCR_is_public`, or if any column is absent from the per-subset allowlist in [`iwac_common/public_columns.json`](iwac_common/public_columns.json). Adding a legitimately new column means editing that allowlist deliberately.
+The complete write gateway independently requires a **private destination**. Public publication must use the explicit projection mode, which validates the policy again. All selected subsets and their exact dataset-card schemas are staged and committed together with a server-side parent-revision precondition. A local lock prevents competing local writers; the Hub precondition rejects remote conflicts. Verification reads every shard's full schema and the published IDs at the exact commit. Readers cannot observe an intermediate data/card schema mismatch.
 
-The uploads carry equivalent rails. Hub baselines fail closed on auth, network, schema, or config errors; a genuinely new config requires `--initialize`. `hub_merge` refuses a frame under 95% of the Hub's current row count; `fetch_items` requires and exactly reconciles the `Omeka-S-Total-Results` header; any mapper or media lookup failure aborts by default. The explicit `--allow-map-failures` and `--allow-media-failures` overrides retain the affected prior Hub row/fields instead of replacing them with blanks. Omeka transport errors are sanitized at the HTTP boundary, so the API key (sent as query parameters) never reaches a log line or an abort panel.
+Uploads fail closed on incomplete Omeka enumeration, mapper/media failures and unreadable Hub baselines. A new subset requires `--initialize`; substantial intentional shrinkage requires `--force-shrink`. Authenticated Omeka access is required for a complete refresh. Explicit failure overrides preserve affected existing values privately until they can be refreshed.
 
-An upload also compares each item's source text (`OCR`, `tableOfContents`, `image_url`, `pub_date`) with the Hub copy. Where it changed, the preserved computed columns (embeddings, lemmas, metrics, topics, Hijri date — declared in `schema.DERIVED_FROM`) describe the old text: the run reports those rows and records them under `.iwac_state/stale_derived/`, or, with `--invalidate-derived`, clears them so each stage's `missing` mode recomputes exactly those rows. Resume caches are tied to their input the same way: each entry carries a hash of the text it was computed from, and the cache filename names the repository.
-
-One rail runs *after* the push instead of before it. `push_to_hub` refreshes a config's byte sizes in the dataset card but not its feature list, so any push that adds or drops a column leaves the card declaring the old schema — and `load_dataset` then raises `CastError: column names don't match`, making the subset unloadable for every consumer, this pipeline's own next run included. It happened twice on 2026-08-06, to the private mirror and then to the public citable dataset. [`iwac_common/hub.py`](iwac_common/hub.py) is now the only write gateway: it conforms every push to the subset's declared column types (nullable `int64` for counts, ids, pages and dates; `list<float32>` for embeddings — a pandas round trip anywhere upstream used to publish them as `float64`), validates IDs and embeddings (flat, finite, 768-dimensional), rejects a changed source revision, acquires a local repo lock, pushes, repairs the card through [`card_sync.py`](iwac_common/card_sync.py), and verifies the exact published revision. That verification is split by cost: `card_sync` compares the card's declared features against the parquet footer on the Hub, and the row-level check then reads only the `o:id` column rather than re-downloading every embedding. If that columnar read is unavailable it falls back to a full reload — never to skipping the check. A test rejects any direct `push_to_hub` call outside this gateway.
+Changed source values **invalidate dependent enrichments by default**, including provenance. An atomic stale-work queue is staged before the remote write and replayed after interruptions. `--preserve-derived` explicitly defers invalidation; resolve its queue before enrichment. References absent from a complete source listing are dropped by default; `--stale-rows keep` retains their full historical record privately. See the [ingestion and recovery contract](docs/ingest-contract.md) for details.
 
 ## Dataset subsets
 
@@ -69,7 +67,7 @@ articles = load_dataset("fmadore/islam-west-africa-collection", name="articles",
 | Image embeddings | `post-processing/semantic_embedding_images.py` | Embeddings over downscaled images |
 | Lemmatisation | `lemmatize_update_hf.py` | spaCy lemmas, with and without stopwords, per language |
 | Topic modeling | `post-processing/lda_topic_modeling/` | LDA topic id, probability, label, and top-k terms |
-| Lexical metrics | `post-processing/calculate_lexical_richness.py`, `calculate_word_count.py` | Word count (one elision-aware definition, shared with the upload mappers), MATTR lexical richness, French Flesch readability (primary-French rows only) |
+| Lexical metrics | `post-processing/calculate_lexical_richness.py`, `calculate_word_count.py` | Word count (one elision-aware definition, shared with the upload mappers), MATTR lexical richness, French Flesch readability (monolingual French rows only) |
 | Islamic calendar | `post-processing/calculate_hijri_dates.py` | Hijri year, month, and day (Umm al-Qura) |
 | Sentiment panel | `iwac_common/sentiment_panel.py` | Registry and consensus helpers for centrality, polarity, and subjectivity annotations imported from Omeka; model inference happens upstream |
 | Related items | `post-processing/related_articles.py` | Nearest neighbours by embedding |
@@ -117,7 +115,7 @@ git clone https://github.com/fmadore/IWAC-Hugging-Face.git
 Set-Location IWAC-Hugging-Face
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements-lock.txt
 python -m pip install -e . --no-deps
 Copy-Item .env.example .env
 ```
@@ -129,12 +127,12 @@ git clone https://github.com/fmadore/IWAC-Hugging-Face.git
 cd IWAC-Hugging-Face
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements-lock.txt
 python -m pip install -e . --no-deps
 cp .env.example .env
 ```
 
-For development, install `requirements-dev.txt` instead; it includes the runtime dependencies, pytest, coverage, and the undefined-name check:
+The lock includes runtime and development dependencies and hashes, with platform markers for the CI environments. To develop against the supported dependency ranges instead:
 
 ```bash
 python -m pip install -r requirements-dev.txt
@@ -142,7 +140,7 @@ python -m pip install -e . --no-deps
 python -m pytest
 ```
 
-The editable install exposes `iwac-upload`, `iwac-mirror`, and `iwac-publish-public` from the checkout. Keep the checkout in place: these commands load scripts at their repository paths. Standalone wheel installation is not currently supported, and runtime dependencies must be installed separately as above.
+Both editable and wheel installs expose `iwac-upload`, `iwac-mirror`, `iwac-publish-public`, `iwac-process`, and `iwac-analyze`. Core dependencies are declared by the package; `pip install ".[all]"` adds NLP and analysis dependencies, or select `.[nlp]` / `.[analysis]`. CI builds the wheel and exercises every command from an empty working directory. With a wheel, set `IWAC_WORK_DIR` to a writable working directory for data, caches, models and reports; the default is the current directory. Source checkouts keep their existing output locations.
 
 The lemmatisation step additionally needs spaCy models:
 
@@ -155,7 +153,7 @@ python -m spacy download en_core_web_lg
 
 Copy `.env.example` to `.env` and fill in `OMEKA_BASE_URL`, `OMEKA_KEY_IDENTITY`, `OMEKA_KEY_CREDENTIAL`, `HF_TOKEN`, and — for the embedding scripts — `GOOGLE_API_KEY`.
 
-Set `IWAC_HF_PRIVATE_REPO` and `IWAC_HF_PUBLIC_REPO` to redirect the pipeline at a scratch dataset. Do this before running anything that writes to the Hub for the first time.
+Set `IWAC_HF_PRIVATE_REPO` and `IWAC_HF_PUBLIC_REPO` to redirect the pipeline at scratch datasets. Settings load dotenv before constructing repository defaults; process environment wins. `IWAC_ENV_FILE` selects an explicit dotenv file. Do this before running write-capable commands. The full destination must be private.
 
 ## Usage
 
@@ -165,6 +163,8 @@ The original script paths remain supported. The installed commands give the comm
 iwac-upload --help
 iwac-mirror --help
 iwac-publish-public --help
+iwac-process --help
+iwac-analyze --help
 ```
 
 `iwac-upload` accepts `articles`, `publications`, `index`, `references`, `audiovisual`, `documents`, or `images` as its subset argument.
@@ -186,15 +186,15 @@ iwac-publish-public
 
 Two properties of this flow are easy to get wrong:
 
-**Pushes to one repo must be sequential.** The writer enforces this locally with a repo-scoped lock and rejects a Hub revision that changed after computation began. That prevents overlapping processes on one machine and detects most remote lost updates; it is still good operational practice to finish one job before starting another. A lock left behind by a crashed process on this host is reclaimed automatically on the next run; one whose owner is still alive, or which was written by another machine, fails closed — wait for that writer rather than deleting the lock file.
+**Pushes to one repo must be sequential.** The writer enforces this locally with a repo-scoped lock and rejects a Hub revision that changed after computation began. That prevents overlapping processes on one machine and atomically rejects remote lost updates; it is still good operational practice to finish one job before starting another. A lock left behind by a crashed process on this host is reclaimed automatically on the next run; one whose owner is still alive, or which was written by another machine, fails closed — wait for that writer rather than deleting the lock file.
 
 **Uploads merge rather than overwrite.** Each upload fetches from Omeka, loads the existing Hub rows, identifies columns that exist only on the Hub, and merges them back on `o:id`. That is what keeps embeddings and topics alive across a re-upload rather than blanking them.
 
-Post-processing scripts share a `--update-mode` flag: `empty` fills only missing values (the cheap default for incremental runs), `all` recomputes every row. **Changing a computation does nothing to published data until you re-run its script with `--update-mode all`** — a method change without a re-run silently leaves the old values in place.
+Post-processing scripts share a `--update-mode` flag: `empty` fills only missing values (the cheap default for incremental runs), `all` recomputes every row. **Changing code does nothing to published data until its stage is rerun.** Embedding and lemma stages now compare persisted input/configuration hashes even in incremental mode; legacy values without provenance are recomputed once. Other method changes can require `--update-mode all`; follow the [migration guide](docs/hardening-migration.md).
 
 ## Reproducibility
 
-For a publication, record the code commit, the dataset repository and full revision SHA, the exact command arguments, and the installed dependency and spaCy model versions. Archive the model artifacts and analysis outputs used for the paper. The dependency ranges in `requirements.txt` support maintenance; they are not a frozen research environment. See [the publication review](docs/publication-review.md) for remaining release work.
+For a publication, record the code commit, the dataset repository and full revision SHA, the exact command arguments, and the installed dependency and spaCy model versions. Archive the model artifacts and analysis outputs used for the paper. Use the hashed `requirements-lock.txt` for the tested research environment; dependency ranges support maintenance and have a separate CI leg. The spaCy model packages must also be retained at the versions recorded in run provenance. See the [migration guide](docs/hardening-migration.md) and [research validation protocol](docs/research-validation.md).
 
 Pin dataset reads to the revision used in the paper:
 
@@ -205,21 +205,27 @@ articles = load_dataset(
 )
 ```
 
-Topic models use a fixed seed (42), write their parameters to `training_parameters.json`, and record coherence metrics alongside the model. Omeka responses are cached atomically in `.cache_omk*` for 24 hours; cache keys include the API host and credential identity so staging/public responses cannot be confused with production/private ones. Lemma and embedding resume caches are fingerprinted by the configuration that produced them — spaCy model plus `LEMMA_LOGIC_VERSION`, embedding model plus dimension and task — and by the repository, so a cache written under a different configuration or for a scratch repo is ignored rather than silently mixed in. Each entry also carries a hash of the input it was computed from, so a row whose text changed before a resumed run is recomputed. These caches are deleted on a successful push, which means a leftover cache file is a reliable signal of an interrupted run.
+New LDA fits freeze their preprocessing and produce hash-verified immutable bundles. `lda_model_name` now contains `lda-sha256:<digest>`; topic IDs have meaning only within that identity. Holdout documents and duplicate/group peers are excluded before fitting phrases, vocabulary or the evaluation model. Prediction exports live in separate run directories, and saved theta rows require matching model identity and input hashes. Legacy mutable models need explicit exploratory opt-in or a new fit.
 
-Report-only analyses write `<script>.manifest.json` beside their outputs (and a timestamped copy under `analyses/output/runs/`): code SHA and dirty flag, dataset repository and revision, arguments, library versions, model inputs, and the SHA-256 of every output.
+Sentiment consensus is generation-specific and records its instrument fingerprint. Topic sentiment computes the selected panel from its raw annotations; ordinal medians and category shares are primary, with equal-spacing means explicit. Constant-label agreement is undefined rather than reported as perfect reliability. Topic trends are descriptive by default; optional inferential assumptions are recorded, and outlet-cluster bootstrap intervals condition on the observed archive and model.
+
+Resume caches use repository, input and configuration fingerprints. Text embedding requests use the Embedding 2 content/instruction contract, bounded batches and conservative byte-bounded chunks; image fingerprints cover the actual encoded bytes. Empty inputs clear obsolete results. Related-item search uses bounded similarity blocks rather than a full corpus-by-corpus matrix.
+
+Report runs archive **complete output bytes**, hashes, arguments, dataset revision, environment versions and code state under `analyses/output/runs/<run-id>/`. Latest filenames remain convenient pointers; earlier runs are retained. A dirty checkout records its tracked diff and names of untracked files, not their contents, so use a clean commit for a fully reconstructable publication run.
+
+The corpus-coverage, blinded-annotation, topic-review and reprint-candidate commands support empirical validation. They do not establish model accuracy or historical representativeness: those require expert reading, adjudication and sensitivity analysis. See [the protocol and command examples](docs/research-validation.md).
 
 `iwac-mirror --dataset private` creates the local `data/iwac_*.parquet` files (typed: nullable ints, booleans and embedding vectors survive; `--format csv` keeps the legacy export) from one pinned Hub revision. Files are staged first and `data/mirror_manifest.json` records the repository SHA, row counts, and SHA-256 hashes. Offline consumers verify that manifest and refuse an interrupted or mixed-revision mirror.
 
-CI compiles every module, rejects undefined names, runs the unit/contract/import-smoke suite with a 70% `iwac_common` coverage floor, executes `pip check`, and tests the supported Linux/Windows/Python matrix. Dependabot tracks both Python and GitHub Action updates, while pull requests receive GitHub's dependency review.
+CI compiles every module, rejects undefined names, tests the complete production tree with a 70% `iwac_common` coverage floor, checks dependency consistency, and exercises the supported Linux/Windows/Python matrix. It separately tests a clean wheel install and the latest supported dependency ranges. Dependabot tracks Python and GitHub Action updates, while pull requests receive GitHub's dependency review.
 
 ## Limitations and caveats
 
-**Public full text is incomplete.** Full text is masked per row by the access status of the source item, so analyses requiring that text cover a subset of the material. Treat access-related selection bias explicitly. The public projection retains the private mirror's rows and reviewed derived columns, allowing some analyses to include source-private items. Enrichment coverage still varies by subset, field, and processing run: new items and failed or inapplicable computations can have missing values. Report the usable row count for each analysis.
+**Public full text is incomplete.** Private parent items are omitted; restricted full text and source properties are masked in the remaining rows. Treat access-related selection bias explicitly. Reviewed derivatives can support some analyses of public items whose OCR is private, but do not recover omitted private parents. Enrichment coverage varies by subset, field, and processing run: new items and failed or inapplicable computations can have missing values. Report the usable row count for each analysis.
 
 **LLM sentiment is non-deterministic and opaque.** The same text sent twice may score differently — measurably so: re-annotating 1,485 articles with `deepseek-v4-flash-0731`, which the vendor runs at temperature 1.0, returned a different centrality for 19 of them. A re-run is a fresh reading, not a correction, and the models' reasoning cannot be traced. This is why sentiment runs as a model panel with a published agreement measure and per-model justification columns, rather than as a single score presented as ground truth. Treat disagreement as information about the item, not as noise to be averaged away.
 
-**Metrics keyed to a French or English lexicon mis-score the collection's own material.** Readability has no valid reading outside French: `Lisibilite_OCR` applies the French Flesch formula, so it is computed only for rows whose primary `language` is French and is null for every other row, the Ewé, Kabiyè, and Dendi items included — a metric that ranks correctly transcribed African-language sources as garbage is worse than no metric. MATTR (`Richesse_Lexicale_OCR`) carries no lexicon and is kept for every language, but its values are not comparable across languages.
+**Metrics keyed to a French or English lexicon mis-score the collection's own material.** Readability has no valid reading outside French: `Lisibilite_OCR` applies the French Flesch formula, so it is computed only for rows whose metadata specifies French alone and is null for every other row, the Ewé, Kabiyè, and Dendi items included — a metric that ranks correctly transcribed African-language sources as garbage is worse than no metric. MATTR (`Richesse_Lexicale_OCR`) carries no lexicon and is kept for every language, but its values are not comparable across languages.
 
 **The number of topics is pinned, not swept.** On the smaller subsets, C_v coherence cannot choose *k* — a three-seed sweep on `references` placed every *k* from 12 to 32 within 0.014 mean C_v while a single *k* varied by up to 0.035 across seeds, so successive re-fits each produced a confident-looking but different "best k". Because *k* defines what `lda_topic_id` means, an auto-sweep would renumber every topic on each re-fit. *k* is therefore fixed per language in `CONFIG_PRESETS` and judged by multi-seed stability and documents-per-topic instead.
 

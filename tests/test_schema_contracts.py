@@ -146,3 +146,30 @@ class TestStricterContracts:
             validate_ids(pd.DataFrame({"o:id": ["1", "  "]}))
         with pytest.raises(DataContractError, match="blank"):
             validate_dataset(Dataset(pa.table({"o:id": ["1", ""]})), "articles")
+def test_empty_privacy_and_provenance_columns_have_stable_arrow_types():
+    import pyarrow as pa
+    from datasets import Dataset
+    from iwac_common.schema import conform_dataset
+
+    ds = Dataset.from_dict({
+        "o:id": ["1"], "item_is_public": [True], "private_fields": [[]],
+        "embedding_OCR_input_hash": [None], "embedding_OCR_config_hash": [None],
+    })
+    actual = conform_dataset(ds, "articles").with_format("arrow")[:].schema
+    assert actual.field("private_fields").type == pa.list_(pa.string())
+    assert actual.field("item_is_public").type == pa.bool_()
+    assert actual.field("embedding_OCR_input_hash").type == pa.string()
+    assert actual.field("embedding_OCR_config_hash").type == pa.string()
+
+
+@pytest.mark.parametrize("column,value", [
+    ("item_is_public", 2), ("item_is_public", "true"),
+    ("private_fields", [42]), ("embedding_OCR_input_hash", 123),
+])
+def test_invalid_visibility_evidence_cannot_be_coerced(column, value):
+    from datasets import Dataset
+    from iwac_common.schema import conform_dataset
+
+    ds = Dataset.from_dict({"o:id": ["1"], column: [value]})
+    with pytest.raises(DataContractError, match="refusing to coerce"):
+        conform_dataset(ds, "articles")

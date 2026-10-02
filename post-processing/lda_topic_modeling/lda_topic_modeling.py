@@ -19,9 +19,12 @@ New columns added:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
+import tempfile
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -32,22 +35,17 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
-# Ensure package imports work when running this file directly
-CURRENT_DIR = Path(__file__).resolve().parent
-PARENT_DIR = CURRENT_DIR.parent
-if str(PARENT_DIR) not in sys.path:
-    sys.path.insert(0, str(PARENT_DIR))
-
-from _common import (  # type: ignore  # noqa: E402
+from iwac_pipeline.processing._common import (  # type: ignore  # noqa: E402
     PRIVATE_REPO_ID,
     choose_config,
     ensure_hf_token,
     get_available_configs,
     load_hub_dataset,
     push_dataset,
+    write_run_manifest,
 )
 
-from lda_topic_modeling.constants import (  # type: ignore
+from iwac_pipeline.processing.lda_topic_modeling.constants import (  # type: ignore
     CONFIG_PRESETS,
     DOMAIN_STOPWORDS,
     LDA_GEO_STOPWORDS,
@@ -68,7 +66,7 @@ from lda_topic_modeling.constants import (  # type: ignore
     DEFAULT_STABILITY_SEEDS,
     DEFAULT_HOLDOUT_FRACTION,
 )
-from lda_topic_modeling.modeling import (  # type: ignore
+from iwac_pipeline.processing.lda_topic_modeling.modeling import (  # type: ignore
     tokenize_documents,
     build_dictionary,
     build_corpus,
@@ -83,7 +81,14 @@ from lda_topic_modeling.modeling import (  # type: ignore
     save_model_parameters,
     get_topic_label,
     find_optimal_topics,
+    tokenize_for_prediction,
 )
+from iwac_pipeline.processing.lda_topic_modeling.artifacts import (  # noqa: E402
+    frozen_preprocessing, load_preprocessing, prediction_tokenizer_kwargs,
+    publish_bundle, resolve_bundle, split_document_indices, digest_file, text_fingerprint,
+    preprocessing_fingerprint, effective_model_identity,
+)
+from iwac_common.paths import workspace_root  # noqa: E402
 
 console = Console(force_terminal=True)
 
@@ -198,9 +203,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--holdout",
         type=float,
         default=DEFAULT_HOLDOUT_FRACTION,
-        help="Optimisation: fraction of docs held out to report per-k held-out "
+        help="Optimisation: fraction of independent document groups held out to report per-k held-out "
              "log-perplexity (the winning k retrains on ALL docs). 0 = off",
     )
+    p.add_argument("--holdout-group-column", default="o:id",
+                   help="Keep a document/reprint group together during evaluation; exact duplicates also stay together")
+    p.add_argument("--allow-legacy-preprocessing", action="store_true",
+                   help="Explicitly allow old models without fully frozen preprocessing")
+    p.add_argument("--include-unknown-language", action="store_true",
+                   help="Explicitly include rows whose language is missing (excluded by default)")
     p.add_argument(
         "--no-relevance-labels",
         action="store_true",
@@ -217,7 +228,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _export_theta(ds, theta_col, model_dir, model_name, num_topics, language, logger):
+def _export_theta(ds, theta_col, model_dir, model_name, num_topics, language, logger,
+                  source_revision=None, repo_id=None, config_name=None, preprocessing=None):
     """Write the full document-topic matrix (theta) for rows this pass
     computed to ``<model_dir>/doc_topics.parquet`` so downstream analyses read
     exact distributions without re-running inference. One float column per
@@ -227,10 +239,11 @@ def _export_theta(ds, theta_col, model_dir, model_name, num_topics, language, lo
     ids = ds["o:id"] if "o:id" in ds.column_names else list(range(len(ds)))
     thetas = ds[theta_col]
     rows = []
-    for oid, theta in zip(ids, thetas):
+    for oid, theta, source_text in zip(ids, thetas, ds["lemma_nostop"]):
         if theta is None:
             continue
-        row = {"o:id": str(oid), "lda_model_name": model_name}
+        row = {"o:id": str(oid), "lda_model_name": model_name,
+               "text_sha256": text_fingerprint(source_text)}
         for k in range(num_topics):
             row[f"topic_{k}"] = float(theta[k]) if k < len(theta) else 0.0
         rows.append(row)
@@ -239,16 +252,53 @@ def _export_theta(ds, theta_col, model_dir, model_name, num_topics, language, lo
         return
     out_path = model_dir / "doc_topics.parquet"
     df = pd.DataFrame(rows)
-    # Compose with an existing export from another language pass, if present.
-    if out_path.exists():
-        try:
-            prev = pd.read_parquet(out_path)
-            prev = prev[~prev["o:id"].isin(set(df["o:id"]))]
-            df = pd.concat([prev, df], ignore_index=True)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Could not merge with existing {out_path.name}: {e}")
     df.to_parquet(out_path, index=False)
+    (model_dir / "doc_topics.metadata.json").write_text(json.dumps({
+        "model_id": model_name, "source_revision": source_revision,
+        "repo_id": repo_id, "config_name": config_name,
+        "language": language, "num_topics": num_topics,
+        "sha256": digest_file(out_path),
+        "preprocessing_sha256": preprocessing_fingerprint(preprocessing) if preprocessing is not None else None,
+    }, indent=2) + "\n", encoding="utf-8")
     logger.info(f"Exported document-topic matrix: {out_path} ({len(rows)} docs this pass)")
+
+
+def prepare_training_corpus(texts, preprocessing, no_below, no_above):
+    """Fit phrase/vocabulary transforms solely on the supplied training texts."""
+    tokenizer = prediction_tokenizer_kwargs(preprocessing)
+    tokenized, phraser = tokenize_documents(
+        texts, **tokenizer,
+        detect_phrases=preprocessing["detect_phrases"],
+        phrase_min_count=preprocessing["phrase_min_count"],
+        phrase_threshold=preprocessing["phrase_threshold"],
+    )
+    chunks = preprocessing["chunk_words"]
+    tokenized = [part for doc in tokenized
+                 for part in (chunk_tokens(doc, chunks) if chunks else [doc]) if part]
+    if not tokenized:
+        raise ValueError("No valid training tokens")
+    dictionary = build_dictionary(tokenized, no_below=no_below, no_above=no_above)
+    if not len(dictionary):
+        raise ValueError("Dictionary is empty after frequency filtering")
+    return tokenized, phraser, dictionary, build_corpus(dictionary, tokenized)
+
+
+def prepare_evaluation(texts, groups, preprocessing, no_below, no_above, holdout):
+    """Group split precedes every fitted transform; holdout only gets transform()."""
+    train_idx, held_idx = split_document_indices(texts, groups, holdout)
+    tokenized, phraser, dictionary, corpus = prepare_training_corpus(
+        [texts[i] for i in train_idx], preprocessing, no_below, no_above,
+    )
+    held_tokens = [tokenize_for_prediction(
+        texts[i], phraser=phraser, **prediction_tokenizer_kwargs(preprocessing)
+    ) for i in held_idx]
+    chunks = preprocessing["chunk_words"]
+    held_tokens = [part for doc in held_tokens
+                   for part in (chunk_tokens(doc, chunks) if chunks else [doc]) if part]
+    held_corpus = [bow for bow in build_corpus(dictionary, held_tokens) if bow]
+    if held_idx and not held_corpus:
+        raise ValueError("Held-out documents contain no training-vocabulary tokens")
+    return corpus, dictionary, tokenized, held_corpus, train_idx, held_idx
 
 
 # ── Main ────────────────────────────────────────────────────────────
@@ -260,6 +310,10 @@ def main() -> int:
     logger = logging.getLogger(__name__)
 
     args = build_arg_parser().parse_args()
+    if not 0 <= args.holdout < 1:
+        raise SystemExit("--holdout must be in [0, 1)")
+    if args.chunk_words is not None and args.chunk_words <= 0:
+        raise SystemExit("--chunk-words must be positive")
 
     repo_id: str = args.repo
     text_column = "lemma_nostop"
@@ -299,10 +353,31 @@ def main() -> int:
     # notably model_path, which otherwise defaults to the other language's
     # model and overwrites it.
     preset = {**preset, **preset.get("language_overrides", {}).get(language, {})}
-    model_dir = Path(args.model_path or preset.get("model_path", "lda_model"))
+    model_root = Path(args.model_path) if args.model_path else workspace_root() / preset.get("model_path", "lda_model")
+    model_dir = model_root
+    if mode == "fit" and (model_root / "bundle.json").exists():
+        raise ValueError("Fit requires a model root, not an immutable bundle directory")
     chunk_words: int | None = (
         args.chunk_words if args.chunk_words is not None else preset.get("chunk_words")
     )
+    saved_prediction_settings = None
+    if mode == "predict":
+        model_dir, model_id = resolve_bundle(model_root)
+        saved_prediction_settings = load_preprocessing(
+            model_dir, allow_legacy=args.allow_legacy_preprocessing,
+        )
+        saved_preprocessing, saved_params = saved_prediction_settings
+        model_id = effective_model_identity(model_id, saved_preprocessing)
+        if args.domain_stopwords_file:
+            raise ValueError("Predict mode uses frozen stopwords; refit to change preprocessing")
+        if args.language is not None and args.language != saved_preprocessing["language"]:
+            raise ValueError("--language does not match the trained model")
+        if args.chunk_words is not None and args.chunk_words != saved_preprocessing["chunk_words"]:
+            raise ValueError("--chunk-words does not match the trained model")
+        if args.no_relevance_labels and saved_params.get("lda", {}).get("label_lambda_relevance") is not None:
+            raise ValueError("Predict mode uses frozen labels; refit to change label settings")
+        language = saved_preprocessing["language"]
+        chunk_words = saved_preprocessing["chunk_words"]
     p_range = preset.get("topic_range")
     range_start = args.topic_range_start if args.topic_range_start is not None else (p_range[0] if p_range else DEFAULT_TOPIC_RANGE_START)
     range_end = args.topic_range_end if args.topic_range_end is not None else (p_range[1] if p_range else DEFAULT_TOPIC_RANGE_END)
@@ -335,11 +410,15 @@ def main() -> int:
         lang_count = sum(1 for l in langs if l == language)
         other_count = sum(1 for l in langs if l and l != language)
         logger.info(f"{language}: {lang_count} | Other: {other_count} | Total: {len(ds)}")
-        if lang_count == 0:
+        unknown_count = sum(1 for lang in langs if lang is None or not str(lang).strip())
+        if lang_count == 0 and not (args.include_unknown_language and unknown_count):
             logger.error(f"No '{language}' documents found.")
             return 1
     else:
-        logger.warning("No 'language' column — all texts will be processed.")
+        if not args.include_unknown_language:
+            logger.error("No language column; use --include-unknown-language to include unclassified texts explicitly.")
+            return 1
+        logger.warning("No 'language' column — explicitly including unclassified texts.")
 
     if text_column not in ds.column_names:
         logger.error(f"Column '{text_column}' not found. Available: {ds.column_names}")
@@ -378,104 +457,66 @@ def main() -> int:
     lda_model = None
     dictionary = None
     phraser = None
+    topic_labels = None
+    preprocessing = frozen_preprocessing(stopwords, language, chunk_words)
 
     if mode == "fit":
         # Extract training texts in the target language
         logger.info(f"Extracting '{language}' texts from lemma_nostop...")
-        if "language" in ds.column_names:
-            docs = [
-                str(t)
-                for t, lang in zip(ds[text_column], ds["language"])
-                if lang == language
-                and t
-                and str(t).strip()
-                and len(str(t).split()) >= args.min_train_tokens
-            ]
-        else:
-            docs = [str(t) for t in ds[text_column] if t and str(t).strip()]
+        if args.holdout_group_column not in ds.column_names:
+            raise ValueError(f"Missing holdout group column: {args.holdout_group_column}")
+        records = [
+            r for r in ds
+            if (r.get("language") == language or (args.include_unknown_language and not str(r.get("language") or "").strip()))
+            and r.get(text_column) and str(r[text_column]).strip()
+            and len(str(r[text_column]).split()) >= args.min_train_tokens
+        ]
+        docs = [str(r[text_column]) for r in records]
         logger.info(f"{language} docs for training: {len(docs)}")
 
         if args.max_documents and len(docs) > args.max_documents:
             logger.info(f"Limiting to {args.max_documents} docs")
             docs = docs[: args.max_documents]
+            records = records[: args.max_documents]
 
-        # Tokenize (with bigram/trigram phrase detection)
-        logger.info("Tokenizing (with phrase detection)...")
-        tokenized, phraser = tokenize_documents(docs, stopwords=stopwords)
-        valid = [(d, t) for d, t in zip(docs, tokenized) if t]
-        if not valid:
-            logger.error("No valid tokenized documents.")
-            return 1
-        docs_valid = [d for d, _ in valid]
-        tokenized_valid = [t for _, t in valid]
-        logger.info(f"Valid tokenized docs: {len(tokenized_valid)}")
-
-        # Long-document subsets train on fixed-size chunks: phrase
-        # detection above ran on whole documents, so phrase tokens
-        # survive the split intact.
-        if chunk_words:
-            tokenized_valid = [
-                chunk
-                for doc_tokens in tokenized_valid
-                for chunk in chunk_tokens(doc_tokens, chunk_words)
-                if chunk
-            ]
-            logger.info(
-                f"Chunking at {chunk_words} tokens: "
-                f"{len(valid)} documents -> {len(tokenized_valid)} training chunks"
-            )
-
-        # Dictionary + corpus
-        logger.info("Building dictionary and corpus...")
-        dictionary = build_dictionary(tokenized_valid, no_below=args.no_below, no_above=args.no_above)
-        logger.info(f"Dictionary: {len(dictionary)} terms")
-        corpus = build_corpus(dictionary, tokenized_valid)
-        # Corpus-wide word probabilities p(w) for relevance-weighted labels.
-        word_probs = compute_corpus_word_probs(dictionary, corpus)
-
-        # Optionally hold out a fraction of docs for held-out perplexity.
-        holdout_corpus = None
-        if args.holdout and args.holdout > 0.0:
-            rng = np.random.default_rng(42)
-            n = len(corpus)
-            n_hold = max(1, int(round(n * args.holdout)))
-            hold_idx = set(rng.choice(n, size=n_hold, replace=False).tolist())
-            holdout_corpus = [corpus[i] for i in range(n) if i in hold_idx]
-            logger.info(
-                f"Held-out evaluation: {len(holdout_corpus)}/{n} docs "
-                f"({args.holdout:.0%}); the winning k retrains on ALL docs."
-            )
-
-        # Optimise num_topics if requested (DH best practice)
-        num_topics = (
-            args.num_topics
-            if args.num_topics is not None
-            else preset.get("num_topics", DEFAULT_NUM_TOPICS)
-        )
+        if not docs:
+            raise ValueError("No eligible training documents")
+        num_topics = args.num_topics if args.num_topics is not None else preset.get("num_topics", DEFAULT_NUM_TOPICS)
         optimization_results = None
+        evaluation_split = None
         if optimize_topics:
-            logger.info(
-                "Running topic-number optimisation "
-                f"(sweep models at passes={args.sweep_passes}, iterations={args.sweep_iterations}, "
-                f"seeds={args.stability_seeds}; the winning k retrains at full settings)..."
+            groups = [r[args.holdout_group_column] for r in records]
+            if any(g is None or not str(g).strip() for g in groups):
+                raise ValueError("Holdout group values must be nonblank")
+            sweep_corpus, sweep_dictionary, sweep_tokens, held_corpus, train_idx, held_idx = prepare_evaluation(
+                docs, groups, preprocessing, args.no_below, args.no_above, args.holdout,
             )
-            best_k, optimization_results = find_optimal_topics(
-                corpus,
-                dictionary,
-                tokenized_valid,
-                topic_range_start=range_start,
-                topic_range_end=range_end,
-                topic_range_step=range_step,
-                sweep_passes=args.sweep_passes,
-                sweep_iterations=args.sweep_iterations,
-                chunksize=args.chunksize,
-                n_seeds=args.stability_seeds,
-                holdout_corpus=holdout_corpus,
+            evaluation_split = {
+                "group_column": args.holdout_group_column,
+                "train_document_ids": [str(records[i]["o:id"]) for i in train_idx],
+                "holdout_document_ids": [str(records[i]["o:id"]) for i in held_idx],
+                "heldout_nonempty_chunks": len(held_corpus),
+                "actual_document_fraction": len(held_idx) / len(docs),
+            }
+            num_topics, optimization_results = find_optimal_topics(
+                sweep_corpus, sweep_dictionary, sweep_tokens,
+                topic_range_start=range_start, topic_range_end=range_end,
+                topic_range_step=range_step, sweep_passes=args.sweep_passes,
+                sweep_iterations=args.sweep_iterations, chunksize=args.chunksize,
+                n_seeds=args.stability_seeds, holdout_corpus=held_corpus or None,
                 logger=logger,
             )
-            _display_optimization_results(optimization_results, best_k)
-            num_topics = best_k
-            logger.info(f"Using optimal num_topics={num_topics}")
+            _display_optimization_results(optimization_results, num_topics)
+        elif args.holdout:
+            logger.info("Held-out evaluation runs only with --optimize-topics; this pinned-k fit is descriptive.")
+
+        # Production fit is explicitly separate from the evaluation models.
+        tokenized_valid, phraser, dictionary, corpus = prepare_training_corpus(
+            docs, preprocessing, args.no_below, args.no_above,
+        )
+        logger.info(f"Dictionary: {len(dictionary)} terms")
+        # Corpus-wide word probabilities p(w) for relevance-weighted labels.
+        word_probs = compute_corpus_word_probs(dictionary, corpus)
 
         # Train
         lda_model = create_lda_model(
@@ -490,17 +531,21 @@ def main() -> int:
         )
 
         # Log top topics (relevance-weighted labels unless disabled)
-        logger.info("Top topics:")
-        for tid in range(min(10, lda_model.num_topics)):
-            label = get_topic_label(
+        topic_labels = {
+            tid: get_topic_label(
                 lda_model, tid, top_n=args.topic_label_words,
                 lambda_relevance=lambda_relevance, word_probs=word_probs,
-            )
-            logger.info(f"  Topic {tid}: {label}")
+            ) for tid in range(lda_model.num_topics)
+        }
+        logger.info("Top topics:")
+        for tid in range(min(10, lda_model.num_topics)):
+            logger.info(f"  Topic {tid}: {topic_labels[tid]}")
 
         # Save model (including phrasers for prediction). The dictionary's
         # collection frequencies (cfs) persist with it, so predict mode
         # recovers p(w) for relevance labels without the training corpus.
+        model_root.mkdir(parents=True, exist_ok=True)
+        model_dir = Path(tempfile.mkdtemp(prefix=".fit-", dir=model_root))
         save_lda_model(lda_model, dictionary, model_dir, logger, phraser=phraser)
 
         # Coherence
@@ -515,10 +560,15 @@ def main() -> int:
         # Save parameters
         extra_info: dict = {
             "config_name": config_name,
-            "num_training_docs": len(tokenized_valid),
+            "num_training_docs": len(docs),
+            "num_training_chunks": len(tokenized_valid),
             "dictionary_size": len(dictionary),
             "chunk_words": chunk_words,
             "language": language,
+            "repo_id": repo_id,
+            "source_revision": source_revision,
+            "training_document_ids": [str(r["o:id"]) for r in records],
+            "include_unknown_language": args.include_unknown_language,
         }
         if optimization_results is not None:
             extra_info["topic_optimization"] = {
@@ -546,14 +596,26 @@ def main() -> int:
             evaluation={
                 "sweep_n_seeds": args.stability_seeds,
                 "holdout_fraction": args.holdout,
+                "performed": bool(optimize_topics),
+                "split": evaluation_split,
             },
+            preprocessing=preprocessing,
+            topic_labels=topic_labels,
         )
+        model_dir, model_id = publish_bundle(model_dir, model_root)
+        logger.info(f"Immutable model bundle: {model_id} ({model_dir})")
         word_probs_for_predict = word_probs
     else:
         # Load existing model
         if not model_dir.exists():
             logger.error(f"Model directory not found: {model_dir}")
             return 1
+        preprocessing, saved_params = saved_prediction_settings
+        language = preprocessing["language"]
+        chunk_words = preprocessing["chunk_words"]
+        stopwords = set(preprocessing["stopwords"])
+        topic_labels = {int(k): v for k, v in saved_params.get("topic_labels", {}).items()} or None
+        lambda_relevance = saved_params.get("lda", {}).get("label_lambda_relevance")
         lda_model, dictionary, phraser = load_lda_model(model_dir, logger)
         # Recover p(w) from the dictionary's persisted collection frequencies
         # so predict labels match fit labels without the training corpus.
@@ -564,24 +626,6 @@ def main() -> int:
                 "pure top-probability labels for this run."
             )
             lambda_relevance = None
-
-        # A chunk-trained model must predict with the same chunking and
-        # language filter. The params file reflects how THIS model was
-        # trained, so it overrides the preset (but not explicit CLI flags).
-        params_path = model_dir / "training_parameters.json"
-        if params_path.exists():
-            try:
-                import json
-
-                saved_extra = json.loads(params_path.read_text(encoding="utf-8")).get("extra", {})
-                if args.chunk_words is None and saved_extra.get("chunk_words"):
-                    chunk_words = int(saved_extra["chunk_words"])
-                    logger.info(f"Using chunk_words={chunk_words} from training_parameters.json")
-                if args.language is None and saved_extra.get("language"):
-                    language = str(saved_extra["language"])
-                    logger.info(f"Using language={language} from training_parameters.json")
-            except Exception as e:
-                logger.warning(f"Could not read settings from {params_path}: {e}")
 
     # ── Predict on full dataset ─────────────────────────────────────
     logger.info("Predicting topics for all documents...")
@@ -618,10 +662,15 @@ def main() -> int:
             chunk_words=chunk_words,
             language=language,
             model_name_col=model_name_col,
-            model_name=model_dir.name,
+            model_name=model_id,
             theta_col=theta_col,
             lambda_relevance=lambda_relevance,
             word_probs=word_probs_for_predict,
+            min_token_length=preprocessing["min_token_length"],
+            custom_collocations=[tuple(c) for c in preprocessing["custom_collocations"]],
+            fragment_stopwords=set(preprocessing["fragment_stopwords"]),
+            topic_labels=topic_labels,
+            include_unknown_language=args.include_unknown_language,
         ),
         batched=True,
         batch_size=args.batch_size,
@@ -630,12 +679,16 @@ def main() -> int:
     )
 
     logger.info("Prediction complete.")
+    # Reports are mutable run products; model artifacts above remain sealed.
+    output_root = model_root.parent.parent if (model_root / "bundle.json").exists() else model_root
+    run_dir = output_root / "predictions" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    run_dir.mkdir(parents=True)
 
     # ── Export full document-topic matrix (theta) ───────────────────
     if theta_col is not None and theta_col in ds_processed.column_names:
         _export_theta(
-            ds_processed, theta_col, model_dir, model_dir.name,
-            lda_model.num_topics, language, logger,
+            ds_processed, theta_col, run_dir, model_id,
+            lda_model.num_topics, language, logger, source_revision, repo_id, config_name, preprocessing,
         )
         ds_processed = ds_processed.remove_columns([theta_col])
 
@@ -654,14 +707,7 @@ def main() -> int:
     # raised IndexError and killed the run just short of the push. The
     # predicate mirrors predict_batch, which also predicts rows with no
     # language value.
-    row_languages = (
-        ds_processed["language"]
-        if "language" in ds_processed.column_names
-        else [None] * len(topic_ids)
-    )
-    own_rows = [
-        i for i, lg in enumerate(row_languages) if lg is None or lg == language
-    ]
+    own_rows = [i for i, name in enumerate(ds_processed[model_name_col]) if name == model_id]
 
     valid_ids = [topic_ids[i] for i in own_rows if topic_ids[i] is not None]
     if valid_ids:
@@ -677,20 +723,28 @@ def main() -> int:
 
         counts = Counter(valid_ids)
         topics_path = export_topic_table(
-            lda_model, model_dir, model_name=model_dir.name, counts=counts,
+            lda_model, run_dir, model_name=model_id, counts=counts,
             top_n=args.topic_label_words, lambda_relevance=lambda_relevance,
             word_probs=word_probs_for_predict,
+            labels=topic_labels,
         )
         logger.info(f"Topic lookup table written to {topics_path}")
         logger.info("Top 10 most frequent topics:")
         for tid, count in counts.most_common(10):
-            label = get_topic_label(
+            label = topic_labels[tid] if topic_labels is not None else get_topic_label(
                 lda_model, tid, top_n=args.topic_label_words,
                 lambda_relevance=lambda_relevance, word_probs=word_probs_for_predict,
             )
             logger.info(f"  Topic {tid}: {label} ({count} docs)")
 
     # ── Reorder columns ────────────────────────────────────────────
+    write_run_manifest(
+        run_dir, script="lda_topic_modeling", repo_id=repo_id,
+        revision=source_revision, args=args,
+        inputs={"model_id": model_id, "model_dir": str(model_dir),
+                "preprocessing": preprocessing},
+        outputs=list(run_dir.glob("*.parquet")) + list(run_dir.glob("*.csv")) + list(run_dir.glob("*.metadata.json")),
+    )
     insert_after = "lemma_nostop"
     cols = list(ds_processed.column_names)
     if insert_after in cols:
@@ -786,12 +840,10 @@ def _display_coherence(metrics: dict) -> None:
 
     if "c_v" in metrics and "score" in metrics["c_v"]:
         cv = metrics["c_v"]["score"]
-        if cv >= 0.5:
-            console.print("[green]\u2713[/green] Good coherence (C_v >= 0.5)")
-        elif cv >= 0.4:
-            console.print("[yellow]i[/yellow] Acceptable coherence (C_v 0.4-0.5)")
-        else:
-            console.print("[yellow]\u26a0[/yellow] Low coherence (C_v < 0.4) — consider adjusting num_topics")
+        console.print(
+            f"[yellow]ℹ[/yellow] C_v={cv:.3f} is a corpus-dependent diagnostic; "
+            "review representative documents and seed/preprocessing sensitivity before interpreting topics."
+        )
 
 
 if __name__ == "__main__":

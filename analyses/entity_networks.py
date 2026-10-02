@@ -15,9 +15,9 @@ Entities are resolved by id: ``articles.subject_ids`` carries the linked
 authorities' ``o:id``, joined to ``index.o:id`` — two authorities sharing a
 title stay two nodes. Rows without ids (a Hub revision older than the ids
 columns) fall back to matching each ``subject`` value against ``index.Titre``
-exactly. Edge weight = number of co-occurring articles; edge ``pmi`` =
-pointwise mutual information over articles (association strength independent
-of raw frequency).
+exactly only when the title is unambiguous. Edge weight = number of co-occurring articles; edge ``pmi`` =
+pointwise mutual information over all filtered articles, including untagged
+rows. This describes catalogued co-occurrence, not real-world social ties.
 
 Outputs (analyses/output/, Gephi-ready):
 - entity_nodes.csv   Id (index o:id), Label, Type, articles_count, first_year, last_year
@@ -34,6 +34,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from collections import Counter, defaultdict
@@ -46,12 +47,21 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "post-processing"))
 
-from _common import (  # noqa: E402
-    PRIVATE_REPO_ID,
-    ensure_hf_token,
-    load_subset_dataframe,
-    write_run_manifest,
-)
+try:
+    from iwac_pipeline.processing._common import (  # noqa: E402
+        PRIVATE_REPO_ID,
+        ensure_hf_token,
+        load_subset_dataframe,
+        write_run_manifest,
+    )
+except ModuleNotFoundError:  # source scripts before editable installation
+    from _common import (  # noqa: E402
+        PRIVATE_REPO_ID,
+        ensure_hf_token,
+        load_subset_dataframe,
+        write_run_manifest,
+    )
+
 
 from rich import box  # noqa: E402
 from rich.console import Console  # noqa: E402
@@ -59,7 +69,9 @@ from rich.panel import Panel  # noqa: E402
 from rich.table import Table  # noqa: E402
 
 console = Console()
-OUTPUT_DIR = REPO_ROOT / "analyses" / "output"
+from iwac_common.paths import workspace_root
+
+OUTPUT_DIR = workspace_root() / "analyses" / "output"
 
 
 # ---------------------------------------------------------------------------
@@ -70,9 +82,40 @@ OUTPUT_DIR = REPO_ROOT / "analyses" / "output"
 def split_subjects(raw) -> Set[str]:
     """Deduplicated, stripped set of subjects from a pipe-separated field.
     Missing/NaN yields the empty set (a subject listed twice counts once)."""
-    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+    if raw is None or (not isinstance(raw, (list, tuple, set)) and pd.isna(raw)):
         return set()
     return {s.strip() for s in str(raw).split("|") if s.strip()}
+
+
+
+def normalize_authority_id(value) -> str:
+    """CSV numeric coercion must not turn the authority key 12 into '12.0'."""
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).strip()
+    try:
+        number = float(text)
+        if math.isfinite(number) and number.is_integer():
+            return str(int(number))
+    except ValueError:
+        pass
+    return text
+
+
+def authority_lookups(index: pd.DataFrame):
+    """Return ID maps and an unambiguous-only title fallback map."""
+    titles, kinds = {}, {}
+    for row in index.to_dict("records"):
+        oid = normalize_authority_id(row.get("o:id"))
+        title = row.get("Titre")
+        if not oid or pd.isna(title) or not str(title).strip():
+            continue
+        titles[oid] = str(title).strip()
+        kind = row.get("Type")
+        kinds[oid] = "" if pd.isna(kind) else str(kind).strip()
+    counts = Counter(titles.values())
+    by_title = {title: oid for oid, title in titles.items() if counts[title] == 1}
+    return titles, kinds, by_title
 
 
 def resolve_entities(
@@ -81,14 +124,14 @@ def resolve_entities(
     """``(entity ids, subject tokens considered)`` for one article.
 
     ``subject_ids`` wins when the row has it; otherwise each ``subject`` label
-    is matched to an index title (the first index row with that title, which is
-    how the title join always resolved homonyms).
+    is matched only to a unique index title. Ambiguous homonyms remain unmatched.
     """
-    ids = split_subjects(row.get("subject_ids"))
+    ids = {normalize_authority_id(i) for i in split_subjects(row.get("subject_ids"))}
     if ids:
         return {i for i in ids if i in id_to_title}, len(ids)
     labels = split_subjects(row.get("subject"))
-    return {title_to_id[t] for t in labels if t in title_to_id}, len(labels)
+    counts = Counter(id_to_title.values())
+    return {title_to_id[t] for t in labels if t in title_to_id and counts[t] == 1}, len(labels)
 
 
 def parse_year(pub_date) -> Optional[int]:
@@ -148,18 +191,7 @@ def main() -> None:
         columns=["o:id", "Titre", "Type"], console=console, revision=source_revision,
     )
 
-    # Authority lookups: o:id -> Titre / Type, and Titre -> first o:id.
-    id_to_title: Dict[str, str] = {}
-    entity_type: Dict[str, str] = {}
-    title_to_id: Dict[str, str] = {}
-    for r in index.to_dict("records"):
-        oid = str(r.get("o:id", "")).strip()
-        titre = str(r.get("Titre", "") or "").strip()
-        if not oid or not titre:
-            continue
-        id_to_title[oid] = titre
-        entity_type[oid] = str(r.get("Type", "") or "").strip()
-        title_to_id.setdefault(titre, oid)
+    id_to_title, entity_type, title_to_id = authority_lookups(index)
     console.print(f"[blue]→[/blue] Authority file: {len(id_to_title):,} entities")
 
     # Optional filters.
@@ -205,7 +237,8 @@ def main() -> None:
 
     # Nodes passing the frequency threshold.
     kept_nodes = {n for n, c in node_articles.items() if c >= args.min_node_count}
-    total_articles = max(1, matched_articles)
+    # PMI is conditional on all filtered corpus articles, including untagged rows.
+    total_articles = len(df)
 
     node_rows = []
     for n in sorted(kept_nodes):
@@ -216,7 +249,7 @@ def main() -> None:
             "first_year": min(yrs) if yrs else "",
             "last_year": max(yrs) if yrs else "",
         })
-    nodes_df = pd.DataFrame(node_rows)
+    nodes_df = pd.DataFrame(node_rows, columns=["Id", "Label", "Type", "articles_count", "first_year", "last_year"])
 
     # Edges among kept nodes passing the weight threshold.
     edge_rows = []
@@ -274,10 +307,17 @@ def main() -> None:
             )
         console.print(et)
 
+    summary_path = OUTPUT_DIR / "entity_networks_summary.json"
+    summary_path.write_text(json.dumps({
+        "n_articles": len(df), "n_with_matched_authorities": matched_articles,
+        "n_subject_tokens": total_subject_tokens, "n_matched_subject_tokens": matched_subject_tokens,
+        "pmi_denominator": "all filtered corpus articles",
+        "interpretation": "Subject-tag co-occurrence is conditional on corpus selection and cataloguing; it does not establish social ties. Ambiguous title fallbacks are excluded.",
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
     write_run_manifest(
         OUTPUT_DIR, script="entity_networks", repo_id=args.repo,
         revision=source_revision, args=args,
-        outputs=[OUTPUT_DIR / "entity_nodes.csv", OUTPUT_DIR / "entity_edges.csv"],
+        outputs=[OUTPUT_DIR / "entity_nodes.csv", OUTPUT_DIR / "entity_edges.csv", summary_path],
     )
     console.print(f"\n[green]✓[/green] Gephi-ready CSVs in [cyan]{OUTPUT_DIR}[/cyan]")
 

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import date
+from functools import lru_cache
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
@@ -160,6 +162,8 @@ def is_content_public(item: Dict[str, Any], field: str = "bibo:content") -> bool
     ``OCR_is_public`` column) to keep public full text public while
     stripping private full text.
     """
+    if item.get("o:is_public") is not True:
+        return False
     val = item.get(field)
     if not val:
         return False
@@ -172,6 +176,57 @@ def is_content_public(item: Dict[str, Any], field: str = "bibo:content") -> bool
         if isinstance(v, dict) and str(v.get("@value") or v.get("display_title") or "").strip()
     ]
     return bool(text_vals) and all(v.get("is_public") is True for v in text_vals)
+
+
+@lru_cache(maxsize=1)
+def _privacy_columns():
+    from .repos import load_public_columns
+
+    return load_public_columns()
+
+
+def visibility_metadata(item: Dict[str, Any], config_name: str) -> Dict[str, Any]:
+    """Carry source rights into the flat record without dropping private data.
+
+    Omeka's authenticated response includes values hidden from anonymous
+    readers. A joined column is restricted if any populated source value is
+    not explicitly public. This applies to prose, labels, IDs, coordinates,
+    dates and live annotation properties, not just OCR.
+    """
+    from .schema import SOURCE_FIELD_COLUMNS
+    from .sentiment_panel import DIMENSION_FIELDS, active_models
+
+    mapping = dict(SOURCE_FIELD_COLUMNS)
+    if config_name in ("articles", "publications", "audiovisual"):
+        mapping["dcterms:publisher"] += ("country",)
+    if config_name == "audiovisual":
+        mapping["dcterms:spatial"] += ("country",)
+        mapping["fabio:hasURL"] += ("source_type",)
+    if config_name == "articles":
+        for model in active_models():
+            for suffix, omeka_suffix in DIMENSION_FIELDS:
+                mapping[model.omeka_property(omeka_suffix)] = (model.column(suffix),)
+
+    present = _privacy_columns()[config_name]
+    private = set()
+    for source, columns in mapping.items():
+        raw = item.get(source)
+        if not raw:
+            continue
+        values = raw if isinstance(raw, list) else [raw]
+        populated = [v for v in values if not isinstance(v, dict) or any(
+            v.get(key) not in (None, "")
+            for key in ("@value", "display_title", "@id", "value_resource_id")
+        )]
+        if any(not isinstance(v, dict) or v.get("is_public") is not True
+               for v in populated):
+            private.update(set(columns) & present)
+    if item.get("_iwac_private_media"):
+        private.update({"PDF", "image_url", "thumbnail", "iiif_manifest"} & present)
+    return {
+        "item_is_public": item.get("o:is_public") is True,
+        "private_fields": sorted(private),
+    }
 
 
 def _values(item: Dict[str, Any], field: str) -> List[Dict[str, Any]]:
@@ -286,9 +341,12 @@ def _iso_date(text: str) -> Optional[Tuple[int, Optional[int], Optional[int]]]:
     year = int(match.group(1))
     month = int(match.group(2)) if match.group(2) else None
     day = int(match.group(3)) if match.group(3) else None
-    if month is not None and not 1 <= month <= 12:
-        return None
-    if day is not None and not 1 <= day <= 31:
+    try:
+        # Validate the actual Gregorian calendar, including leap years and
+        # year zero. Missing components use the first valid day solely for
+        # validation; returned precision remains unchanged.
+        date(year, month if month is not None else 1, day if day is not None else 1)
+    except ValueError:
         return None
     return year, month, day
 
@@ -404,6 +462,7 @@ __all__ = [
     "get_uri_value",
     "get_rights_label",
     "is_content_public",
+    "visibility_metadata",
     "get_media_ids",
     "to_int_or_none",
     "extract_added_date",

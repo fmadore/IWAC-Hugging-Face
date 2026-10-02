@@ -3,14 +3,13 @@
 Python pipeline that mirrors the **Islam West Africa Collection (IWAC)** from an
 Omeka S archive (https://islam.zmo.de/api) into Hugging Face datasets.
 
-## Load the `iwac-data` skill first
+## Canonical ingestion contract
 
-Before touching anything that reads, transforms, or pushes the dataset, load the
-**`iwac-data` skill**. It is the single source of truth for per-subset schemas,
-field mappings, Omeka resource classes, sentiment field shapes, the authority
-join, and the end-to-end Omeka → HF flow. Do not re-derive any of that here — and
-if the pipeline changes (new computed column, new subset, changed class ID),
-update the skill's `references/omeka-to-hf-mapping.md` to match.
+Before changing ingestion or publication, read `docs/ingest-contract.md`,
+`iwac_common/schema.py`, and `iwac_common/public_columns.json`. These checked-in
+files are the canonical mapping/privacy contract. If the external `iwac-data`
+skill is available, keep its mapping reference synchronized as supplementary
+documentation; the repository does not require access to that external skill.
 
 ## The two-repo split (read this before any push)
 
@@ -23,58 +22,28 @@ update the skill's `references/omeka-to-hf-mapping.md` to match.
   written **only** by `post-processing/publish_public.py`. Never write to it by
   any other route.
 
-The projection **masks full text per row**, it does not blanket-strip it.
-`OCR` / `lemma_text` / `lemma_nostop` survive for rows where `OCR_is_public` is
-true (the per-value `is_public` flag on `bibo:content`, emitted by every upload
-mapper via `is_content_public()`). Everything else — embeddings, LDA, sentiment
-and justifications, `descriptionAI`, metrics — is always projected.
+Publication removes private parent items, masks private source properties and
+OCR/reconstructive lemma text, and retains explicitly reviewed derivatives.
+Missing `item_is_public`, `private_fields`, or required `OCR_is_public` fails
+closed. A new public column needs an intentional rights review; do not silence
+an unknown-column guard. Private annotation dependencies also restrict their
+consensus. See `iwac_common/write_policy.py`.
 
-Two guards exist because a leak here is unrecoverable: `publish_public.py` aborts
-if a content subset lacks `OCR_is_public`, and aborts on any column missing from
-the per-subset allowlist in `iwac_common/public_columns.json`. If a new column is
-legitimate, add it to the allowlist deliberately — never silence the guard.
+Every Hub write uses `iwac_common.hub.push_dataset_verified` or the batch
+`push_datasets_verified`. Full-data mode verifies that the destination is
+private. Public mode independently validates projection policy. Parquet files
+and exact card metadata commit together under a server-side parent-SHA
+precondition, followed by revision-pinned schema/ID verification. Never call
+`Dataset.push_to_hub` from a script or bypass this gateway.
 
-The uploads have their own rails, and the same rule applies: an abort is
-information, not an obstacle. All of them **fail closed by default** — every
-override is opt-in, and every override preserves what it could not refresh
-rather than blanking it:
-
-- `hub_merge` refuses a frame under 95% of the Hub's row count
-  (`--force-shrink`). It also refuses to treat an unreadable Hub config as a
-  first run: a genuinely new config needs `--initialize`.
-- `fetch_items` *requires* the `Omeka-S-Total-Results` header and reconciles
-  against it exactly — a missing header or any count mismatch raises, where it
-  once only caught short reads.
-- **Any** media-lookup failure aborts (`--allow-media-failures`), not just a
-  mass one. The threshold was 20 %, which let a handful of transient failures
-  through — and those are exactly what blanks a good `PDF`/`thumbnail` while the
-  row count stays identical, so neither the shrink tripwire nor the count
-  reconciliation notices. With the override, `MediaFetchStats` tracks *which
-  fields of which item* failed and the merge carries those values forward from
-  the Hub.
-- **Any** mapper failure aborts (`--allow-map-failures`). With the override, the
-  affected items keep their complete existing Hub row instead of vanishing.
-- A changed source text is detected, not silently kept. Each upload compares
-  `OCR`/`tableOfContents`/`image_url`/`pub_date` with the Hub copy; rows whose
-  source changed have stale preserved columns (`schema.DERIVED_FROM`). They are
-  reported and recorded in `.iwac_state/stale_derived/` by default;
-  `--invalidate-derived` clears them so each stage's `missing` mode recomputes
-  exactly those rows. The comparison only works in the run that lands the
-  change — once pushed, the Hub text equals Omeka again — hence the worklist.
-
-If a media or mapper guard fires, fix connectivity first — a VPN or DNS change
-is the usual cause, and overriding is almost never right.
-
-**Every Hub write goes through `iwac_common/hub.py`.** `push_dataset_verified`
-is the only place allowed to call `push_to_hub`, and a test enforces that. It
-conforms the frame to the subset's declared types (`schema.SUBSETS[...]
-.int_columns` → nullable `int64`, embeddings → `list<float32>`; a fractional
-value in an int column fails the write), validates it, takes a machine-local repo lock, rejects a Hub revision
-that changed since the caller loaded its input (optimistic concurrency —
-`_iwac_source_revision` rides along through the post-processing transforms),
-pushes, repairs the card via `card_sync`, then verifies the published row ids.
-That last step reads only the `o:id` column from the parquet footers; if that
-fast path is unavailable it falls back to a full reload, never to skipping.
+Uploads require authenticated source access and exact count reconciliation.
+Mapper/media failures abort by default; explicit overrides preserve affected
+baseline data privately until a successful refresh. Changed inputs invalidate
+`schema.DERIVED_FROM` dependencies by default. `--preserve-derived` stages a
+durable queue before writing, and the next invalidating upload replays it.
+Only a verified successful invalidating write clears that queue. Resolve it
+before enrichment. References default to dropping absent source rows;
+`--stale-rows keep` retains their complete baseline record privately.
 
 ## DOIs: mint at release points, never on every update
 
@@ -110,10 +79,9 @@ DOI always resolves to the newest version. That is what the commented block in
 ## Non-obvious gotchas
 
 **Code changes never move data.** Editing a computation does nothing to the Hub
-until you re-run the script that owns that column, with `--update-mode all` —
-uniform across every script since the Tier D CLI unification, `lemmatize`
-included (its `--mode all|empty` still works but is the legacy alias). A method
-change without a re-run leaves the old values in place, silently.
+until its stage runs again. Embedding and lemma stages use persisted provenance
+to detect incompatible method/input changes in incremental mode; other stages
+may require `--update-mode all`. Follow `docs/hardening-migration.md`.
 
 **The Hijri converter is a compatibility contract, not an implementation
 detail.** `calculate_hijri_dates.py` uses `hijridate` (Umm al-Qura) because
@@ -128,17 +96,10 @@ re-file thousands of 1960s–90s items. Only 0.86 % of articles change lunar
 not. Not computed for `references`: an academic imprint date has no meaningful
 lunar reading.
 
-**Pushes to one repo must be sequential.** `push_to_hub` rewrites the whole
-config and the shared README metadata. Two scripts pushing concurrently — even to
-different subsets — will clobber each other's columns via lost update. Finish one
-before starting the next.
-
-This is now enforced rather than merely documented: `hub_write_lock` (in
-`.iwac_locks/`, or `IWAC_LOCK_DIR`) blocks a second local writer, and the
-revision precondition catches most remote lost updates. A lock left by a crashed
-process on this host is reclaimed automatically; one held by a live process, or
-written by another machine, still fails closed — wait for it rather than deleting
-the file. Enforcement is per-machine, so the operational rule stands.
+**Pushes to one repo should be sequential.** A machine-local lock prevents
+local overlap and the server-side parent commit precondition rejects remote
+conflicts. Restart from a fresh pinned baseline after a conflict. Never remove
+a live writer's lock to proceed.
 
 **LDA stopwords come in tiers, and the tier decides the outcome.** Which set a
 word goes in matters more than whether it is in one at all:
@@ -158,8 +119,8 @@ word goes in matters more than whether it is in one at all:
 - `ARTIFACT_LABEL_STOPWORDS` — vetoes a label word-by-word, so compounds from
   models trained before a fix stop surfacing pending a re-fit.
 
-Adding a modeling stopword only takes effect on `--mode fit`; `--mode predict`
-refreshes labels alone. Before adding one, check what it costs: a token absent
+Adding a modeling stopword only takes effect on `--mode fit`; prediction uses
+the bundle's frozen preprocessing. Before adding one, check what it costs: a token absent
 from the `articles` (press) dictionary but present in `references` is citation
 apparatus, which is how `oxford`/`indiana`/`press` were cleared and why
 `berlin` and `licence` were not.
@@ -167,8 +128,8 @@ apparatus, which is how `oxford`/`indiana`/`press` were cleared and why
 **Uploads merge rather than overwrite.** Each upload fetches from Omeka, loads
 the existing Hub rows, identifies columns present only on the Hub (the computed
 ones), and merges them back on `o:id`. That is what keeps embeddings and topics
-alive across an upload. `reference/` merges `how="outer"` — the others use
-`"left"`.
+alive across an upload. References also drop source-absent rows by default; explicit retention keeps
+the full historical row privately.
 
 **Import-smoke tests cannot catch undefined names** used inside `main()` or in a
 rarely-taken branch. CI runs `ruff check` for exactly that reason — F821 for the
@@ -201,19 +162,21 @@ not the method.
 .venv\Scripts\python script_name.py
 ```
 
-The editable install also exposes three console entry points, which are the
+Editable and wheel installs expose five console entry points, which are the
 preferred way to drive the pipeline:
 
 ```
 iwac-upload <subset>        # articles|publications|index|references|audiovisual|documents|images
 iwac-mirror --dataset private
 iwac-publish-public
+iwac-process <stage>
+iwac-analyze <analysis>
 ```
 
 `iwac-upload` forwards its remaining flags to the subset's own parser, so
 `iwac-upload articles --dry-run --no-cache` works. They are thin wrappers
-(`iwac_pipeline/cli.py`) that load the same scripts by path — there is no second
-code path to keep in step, but a moved or renamed script breaks them.
+(`iwac_pipeline/cli.py`) that import the same implementations as modules. Setuptools maps the
+historical directories to package names; keep both source and wheel routes tested.
 
 `iwac_common` and `country_mapper` are editable-installed (`pip install -e .
 --no-deps`), so they import from any working directory; scripts keep sys.path
@@ -267,7 +230,7 @@ English stopwords in French documents.
 keyed to a French or English lexicon will mis-score the Ewé, Kabiyè, and Dendi
 items. Score them as null rather than as low quality; a metric that ranks
 correctly-transcribed African-language sources as garbage is worse than no metric.
-`Lisibilite_OCR` (French Flesch) is therefore computed for primary-French rows
+`Lisibilite_OCR` (French Flesch) is therefore computed for monolingual French rows
 only and nulled everywhere else, in every update mode.
 
 **Join authorities on ids, not titles.** Content subsets carry `*_ids` beside
@@ -275,8 +238,9 @@ each linked-authority label column; the index frequency and `entity_networks`
 join them to `index.o:id` and fall back to the exact title only for rows
 without ids.
 
-**Topic modeling:** ~30 topics for ~12K documents; prioritise C_v coherence
-(≥ 0.5 is good); domain collocations are forced in `constants.py`.
+**Topic modeling:** preserve domain collocations in `constants.py`. Coherence
+is a diagnostic, not a validated quality threshold. Compare seed stability,
+source-linked expert interpretation, and sensitivity to corpus composition.
 
 **C_v cannot choose k on the small subsets — do not let it.** On `references`
 a 3-seed sweep put every k from 12 to 32 within 0.014 mean C_v while a single
@@ -292,3 +256,17 @@ as k rises where C_v does not. Re-check only if a corpus grows substantially.
 **Reproducibility:** fixed seed 42, parameters saved to `training_parameters.json`,
 coherence metrics recorded. Report-only analyses write to `analyses/output/`
 (gitignored) and never add Hub columns.
+
+## Hardening and research validation
+
+Read `docs/hardening-migration.md` before refreshing legacy outputs. LDA bundle
+identity, frozen preprocessing and theta input hashes define topic provenance.
+Holdout groups and exact duplicates must be separated before vocabulary or
+phrase fitting. Consensus is generation-specific; constant-label reliability
+is undefined. Trends are descriptive unless explicit assumptions are selected.
+
+Use `docs/research-validation.md` for coverage/cohort audits, blinded probability
+sampling, source-linked topic review and reprint calibration. Automated tests
+and model agreement do not supply human gold labels or establish historical
+representativeness. Report generation archives full outputs and environments;
+keep a clean code commit and the exact input revision for publication.

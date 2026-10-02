@@ -18,6 +18,7 @@ Two tokenizers with distinct purposes:
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import AbstractSet, List
 
 # Elided clitics that should be separated from the following word.
@@ -25,7 +26,7 @@ from typing import AbstractSet, List
 _ELISION_RE = re.compile(
     r"\b(?:qu|jusqu|lorsqu|puisqu|quoiqu|quelqu|[ldjmnstc])[’']", re.IGNORECASE
 )
-_WORD_RE = re.compile(r"\b\w+\b", re.UNICODE)
+TOKENIZER_VERSION = 2
 _APOSTROPHE_WORDS = {
     "aujourd'hui": "aujourdhui",
     "aujourd’hui": "aujourdhui",
@@ -50,7 +51,11 @@ def simple_tokenize(
     ]
 
 
-def tokenize_words(text: str) -> List[str]:
+def language_labels(value: object) -> list[str]:
+    return list(dict.fromkeys(part.strip() for part in str(value or "").split("|") if part.strip()))
+
+
+def tokenize_words(text: str, language: str = "Français") -> List[str]:
     """Tokenize raw (French) text into words, handling elision.
 
     ``l'islam`` → ``["islam"]``; ``qu'il`` → ``["il"]``;
@@ -59,11 +64,24 @@ def tokenize_words(text: str) -> List[str]:
     """
     if not text:
         return []
-    lowered = str(text).lower()
-    for src, repl in _APOSTROPHE_WORDS.items():
-        lowered = lowered.replace(src, repl)
-    lowered = _ELISION_RE.sub(" ", lowered)
-    return _WORD_RE.findall(lowered)
+    lowered = unicodedata.normalize("NFC", str(text)).lower()
+    if language in {"Français", "fr", "fra"}:
+        for src, repl in _APOSTROPHE_WORDS.items():
+            lowered = lowered.replace(src, repl)
+        lowered = _ELISION_RE.sub(" ", lowered)
+    # Python's \w excludes combining marks. Preserve them inside words (for
+    # Arabic and African-language orthographies) rather than splitting a word
+    # into several tokens at every vowel/tonal mark.
+    tokens, current = [], []
+    for char in lowered:
+        if char.isalnum() or char == "_" or (current and unicodedata.category(char).startswith("M")):
+            current.append(char)
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    return tokens
 
 
 def count_words(text: object) -> int:

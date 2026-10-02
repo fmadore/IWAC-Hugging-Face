@@ -60,28 +60,31 @@ def hub(monkeypatch):
 
     def _install(card_text: str, schema: pa.Schema, *, repair_writes=True):
         state["card"] = card_text
-        state["schema"] = schema
+        state["schema"] = card_sync._normalize_schema(schema)
 
         class FakeApi:
             def __init__(self, *a, **k):
                 pass
 
             def upload_file(self, *, path_or_fileobj, path_in_repo, repo_id,
-                            repo_type, commit_message):
+                            repo_type, commit_message, parent_commit):
                 text = path_or_fileobj.decode("utf-8")
                 state["uploads"].append(text)
                 if repair_writes:  # the Hub now serves what we wrote
                     state["card"] = text
+                from types import SimpleNamespace
+                return SimpleNamespace(oid="after")
 
         monkeypatch.setattr(card_sync, "HfApi", FakeApi)
         monkeypatch.setattr(
-            card_sync.DatasetCard, "load",
-            classmethod(lambda cls, *a, **k: DatasetCard(state["card"])),
+            card_sync, "_load_card",
+            lambda *a, **k: DatasetCard(state["card"]),
         )
         monkeypatch.setattr(
             card_sync, "_parquet_schema", lambda *a, **k: state["schema"]
         )
         monkeypatch.setattr(card_sync, "resolve_hf_token", lambda *a, **k: "tok")
+        monkeypatch.setattr(card_sync, "get_repo_revision", lambda *a, **k: "before")
         return state
 
     return _install
@@ -200,6 +203,7 @@ class TestFailureModes:
 
     def test_missing_parquet_raises(self, monkeypatch):
         monkeypatch.setattr(card_sync, "resolve_hf_token", lambda *a, **k: "tok")
+        monkeypatch.setattr(card_sync, "get_repo_revision", lambda *a, **k: "before")
 
         class EmptyFs:
             def __init__(self, *a, **k):
@@ -221,9 +225,10 @@ class TestWiredIntoSingleWriter:
 
         import iwac_common.hub as hub
 
-        src = inspect.getsource(hub.push_dataset_verified)
+        src = inspect.getsource(hub._verify_committed_dataset)
         assert "sync_card_features(" in src
-        assert "CardSchemaError" in src
+        assert "expected_schema=" in src
+        assert "revision=revision" in src
 
     def test_no_script_bypasses_verified_writer(self):
         from pathlib import Path
@@ -244,3 +249,50 @@ class TestWiredIntoSingleWriter:
             if ".push_to_hub(" in path.read_text(encoding="utf-8"):
                 offenders.append(str(path.relative_to(root)))
         assert offenders == []
+
+
+def test_same_names_different_scalar_type_are_repaired(hub):
+    state = hub(_card(articles_cols=["o:id", "nb_mots"]),
+                pa.schema([("o:id", pa.string()), ("nb_mots", pa.int64())]))
+    assert sync_card_features("repo", "articles") is False
+    entry = DatasetCard(state["card"]).data["dataset_info"][0]
+    assert entry["features"][1]["dtype"] == "int64"
+
+
+def test_same_names_different_nested_type_are_repaired(hub):
+    state = hub(_card(articles_cols=["o:id", "embedding_OCR"]),
+                pa.schema([("o:id", pa.string()), ("embedding_OCR", pa.list_(pa.float32()))]))
+    assert sync_card_features("repo", "articles") is False
+    assert len(state["uploads"]) == 1
+
+
+def test_expected_types_are_checked_even_if_names_match(hub):
+    hub(_card(articles_cols=["o:id", "nb_mots"]),
+        pa.schema([("o:id", pa.string()), ("nb_mots", pa.string())]))
+    with pytest.raises(CardSchemaError, match="schema differs"):
+        sync_card_features("repo", "articles", expected_schema=pa.schema([
+            ("o:id", pa.string()), ("nb_mots", pa.int64())]))
+
+
+def test_parquet_verification_reads_every_shard_at_pinned_revision(monkeypatch):
+    import io
+    import pyarrow.parquet as pq
+
+    bodies = {}
+    for name, values in (("one", [1]), ("two", ["changed type"])):
+        output = io.BytesIO()
+        pq.write_table(pa.table({"o:id": ["1"], "value": values}), output)
+        bodies[name] = output.getvalue()
+
+    class Files:
+        def __init__(self, **kwargs):
+            pass
+        def glob(self, pattern):
+            assert "repo@revision/articles" in pattern
+            return ["one", "two"]
+        def open(self, path, mode):
+            return io.BytesIO(bodies[path])
+
+    monkeypatch.setattr(card_sync, "HfFileSystem", Files)
+    with pytest.raises(CardSchemaError, match="Inconsistent"):
+        card_sync._parquet_schema("repo", "articles", "token", "revision")

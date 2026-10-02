@@ -1,0 +1,6 @@
+spacy>=3.8.16,<4
+textstat>=0.7.13,<0.8
+google-genai>=2.27.0,<3
+pillow>=12.3.0,<13
+# Calendar convention is a versioned method; see migration documentation.
+hijridate>=2.6.0,<3
