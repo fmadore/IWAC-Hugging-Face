@@ -8,6 +8,6 @@ tqdm>=4.70.1,<5
 pandas>=3.0.6,<4
 pyarrow>=25.0.1,<26
 datasets>=5.0.1,<6
-huggingface_hub[hf_xet]>=1.33.0,<2
+huggingface_hub[hf_xet]>=2.0.0,<3
 # The NumPy ABI and Python floor are deliberately bounded.
 numpy>=2.5.3,<2.6
