@@ -37,10 +37,14 @@ BENIN_NEWSPAPERS = [
 ]
 
 BURKINA_FASO_NEWSPAPERS = [
+    "Actualite.bf",
+    "ActuBurkina",
     "Agence d'Information du Burkina",
     "Al Mawadda",
     "An-Nasr Trimestriel",
     "An-Nasr Vendredi",
+    "Aujourd'hui au Faso",
+    "Burkimbia",
     "Burkina 24",
     "Burkina Info",
     "Carrefour africain",
@@ -64,6 +68,7 @@ BURKINA_FASO_NEWSPAPERS = [
     "Radio Oméga",
     "San Finna",
     "Sidwaya",
+    "Toute Info",
     "Wakat Séra",
 ]
 
