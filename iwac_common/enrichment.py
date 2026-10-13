@@ -11,7 +11,7 @@ import json
 from typing import Any, Mapping, Sequence
 
 PROVENANCE_OUTPUTS = (
-    "embedding_OCR", "embedding_tableOfContents", "embedding_image",
+    "embedding_OCR", "embedding_abstract", "embedding_tableOfContents", "embedding_image",
     "lemma_text", "Richesse_Lexicale_OCR", "Lisibilite_OCR",
 )
 PRIVATE_PROVENANCE_COLUMNS = frozenset(

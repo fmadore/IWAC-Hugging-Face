@@ -39,7 +39,7 @@ def shingles(text: str, size=3) -> set[tuple[str, ...]]:
 
 
 def reprint_candidates(df, *, embedding_column="embedding_OCR", text_column="OCR",
-                       min_cosine=0.93, min_jaccard=0.45, shingle_size=3, top_k=20,
+                       min_cosine=0.91, min_jaccard=0.45, shingle_size=3, top_k=20,
                        block_size=128, max_days=None, excerpt_chars=0, allow_unverified_embeddings=False):
     if not -1 <= min_cosine <= 1 or not 0 <= min_jaccard <= 1:
         raise ValueError("Similarity thresholds outside their valid ranges")
@@ -166,7 +166,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     add_input_args(parser, excerpts=True)
     parser.add_argument("--embedding-column", default="embedding_OCR")
-    parser.add_argument("--min-cosine", type=float, default=0.93)
+    # Recall-oriented prefilter for EmbeddingGemma 2 article vectors (iwac-analyze
+    # similarity-calibration, 2026-10): passes 97.6 % of held-out lexical duplicates.
+    parser.add_argument("--min-cosine", type=float, default=0.91)
     parser.add_argument("--min-jaccard", type=float, default=0.45)
     parser.add_argument("--shingle-size", type=int, default=3)
     parser.add_argument("--top-k", type=int, default=20)

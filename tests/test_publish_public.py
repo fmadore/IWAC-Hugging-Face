@@ -149,6 +149,18 @@ class TestLiveAllowlistFile:
                 assert c in allow[cfg], f"{c} missing from allowlist[{cfg}]"
             assert "OCR_is_public" in allow[cfg]
 
+    def test_repo_allowlist_covers_embedding_columns(self):
+        """A subset's schema embedding columns are reviewed derivatives: the
+        allowlist must carry them, or the first push after an embedding run
+        aborts publication."""
+        from iwac_common.repos import load_public_columns
+        from iwac_common.schema import SUBSETS
+
+        allow = load_public_columns()
+        for cfg, spec in SUBSETS.items():
+            for column in spec.embedding_columns or {}:
+                assert column in allow[cfg], f"{column} missing from allowlist[{cfg}]"
+
     def test_bilingual_summary_columns_are_paired(self):
         """`descriptionAI_en` must be allow-listed wherever `descriptionAI` is.
 

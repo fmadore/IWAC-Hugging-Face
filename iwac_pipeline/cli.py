@@ -38,6 +38,7 @@ ANALYSIS_MODULES = {
     "coverage": "iwac_pipeline.analyses.corpus_coverage",
     "annotation-review": "iwac_pipeline.analyses.annotation_review",
     "reprints": "iwac_pipeline.analyses.reprint_candidates",
+    "similarity-calibration": "iwac_pipeline.analyses.similarity_calibration",
     "topic-review": "iwac_pipeline.analyses.topic_review",
 }
 

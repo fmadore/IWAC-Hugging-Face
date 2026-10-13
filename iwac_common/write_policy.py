@@ -21,7 +21,7 @@ class PublicationPolicyError(ValueError):
 # claim that embeddings cannot reveal source information. Directly private
 # Omeka values (including AI summaries/justifications) always override this set.
 REVIEWED_DERIVED_COLUMNS = frozenset({
-    "embedding_OCR", "embedding_tableOfContents", "embedding_image",
+    "embedding_OCR", "embedding_abstract", "embedding_tableOfContents", "embedding_image",
     "nb_mots", "Richesse_Lexicale_OCR", "Lisibilite_OCR",
     "lda_topic_id", "lda_topic_prob", "lda_topic_label", "lda_topic_topk",
     "lda_model_name", "related_articles", "hijri_year", "hijri_month", "hijri_day",

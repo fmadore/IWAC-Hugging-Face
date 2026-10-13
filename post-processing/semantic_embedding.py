@@ -3,53 +3,53 @@
 semantic_embedding.py
 =====================
 
-Adds semantic embedding columns to Hugging Face dataset subsets using Google's
-gemini-embedding-2 model via the Gemini API for high-quality
-multilingual embeddings.
+Adds semantic embedding columns to Hugging Face dataset subsets with
+``google/embeddinggemma-2``, run locally (ONNX, fp32) at pinned revisions, so
+the vectors can be recomputed offline without an API key. See
+``_gemma_encoder.py`` for the model identity and its verification.
 
 Supported configurations:
 - **articles**: embeds the 'OCR' column → 'embedding_OCR'
 - **publications**: embeds the 'tableOfContents' column → 'embedding_tableOfContents'
   (rows without tableOfContents are left with empty embeddings)
+- **references**: embeds the 'abstract' column → 'embedding_abstract' (rows
+  without an abstract are left empty; full texts are book-length)
+- **documents**: embeds the 'OCR' column → 'embedding_OCR'
 
-Texts are split at whitespace into overlapping UTF-8-byte-bounded chunks;
-token-limit responses are split again adaptively. Chunk vectors are pooled
-with a length-weighted average. Documents use Embedding 2's task instructions
-and one Content object per independently embedded chunk.
+Texts are split at whitespace into overlapping UTF-8-byte-bounded chunks, each
+embedded as ``title: {title} | text: {chunk}`` (the model card's document
+prompt). Chunk vectors are pooled with a length-weighted average.
 
-Progress is checkpointed transactionally to SQLite in ``.cache_embeddings/``. The
-cache filename embeds the repository and a fingerprint of (model,
-dimensionality, task type), so a cache written under one embedding
-configuration — or for another repository — is never restored. Each entry
-also carries a hash of the row's text and chunking settings, so a row whose
-text changed since it was cached is embedded afresh. Only rows whose chunks
-ALL embedded successfully are cached — partially-embedded rows are retried on
-re-run.
+Interruption-safe: every chunk vector is written to a transactional SQLite
+cache in ``.cache_embeddings/`` as soon as its batch finishes, so an
+interrupted run loses at most one batch. Re-running the same command resumes,
+in either update mode: a local model at a pinned revision gives the same vector
+for the same input, so cached work is reused instead of discarded. The cache
+filename embeds the repository and a fingerprint of the configuration, and each
+entry carries a hash of its row's text, title and chunking, so a changed row is
+embedded afresh. ``--fresh-cache`` discards the cache explicitly.
 
 Usage
 -----
-    python post-processing/semantic_embedding.py [--config articles|publications]
+    python post-processing/semantic_embedding.py [--config articles|publications|references|documents]
 
 Example:
     python post-processing/semantic_embedding.py --config publications --dry-run
-    python post-processing/semantic_embedding.py --dimensionality 768
+    python post-processing/semantic_embedding.py --config articles --update-mode all
 
 Environment Variables
 ---------------------
-GOOGLE_API_KEY   API key for the Gemini API (or GEMINI_API_KEY).
 HF_TOKEN         Personal access token for the Hugging Face Hub.
 
 Dependencies
 ------------
-    pip install google-genai datasets huggingface_hub rich
+    pip install onnxruntime tokenizers datasets huggingface_hub rich
 """
 import argparse
-from importlib.metadata import version
 import logging
 import os
 import sys
 import time
-from pathlib import Path
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 # Make ``post-processing/_common.py`` and ``_embedding_utils.py`` importable.
@@ -75,14 +75,17 @@ from _embedding_utils import (  # noqa: E402
     repo_slug,
     save_cache,
 )
-from _gemini_client import (  # noqa: E402
-    call_with_retry,
-    restore_from_cache,
-    set_embedding_column,
-    validate_response,
+from _embedding_columns import set_embedding_column  # noqa: E402
+from _gemma_encoder import (  # noqa: E402
+    DIMENSION,
+    MODEL_ID,
+    MODEL_REVISION,
+    GemmaEncoder,
+    document_text,
+    model_settings,
+    runtime_versions,
+    token_batches,
 )
-from google import genai
-from google.genai import types
 
 # Load .env from project root
 load_dotenv(workspace_root() / ".env")
@@ -90,16 +93,16 @@ load_dotenv(workspace_root() / ".env")
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich.progress import (
+from rich.console import Console  # noqa: E402
+from rich.panel import Panel  # noqa: E402
+from rich.table import Table  # noqa: E402
+from rich.progress import (  # noqa: E402
     Progress, SpinnerColumn, TextColumn, BarColumn,
-    TaskProgressColumn, TimeElapsedColumn,
+    TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn,
 )
-from rich.logging import RichHandler
-from rich.prompt import Prompt
-from rich import box
+from rich.logging import RichHandler  # noqa: E402
+from rich.prompt import Prompt  # noqa: E402
+from rich import box  # noqa: E402
 
 console = Console()
 
@@ -112,34 +115,44 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Constants ---
-MODEL_NAME = "gemini-embedding-2"
 # Conservative byte-sized chunks avoid assuming a French chars/token ratio
-# for multilingual OCR. Token-overflow responses are split again on demand.
+# for multilingual OCR; 7,000 bytes stay far below the 8,192-token context.
 CHUNK_SIZE = 7_000
 CHUNK_OVERLAP = 400
 FORMAT_VERSION = 2
-DEFAULT_DIMENSIONALITY = 768
-# Wrap each document as Content: bare string lists aggregate into one vector.
-DEFAULT_BATCH_SIZE = 16
-# Retry ladder (MAX_RETRIES / BASE_RETRY_DELAY) is shared with the image
-# embedding script and lives in _gemini_client.call_with_retry.
+# Padded tokens per encoder call. ~16k keeps a CPU batch near one minute, which
+# bounds the work an interruption can lose; raise it on a GPU.
+DEFAULT_BATCH_TOKENS = 16_384
 CACHE_DIR = workspace_root() / ".cache_embeddings"
-CHECKPOINT_EVERY = 5  # save cache every N API batches
 
 # Per-config settings: (text_column, embedding_column, cache_stem).
-# The resume cache filename is "<stem>_<cache_fingerprint(model, dim, task)>.json.gz",
+# The resume cache filename is "<stem>_<repo>_<cache_fingerprint>_<config hash>.sqlite3",
 # so a cache written at one embedding configuration is never restored into a
 # run with different parameters.
 CONFIG_SETTINGS = {
     "articles": ("OCR", "embedding_OCR", "ocr_embeddings"),
     "publications": ("tableOfContents", "embedding_tableOfContents", "toc_embeddings"),
-    "references": ("OCR", "embedding_OCR", "references_ocr_embeddings"),
+    "references": ("abstract", "embedding_abstract", "references_abstract_embeddings"),
+    "documents": ("OCR", "embedding_OCR", "documents_ocr_embeddings"),
+}
+
+# Vector columns a subset no longer produces. The upload merge preserves every
+# Hub-only column, so a superseded vector would otherwise survive forever beside
+# its replacement; the run that writes the replacement removes it.
+RETIRED_COLUMNS = {
+    "references": ("embedding_OCR",),
 }
 
 
-# Cache + chunking + averaging helpers live in _embedding_utils. The
-# module-level CHUNK_SIZE / CHUNK_OVERLAP constants are still applied —
-# we wrap chunk_text() so call sites stay parameter-free.
+def drop_retired_columns(ds, config_name: str):
+    """Remove retired vectors and their provenance; return (dataset, dropped)."""
+    from iwac_common.enrichment import provenance_columns
+
+    dropped = []
+    for column in RETIRED_COLUMNS.get(config_name, ()):
+        dropped += [name for name in (column, *provenance_columns(column), f"{column}_config_json")
+                    if name in ds.column_names]
+    return (ds.remove_columns(dropped) if dropped else ds), dropped
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
@@ -163,6 +176,17 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
             break
         start = max(start + 1, end - min(overlap, (end - start) // 4))
     return chunks or [text]
+
+
+def chunk_key(row_id: Any, index: int) -> str:
+    """Resume-cache key of one chunk; its entry carries the row's input hash."""
+    return f"{row_id}#{index}"
+
+
+def load_encoder(args, token: str) -> GemmaEncoder:
+    """Separate so tests can substitute an offline encoder."""
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if args.device == "cuda" else ["CPUExecutionProvider"]
+    return GemmaEncoder(providers=providers, threads=args.threads, token=token)
 
 
 def choose_config() -> str:
@@ -196,7 +220,7 @@ def choose_update_mode() -> str:
     table.add_column("Mode", style="green")
     table.add_column("Description", style="white")
 
-    table.add_row("1", "missing", "Update only rows without embeddings (recommended)")
+    table.add_row("1", "missing", "Update only rows without compatible embeddings (recommended)")
     table.add_row("2", "all", "Recalculate all embeddings (may take longer)")
 
     console.print(table)
@@ -210,85 +234,9 @@ def choose_update_mode() -> str:
             raise SystemExit(0)
 
 
-def validate_existing_embeddings(
-    ds, embedding_col: str, expected_dim: int
-) -> None:
-    """Validate that existing embeddings are compatible with the target dimensionality."""
-    if embedding_col not in ds.column_names:
-        return
-
-    for emb in ds[embedding_col]:
-        if not is_empty_embedding(emb):
-            actual_dim = len(emb)
-            if actual_dim != expected_dim:
-                raise ValueError(
-                    f"Existing embeddings have dimension {actual_dim}, but target "
-                    f"dimensionality is {expected_dim}. "
-                    f"Use update mode 'all' to recompute all embeddings."
-                )
-            break
-
-
-def embed_texts_with_retry(
-    client: genai.Client,
-    texts: List[str],
-    task_type: str,
-    dimensionality: int,
-    titles: List[str] | None = None,
-) -> List[List[float]]:
-    """Call Gemini embed_content with the shared 429/backoff retry ladder."""
-    def _call() -> List[List[float]]:
-        response = client.models.embed_content(
-            model=MODEL_NAME,
-            contents=[types.Content(parts=[types.Part.from_text(text=format_embedding_text(
-                text, task_type, title
-            ))]) for text, title in zip(texts, titles or ["none"] * len(texts), strict=True)],
-            config=types.EmbedContentConfig(
-                output_dimensionality=dimensionality,
-            ),
-        )
-        # A short response, or a null vector inside it, is a FAILURE and has
-        # to raise: the caller fills its slots positionally, so anything it
-        # never receives stays None silently — no retry, no log line, and the
-        # row is written empty as though nothing had gone wrong.
-        return validate_response(response, len(texts), dimensionality)
-
-    try:
-        return call_with_retry(_call)
-    except Exception as exc:
-        message = str(exc).lower()
-        if getattr(exc, "code", None) != 400 or "token" not in message or not any(
-            word in message for word in ("exceed", "limit", "maximum", "too long")
-        ):
-            raise
-        # Keep one output per original chunk if the model rejects its size.
-        output = []
-        for text, title in zip(texts, titles or ["none"] * len(texts), strict=True):
-            if len(text) < 2:
-                raise
-            middle = len(text) // 2
-            boundary = text.rfind(" ", len(text) // 4, middle + 1)
-            middle = boundary if boundary > 0 else middle
-            pieces = [text[:middle], text[middle:]]
-            vectors = embed_texts_with_retry(client, pieces, task_type, dimensionality,
-                                             titles=[title, title])
-            output.append(average_embeddings(vectors, weights=[len(piece) for piece in pieces]))
-        return output
-
-
-def format_embedding_text(text: str, task_type: str, title: str = "none") -> str:
-    """Embedding 2 uses text instructions, never EmbedContentConfig.task_type."""
-    if task_type == "RETRIEVAL_DOCUMENT":
-        return f"title: {title or 'none'} | text: {text}"
-    prefixes = {"RETRIEVAL_QUERY": "search result", "SEMANTIC_SIMILARITY": "sentence similarity",
-                "CLASSIFICATION": "classification", "CLUSTERING": "clustering"}
-    return f"task: {prefixes[task_type]} | query: {text}"
-
-
 def display_config_panel(
     repo_id: str, config_name: str, text_column: str, embedding_column: str,
-    model_name: str, update_mode: str,
-    batch_size: int, dimensionality: int, task_type: str, dry_run: bool,
+    update_mode: str, batch_tokens: int, providers: List[str], dry_run: bool,
 ):
     """Display configuration in a Rich panel."""
     table = Table(show_header=False, box=box.SIMPLE)
@@ -299,14 +247,15 @@ def display_config_panel(
     table.add_row("Configuration", config_name)
     table.add_row("Source Column", text_column)
     table.add_row("Embedding Column", embedding_column)
-    table.add_row("Model", model_name)
-    table.add_row("Task Type", task_type)
-    table.add_row("Output Dimensionality", str(dimensionality))
-    table.add_row("API Batch Size", str(batch_size))
+    table.add_row("Model", f"{MODEL_ID}@{MODEL_REVISION[:12]}")
+    table.add_row("Runtime", f"onnxruntime fp32 ({', '.join(providers)})")
+    table.add_row("Output Dimensionality", str(DIMENSION))
+    table.add_row("Batch Budget", f"{batch_tokens:,} padded tokens")
     table.add_row("Update Mode", update_mode)
     table.add_row("Chunk Budget", f"{CHUNK_SIZE:,} UTF-8 bytes")
     table.add_row("Chunk Overlap", f"{CHUNK_OVERLAP:,} chars")
     table.add_row("Long Text Strategy", "chunk → embed each → average")
+    table.add_row("Checkpoint", "every batch (resume by re-running)")
     if dry_run:
         table.add_row("Dry Run", "[yellow]YES — no changes will be pushed[/yellow]")
 
@@ -334,35 +283,10 @@ def display_text_stats(texts: List[Any], column_name: str) -> int:
         table.add_row("Avg. text length", f"{avg_length:,.0f} characters")
         table.add_row("Max text length", f"{max_length:,} characters")
         if will_chunk > 0:
-            total_chunks = sum(len(chunk_text(str(t))) for t in non_empty_texts if len(str(t)) > CHUNK_SIZE)
-            table.add_row("Will be chunked", f"[yellow]{will_chunk}[/yellow] texts > {CHUNK_SIZE:,} chars ({total_chunks} total chunks)")
+            table.add_row("Will be chunked", f"[yellow]{will_chunk}[/yellow] texts > {CHUNK_SIZE:,} chars")
 
     console.print(table)
     return len(non_empty_texts)
-
-
-def display_embedding_stats(existing_embeddings: List[Any]) -> tuple[int, int]:
-    """Display statistics about existing embeddings and return (valid, missing) counts."""
-    valid_embeddings = 0
-    empty_embeddings = 0
-
-    for emb in existing_embeddings:
-        if is_empty_embedding(emb):
-            empty_embeddings += 1
-        else:
-            valid_embeddings += 1
-
-    table = Table(title="Existing Embeddings Statistics", box=box.ROUNDED)
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="green")
-
-    table.add_row("Valid embeddings", str(valid_embeddings))
-    table.add_row("Missing/empty embeddings", str(empty_embeddings))
-    percentage = (empty_embeddings / len(existing_embeddings) * 100) if existing_embeddings else 0
-    table.add_row("To be processed", f"{percentage:.1f}%")
-
-    console.print(table)
-    return valid_embeddings, empty_embeddings
 
 
 def text_fingerprint(text: Any, title: str = "none") -> str:
@@ -371,54 +295,16 @@ def text_fingerprint(text: Any, title: str = "none") -> str:
     return input_fingerprint(str(text or ""), title, CHUNK_SIZE, CHUNK_OVERLAP, FORMAT_VERSION)
 
 
-def _save_completed_to_cache(
-    cache: Dict[str, Any],
-    row_chunks: List[tuple[int, List[str]]],
-    flat_embeddings: List[Any],
-    row_ids: List[Any],
-    all_embeddings: List[Any],
-    cache_file: Path,
-    fingerprints: List[str],
-    state: Dict[str, int] | None = None,
-    processed_chunks: int | None = None,
-) -> None:
-    """Reassemble fully-completed chunk embeddings into row embeddings and save cache.
-
-    A row is assembled and cached ONLY when every one of its chunks has a
-    vector. Partially-embedded rows (some chunk vectors None because a batch
-    failed) are left untouched — caching them would freeze a permanently
-    truncated average. Chunk vectors are pooled with a length-weighted mean
-    so short tail chunks don't count as much as full-size ones.
-    """
-    state = state if state is not None else {}
-    flat_offset = state.get("offset", 0)
-    next_row = state.get("row", 0)
-    updated = {}
-    for position in range(next_row, len(row_chunks)):
-        row_idx, chunks = row_chunks[position]
-        if processed_chunks is not None and flat_offset + len(chunks) > processed_chunks:
-            break
-        chunk_embs = flat_embeddings[flat_offset:flat_offset + len(chunks)]
-        if cached_value(cache, row_ids[row_idx], fingerprints[row_idx]) is None and all(emb is not None for emb in chunk_embs):
-            averaged = average_embeddings(chunk_embs, weights=[len(c) for c in chunks])
-            all_embeddings[row_idx] = averaged
-            oid_str = str(row_ids[row_idx])
-            fingerprint = fingerprints[row_idx]
-            if cached_value(cache, oid_str, fingerprint) is None:
-                cache[oid_str] = make_entry(averaged, fingerprint)
-                updated[oid_str] = cache[oid_str]
-        flat_offset += len(chunks)
-        next_row += 1
-    state.update(offset=flat_offset, row=next_row)
-    if updated:
-        save_cache(updated if cache_file.suffix == ".sqlite3" else cache, cache_file)
-        logger.info(f"Checkpoint: saved {len(cache)} total embeddings to cache")
+def resume_hint(cache_file, config_name: str, update_mode: str) -> str:
+    return (f"Finished batches are saved in {cache_file}.\n"
+            f"Re-run the same command to resume:\n"
+            f"  iwac-process embeddings --config {config_name} --update-mode {update_mode}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Add semantic embedding column to a dataset subset using "
-                    "Google Gemini embeddings."
+        description="Add a semantic embedding column to a dataset subset using "
+                    f"{MODEL_ID}, run locally."
     )
     parser.add_argument(
         "--repo",
@@ -431,32 +317,23 @@ def main() -> int:
         help="Dataset configuration to process. If omitted, an interactive menu is shown.",
     )
     parser.add_argument(
-        "--dimensionality",
+        "--batch-tokens",
         type=int,
-        default=DEFAULT_DIMENSIONALITY,
-        help=f"Output embedding dimensionality (default: {DEFAULT_DIMENSIONALITY}). "
-             "Supported: 128-3072.",
+        default=DEFAULT_BATCH_TOKENS,
+        help=f"Padded tokens per encoder call (default: {DEFAULT_BATCH_TOKENS:,}). "
+             "Each finished batch is checkpointed.",
     )
     parser.add_argument(
-        "--task-type",
-        default="RETRIEVAL_DOCUMENT",
-        choices=[
-            "RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY", "SEMANTIC_SIMILARITY",
-            "CLASSIFICATION", "CLUSTERING",
-        ],
-        help="Embedding task type (default: RETRIEVAL_DOCUMENT).",
-    )
-    parser.add_argument(
-        "--batch-size",
+        "--threads",
         type=int,
-        default=DEFAULT_BATCH_SIZE,
-        help=f"Number of texts per Gemini API call (default: {DEFAULT_BATCH_SIZE}).",
+        default=None,
+        help="onnxruntime intra-op threads (default: onnxruntime's choice).",
     )
     parser.add_argument(
-        "--delay",
-        type=float,
-        default=0.5,
-        help="Delay in seconds between API calls to avoid rate limits (default: 0.5).",
+        "--device",
+        choices=["cpu", "cuda"],
+        default="cpu",
+        help="cuda requires the onnxruntime-gpu package instead of onnxruntime.",
     )
     parser.add_argument(
         "--max-shard-size",
@@ -466,7 +343,7 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Compute embeddings but do not push to Hub.",
+        help="Compute embeddings but do not push to Hub (the cache is kept for the real run).",
     )
     parser.add_argument(
         "--update-mode",
@@ -475,34 +352,33 @@ def main() -> int:
         help="Update only missing embeddings or recompute all (skips the interactive prompt).",
     )
     parser.add_argument(
+        "--fresh-cache",
+        action="store_true",
+        help="Discard this configuration's resume cache before starting.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume a crashed --update-mode all run from its cache instead of starting fresh.",
+        help=argparse.SUPPRESS,  # resuming is now the default; kept so old commands still parse
     )
     parser.add_argument(
         "--allow-partial",
         action="store_true",
-        help="Push even if Gemini chunks failed. By default the cache is kept "
+        help="Push even if some chunks failed. By default the cache is kept "
              "and the Hub is left untouched for a safe retry.",
     )
 
     args = parser.parse_args()
-    if args.batch_size < 1 or args.delay < 0:
-        parser.error("--batch-size must be positive and --delay nonnegative")
+    if args.batch_tokens < 1 or (args.threads is not None and args.threads < 1):
+        parser.error("--batch-tokens and --threads must be positive")
 
     repo_id = args.repo
-    dimensionality = args.dimensionality
-    task_type = args.task_type
     configuration_settings = {
-        "model": MODEL_NAME, "dimension": dimensionality, "task": task_type,
+        **model_settings(), "document_format": "title: {title} | text: {text}",
         "format_version": FORMAT_VERSION, "chunk_bytes": CHUNK_SIZE,
         "overlap_chars": CHUNK_OVERLAP, "pooling": "character-weighted-mean",
-        "google_genai": version("google-genai"),
     }
     configuration = config_fingerprint(configuration_settings)
-    batch_size = args.batch_size
-    delay = args.delay
-    max_shard_size = args.max_shard_size
     dry_run = args.dry_run
 
     # --- Configuration selection ---
@@ -515,56 +391,37 @@ def main() -> int:
     # Resolve per-config settings
     text_column, embedding_column, cache_stem = CONFIG_SETTINGS[config_name]
     expected_dimension = (SUBSETS[config_name].embedding_columns or {})[embedding_column]
-    if dimensionality != expected_dimension:
-        parser.error(
-            f"--dimensionality must be {expected_dimension} for the canonical "
-            f"{config_name}.{embedding_column} schema"
-        )
-    # Key the resume cache by (model, dimensionality, task type) so a cache
-    # written at one embedding configuration can never be restored into a run
-    # with different parameters. Old un-fingerprinted cache files (e.g.
-    # "ocr_embeddings.json.gz") are simply ignored (fresh start), not migrated.
-    # The repository is part of the name too: a scratch run and a production
-    # run must not share results for identical o:id values. Entries inside
-    # carry a hash of their input text (see text_fingerprint).
+    if DIMENSION != expected_dimension:
+        parser.error(f"{MODEL_ID} produces {DIMENSION} dims; schema expects {expected_dimension}")
+    # The repository is part of the name: a scratch run and a production run
+    # must not share results for identical o:id values. Entries inside carry a
+    # hash of their row's input (see text_fingerprint).
     cache_file = CACHE_DIR / (
         f"{cache_stem}_{repo_slug(repo_id)}_"
-        f"{cache_fingerprint(MODEL_NAME, dimensionality, task_type)}_{configuration[:16]}.sqlite3"
+        f"{cache_fingerprint(MODEL_ID, DIMENSION, 'document')}_{configuration[:16]}.sqlite3"
     )
+    if args.fresh_cache and cache_file.exists():
+        cache_file.unlink()
+        console.print("[yellow]ℹ[/yellow] --fresh-cache: deleted the existing resume cache.")
 
     # --- Step 1: Authentication ---
     console.print("\n[bold cyan]Step 1:[/bold cyan] Authenticating...")
-
-    # Gemini API key
-    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        console.print("[red]✗[/red] GOOGLE_API_KEY (or GEMINI_API_KEY) not found in environment.")
-        return 1
-    console.print("[green]✓[/green] Gemini API key found.")
-
-    # Hugging Face token
     try:
         hf_token = ensure_hf_token(console=console)
     except SystemExit:
         return 1
     console.print("[green]✓[/green] Hugging Face authenticated.")
 
-    # --- Step 2: Initialize Gemini client ---
-    console.print("\n[bold cyan]Step 2:[/bold cyan] Initializing Gemini client...")
+    # --- Step 2: Load the encoder ---
+    console.print(f"\n[bold cyan]Step 2:[/bold cyan] Loading {MODEL_ID} (first run downloads ~1.1 GB)...")
     try:
-        client = genai.Client(api_key=api_key)
-        # Test the connection with a tiny embedding
-        test_response = client.models.embed_content(
-            model=MODEL_NAME,
-            contents=["test"],
-            config=types.EmbedContentConfig(output_dimensionality=dimensionality),
-        )
-        validate_response(test_response, 1, dimensionality)
-        actual_dim = dimensionality
-        console.print(f"[green]✓[/green] Gemini client ready. Model: [cyan]{MODEL_NAME}[/cyan]")
-        console.print(f"[blue]→[/blue] Output dimensionality: [cyan]{actual_dim}[/cyan]")
+        encoder = load_encoder(args, hf_token)
+        encoder.encode([document_text("test")])  # readiness probe; validates the output
+        versions = runtime_versions()
+        console.print(f"[green]✓[/green] Encoder ready on {', '.join(encoder.providers)} "
+                      f"(onnxruntime {versions['onnxruntime']}, tokenizers {versions['tokenizers']})")
     except Exception as e:
-        console.print(f"[red]✗[/red] Failed to initialize Gemini client: {e}")
+        console.print(f"[red]✗[/red] Failed to load the encoder: {e}")
         return 1
 
     # --- Update mode selection ---
@@ -574,24 +431,13 @@ def main() -> int:
         update_mode = choose_update_mode()
     console.print(f"[green]✓[/green] Update mode: [cyan]{update_mode}[/cyan]")
 
-    # 'all' means recompute everything: start from a fresh cache unless the
-    # user explicitly resumes a crashed run. 'missing' always reuses the cache.
-    if update_mode == "all" and cache_file.exists():
-        if args.resume:
-            console.print("[yellow]ℹ[/yellow] --resume: reusing the existing cache for this 'all' run.")
-        else:
-            cache_file.unlink()
-            console.print(
-                "[yellow]ℹ[/yellow] Update mode 'all': deleted existing resume cache "
-                "(pass --resume to reuse a crashed run's cache)."
-            )
-
     # --- Display configuration ---
     console.print()
-    display_config_panel(repo_id, config_name, text_column, embedding_column, MODEL_NAME, update_mode, batch_size, dimensionality, task_type, dry_run)
+    display_config_panel(repo_id, config_name, text_column, embedding_column, update_mode,
+                         args.batch_tokens, encoder.providers, dry_run)
 
     # --- Step 3: Load dataset ---
-    console.print(f"\n[bold cyan]Step 3:[/bold cyan] Loading dataset...")
+    console.print("\n[bold cyan]Step 3:[/bold cyan] Loading dataset...")
     ds = load_hub_dataset(repo_id, config_name, token=hf_token, console=console)
     source_revision = getattr(ds, "_iwac_source_revision", None)
 
@@ -602,24 +448,23 @@ def main() -> int:
         return 1
 
     # Provenance below establishes compatibility; legacy vectors are recomputed.
-
     if embedding_column in ds.column_names:
         if update_mode == "all":
             console.print(f"[yellow]⚠[/yellow] Embedding column '{embedding_column}' exists and will be overwritten.")
         else:
-            console.print(f"[yellow]ℹ[/yellow] Embedding column '{embedding_column}' exists. Only missing values will be computed.")
+            console.print(f"[yellow]ℹ[/yellow] Embedding column '{embedding_column}' exists. "
+                          "Rows without compatible provenance will be computed.")
     else:
         console.print(f"[blue]→[/blue] Embedding column '{embedding_column}' will be created.")
 
     # --- Step 4: Analyze source data ---
-    console.print(f"\n[bold cyan]Step 4:[/bold cyan] Analyzing source data...")
+    console.print("\n[bold cyan]Step 4:[/bold cyan] Analyzing source data...")
     texts = ds[text_column]
     display_text_stats(texts, text_column)
 
-    # --- Load embedding cache ---
     cache = load_cache(cache_file)
     if cache:
-        console.print(f"[green]✓[/green] Resuming with [cyan]{len(cache)}[/cyan] cached embeddings")
+        console.print(f"[green]✓[/green] Resume cache holds [cyan]{len(cache)}[/cyan] chunk vectors")
 
     # --- Identify rows to process ---
     # Use [] instead of None for missing embeddings so PyArrow infers a consistent list<float> type
@@ -634,156 +479,116 @@ def main() -> int:
         and not is_empty_embedding(emb) else []
         for emb, ok, text in zip(existing_embeddings, compatible, texts, strict=True)
     ]
-    cache_hits = restore_from_cache(all_embeddings, row_ids, cache, fingerprints)
+    indices_to_process = [
+        i for i, (text, emb) in enumerate(zip(texts, all_embeddings))
+        if text is not None and str(text).strip() and is_empty_embedding(emb)
+    ]
 
-    if cache_hits > 0:
-        console.print(f"[green]✓[/green] Restored [cyan]{cache_hits}[/cyan] embeddings from cache")
+    # Every chunk of every row to process; those already in the cache for the
+    # row's current input are reused, the rest are queued.
+    row_chunks: Dict[int, List[str]] = {i: chunk_text(str(texts[i])) for i in indices_to_process}
+    chunk_vectors: Dict[tuple[int, int], Any] = {}
+    queue: List[tuple[int, int]] = []
+    for i, chunks in row_chunks.items():
+        for c in range(len(chunks)):
+            vector = cached_value(cache, chunk_key(row_ids[i], c), fingerprints[i])
+            if vector is None:
+                queue.append((i, c))
+            else:
+                chunk_vectors[(i, c)] = vector
+    cache.clear()  # vectors needed are now in chunk_vectors
 
-    # Determine which rows still need embedding
-    error_counter = {"failed": 0, "chunked": 0, "total_chunks": 0}
-    indices_to_process = []
-    for i, (text, emb) in enumerate(zip(texts, all_embeddings)):
-        if update_mode == "all":
-            if text is not None and str(text).strip():
-                # In 'all' mode, skip only if already in cache (this run's
-                # checkpoints, or a crashed run's cache kept via --resume)
-                if cached_value(cache, row_ids[i], fingerprints[i]) is None:
-                    indices_to_process.append(i)
-        elif update_mode == "missing":
-            if is_empty_embedding(emb) and text is not None and str(text).strip():
-                indices_to_process.append(i)
-
+    failed = 0
     if not indices_to_process:
         console.print(Panel(
             "[green]No rows to process![/green]\n\n"
-            "All embeddings are computed (including cached results).\n"
-            "Proceeding to update dataset and push.",
-            title="Cache Complete",
+            "Every row has a compatible embedding. Proceeding to update dataset and push.",
+            title="Up to Date",
             border_style="green",
         ))
     else:
-        console.print(f"[blue]→[/blue] [cyan]{len(indices_to_process)}[/cyan] rows to embed")
-
-        # --- Step 5: Compute embeddings ---
-        console.print(f"\n[bold cyan]Step 5:[/bold cyan] Computing embeddings via Gemini API...")
-
-        # Pre-compute chunks for all texts to process.
-        # Each entry: (row_index, [chunk1, chunk2, ...])
-        row_chunks: List[tuple[int, List[str]]] = []
-        for idx in indices_to_process:
-            text = str(texts[idx])
-            chunks = chunk_text(text)
-            if len(chunks) > 1:
-                error_counter["chunked"] += 1
-                error_counter["total_chunks"] += len(chunks)
-            row_chunks.append((idx, chunks))
-
-        # Flatten all chunks into a single list for batched API calls.
-        flat_chunks: List[str] = []
-        flat_titles: List[str] = []
-        for row_idx, chunks in row_chunks:
-            flat_chunks.extend(chunks)
-            flat_titles.extend([titles[row_idx]] * len(chunks))
-
         console.print(
-            f"[blue]→[/blue] {len(flat_chunks)} total chunks from "
-            f"{len(indices_to_process)} rows "
-            f"({error_counter['chunked']} multi-chunk)"
+            f"[blue]→[/blue] [cyan]{len(indices_to_process)}[/cyan] rows, "
+            f"{sum(len(c) for c in row_chunks.values())} chunks; "
+            f"[cyan]{len(chunk_vectors)}[/cyan] restored from cache, [cyan]{len(queue)}[/cyan] to embed"
         )
 
-        # Embed all chunks in batches
-        flat_embeddings: List[Any] = [None] * len(flat_chunks)
-        batch_count = 0
-        checkpoint_state: Dict[str, int] = {}
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("[cyan]Embedding chunks", total=len(flat_chunks))
-
-            for batch_start in range(0, len(flat_chunks), batch_size):
-                batch_end = min(batch_start + batch_size, len(flat_chunks))
-                batch_texts = flat_chunks[batch_start:batch_end]
-
-                try:
-                    embeddings = embed_texts_with_retry(
-                        client, batch_texts, task_type, dimensionality,
-                        titles=flat_titles[batch_start:batch_end],
-                    )
-                    for i, emb in enumerate(embeddings):
-                        flat_embeddings[batch_start + i] = emb
-                except Exception as e:
-                    logger.error(f"Batch failed (chunks {batch_start}-{batch_end - 1}): {e}")
-                    error_counter["failed"] += len(batch_texts)
-
-                progress.update(task, advance=len(batch_texts))
-                batch_count += 1
-
-                # Checkpoint: reassemble completed rows and save cache
-                if batch_count % CHECKPOINT_EVERY == 0:
-                    _save_completed_to_cache(
-                        cache, row_chunks, flat_embeddings, row_ids, all_embeddings,
-                        cache_file, fingerprints, checkpoint_state, batch_end,
-                    )
-
-                # Delay between API calls to respect rate limits
-                if delay > 0 and batch_end < len(flat_chunks):
-                    time.sleep(delay)
-
-        # Final reassemble: group chunk embeddings by row and length-weighted
-        # average (only rows whose chunks ALL succeeded are assembled/cached).
-        _save_completed_to_cache(
-            cache, row_chunks, flat_embeddings, row_ids, all_embeddings,
-            cache_file, fingerprints, checkpoint_state, len(flat_chunks),
-        )
-
-        # Rows with any failed chunk must end EMPTY — never a truncated
-        # average, never a stale pre-existing vector — so a re-run in
-        # 'missing' mode retries them.
-        partial_rows = 0
-        flat_offset = 0
-        for row_idx, chunks in row_chunks:
-            chunk_embs = flat_embeddings[flat_offset:flat_offset + len(chunks)]
-            if any(emb is None for emb in chunk_embs):
-                all_embeddings[row_idx] = []
-                partial_rows += 1
-            flat_offset += len(chunks)
-        if partial_rows > 0:
-            console.print(
-                f"[yellow]⚠[/yellow] {partial_rows} row(s) had failed chunks and were "
-                f"left empty — re-run in 'missing' mode to retry them."
-            )
-
+    if queue:
+        # --- Step 5: Compute embeddings ---
+        console.print(f"\n[bold cyan]Step 5:[/bold cyan] Computing embeddings with {MODEL_ID}...")
+        queued_texts = [document_text(row_chunks[i][c], titles[i]) for i, c in queue]
+        lengths = encoder.token_lengths(queued_texts)
+        started = time.time()
+        done_tokens = 0
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TextColumn("{task.fields[rate]}"),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("[cyan]Embedding tokens", total=sum(lengths), rate="")
+                for batch in token_batches(lengths, args.batch_tokens):
+                    try:
+                        vectors = encoder.encode([queued_texts[k] for k in batch])
+                    except Exception as e:
+                        logger.error(f"Batch of {len(batch)} chunks failed: {e}")
+                        failed += len(batch)
+                    else:
+                        # Checkpoint this batch before starting the next one.
+                        completed = {}
+                        for k, vector in zip(batch, vectors, strict=True):
+                            i, c = queue[k]
+                            chunk_vectors[(i, c)] = vector.tolist()
+                            completed[chunk_key(row_ids[i], c)] = make_entry(chunk_vectors[(i, c)], fingerprints[i])
+                        save_cache(completed, cache_file)
+                    batch_tokens = sum(lengths[k] for k in batch)
+                    done_tokens += batch_tokens
+                    rate = done_tokens / max(time.time() - started, 1e-9)
+                    progress.update(task, advance=batch_tokens, rate=f"{rate:,.0f} tok/s")
+        except KeyboardInterrupt:
+            console.print(Panel(
+                "[yellow]Interrupted; Hub left untouched.[/yellow]\n\n"
+                + resume_hint(cache_file, config_name, update_mode),
+                title="Embedding paused",
+                border_style="yellow",
+            ))
+            return 130
         console.print("[green]✓[/green] Embedding computation complete.")
 
-        if error_counter["chunked"] > 0:
-            console.print(
-                f"[yellow]ℹ[/yellow] {error_counter['chunked']} long texts were split "
-                f"into {error_counter['total_chunks']} chunks (averaged back to 1 vector each)."
-            )
-        if error_counter["failed"] > 0:
-            console.print(
-                f"[yellow]⚠[/yellow] {error_counter['failed']} chunks failed during "
-                f"encoding."
-            )
+    # Rows with any failed chunk must end EMPTY — never a truncated average,
+    # never a stale pre-existing vector — so a re-run retries them.
+    partial_rows = 0
+    multi_chunk = 0
+    for i, chunks in row_chunks.items():
+        vectors = [chunk_vectors.get((i, c)) for c in range(len(chunks))]
+        if any(v is None for v in vectors):
+            all_embeddings[i] = []
+            partial_rows += 1
+            continue
+        multi_chunk += len(chunks) > 1
+        all_embeddings[i] = average_embeddings(vectors, weights=[len(c) for c in chunks])
+    if multi_chunk:
+        console.print(f"[yellow]ℹ[/yellow] {multi_chunk} long texts were averaged from several chunks.")
+    if partial_rows:
+        console.print(f"[yellow]⚠[/yellow] {partial_rows} row(s) had failed chunks and were left empty.")
 
-    if error_counter["failed"] > 0 and not args.allow_partial:
+    if failed and not args.allow_partial:
         console.print(Panel(
             "[bold red]Embedding run incomplete; Hub left untouched.[/bold red]\n\n"
-            f"{error_counter['failed']} chunk(s) failed. Successful work remains "
-            f"in {cache_file}; re-run to retry, or pass --allow-partial explicitly.",
+            f"{failed} chunk(s) failed. " + resume_hint(cache_file, config_name, update_mode)
+            + "\nOr pass --allow-partial explicitly.",
             title="Fail-closed derived-data write",
             border_style="red",
         ))
         return 1
 
     # --- Update the dataset ---
-    console.print(f"\n[bold cyan]Step 6:[/bold cyan] Updating dataset...")
+    console.print("\n[bold cyan]Step 6:[/bold cyan] Updating dataset...")
 
     # Build the column as a typed PyArrow array (nulls + float lists coexist)
     # to avoid type-inference issues with sparse embeddings.
@@ -797,6 +602,9 @@ def main() -> int:
     )
     # A neighbor rank depends on all vectors, not just on its own document.
     ds_processed = invalidate_columns(ds_processed, ["related_articles"], [vector_changed] * len(ds))
+    ds_processed, retired = drop_retired_columns(ds_processed, config_name)
+    if retired:
+        console.print(f"[blue]→[/blue] Removing retired columns: {', '.join(retired)}")
 
     # --- Verify results ---
     console.print("\n[bold]Sample embeddings (first 3 non-empty):[/bold]")
@@ -829,20 +637,19 @@ def main() -> int:
             "[yellow]Dry run mode — no changes pushed to Hub.[/yellow]\n\n"
             f"Would have pushed [cyan]{len(ds_processed)}[/cyan] rows to "
             f"[cyan]{repo_id}[/cyan] (config: {config_name}).\n\n"
-            f"[yellow]Embeddings are cached in {cache_file}[/yellow]\n"
-            f"(filename is fingerprinted by model/dim/task)\n"
-            f"Re-run without --dry-run to push (cached results will be reused; "
-            f"in --update-mode all, add --resume to keep them).",
+            f"[yellow]Chunk vectors are cached in {cache_file}[/yellow]\n"
+            "Re-run without --dry-run to push; cached results are reused.",
             title="Dry Run Complete",
             border_style="yellow",
         ))
         return 0
 
-    console.print(f"\n[bold cyan]Step 7:[/bold cyan] Pushing to Hugging Face Hub...")
+    console.print("\n[bold cyan]Step 7:[/bold cyan] Pushing to Hugging Face Hub...")
 
+    versions = runtime_versions()
     commit_message = (
-        f"Add/update '{embedding_column}' embeddings using {MODEL_NAME} "
-        f"(dim={dimensionality}, task={task_type}, config={config_name})"
+        f"Add/update '{embedding_column}' embeddings using {MODEL_ID}@{MODEL_REVISION[:12]} "
+        f"(dim={DIMENSION}, onnxruntime {versions['onnxruntime']}, config={config_name})"
     )
 
     if push_dataset(
@@ -851,7 +658,7 @@ def main() -> int:
         config_name=config_name,
         commit_message=commit_message,
         token=hf_token,
-        max_shard_size=max_shard_size,
+        max_shard_size=args.max_shard_size,
         console=console,
         expected_revision=source_revision,
     ):
@@ -864,13 +671,12 @@ def main() -> int:
             f"Repository: [cyan]{repo_id}[/cyan]\n"
             f"Configuration: [cyan]{config_name}[/cyan]\n"
             f"Column: [cyan]{embedding_column}[/cyan] ({action})\n"
-            f"Model: [cyan]{MODEL_NAME}[/cyan]\n"
-            f"Embedding dimension: [cyan]{dimensionality}[/cyan]\n"
-            f"Task type: [cyan]{task_type}[/cyan]\n"
+            f"Model: [cyan]{MODEL_ID}@{MODEL_REVISION[:12]}[/cyan]\n"
+            f"Embedding dimension: [cyan]{DIMENSION}[/cyan]\n"
             f"Valid embeddings: [cyan]{total_valid}[/cyan] / {len(ds_processed)}"
         )
-        if error_counter["failed"] > 0:
-            summary += f"\n[yellow]Encoding failures: {error_counter['failed']}[/yellow]"
+        if failed:
+            summary += f"\n[yellow]Encoding failures: {failed}[/yellow]"
 
         console.print(Panel(summary, title="Upload Complete", border_style="green"))
 

@@ -13,68 +13,76 @@ from rich.console import Console
 import semantic_embedding as text
 import semantic_embedding_images as images
 from _embedding_utils import load_cache
-from _gemini_client import validate_response
+from _gemma_encoder import document_text, query_text, validate_vectors
 from iwac_common.enrichment import compatible_rows, set_provenance
 from iwac_common.text_utils import tokenize_words
 from related_articles import candidate_pairs, parse_embeddings, topk_neighbors
 
 
-def response(vectors):
-    return SimpleNamespace(embeddings=[SimpleNamespace(values=v) for v in vectors])
-
-
-@pytest.mark.parametrize("vectors", [[], [[1.] * 768], [None, [1.] * 768],
-    [[1.] * 767, [1.] * 768], [[float('nan')] * 768, [1.] * 768], [[0.] * 768] * 2,
-    [[1.] * 768] * 3])
-def test_response_validation_rejects_entire_malformed_batch(vectors):
+@pytest.mark.parametrize("vectors", [np.ones((1, 768)), np.ones((2, 767)), np.ones((3, 768)),
+    np.array([[float('nan')] * 768, [1.] * 768]), np.zeros((2, 768))])
+def test_vector_validation_rejects_entire_malformed_batch(vectors):
     with pytest.raises(ValueError):
-        validate_response(response(vectors), 2, 768)
+        validate_vectors(vectors, 2)
 
 
-def test_text_payload_uses_separate_content_and_instruction(monkeypatch):
-    captured = []
-    def embed(**kwargs):
-        captured.append(kwargs)
-        return response([[1.] * 768] * len(kwargs['contents']))
-    client = SimpleNamespace(models=SimpleNamespace(embed_content=embed))
-    output = text.embed_texts_with_retry(client, ['alpha', 'beta'], 'RETRIEVAL_DOCUMENT', 768,
-                                         titles=['Title A', 'Title B'])
-    assert len(output) == 2
-    kwargs = captured[0]
-    assert kwargs['config'].task_type is None
-    assert [item.parts[0].text for item in kwargs['contents']] == [
-        'title: Title A | text: alpha', 'title: Title B | text: beta']
-    assert text.format_embedding_text('faith', 'RETRIEVAL_QUERY') == 'task: search result | query: faith'
+def test_document_and_query_prompts_follow_the_model_card():
+    assert document_text('alpha', 'Title A') == 'title: Title A | text: alpha'
+    assert document_text('alpha', '') == 'title: none | text: alpha'
+    assert query_text('faith') == 'task: search result | query: faith'
 
 
-def configure_main(monkeypatch, module, dataset, tmp_path, argv, *, short_images=False):
+class FakeEncoder:
+    """Offline stand-in for GemmaEncoder; ``calls`` counts inference calls."""
+
+    def __init__(self, fail_on=None, interrupt_on=None):
+        self.calls, self.texts = 0, []
+        self.fail_on, self.interrupt_on = fail_on, interrupt_on
+        self.providers = ['FakeExecutionProvider']
+
+    def token_lengths(self, texts):
+        return [len(t) for t in texts]
+
+    def _call(self):
+        self.calls += 1
+        if self.calls == self.interrupt_on:
+            raise KeyboardInterrupt
+        if self.calls == self.fail_on:
+            raise ValueError('malformed output')
+
+    def encode(self, texts):
+        self._call()
+        self.texts.extend(texts)
+        return np.full((len(texts), 768), 1 / np.sqrt(768), np.float32)
+
+    def encode_image(self, image):
+        self._call()
+        return np.full(768, 1 / np.sqrt(768), np.float32)
+
+
+def configure_main(monkeypatch, module, dataset, tmp_path, argv, encoder=None):
     calls = []
-    api_calls = []
-    def embed(**kwargs):
-        api_calls.append(kwargs)
-        n = len(kwargs['contents'])
-        if short_images and api_calls and len(api_calls) > 1:
-            n = 1
-        return response([[1.] * 768] * n)
-    monkeypatch.setenv('GOOGLE_API_KEY', 'offline-placeholder')
+    encoder = encoder or FakeEncoder()
     monkeypatch.setattr(module, 'console', Console(file=io.StringIO()))
     monkeypatch.setattr(module, 'CACHE_DIR', tmp_path)
     monkeypatch.setattr(module, 'ensure_hf_token', lambda **kwargs: 'offline-placeholder')
-    monkeypatch.setattr(module.genai, 'Client', lambda **kwargs: SimpleNamespace(models=SimpleNamespace(embed_content=embed)))
+    monkeypatch.setattr(module, 'load_encoder', lambda args, token: encoder)
     monkeypatch.setattr(module, 'load_hub_dataset', lambda *args, **kwargs: dataset)
     monkeypatch.setattr(module, 'push_dataset', lambda ds, **kwargs: calls.append(ds) or True)
-    monkeypatch.setattr(module, 'call_with_retry', lambda callback: callback())
-    monkeypatch.setattr('sys.argv', ['audit', '--delay', '0', *argv])
+    monkeypatch.setattr('sys.argv', ['audit', *argv])
     if module is images:
-        monkeypatch.setattr(module, 'download_image_bytes', lambda url, side: url.encode())
-    return calls, api_calls
+        monkeypatch.setattr(module, 'download_image', lambda url: url.encode())
+        monkeypatch.setattr(module, 'decode_image', lambda raw: raw)
+    return calls, encoder
 
 
-def test_image_main_never_pushes_short_response(monkeypatch, tmp_path):
+def test_image_main_never_pushes_a_failed_embedding(monkeypatch, tmp_path):
     ds = Dataset.from_dict({'o:id': [1, 2], 'image_url': ['one', 'two']})
-    pushed, _ = configure_main(monkeypatch, images, ds, tmp_path, ['--update-mode', 'all'], short_images=True)
+    pushed, _ = configure_main(monkeypatch, images, ds, tmp_path, ['--update-mode', 'all'],
+                               encoder=FakeEncoder(fail_on=3))  # probe, image 1, then image 2 fails
     assert images.main() == 1
     assert pushed == []
+    assert len(load_cache(next(tmp_path.glob('*.sqlite3')))) == 1  # image 1 kept for the retry
 
 
 @pytest.mark.parametrize('module,source,column,args', [
@@ -83,23 +91,30 @@ def test_image_main_never_pushes_short_response(monkeypatch, tmp_path):
 ])
 def test_all_mode_clears_removed_source(monkeypatch, tmp_path, module, source, column, args):
     ds = Dataset.from_dict({'o:id': [1], source: [''], column: [[1.] * 768]})
-    pushed, api_calls = configure_main(monkeypatch, module, ds, tmp_path, [*args, '--update-mode', 'all'])
+    pushed, encoder = configure_main(monkeypatch, module, ds, tmp_path, [*args, '--update-mode', 'all'])
     assert module.main() == 0
     assert pushed[0][column][0] is None
     assert pushed[0][f'{column}_input_hash'][0] is None
-    assert len(api_calls) == 1  # only readiness probe, no inference on missing input
+    assert encoder.calls == 1  # only readiness probe, no inference on missing input
 
 
 def test_text_legacy_migration_then_matching_provenance_skips_inference(monkeypatch, tmp_path):
     ds = Dataset.from_dict({'o:id': [1], 'OCR': ['corrected text'], 'embedding_OCR': [[2.] * 768]})
-    pushed, api_calls = configure_main(monkeypatch, text, ds, tmp_path, ['--config', 'articles', '--update-mode', 'missing'])
+    pushed, encoder = configure_main(monkeypatch, text, ds, tmp_path, ['--config', 'articles', '--update-mode', 'missing'])
     assert text.main() == 0
-    assert len(api_calls) == 2
+    assert encoder.calls == 2
     migrated = pushed[-1]
-    pushed, api_calls = configure_main(monkeypatch, text, migrated, tmp_path, ['--config', 'articles', '--update-mode', 'missing'])
+    pushed, encoder = configure_main(monkeypatch, text, migrated, tmp_path, ['--config', 'articles', '--update-mode', 'missing'])
     assert text.main() == 0
-    assert len(api_calls) == 1
+    assert encoder.calls == 1
     assert pushed[0]['embedding_OCR_config_hash'][0]
+
+
+def test_text_chunks_carry_the_document_instruction(monkeypatch, tmp_path):
+    ds = Dataset.from_dict({'o:id': [1], 'OCR': ['alpha'], 'title': ['Titre']})
+    _, encoder = configure_main(monkeypatch, text, ds, tmp_path, ['--config', 'articles', '--update-mode', 'all'])
+    assert text.main() == 0
+    assert encoder.texts[-1] == 'title: Titre | text: alpha'
 
 
 def test_image_same_url_changed_bytes_refreshes(monkeypatch, tmp_path):
@@ -107,33 +122,42 @@ def test_image_same_url_changed_bytes_refreshes(monkeypatch, tmp_path):
     pushed, _ = configure_main(monkeypatch, images, ds, tmp_path, [])
     assert images.main() == 0
     ds = pushed[-1]
-    pushed, api_calls = configure_main(monkeypatch, images, ds, tmp_path, [])
+    pushed, encoder = configure_main(monkeypatch, images, ds, tmp_path, [])
     assert images.main() == 0
-    assert len(api_calls) == 1
-    pushed, api_calls = configure_main(monkeypatch, images, ds, tmp_path, [])
-    monkeypatch.setattr(images, 'download_image_bytes', lambda url, side: b'changed bytes')
+    assert encoder.calls == 1
+    pushed, encoder = configure_main(monkeypatch, images, ds, tmp_path, [])
+    monkeypatch.setattr(images, 'download_image', lambda url: b'changed bytes')
     assert images.main() == 0
-    assert len(api_calls) == 2
+    assert encoder.calls == 2
     assert pushed[-1]['embedding_image_input_hash'][0] != ds['embedding_image_input_hash'][0]
 
 
-def test_checkpoint_pools_each_completed_row_once_and_keeps_failed_rows_retryable(monkeypatch, tmp_path):
-    pooled = []
-    monkeypatch.setattr(text, 'average_embeddings', lambda vectors, weights: pooled.append(vectors) or [1.])
-    n = 50
-    flat = [None] * n
-    rows = [(i, ['abc']) for i in range(n)]
-    cache, state, output = {}, {}, [[] for _ in range(n)]
-    path = tmp_path / 'cache.sqlite3'
-    for end in range(5, n + 1, 5):
-        flat[end-5:end] = [[1.]] * 5
-        flat[2] = None  # a permanently failed earlier request must not stall later rows
-        text._save_completed_to_cache(cache, rows, flat, list(range(n)), output, path,
-                                      ['hash'] * n, state, end)
-    assert len(pooled) == n - 1
-    assert len(load_cache(path)) == n - 1
-    assert output[2] == []
-    assert state == {'offset': n, 'row': n}
+def test_interrupted_run_resumes_from_its_last_finished_batch(monkeypatch, tmp_path):
+    # Six equal-length one-chunk rows and a budget of two rows: three batches.
+    ds = Dataset.from_dict({'o:id': list(range(6)), 'OCR': [f'row text {i}' for i in range(6)]})
+    budget = 2 * len(document_text('row text 0'))  # FakeEncoder counts one token per character
+    argv = ['--config', 'articles', '--update-mode', 'all', '--batch-tokens', str(budget)]
+    pushed, encoder = configure_main(monkeypatch, text, ds, tmp_path, argv,
+                                     encoder=FakeEncoder(interrupt_on=4))  # probe, batch 1, batch 2, interrupt
+    assert text.main() == 130
+    assert pushed == []
+    assert len(load_cache(next(tmp_path.glob('*.sqlite3')))) == 4  # both finished batches were saved
+    pushed, encoder = configure_main(monkeypatch, text, ds, tmp_path, argv)
+    assert text.main() == 0
+    assert encoder.calls == 2  # probe + the one unfinished batch; nothing is recomputed
+    assert len(encoder.texts) == 3  # probe text + 2 chunks
+    assert all(v is not None for v in pushed[-1]['embedding_OCR'])
+    assert not list(tmp_path.glob('*.sqlite3'))  # cache removed after the verified push
+
+
+def test_failed_batch_leaves_its_rows_empty_and_blocks_the_push(monkeypatch, tmp_path):
+    ds = Dataset.from_dict({'o:id': [1, 2], 'OCR': ['a', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb']})
+    pushed, _ = configure_main(monkeypatch, text, ds, tmp_path,
+                               ['--config', 'articles', '--update-mode', 'all', '--batch-tokens', '1'],
+                               encoder=FakeEncoder(fail_on=3))
+    assert text.main() == 1
+    assert pushed == []
+    assert len(load_cache(next(tmp_path.glob('*.sqlite3')))) == 1  # the successful batch survives
 
 
 def test_provenance_rejects_same_dimension_different_configuration():
@@ -227,8 +251,9 @@ def test_readable_configuration_matches_persisted_hash(monkeypatch, tmp_path):
     assert text.main() == 0
     row = pushed[-1][0]
     settings = json.loads(row['embedding_OCR_config_json'])
-    assert settings['model'] == 'gemini-embedding-2'
-    assert settings['google_genai']
+    assert settings['model'] == 'google/embeddinggemma-2'
+    assert len(settings['model_revision']) == 40
+    assert settings['onnx_export'].startswith('onnx-community/embeddinggemma-2-ONNX@')
     assert config_fingerprint(settings) == row['embedding_OCR_config_hash']
 
 
@@ -251,3 +276,47 @@ def test_lemma_resume_rejects_changed_processing_configuration(tmp_path):
     assert list(out['lemma_text']) == ['new']
     assert new.calls == 1
     assert out['lemma_text_config_hash'][0] != ds['lemma_text_config_hash'][0]
+
+
+def test_text_embedding_configs_match_schema():
+    """Every subset with a text embedding column can be embedded, and into that column."""
+    from iwac_common.schema import SUBSETS
+
+    expected = {cfg: column for cfg, spec in SUBSETS.items()
+                for column in (spec.embedding_columns or {}) if column != "embedding_image"}
+    assert {cfg: emb for cfg, (_, emb, _) in text.CONFIG_SETTINGS.items()} == expected
+    stems = [stem for _, _, stem in text.CONFIG_SETTINGS.values()]
+    assert len(stems) == len(set(stems))
+
+
+def test_related_item_configs_read_schema_embeddings_and_are_publishable():
+    """Each related-items subset ranks a schema embedding column, invalidates its
+    rankings when that embedding's sources change, and may publish the result."""
+    import related_articles
+    from iwac_common.repos import load_public_columns
+    from iwac_common.schema import DERIVED_FROM, SUBSETS
+
+    assert "documents" in related_articles.CONFIG_SETTINGS
+    allow = load_public_columns()
+    for cfg, (embedding, _) in related_articles.CONFIG_SETTINGS.items():
+        assert embedding in (SUBSETS[cfg].embedding_columns or {})
+        for source, derived in DERIVED_FROM[cfg].items():
+            if embedding in derived:
+                assert "related_articles" in derived, (cfg, source)
+        if cfg != "publications":  # its rankings are not yet reviewed for publication
+            assert "related_articles" in allow[cfg]
+
+
+def test_references_embed_abstracts_and_retire_full_text_vectors():
+    """A superseded vector and its provenance leave with the run that replaces it."""
+    assert text.CONFIG_SETTINGS["references"][:2] == ("abstract", "embedding_abstract")
+    ds = Dataset.from_dict({
+        "o:id": ["1"], "embedding_OCR": [[0.1]], "embedding_OCR_input_hash": ["h"],
+        "embedding_OCR_config_hash": ["c"], "embedding_OCR_config_json": ["{}"],
+        "embedding_abstract": [[0.2]],
+    })
+    kept, dropped = text.drop_retired_columns(ds, "references")
+    assert kept.column_names == ["o:id", "embedding_abstract"]
+    assert set(dropped) == {"embedding_OCR", "embedding_OCR_input_hash",
+                            "embedding_OCR_config_hash", "embedding_OCR_config_json"}
+    assert text.drop_retired_columns(ds, "articles")[0].column_names == ds.column_names

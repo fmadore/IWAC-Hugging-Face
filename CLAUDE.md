@@ -141,12 +141,34 @@ runtime.
 **Caches:** Omeka responses in `.cache_omk*` (gzipped JSON, 24h TTL). Lemma and
 embedding resume caches are deleted on a successful push, so a leftover file
 means an interrupted run. Both are fingerprinted by the config that produced
-them (spaCy model + `LEMMA_LOGIC_VERSION`; embedding model + dim + task) and by
-the repository, and every entry carries a hash of its input text
-(`_embedding_utils.make_entry`), so a cache from a different configuration,
-repo or text version is ignored rather than silently mixed in — no manual
-date-checking needed. Bump `LEMMA_LOGIC_VERSION` whenever the lemmatisation
-output changes for identical input.
+them (spaCy model + `LEMMA_LOGIC_VERSION`; embedding model revision + export +
+prompt/chunking settings) and by the repository, and every entry carries a hash
+of its input text (`_embedding_utils.make_entry`), so a cache from a different
+configuration, repo or text version is ignored rather than silently mixed in —
+no manual date-checking needed. Bump `LEMMA_LOGIC_VERSION` whenever the
+lemmatisation output changes for identical input. The text embedding cache
+holds one entry per *chunk*, written after every batch: an interrupted run
+resumes by re-running the same command, in either update mode
+(`--fresh-cache` discards it).
+
+**Embeddings are EmbeddingGemma 2, run locally — and every vector column must
+share one model revision.** `_gemma_encoder.py` pins `google/embeddinggemma-2`
+and the `onnx-community` fp32 export it runs with onnxruntime + `tokenizers`
+(no torch, no API key). Text and images share one space, which is what makes
+text→photo search work, so `embedding_image` must be re-embedded in the same
+release as the text columns. The 2026-10 pilot
+(`analyses/output/embeddinggemma2_pilot.md`, local) found it on par with
+`gemini-embedding-2` on IWAC subject-tag retrieval and showed the vectors
+published before then were raw-text Gemini vectors that current code cannot
+reproduce. Cosine scales differ between models: on any new vector space, run
+`iwac-analyze similarity-calibration` and update `reprint_candidates.py
+--min-cosine` (now 0.91), `related_articles.NEAR_DUP_THRESHOLD` (now 0.97, keyed
+to its config hash) and downstream reprint/related tools. The image resize must stay the Pillow path in
+`image_patches`: transformers.js resizes differently (cosine down to 0.92
+against the reference). Consumers embed queries as
+`task: search result | query: {q}` (`_gemma_encoder.QUERY_PREFIX`). On a CPU a
+full text re-embed is ~30 h (~290 tokens/s); `--device cuda` with
+onnxruntime-gpu is the fast path.
 
 **Never round-trip a whole subset through pandas to fix one column's type.**
 `to_pandas()` turns every nullable int column into `float64`; that is how
@@ -196,8 +218,7 @@ analyses write `<script>.manifest.json` (code SHA, dataset revision, arguments,
 output hashes) beside their outputs.
 
 Required in `.env`: `OMEKA_BASE_URL`, `OMEKA_KEY_IDENTITY`,
-`OMEKA_KEY_CREDENTIAL`, `HF_TOKEN`, and `GOOGLE_API_KEY` for the embedding
-scripts. `IWAC_HF_PRIVATE_REPO` / `IWAC_HF_PUBLIC_REPO` optionally redirect the
+`OMEKA_KEY_CREDENTIAL` and `HF_TOKEN`. `IWAC_HF_PRIVATE_REPO` / `IWAC_HF_PUBLIC_REPO` optionally redirect the
 repo IDs at `iwac_common/repos.py` — useful for testing against a scratch repo.
 
 Development is **CPU only**. Prefer CPU-viable models (spaCy `*_lg`, not

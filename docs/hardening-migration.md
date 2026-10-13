@@ -68,11 +68,27 @@ Existing nonempty values without compatible provenance are recomputed once,
 even in incremental mode. Plan inference cost accordingly. Source and method
 changes then permit selective recomputation. Empty inputs clear obsolete values.
 
-Embedding 2 requests now use distinct content objects, instruction-prefixed
-text and bounded batches; its unsupported task-type parameter is omitted.
-Conservative byte-bounded chunking changes long-document aggregation. Old and
-new vectors should not be treated as a single calibrated similarity space.
-Image identity covers downloaded and re-encoded bytes, so a URL whose content
+Embeddings now come from `google/embeddinggemma-2`, run locally from its
+pinned fp32 ONNX export (`post-processing/_gemma_encoder.py`), with the model
+card's `title: … | text: …` document prompt and byte-bounded chunking. The
+vectors published before October 2026 are `gemini-embedding-2` vectors of raw
+text and cannot be reproduced by current code; every embedding column
+(`embedding_OCR` on articles and documents, `embedding_abstract` on
+references, `embedding_tableOfContents`, `embedding_image`) must be regenerated
+in one release, because text and image vectors share one space. Old and new
+vectors are not a single calibrated similarity space: recalibrate cosine
+thresholds afterwards.
+
+References embed their abstract, not their full text. Half the reference texts
+exceed 58k characters and the longest run to 1.8M: averaging hundreds of
+chunks yields a centroid of genre and bibliography rather than argument, and
+notes and bibliographies outweigh the thesis. References without an abstract
+keep an empty vector. The run that writes `embedding_abstract` removes the
+retired `embedding_OCR` from references; consumers must read the new column.
+
+On a CPU the articles re-embed is a long job (about 16 h); each finished batch is
+checkpointed, so an interrupted run resumes by re-running the same command.
+Image identity covers the downloaded bytes and URL, so a URL whose content
 changed is detectable. Incremental image validation still downloads the image.
 Readable configuration JSON accompanies each fingerprint privately. Related-item
 and reprint tools reject mixed known configurations; legacy/public vectors that

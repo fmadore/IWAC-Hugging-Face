@@ -21,7 +21,7 @@ from _embedding_utils import (
     repo_slug,
     save_cache,
 )
-from _gemini_client import restore_from_cache
+from _embedding_columns import restore_from_cache
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 

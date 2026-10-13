@@ -33,7 +33,7 @@ Cheapest item here by a wide margin.
 
 `post-processing/related_articles.py` already computes near-duplicate cosine
 pairs but keeps only each row's top-1 neighbour. Union-find over *all* pairs
-≥ 0.95 would give reprint clusters: which stories crossed borders, and with what
+≥ 0.97 (the calibrated EmbeddingGemma 2 near-duplicate cutoff) would give reprint clusters: which stories crossed borders, and with what
 lag.
 
 Worth doing for a second reason — undetected reprints inflate topic-prevalence

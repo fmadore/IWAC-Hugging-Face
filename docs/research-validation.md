@@ -126,12 +126,27 @@ retraining. Do not treat coherence alone as a historically validated quality sco
 
 ```bash
 iwac-analyze reprints --input snapshot.parquet \
-  --min-cosine 0.93 --min-jaccard 0.45 --shingle-size 3 --top-k 20
+  --min-cosine 0.91 --min-jaccard 0.45 --shingle-size 3 --top-k 20
 ```
 
 A pair must pass both normalized embedding cosine similarity and lexical Jaccard
 similarity of case-folded word trigrams. The supplied thresholds are starting points
-for calibration, not validated IWAC operating points. Semantic similarity without
+for calibration, not validated IWAC operating points.
+
+Cosine scales differ between embedding models, so every new vector space needs its
+cutoffs re-derived before old numbers are reused:
+
+```bash
+iwac-analyze similarity-calibration --source hub
+```
+
+It scores the stored `related_articles` neighbour pairs by trigram Jaccard, chooses
+the cosine prefilter for recall and the cosine-only near-duplicate cutoff for
+precision on one half of the pairs, and reports both on the other half. For the
+EmbeddingGemma 2 article vectors (2026-10) it chose 0.91 (held-out recall 97.6 %
+of lexical duplicates) and 0.97 (held-out precision 93.7 %, recall 67.5 %); the
+Gemini-era 0.93 and 0.95 now pass only 95 % and are 52 % precise respectively.
+The label is a lexical proxy over top-k neighbours, not an adjudicated reprint. Semantic similarity without
 lexical overlap suggests shared subject matter, not necessarily copying. OCR errors,
 abridgments, translations and boilerplate can respectively hide or create matches.
 The default text field is OCR; `--text-column` is explicit because lemmatized text

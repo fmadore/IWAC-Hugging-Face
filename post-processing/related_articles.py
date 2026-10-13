@@ -3,7 +3,7 @@
 related_articles.py
 ===================
 
-Precompute the top-k most similar items per row from the existing Gemini
+Precompute the top-k most similar items per row from the existing
 embeddings (cosine similarity), for a "related articles" feature and as a
 near-duplicate / reprint detector (agency dispatches and communiqués are
 frequently reprinted across West African newspapers).
@@ -11,6 +11,7 @@ frequently reprinted across West African newspapers).
 Supported configurations:
 - **articles**:     'embedding_OCR'             → 'related_articles'
 - **publications**: 'embedding_tableOfContents' → 'related_articles'
+- **documents**:    'embedding_OCR'             → 'related_articles'
 
 Column format: ``"o:id:cosine|o:id:cosine|..."`` (top-k, descending
 similarity, 4 decimals). Rows without an embedding get None.
@@ -60,9 +61,22 @@ OUTPUT_DIR = REPO_ROOT / "analyses" / "output"
 CONFIG_SETTINGS = {
     "articles": ("embedding_OCR", ["title", "newspaper", "pub_date"]),
     "publications": ("embedding_tableOfContents", ["title", "pub_date"]),
+    "documents": ("embedding_OCR", ["title", "pub_date"]),
 }
 
-NEAR_DUP_THRESHOLD = 0.95
+# Cosine-only near-duplicate cutoff, and the vector space it was calibrated in.
+# Chosen by `iwac-analyze similarity-calibration` on articles (EmbeddingGemma 2,
+# 2026-10): on held-out neighbour pairs, 94 % of pairs at or above it share
+# word-trigram Jaccard >= 0.45. Cosine scales differ between models, so any
+# other subset or configuration is reported as uncalibrated.
+NEAR_DUP_THRESHOLD = 0.97
+NEAR_DUP_CALIBRATION = ("articles", "c0cf10d8be87655367ada20867b3f29b0306f68073a9ec9060f6a2b093898a98")
+
+
+def near_dup_label(config: str, configurations) -> str:
+    """Whether the cutoff was calibrated for this subset and embedding space."""
+    calibrated = (config, *sorted(map(str, configurations))) == NEAR_DUP_CALIBRATION
+    return "lexical-proxy calibrated cutoff" if calibrated else "uncalibrated for this subset/vector space"
 
 
 def parse_embeddings(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
@@ -141,7 +155,7 @@ def candidate_pairs(ids: np.ndarray, nn_idx: np.ndarray, nn_sim: np.ndarray) -> 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Top-k related items per row from existing Gemini embeddings. "
+        description="Top-k related items per row from existing embeddings. "
                     "Report-only by default (nothing is written); pass --push to add "
                     "the output column and push it to the Hub."
     )
@@ -228,7 +242,9 @@ def main() -> int:
     stats.add_row("Rows with neighbors", f"{len(positions):,}")
     stats.add_row("Median top-1 similarity", f"{np.median(top1):.3f}")
     stats.add_row("Mean top-1 similarity", f"{top1.mean():.3f}")
-    stats.add_row(f"Rows with top-1 ≥ {NEAR_DUP_THRESHOLD} (uncalibrated similarity cutoff)", f"{n_dup:,}")
+    configurations = df[config_col].dropna().unique() if config_col in df else []
+    stats.add_row(f"Rows with top-1 ≥ {NEAR_DUP_THRESHOLD} ({near_dup_label(args.config, configurations)})",
+                  f"{n_dup:,}")
     console.print(stats)
 
     # Top near-duplicate pairs (deduplicated i<j)

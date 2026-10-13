@@ -63,8 +63,8 @@ articles = load_dataset("fmadore/islam-west-africa-collection", name="articles",
 
 | Stage | Script | Output |
 |-------|--------|--------|
-| Semantic embeddings | `post-processing/semantic_embedding.py` | Gemini embeddings over full text, chunked and averaged for long documents |
-| Image embeddings | `post-processing/semantic_embedding_images.py` | Embeddings over downscaled images |
+| Semantic embeddings | `post-processing/semantic_embedding.py` | EmbeddingGemma 2 vectors (run locally at a pinned revision) over full text (abstracts for `references`), chunked and averaged for long documents; checkpointed after every batch |
+| Image embeddings | `post-processing/semantic_embedding_images.py` | EmbeddingGemma 2 vectors of the photographs, in the same space as the text embeddings |
 | Lemmatisation | `lemmatize_update_hf.py` | spaCy lemmas, with and without stopwords, per language |
 | Topic modeling | `post-processing/lda_topic_modeling/` | LDA topic id, probability, label, and top-k terms |
 | Lexical metrics | `post-processing/calculate_lexical_richness.py`, `calculate_word_count.py` | Word count (one elision-aware definition, shared with the upload mappers), MATTR lexical richness, French Flesch readability (monolingual French rows only) |
@@ -151,7 +151,7 @@ python -m spacy download en_core_web_lg
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in `OMEKA_BASE_URL`, `OMEKA_KEY_IDENTITY`, `OMEKA_KEY_CREDENTIAL`, `HF_TOKEN`, and — for the embedding scripts — `GOOGLE_API_KEY`.
+Copy `.env.example` to `.env` and fill in `OMEKA_BASE_URL`, `OMEKA_KEY_IDENTITY`, `OMEKA_KEY_CREDENTIAL` and `HF_TOKEN`. The embedding scripts need no API key: they download the pinned EmbeddingGemma 2 ONNX export (~1.1 GB, plus ~0.7 GB for the vision encoder) on first use.
 
 Set `IWAC_HF_PRIVATE_REPO` and `IWAC_HF_PUBLIC_REPO` to redirect the pipeline at scratch datasets. Settings load dotenv before constructing repository defaults; process environment wins. `IWAC_ENV_FILE` selects an explicit dotenv file. Do this before running write-capable commands. The full destination must be private.
 
@@ -209,7 +209,7 @@ New LDA fits freeze their preprocessing and produce hash-verified immutable bund
 
 Sentiment consensus is generation-specific and records its instrument fingerprint. Topic sentiment computes the selected panel from its raw annotations; ordinal medians and category shares are primary, with equal-spacing means explicit. Constant-label agreement is undefined rather than reported as perfect reliability. Topic trends are descriptive by default; optional inferential assumptions are recorded, and outlet-cluster bootstrap intervals condition on the observed archive and model.
 
-Resume caches use repository, input and configuration fingerprints. Text embedding requests use the Embedding 2 content/instruction contract, bounded batches and conservative byte-bounded chunks; image fingerprints cover the actual encoded bytes. Empty inputs clear obsolete results. Related-item search uses bounded similarity blocks rather than a full corpus-by-corpus matrix.
+Resume caches use repository, input and configuration fingerprints. Text embeddings use the EmbeddingGemma 2 `title: … | text: …` document prompt, token-bounded batches and conservative byte-bounded chunks; image fingerprints cover the actual encoded bytes. Empty inputs clear obsolete results. Related-item search uses bounded similarity blocks rather than a full corpus-by-corpus matrix.
 
 Report runs archive **complete output bytes**, hashes, arguments, dataset revision, environment versions and code state under `analyses/output/runs/<run-id>/`. Latest filenames remain convenient pointers; earlier runs are retained. A dirty checkout records its tracked diff and names of untracked files, not their contents, so use a clean commit for a fully reconstructable publication run.
 
@@ -250,7 +250,7 @@ The pipeline and the data it produces are separate objects, and which one you ci
 
 ## Acknowledgements
 
-One member of the sentiment panel is not a vendor API. `Qwen/Qwen3.8-27B` was served from a self-hosted vLLM instance on *festus*, the cluster of the Bayreuth Centre for High Performance Computing (BZHPC), across one L40S and two H100 shards; the serving harness lives in [iwac-ai-pipelines](https://github.com/fmadore/iwac-ai-pipelines). Everything else the pipeline computes — Gemini embeddings, spaCy lemmas, LDA, lexical metrics — ran off the cluster and is not covered by this.
+One member of the sentiment panel is not a vendor API. `Qwen/Qwen3.8-27B` was served from a self-hosted vLLM instance on *festus*, the cluster of the Bayreuth Centre for High Performance Computing (BZHPC), across one L40S and two H100 shards; the serving harness lives in [iwac-ai-pipelines](https://github.com/fmadore/iwac-ai-pipelines). Everything else the pipeline computes — embeddings, spaCy lemmas, LDA, lexical metrics — ran off the cluster and is not covered by this.
 
 The centre states that its funding acknowledgement is mandatory rather than a courtesy, so any publication whose results depend on the `qwen3_8_27b_*` columns carries it verbatim:
 

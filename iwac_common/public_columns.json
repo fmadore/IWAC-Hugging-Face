@@ -199,6 +199,8 @@
     "nb_mots",
     "lemma_text",
     "lemma_nostop",
+    "embedding_OCR",
+    "related_articles",
     "OCR_is_public"
   ],
   "images": [
@@ -352,7 +354,7 @@
     "OCR_is_public",
     "nb_mots",
     "country",
-    "embedding_OCR",
+    "embedding_abstract",
     "lda_topic_id",
     "lda_topic_prob",
     "lda_topic_label",

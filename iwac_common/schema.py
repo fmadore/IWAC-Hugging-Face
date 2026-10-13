@@ -25,7 +25,7 @@ import pandas as pd
 
 from .sentiment_panel import PANEL, consensus_columns, numeric_subjectivite_columns
 
-#: Stored element type of every embedding vector. Gemini returns values of
+#: Stored element type of every embedding vector. The encoder returns values of
 #: float32 precision; storing them as float64 doubled the bytes of the largest
 #: columns in the dataset without adding information (cosine similarity is
 #: unaffected at 768 dimensions).
@@ -69,7 +69,9 @@ SUBSETS: dict[str, SubsetDefinition] = {
     "references": SubsetDefinition(
         "references", (35, 43, 88, 40, 82, 178, 52, 77, 305),
         ("OCR", "lemma_text", "lemma_nostop"),
-        {"embedding_OCR": 768},
+        # Abstracts, not full text: averaging a book's hundreds of chunks
+        # yields a centroid of its genre and bibliography, not its argument.
+        {"embedding_abstract": 768},
         # chapter/edition/nb_pages/page_* stay strings here on purpose: the
         # source holds ranges such as "12-15".
         ("pub_year", "nb_mots", "lda_topic_id"),
@@ -80,6 +82,7 @@ SUBSETS: dict[str, SubsetDefinition] = {
     ),
     "documents": SubsetDefinition(
         "documents", (49,), ("OCR", "lemma_text", "lemma_nostop"),
+        {"embedding_OCR": 768},
         int_columns=("nb_pages", *_HIJRI, "pub_year", "nb_mots"),
     ),
     "images": SubsetDefinition(
@@ -117,12 +120,14 @@ DERIVED_FROM: dict[str, dict[str, tuple[str, ...]]] = {
         "pub_date": _HIJRI,
     },
     "references": {
-        "OCR": ("embedding_OCR", *_LEMMAS, *_OCR_METRICS, *_LDA),
-        "title": ("embedding_OCR",),
+        "OCR": (*_LEMMAS, *_OCR_METRICS, *_LDA),
+        "abstract": ("embedding_abstract",),
+        "title": ("embedding_abstract",),
         "language": (*_LEMMAS, "Richesse_Lexicale_OCR", "Lisibilite_OCR", *_LDA),
     },
     "documents": {
-        "OCR": (*_LEMMAS, *_OCR_METRICS),
+        "OCR": ("embedding_OCR", *_LEMMAS, *_OCR_METRICS, "related_articles"),
+        "title": ("embedding_OCR", "related_articles"),
         "language": (*_LEMMAS, "Richesse_Lexicale_OCR", "Lisibilite_OCR"),
         "pub_date": _HIJRI,
     },
