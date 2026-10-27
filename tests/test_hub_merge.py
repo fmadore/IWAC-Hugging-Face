@@ -440,6 +440,29 @@ class TestStaleDerivedValues:
         assert out[own["consensus_centralite"]] == "Central"
         assert out["consensus_g1_polarite"] == "Négatif"
 
+    def test_new_panel_member_invalidates_the_consensus_it_did_not_vote_in(self, hub):
+        """A member's first upload brings columns the Hub never had; the stored
+        consensus was computed without it, so rows it answered go stale."""
+        from iwac_common.schema import DERIVED_FROM
+        from iwac_common.sentiment_panel import active_models, consensus_columns
+
+        newcomer = active_models()[-1]
+        own = consensus_columns(newcomer.generation)
+        source = newcomer.column("polarite")
+        hub(pd.DataFrame({
+            "o:id": ["1", "2"],
+            own["consensus_polarite"]: ["Positif", "Neutre"],
+            own["instrument_id"]: ["previous panel", "previous panel"],
+        }))
+        out = merge_with_hub_dataset(
+            pd.DataFrame({"o:id": ["1", "2"], source: ["Négatif", ""]}),
+            "repo", "articles", derived_from=DERIVED_FROM["articles"],
+        ).set_index("o:id")
+        assert pd.isna(out.at["1", own["consensus_polarite"]])
+        assert pd.isna(out.at["1", own["instrument_id"]])
+        # Where the newcomer did not answer, the old consensus still holds.
+        assert out.at["2", own["consensus_polarite"]] == "Neutre"
+
     @pytest.mark.parametrize("change", ["text", "membership"])
     def test_neighbor_candidates_change_invalidates_every_query(self, hub, change):
         from iwac_common.schema import DERIVED_FROM

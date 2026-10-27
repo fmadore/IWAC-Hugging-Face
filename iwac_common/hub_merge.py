@@ -75,7 +75,12 @@ def detect_source_changes(
     derived_from: Mapping[str, Sequence[str]],
 ) -> dict[str, list[str]]:
     """``{source column: [o:id, …]}`` for rows present in both frames whose
-    source value changed (after whitespace normalisation)."""
+    source value changed (after whitespace normalisation).
+
+    A source the Hub has never carried reads as empty there, so its first
+    non-empty values count as changes. That is the case of a new sentiment
+    panel member: its columns arrive with the upload, and the stored consensus
+    of the previous panel stops describing the current one."""
     changes: dict[str, list[str]] = {}
     common = new_df[["o:id"]].merge(existing_df[["o:id"]], on="o:id")["o:id"]
     if common.empty:
@@ -83,7 +88,13 @@ def detect_source_changes(
     fresh = new_df.set_index("o:id")
     hub = existing_df.set_index("o:id")
     for source in derived_from:
-        if source not in fresh.columns or source not in hub.columns:
+        if source not in fresh.columns:
+            continue
+        if source not in hub.columns:
+            after = fresh.loc[common, source].map(_normalized_text)
+            changed = common[(after != "").to_numpy()]
+            if len(changed):
+                changes[source] = [str(i) for i in changed]
             continue
         before = hub.loc[common, source].map(_normalized_text)
         after = fresh.loc[common, source].map(_normalized_text)

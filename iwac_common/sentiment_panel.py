@@ -38,7 +38,7 @@ generation 1 they were never mirrored to the Hub, so they are simply gone),
 until Gemma took it on 2026-08-14 and wrote nothing in between — verified at 0
 items on the day of the swap, so nothing was mixed), and ``iwac:gemini36Flash*``
 / ``iwac:qwen35A3b*`` / ``iwac:qwen35A10b*`` (reserved or dropped, zero values).
-Thirteen property prefixes in Omeka vocabulary 10 describe eight columns' worth
+Fourteen property prefixes in Omeka vocabulary 10 describe nine columns' worth
 of annotators here — and the five matching no panel member stay installed, all
 of them now measuring zero, since on this instance the vocabulary update adds
 what the TTL declares without deleting what it omits.
@@ -135,9 +135,9 @@ class SentimentModel:
 
     Reproducibility, not decoration: neither generation shares one config
     (Ministral capped output at 512 tokens and GPT-5 mini set no temperature at
-    all; in generation 2 only Luna and Qwen3.8 get the middle reasoning level
-    the panel asks for, the other three having no middle rung to give), so a
-    column cannot be re-derived without it.
+    all; in generation 2 only Luna, Qwen3.8 and Claude Haiku 5.5 get the middle
+    reasoning level the panel asks for, the other three having no middle rung
+    to give), so a column cannot be re-derived without it.
     """
 
     prompt_fingerprint: str = ""
@@ -206,7 +206,9 @@ class SentimentModel:
 #: practice on 2026-08-25: ``qwen3_8_27b`` sits at 12,098 articles where the
 #: other four sit at 12,298, because 153 of them were retired after four
 #: attempts each. A member short of its neighbours is not evidence of a broken
-#: run — check the campaign's failure log before re-running anything.
+#: run — check the campaign's failure log before re-running anything. The
+#: converse holds since 2026-10-23: ``claude_haiku_5_5`` reaches well past the
+#: other members, so a member *ahead* of its neighbours is not an error either.
 #:
 #: **Generation 1 is frozen** (``omeka_prefix=None``). Its Omeka properties are
 #: being deleted from the archive; the six columns per model stay on the Hub as
@@ -223,8 +225,9 @@ PANEL: Tuple[SentimentModel, ...] = (
         omeka_prefix="iwac:gpt56Luna",
         campaign="2026-08-03",
         generation=2,
-        # The only member that got the middle reasoning level the panel asks
-        # for; the other two have no medium and round up. 2.7 h for the corpus.
+        # One of three members that get the middle reasoning level the panel
+        # asks for (with Qwen3.8 and Claude Haiku 5.5); Mistral, DeepSeek and
+        # Gemma have no medium and round up. 2.7 h for the corpus.
         run_config="reasoning_effort=medium; response schema; no temperature",
         prompt_fingerprint="d14ace9ac192",
     ),
@@ -312,12 +315,12 @@ PANEL: Tuple[SentimentModel, ...] = (
         # high-centrality material. The retired items are listed in the run's
         # ``*_failures.json`` beside its merged JSONL.
         #
-        # Read at the depth the panel actually asks for, which only Luna also
-        # manages: Qwen3.8 has a real low|medium|xhigh ladder (measured on the
+        # Read at the depth the panel actually asks for, as are Luna and Claude
+        # Haiku 5.5: Qwen3.8 has a real low|medium|xhigh ladder (measured on the
         # endpoint — 28.5 s / 37.0 s / 89.1 s median completion), where Mistral,
         # DeepSeek and Gemma have no middle rung and round ``medium`` up to
         # ``high``. Any write-up of panel results has to say that three of the
-        # five are read deeper than requested and two are not.
+        # six are read deeper than requested and three are not.
         #
         # temperature=1.0 is Qwen's *thinking-mode* recipe (its
         # ``generation_config.json`` ships 1.0 / top_p 0.95 / top_k 20); the
@@ -328,6 +331,31 @@ PANEL: Tuple[SentimentModel, ...] = (
             "temperature=1.0 (Qwen thinking-mode recipe); reasoning_effort=medium "
             "(a rung the model has, not one it was rounded up to); guided decoding; "
             "self-hosted vLLM, bf16, Festus/Bayreuth"
+        ),
+        prompt_fingerprint="d14ace9ac192",
+    ),
+    SentimentModel(
+        prefix="claude_haiku_5_5",
+        label="Claude Haiku 5.5",
+        model_id="claude-haiku-5-5",
+        omeka_prefix="iwac:claudeHaiku55",
+        # Corpus pass written straight to Omeka by ``01_sentiment_analysis.py``.
+        # Promoted into the panel on 2026-10-22 **without a pilot**, at the
+        # curator's decision, so no agreement or self-consistency figure exists
+        # for it yet (``02_pilot_new_panel.py --repeats 3`` is pending in
+        # iwac-ai-pipelines). Authority item 125443.
+        #
+        # Not the same eligible set as the rest of the panel: on 2026-10-27 it
+        # held centralité and polarité on 16,617 of 16,715 articles, where every
+        # other generation-2 member stops at 12,298 or below. The ~4,300 rows
+        # only Haiku answered carry a single vote, so they get no consensus.
+        campaign="2026-10-23",
+        generation=2,
+        # A genuine middle rung (the API offers low|medium|high|xhigh|max), so
+        # with Luna and Qwen3.8 it is read at the depth the panel asks for.
+        run_config=(
+            "reasoning_effort=medium (a rung the model has); temperature unset "
+            "(the API rejects any but the default); Anthropic API, direct"
         ),
         prompt_fingerprint="d14ace9ac192",
     ),

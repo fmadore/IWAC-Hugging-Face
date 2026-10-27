@@ -81,6 +81,16 @@ class TestPanelShape:
         for model in active_models():
             assert model.prompt_fingerprint, model.prefix
 
+    def test_claude_haiku_5_5_is_a_live_generation_2_member(self):
+        """Issue #21: the sixth generation-2 member, read from IWAC vocabulary
+        properties 399-404."""
+        haiku = next(m for m in PANEL if m.prefix == "claude_haiku_5_5")
+        assert haiku.model_id == "claude-haiku-5-5"
+        assert haiku.omeka_property("Centralite") == "iwac:claudeHaiku55Centralite"
+        assert haiku.generation == 2 and not haiku.frozen
+        assert haiku.prompt_fingerprint == "d14ace9ac192"
+        assert len(generation(2)) == 6
+
     def test_prefixes_are_unique(self):
         prefixes = [m.prefix for m in PANEL]
         assert len(prefixes) == len(set(prefixes))
