@@ -127,14 +127,19 @@ DOMAIN_STOPWORDS = {
     # the text discusses them, so they crowd into labels as though they were
     # subjects. All of these are references-only — none appears in the
     # articles dictionary. Removing the given name and surname dissolves the
-    # co-author strings too (leblanc_gomez_perez, savadogo_gomez_perez), so
-    # "leblanc" and "savadogo" need not be listed and are better left out:
-    # Savadogo is an everyday Burkinabè surname. For the same reason "souza"
-    # is absent — it IS in the press corpus, naming the Afro-Brazilian
-    # families of Ouidah (francisco_félix_souza, famille_souza).
+    # co-author strings too (savadogo_gomez_perez), so "savadogo" need not be
+    # listed and is better left out: Savadogo is an everyday Burkinabè
+    # surname. For the same reason "souza" is absent — it IS in the press
+    # corpus, naming the Afro-Brazilian families of Ouidah
+    # (francisco_félix_souza, famille_souza).
     "muriel", "gomez", "perez", "sean", "hanretta", "weiss", "caleb",
     "playbook",  # from the report title weiss_aqim_imperial_playbook;
                  # "aqim" stays, it is a real organisation
+    # Once gomez_perez was gone, the 2026-11 re-fit grew
+    # marie_nathalie_leblanc (61 English chunks) into a topic label.
+    # "leblanc" occurs in neither the articles nor the publications
+    # dictionary; "marie" and "nathalie" do, so only the surname goes.
+    "leblanc",
 
     # Markup / URL residue surviving OCR and HTML extraction ("&amp;" → amp)
     "amp", "http", "https", "www", "url", "com", "pdf", "doi", "isbn",
@@ -189,6 +194,48 @@ JUNK_COMPOUND_STOPWORDS = {
     "war_journal",                # Long War Journal, a source on jihadism
     # NOT listed: journal_officiel (the government gazette — a primary
     # source in this collection, not apparatus).
+
+    "marie_nathalie",             # safety net once "leblanc" is stripped
+
+    # Thesis apparatus: title pages and running headers of the mémoires and
+    # theses in references. A handful of long theses carry them on every
+    # page, so in the 2026-11 French re-fit they took over whole topics
+    # (mémoire_maîtrise_kont_drissa, tabl_matiere - tome_ii - chapitre_ii).
+    # Each compound has zero occurrences in the articles dictionary. NOT
+    # listed: mémoire_collectif (collective memory is a subject), and
+    # entretien_réaliser, which the press uses too (60 articles chunks).
+    "mémoire_maîtrise",
+    "mémoire_maîtrise_histoire",
+    "mémoire_maîtrise_histoire_université",
+    "mémoire_maîtrise_université",
+    "mémoire_maîtrise_kont_drissa",
+    "mémoire_master",
+    "thèse_doctorat",
+    "thèse_doctorat_cycle",
+    "thèse_doctorat_etat",
+    "thèse_doctorat_unique",
+    "thèse_doctorat_université",
+    "thèse_cycle",
+    "thèse_unique",
+    "thèse_mémoire",
+    "département_histoire",
+    # Document structure: front matter and chapter headings.
+    "tabl_matiere",
+    "table_matière",
+    "tome_ii",
+    "chapitre_ii",
+    "chapitre_iii",
+    "chapitre_iv",
+    "chapitre_vi",
+    "cadre_géographique",
+    "source_oral",
+    # Running headers and cited titles, as with the journal titles above.
+    "arabisant_diffusion",
+    "drissa_arabisant",
+    "radicalisme_islamique_sud_sahara",
+    # Archival shelfmarks in footnotes ("ANS, carton …, dossier …").
+    "carton_dossier_archives_nationales",
+    "archives_nationales",
 }
 
 # What the post-phrase pass actually filters.
