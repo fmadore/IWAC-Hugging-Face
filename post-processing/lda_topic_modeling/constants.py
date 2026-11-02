@@ -561,6 +561,13 @@ CONFIG_PRESETS: dict[str, dict] = {
         # grows substantially; judge by stability, not by C_v.
         "model_path": "lda_model_references",
         "chunk_words": 1000,
+        # Ten long books and theses supplied 30% of the French training
+        # chunks; uncapped, each claimed a topic and 46% of documents fell
+        # into one generic topic. At 16 chunks per document (2026-11, seeds
+        # 42-44): largest topic 17%, no topic owned by a single book, shared
+        # C_v 0.478 -> 0.520, stability 0.359 -> 0.320 (the uncapped figure
+        # is inflated by book topics, which every seed recovers).
+        "max_chunks_per_doc": 16,
         "language": "Français",
         "num_topics": 16,
         "topic_range": (12, 32, 4),
@@ -569,6 +576,9 @@ CONFIG_PRESETS: dict[str, dict] = {
                 "model_path": "lda_model_references_en",
                 "num_topics": 8,
                 "topic_range": (8, 24, 4),
+                # Already balanced uncapped (2-36 documents per topic); a cap
+                # lowered both C_v and stability.
+                "max_chunks_per_doc": None,
             },
         },
     },
