@@ -40,8 +40,8 @@ def digest_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def frozen_preprocessing(stopwords, language, chunk_words) -> dict:
-    return {
+def frozen_preprocessing(stopwords, language, chunk_words, max_chunks_per_doc=None) -> dict:
+    settings = {
         "version": 1, "stopwords": sorted(stopwords),
         "fragment_stopwords": sorted(POST_PHRASE_STOPWORDS),
         "custom_collocations": [list(c) for c in CUSTOM_COLLOCATIONS],
@@ -50,6 +50,11 @@ def frozen_preprocessing(stopwords, language, chunk_words) -> dict:
         "language": language, "chunk_words": chunk_words,
         "inference_initialization": "per-document-token-sha256-v1",
     }
+    # Training-only, but it shapes the model, so it belongs to its identity.
+    # Recorded only when set: uncapped fits keep their earlier fingerprint.
+    if max_chunks_per_doc:
+        settings["max_chunks_per_doc"] = max_chunks_per_doc
+    return settings
 
 
 def prediction_tokenizer_kwargs(preprocessing: dict) -> dict:

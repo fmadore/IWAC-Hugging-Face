@@ -223,6 +223,27 @@ def chunk_tokens(tokens: List[str], chunk_size: int) -> List[List[str]]:
     return chunks
 
 
+def cap_chunks(chunks: List[List[str]], max_chunks: int | None) -> List[List[str]]:
+    """Keep at most ``max_chunks`` chunks, evenly spaced across the document.
+
+    Chunking alone lets length buy influence back: in the references corpus
+    ten books and theses supplied 30% of the French training chunks, each
+    claimed a topic of its own, and the remaining documents crowded into a
+    generic one. Capping per document restores roughly one-document-one-vote
+    at training time. The spacing is deterministic (no RNG) and spans the
+    whole work, so a book is still represented from introduction to
+    conclusion rather than by its opening pages. Training only — prediction
+    still infers every chunk.
+    """
+    if not max_chunks or len(chunks) <= max_chunks:
+        return chunks
+    if max_chunks == 1:
+        return [chunks[len(chunks) // 2]]
+    last = len(chunks) - 1
+    picks = sorted({round(i * last / (max_chunks - 1)) for i in range(max_chunks)})
+    return [chunks[i] for i in picks]
+
+
 def build_dictionary(
     tokenized_docs: List[List[str]],
     no_below: int = DEFAULT_NO_BELOW,

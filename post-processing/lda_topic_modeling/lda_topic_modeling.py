@@ -70,6 +70,7 @@ from iwac_pipeline.processing.lda_topic_modeling.modeling import (  # type: igno
     tokenize_documents,
     build_dictionary,
     build_corpus,
+    cap_chunks,
     chunk_tokens,
     create_lda_model,
     save_lda_model,
@@ -155,6 +156,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "Prediction averages chunk distributions back to one mixture per document. "
              "In predict mode the value is read from the model's training_parameters.json "
              "when not given.",
+    )
+    p.add_argument(
+        "--max-chunks-per-doc",
+        type=int,
+        default=None,
+        help="Fit only: train on at most N chunks per document, evenly spaced, so a "
+             "few long books cannot dominate the topics. Prediction still uses "
+             "every chunk. Default: per-config preset, else no cap.",
     )
     p.add_argument("--skip-coherence", action="store_true", help="Skip coherence metric computation")
     p.add_argument(
@@ -263,6 +272,14 @@ def _export_theta(ds, theta_col, model_dir, model_name, num_topics, language, lo
     logger.info(f"Exported document-topic matrix: {out_path} ({len(rows)} docs this pass)")
 
 
+def training_chunks(tokenized_docs, preprocessing):
+    """Chunk each document, then apply the frozen per-document cap (if any)."""
+    size = preprocessing["chunk_words"]
+    cap = preprocessing.get("max_chunks_per_doc")
+    return [part for doc in tokenized_docs
+            for part in cap_chunks(chunk_tokens(doc, size) if size else [doc], cap) if part]
+
+
 def prepare_training_corpus(texts, preprocessing, no_below, no_above):
     """Fit phrase/vocabulary transforms solely on the supplied training texts."""
     tokenizer = prediction_tokenizer_kwargs(preprocessing)
@@ -272,9 +289,7 @@ def prepare_training_corpus(texts, preprocessing, no_below, no_above):
         phrase_min_count=preprocessing["phrase_min_count"],
         phrase_threshold=preprocessing["phrase_threshold"],
     )
-    chunks = preprocessing["chunk_words"]
-    tokenized = [part for doc in tokenized
-                 for part in (chunk_tokens(doc, chunks) if chunks else [doc]) if part]
+    tokenized = training_chunks(tokenized, preprocessing)
     if not tokenized:
         raise ValueError("No valid training tokens")
     dictionary = build_dictionary(tokenized, no_below=no_below, no_above=no_above)
@@ -292,9 +307,7 @@ def prepare_evaluation(texts, groups, preprocessing, no_below, no_above, holdout
     held_tokens = [tokenize_for_prediction(
         texts[i], phraser=phraser, **prediction_tokenizer_kwargs(preprocessing)
     ) for i in held_idx]
-    chunks = preprocessing["chunk_words"]
-    held_tokens = [part for doc in held_tokens
-                   for part in (chunk_tokens(doc, chunks) if chunks else [doc]) if part]
+    held_tokens = training_chunks(held_tokens, preprocessing)
     held_corpus = [bow for bow in build_corpus(dictionary, held_tokens) if bow]
     if held_idx and not held_corpus:
         raise ValueError("Held-out documents contain no training-vocabulary tokens")
@@ -314,6 +327,8 @@ def main() -> int:
         raise SystemExit("--holdout must be in [0, 1)")
     if args.chunk_words is not None and args.chunk_words <= 0:
         raise SystemExit("--chunk-words must be positive")
+    if args.max_chunks_per_doc is not None and args.max_chunks_per_doc <= 0:
+        raise SystemExit("--max-chunks-per-doc must be positive")
 
     repo_id: str = args.repo
     text_column = "lemma_nostop"
@@ -360,6 +375,12 @@ def main() -> int:
     chunk_words: int | None = (
         args.chunk_words if args.chunk_words is not None else preset.get("chunk_words")
     )
+    max_chunks_per_doc: int | None = (
+        args.max_chunks_per_doc if args.max_chunks_per_doc is not None
+        else preset.get("max_chunks_per_doc")
+    )
+    if max_chunks_per_doc and not chunk_words:
+        raise SystemExit("--max-chunks-per-doc requires --chunk-words")
     saved_prediction_settings = None
     if mode == "predict":
         model_dir, model_id = resolve_bundle(model_root)
@@ -374,6 +395,8 @@ def main() -> int:
             raise ValueError("--language does not match the trained model")
         if args.chunk_words is not None and args.chunk_words != saved_preprocessing["chunk_words"]:
             raise ValueError("--chunk-words does not match the trained model")
+        if args.max_chunks_per_doc is not None:
+            raise ValueError("--max-chunks-per-doc is a training setting; predict uses the model's own")
         if args.no_relevance_labels and saved_params.get("lda", {}).get("label_lambda_relevance") is not None:
             raise ValueError("Predict mode uses frozen labels; refit to change label settings")
         language = saved_preprocessing["language"]
@@ -390,6 +413,7 @@ def main() -> int:
         logger.info(
             f"Preset '{config_name}': language={language}, model_path={model_dir}, "
             f"chunk_words={chunk_words}"
+            + (f", max_chunks_per_doc={max_chunks_per_doc}" if mode == "fit" and max_chunks_per_doc else "")
             + (
                 f", k-sweep {range_start}-{range_end} step {range_step}"
                 if optimize_topics
@@ -458,7 +482,7 @@ def main() -> int:
     dictionary = None
     phraser = None
     topic_labels = None
-    preprocessing = frozen_preprocessing(stopwords, language, chunk_words)
+    preprocessing = frozen_preprocessing(stopwords, language, chunk_words, max_chunks_per_doc)
 
     if mode == "fit":
         # Extract training texts in the target language
@@ -564,6 +588,7 @@ def main() -> int:
             "num_training_chunks": len(tokenized_valid),
             "dictionary_size": len(dictionary),
             "chunk_words": chunk_words,
+            "max_chunks_per_doc": max_chunks_per_doc,
             "language": language,
             "repo_id": repo_id,
             "source_revision": source_revision,

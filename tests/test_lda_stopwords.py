@@ -120,10 +120,12 @@ class TestJunkCompounds:
             assert word not in DOMAIN_STOPWORDS
 
     def test_cited_scholars_dissolve_their_coauthor_strings(self):
-        # Removing gomez/perez is what kills leblanc_/savadogo_gomez_perez,
-        # so those everyday West African surnames stay out of the set.
-        assert {"muriel", "gomez", "perez", "hanretta", "weiss"} <= DOMAIN_STOPWORDS
-        for surname in ("leblanc", "savadogo", "souza"):
+        # Removing gomez/perez is what kills savadogo_gomez_perez, so those
+        # everyday West African surnames stay out of the set. "leblanc" is
+        # in it: absent from the press and publications dictionaries, it
+        # otherwise re-forms marie_nathalie_leblanc as a topic label.
+        assert {"muriel", "gomez", "perez", "hanretta", "weiss", "leblanc"} <= DOMAIN_STOPWORDS
+        for surname in ("savadogo", "souza"):
             assert surname not in DOMAIN_STOPWORDS
 
     def test_junk_compounds_are_compounds(self):
