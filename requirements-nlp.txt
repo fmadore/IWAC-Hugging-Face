@@ -4,6 +4,6 @@ textstat>=0.7.13,<0.8
 # tokenizers 0.22.1 and 0.23.2 were both checked to reproduce the reference token ids.
 onnxruntime>=1.31.0,<2
 tokenizers>=0.22.1,<0.24
-pillow>=12.3.0,<13
+pillow>=13.0.0,<14
 # Calendar convention is a versioned method; see migration documentation.
 hijridate>=2.6.0,<3
