@@ -158,19 +158,111 @@ def test_fit_cli_sweep_receives_only_training_documents(fitted_model, monkeypatc
 
     monkeypatch.setattr(cli, "find_optimal_topics", sweep)
     root = tmp_path / "evaluated"
+    pushes_before = state.get("push")
     monkeypatch.setattr(sys, "argv", [
         "lda", "--repo", "test/repo", "--config", "articles", "--mode", "fit", "--yes",
         "--model-path", str(root), "--optimize-topics", "--passes", "1", "--iterations", "20",
         "--no-below", "1", "--no-above", "1.0", "--skip-coherence", "--holdout", "0.34",
     ])
     assert cli.main() == 0
-    directory, _ = resolve_bundle(root)
-    _, params = load_preprocessing(directory)
-    split = params["evaluation"]["split"]
+    # articles pins k, so the sweep is report-only: no bundle, no push.
+    assert not (root / "bundles").exists() and not (root / "current.json").exists()
+    assert state.get("push") is pushes_before
+    report = json.loads(next((root / "sweeps").glob("*/sweep_report.json")).read_text())
+    assert report["k_pinned"] and report["pinned_k"] == 30
+    assert "not a document-completion" in report["holdout_metric"]
+    split = report["evaluation_split"]
     assert set(split["train_document_ids"]).isdisjoint(split["holdout_document_ids"])
     assert captured["holdout"]
     for oid in split["holdout_document_ids"]:
         assert f"uniquemarker{'abcdef'[int(oid)]}" not in captured["vocabulary"]
+
+
+def test_pinned_k_refuses_selection_from_the_sweep(fitted_model, monkeypatch, tmp_path):
+    for extra in (["--num-topics", "3"], []):  # explicit pin, then the articles preset pin
+        monkeypatch.setattr(sys, "argv", [
+            "lda", "--repo", "test/repo", "--config", "articles", "--mode", "fit", "--yes",
+            "--model-path", str(tmp_path / "refused"), "--select-k-from-sweep", *extra,
+        ])
+        with pytest.raises(SystemExit, match="pinned"):
+            cli.main()
+    assert not (tmp_path / "refused").exists()
+
+
+def test_unpinned_config_selects_k_only_on_request(fitted_model, monkeypatch, tmp_path):
+    _, state = fitted_model
+    monkeypatch.setattr(cli, "find_optimal_topics", lambda *a, **kw: (3, [
+        {"k": 2, "c_v": 0.40, "c_v_sd": 0.05}, {"k": 3, "c_v": 0.42, "c_v_sd": 0.05},
+    ]))
+    root = tmp_path / "selected"
+    base = ["lda", "--repo", "test/repo", "--config", "unpinned-subset", "--mode", "fit", "--yes",
+            "--model-path", str(root), "--passes", "1", "--iterations", "20", "--no-below", "1",
+            "--no-above", "1.0", "--skip-coherence"]
+    monkeypatch.setattr(sys, "argv", base + ["--optimize-topics"])
+    assert cli.main() == 0
+    assert not (root / "current.json").exists()      # without opt-in: report only
+    monkeypatch.setattr(sys, "argv", base + ["--select-k-from-sweep", "--stability-seeds", "2"])
+    assert cli.main() == 0
+    directory, _ = resolve_bundle(root)
+    _, params = load_preprocessing(directory)
+    assert params["lda"]["num_topics"] == 3 and params["extra"]["k_source"] == "sweep"
+    ranking = params["extra"]["topic_optimization"]["ranking"]
+    assert ranking["runner_up_k"] == 2 and ranking["distinguishable"] is False
+
+
+def test_sweep_ranking_reports_indistinguishable_and_unknown():
+    from iwac_pipeline.processing.lda_topic_modeling.modeling import sweep_ranking
+
+    close = sweep_ranking([{"k": 8, "c_v": 0.50, "c_v_sd": 0.02}, {"k": 12, "c_v": 0.51, "c_v_sd": 0.03}])
+    assert close["best_k"] == 12 and close["distinguishable"] is False
+    clear = sweep_ranking([{"k": 8, "c_v": 0.40, "c_v_sd": 0.01}, {"k": 12, "c_v": 0.51, "c_v_sd": 0.01}])
+    assert clear["distinguishable"] is True
+    single = sweep_ranking([{"k": 8, "c_v": 0.40, "c_v_sd": None}, {"k": 12, "c_v": 0.51, "c_v_sd": None}])
+    assert single["distinguishable"] is None
+
+
+def test_evidence_floor_nulls_assignments_and_is_recorded(fitted_model, monkeypatch):
+    model_root, state = fitted_model
+    directory, model_id = resolve_bundle(model_root)
+    _, params = load_preprocessing(directory)
+    assert params["extra"]["min_train_tokens"] == 5
+    monkeypatch.setattr(sys, "argv", [
+        "lda", "--repo", "test/repo", "--config", "articles", "--mode", "predict", "--yes",
+        "--model-path", str(model_root), "--min-predict-tokens", "1000",
+    ])
+    assert cli.main() == 0
+    assert all(t is None for t in state["dataset"]["lda_topic_id"])
+    assert all(t is None for t in state["dataset"]["lda_topic_label"])
+    assert set(state["dataset"]["lda_model_name"]) == {model_id}
+    assert "min in-vocabulary tokens 1000" in state["push"]["commit_message"]
+    assert "_lda_vocab_tokens" not in state["dataset"].column_names
+    run = max((model_root / "predictions").iterdir())
+    theta = pd.read_parquet(run / "doc_topics.parquet")
+    assert theta["below_min_evidence"].all() and (theta["n_vocab_tokens"] > 0).all()
+    metadata = json.loads((run / "doc_topics.metadata.json").read_text())
+    assert metadata["min_vocab_tokens"] == 1000
+
+
+def test_training_reads_only_the_columns_it_needs(fitted_model, monkeypatch, tmp_path):
+    _, state = fitted_model
+    data = state["dataset"].to_dict()
+    data["OCR"] = ["x" * 10_000] * len(data["o:id"])
+    state["dataset"] = Dataset.from_dict(data)
+    seen = {}
+    original = Dataset.select_columns
+
+    def spy(self, columns, *a, **kw):
+        seen.setdefault("first", list(columns))
+        return original(self, columns, *a, **kw)
+
+    monkeypatch.setattr(Dataset, "select_columns", spy)
+    monkeypatch.setattr(sys, "argv", [
+        "lda", "--repo", "test/repo", "--config", "articles", "--mode", "fit", "--yes",
+        "--model-path", str(tmp_path / "narrow"), "--num-topics", "2", "--passes", "1",
+        "--iterations", "20", "--no-below", "1", "--no-above", "1.0", "--skip-coherence",
+    ])
+    assert cli.main() == 0
+    assert seen["first"] == ["o:id", "language", "lemma_nostop"]
 
 
 def test_prevalence_theta_reuse_and_stale_input_rejection(fitted_model):

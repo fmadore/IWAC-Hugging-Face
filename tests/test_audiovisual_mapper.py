@@ -124,15 +124,12 @@ class _FakeApi:
 def _map(item, monkeypatch, *, thumbnail="https://islam.zmo.de/iiif-thumb.jpg"):
     """Run the async mapper with the two network helpers stubbed out."""
 
-    async def fake_thumbnail(_omeka_id, _session):
+    from iwac_common import omeka_client
+
+    async def fake_thumbnail(_omeka_id, _session=None):
         return thumbnail
 
-    class _FakeConnManager:
-        async def get(self):
-            return None
-
-    monkeypatch.setattr(av, "fetch_iiif_thumbnail_url", fake_thumbnail)
-    monkeypatch.setattr(av, "conn_manager", _FakeConnManager())
+    monkeypatch.setattr(omeka_client, "fetch_iiif_thumbnail_url", fake_thumbnail)
     return asyncio.run(av.map_audiovisual_document(item, _FakeApi()))
 
 

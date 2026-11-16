@@ -1,32 +1,25 @@
 """Verify the complete card/Parquet schema at one immutable Hub revision.
 
-The normal write gateway now stages the card and Parquet in one atomic commit.
-This utility verifies that result without mutation (``repair=False``). Explicit
-repair remains available for legacy inconsistent cards, using a parent-commit
-precondition so it cannot overwrite a concurrent card edit.
+The write gateway (``hub.push_datasets_verified``) serialises every Parquet
+shard *and* the card's ``dataset_info``/``configs`` entries for the written
+configs, then lands them together in one ``create_commit`` with a parent-SHA
+precondition. The card's declared ``features`` are generated from the same
+Arrow schema as the shards (:func:`_features_yaml`), so the two cannot drift in
+a successful commit.
 
-**Why this exists.** ``push_to_hub`` rewrites the card's ``dataset_info`` byte
-sizes for the config it just pushed but, observed twice on 2026-08-06 with
-``datasets`` 5.0.1, does *not* rewrite that config's ``features`` list. A push
-that adds or removes a column therefore leaves the card declaring the old schema,
-and ``load_dataset`` then raises::
+This module is the post-commit read-only check of that result, pinned to the
+new revision: the published Parquet footers must equal the prepared schema and
+columns, and the card must declare exactly that schema. A mismatch raises
+:class:`CardSchemaError`, which the gateway reports as "commit landed but
+verification failed" so the revision is inspected before any retry.
 
-    CastError: Couldn't cast … because column names don't match
-
-That is a hard read failure, not a cosmetic drift: the subset becomes unloadable
-for every consumer — and for this pipeline's own next run, since ``hub_merge``
-loads the Hub copy before merging. It happened to ``articles`` on the private
-mirror and then, from ``publish_public.py``, to the public *citable* dataset.
-
-**Why it repairs rather than just aborting.** Every other rail in this repo
-aborts *before* touching the Hub, so aborting protects the data. Here the push has
-already happened; refusing to continue would leave the dataset broken. So this
-checks, rewrites the one stale ``features`` list from the parquet that is now on
-the Hub, and re-verifies. It raises only when the mismatch survives that.
-
-Deliberately narrow: it replaces one config's ``features`` and nothing else —
-never the byte sizes (``push_to_hub`` computes those correctly) and never another
-config's entry, which is asserted before the card is written.
+**Why it matters.** A card whose ``features`` disagree with the Parquet makes
+``load_dataset`` raise ``CastError: Couldn't cast … because column names don't
+match`` — the subset becomes unloadable for every consumer and for this
+pipeline's own next run, since ``hub_merge`` loads the Hub copy before merging.
+That happened on 2026-08-06, when writes still went through ``push_to_hub``
+(which refreshed the byte sizes but not the feature list); the atomic commit
+replaced that flow.
 """
 
 from __future__ import annotations
@@ -34,16 +27,15 @@ from __future__ import annotations
 from typing import List, Optional, Sequence
 
 import pyarrow as pa
-import pyarrow.parquet as pq
-from huggingface_hub import DatasetCard, HfApi, HfFileSystem, hf_hub_download
+from huggingface_hub import DatasetCard, hf_hub_download
 from rich.console import Console
 
-from .hub import get_repo_revision, resolve_hf_token
+from .hub import get_repo_revision, iter_parquet_shards, resolve_hf_token
 
 
 class CardSchemaError(RuntimeError):
-    """The card's declared schema disagrees with the pushed parquet and could not
-    be repaired. The subset is unloadable until the card is fixed."""
+    """The card's declared schema, the published parquet and the prepared
+    dataset disagree. A subset in that state is unloadable until fixed."""
 
 
 def _narrow(dtype: pa.DataType) -> pa.DataType:
@@ -52,7 +44,7 @@ def _narrow(dtype: pa.DataType) -> pa.DataType:
     The two are the same logical type, ``string`` is what every hand-written
     entry in these cards uses, and it matches the ``num_bytes`` ``push_to_hub``
     records (which assumes 4-byte offsets). Normalising *both* sides before
-    comparing is also what stops this guard from "repairing" on every push.
+    comparing is also what stops this guard from failing on every push.
     """
     if pa.types.is_large_string(dtype):
         return pa.string()
@@ -68,17 +60,11 @@ def _narrow(dtype: pa.DataType) -> pa.DataType:
 def _parquet_schema(repo: str, config_name: str, token: Optional[str], revision: Optional[str] = None) -> pa.Schema:
     """Arrow schema of the config's parquet on the Hub, read from the footer only
     (no shard download). All shards of a config share one schema."""
-    fs = HfFileSystem(token=token)
-    location = f"{repo}@{revision}" if revision else repo
-    shards = sorted(fs.glob(f"datasets/{location}/{config_name}/*.parquet"))
-    if not shards:
-        raise CardSchemaError(
-            f"No parquet found for '{config_name}' in {repo}; cannot verify the card."
-        )
     schema = None
-    for shard in shards:
-        with fs.open(shard, "rb") as handle:
-            current = _normalize_schema(pq.ParquetFile(handle).schema_arrow)
+    for _, parquet in iter_parquet_shards(
+        repo, config_name, revision=revision, token=token, error=CardSchemaError
+    ):
+        current = _normalize_schema(parquet.schema_arrow)
         if schema is not None and not schema.equals(current):
             raise CardSchemaError(f"Inconsistent Parquet schemas in '{config_name}' at {revision}")
         schema = current
@@ -130,41 +116,33 @@ def _declared(card: DatasetCard, config_name: str) -> Optional[dict]:
     return next((e for e in infos if e.get("config_name") == config_name), None)
 
 
-def _entry_index(card: DatasetCard, config_name: str) -> Optional[int]:
-    infos = card.data.get("dataset_info")
-    if not isinstance(infos, list):
-        return None
-    return next(
-        (i for i, e in enumerate(infos) if e.get("config_name") == config_name), None
-    )
-
-
 def sync_card_features(
     repo: str,
     config_name: str,
     *,
     token: Optional[str] = None,
     console: Optional[Console] = None,
-    repair: bool = True,
     expected_columns: Optional[Sequence[str]] = None,
     expected_schema: Optional[pa.Schema] = None,
     revision: Optional[str] = None,
-) -> bool:
-    """Verify — and by default repair — the card's declared features for one config.
+    parquet_schema: Optional[pa.Schema] = None,
+) -> None:
+    """Verify, without writing, that one config's card features match its parquet.
 
-    Returns ``True`` when the card already matched, ``False`` when it was
-    repaired. Raises :class:`CardSchemaError` if the mismatch survives the repair
-    or ``repair=False``.
-
-    ``expected_columns`` is optional belt-and-braces: when given, the parquet on
-    the Hub must also carry exactly those columns, which catches a push that
-    landed a different frame than the caller thinks it did.
+    Raises :class:`CardSchemaError` on any mismatch. ``expected_columns`` and
+    ``expected_schema`` additionally require the parquet on the Hub to be the
+    frame the caller prepared, which catches a commit that landed something
+    else. ``parquet_schema`` is the normalized footer schema when the caller has
+    already read it at ``revision``; otherwise the footers are read here.
     """
     console = console or Console()
     token = resolve_hf_token(token)
 
     revision = revision or get_repo_revision(repo, token=token)
-    schema = _parquet_schema(repo, config_name, token, revision)
+    schema = (
+        _normalize_schema(parquet_schema) if parquet_schema is not None
+        else _parquet_schema(repo, config_name, token, revision)
+    )
     if expected_schema is not None and not schema.equals(_normalize_schema(expected_schema)):
         raise CardSchemaError(f"{repo}/{config_name}: published schema differs from the prepared dataset")
     actual = list(schema.names)
@@ -184,7 +162,7 @@ def sync_card_features(
             f"[dim]ℹ Card for '{config_name}' declares no dataset_info features; "
             f"nothing can desync.[/dim]"
         )
-        return True
+        return
 
     declared = [f.get("name") for f in entry["features"]]
     if _declared_schema(entry).equals(schema):
@@ -192,7 +170,7 @@ def sync_card_features(
             f"[green]✓[/green] Card schema matches the pushed parquet "
             f"({len(actual)} columns)."
         )
-        return True
+        return
 
     added = [c for c in actual if c not in declared]
     removed = [c for c in declared if c not in actual]
@@ -211,52 +189,7 @@ def sync_card_features(
         f"[yellow]⚠[/yellow] {detail}.\n"
         f"[yellow]  load_dataset would raise CastError until the card is fixed.[/yellow]"
     )
-    if not repair:
-        raise CardSchemaError(detail)
-
-    index = _entry_index(card, config_name)
-    if index is None:
-        raise CardSchemaError(
-            f"{detail}. The card's dataset_info is not a list, so this guard "
-            f"cannot rewrite one entry; fix it by hand."
-        )
-    infos = card.data["dataset_info"]
-    others_before = [e for i, e in enumerate(infos) if i != index]
-    infos[index]["features"] = _features_yaml(schema)
-    if [e for i, e in enumerate(infos) if i != index] != others_before:
-        raise CardSchemaError(  # pragma: no cover - defensive
-            f"{detail}. Rewriting '{config_name}' altered another config's entry; "
-            f"refusing to write the card."
-        )
-
-    commit = HfApi(token=token).upload_file(
-        path_or_fileobj=card.content.encode("utf-8"),
-        path_in_repo="README.md",
-        repo_id=repo,
-        repo_type="dataset",
-        parent_commit=revision,
-        commit_message=(
-            f"Card: declare the {config_name} schema pushed in the preceding commit "
-            f"({len(actual)} columns) — fixes load_dataset CastError"
-        ),
-    )
-
-    # Re-verify against the Hub rather than trusting the local object.
-    reloaded = _declared(
-        _load_card(repo, token, commit.oid), config_name
-    )
-    names = [f.get("name") for f in (reloaded or {}).get("features", [])]
-    if not reloaded or not _declared_schema(reloaded).equals(schema):
-        raise CardSchemaError(
-            f"{detail}. The card was rewritten but still does not match "
-            f"({len(names)} columns declared). Fix it by hand before anyone loads "
-            f"this subset."
-        )
-    console.print(
-        f"[green]✓[/green] Card repaired: '{config_name}' now declares "
-        f"{len(actual)} columns and loads cleanly."
-    )
-    return False
+    raise CardSchemaError(detail)
 
 
 __all__ = ["CardSchemaError", "sync_card_features"]

@@ -14,6 +14,7 @@ from lda_topic_modeling.constants import (
     FRAGMENT_STOPWORDS,
     JUNK_COMPOUND_STOPWORDS,
     POST_PHRASE_STOPWORDS,
+    modeling_stopwords,
 )
 from lda_topic_modeling.modeling import (
     _contains_artifact,
@@ -50,10 +51,13 @@ class TestFragmentStopwords:
         assert drop_fragments(tokens) == ["al_azhar", "el_hadj", "page_facebook"]
 
     def test_fragments_are_not_modeling_stopwords(self):
-        # In DOMAIN_STOPWORDS they would be stripped pre-phrase and the
-        # compounds could never form in the first place.
+        # In the pre-phrase set they would be stripped before phrasing and
+        # the compounds could never form in the first place. English "an" is
+        # an article in the English model, where pre-phrase removal is right.
+        french = modeling_stopwords("Français")
         for frag in FRAGMENT_STOPWORDS:
-            assert frag not in DOMAIN_STOPWORDS
+            assert frag not in french
+        assert FRAGMENT_STOPWORDS & modeling_stopwords("Anglais") == {"an"}
 
     # Joining is driven by an explicit collocation rather than gensim's
     # statistics: the invariant under test is the ORDER of the passes, and a

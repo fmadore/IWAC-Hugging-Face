@@ -246,6 +246,109 @@ class TestOuterMergeStaleRows:
         with pytest.raises(ValueError):
             merge_with_hub_dataset(_new(), "repo", "references", stale_rows="maybe")
 
+    def test_kept_row_with_one_element_list_round_trips_through_arrow(self, monkeypatch):
+        """A kept row's ``private_fields == ['OCR']`` used to be copied cell by
+        cell through ``.at`` into a NaN cell, became a 0-d array, and Arrow
+        refused the whole frame ("Only 1D arrays accepted")."""
+        import pyarrow as pa
+        from datasets import Dataset
+
+        table = pa.table({
+            "o:id": ["1", "2"], "title": ["a", "b"], "item_is_public": [True, True],
+            "private_fields": pa.array([[], ["OCR"]], pa.list_(pa.string())),
+            "OCR": ["one", "two"],
+            "embedding_abstract": pa.array([[0.1], [0.2]], pa.list_(pa.float32())),
+        })
+        monkeypatch.setattr(hub_merge, "load_dataset", lambda *a, **k: Dataset(table))
+        fresh = pd.DataFrame({
+            "o:id": ["1"], "title": ["A"], "item_is_public": [True],
+            "private_fields": [[]], "OCR": ["one"],
+        })
+        out = merge_with_hub_dataset(
+            fresh, "repo", "references", how="outer", stale_rows="keep", allow_shrink=True,
+        )
+        kept = out.set_index("o:id").loc["2"]
+        assert list(kept["private_fields"]) == ["OCR"]
+        assert kept["title"] == "b" and kept["OCR"] == "two"
+        assert not kept["item_is_public"]
+        assert list(kept["embedding_abstract"]) == pytest.approx([0.2])
+        assert out.set_index("o:id").loc["1", "item_is_public"]
+        pa.Table.from_pandas(out, preserve_index=False)
+        ds = Dataset.from_pandas(out, preserve_index=False)
+        assert ds["private_fields"] == [[], ["OCR"]]
+
+    def test_kept_rows_keep_their_merge_position(self, hub):
+        hub(_existing(20))
+        fresh = _new(20)
+        fresh = fresh[fresh["o:id"] != "10"]
+        out = merge_with_hub_dataset(fresh, "repo", "references", how="outer",
+                                     stale_rows="keep")
+        assert sorted(out["o:id"]) == sorted(_existing(20)["o:id"])
+        assert out["o:id"].is_unique
+
+
+class TestMergeSteps:
+    def test_preserved_mapper_failure_is_private(self, hub):
+        existing = _existing(2)
+        existing["item_is_public"] = [True, True]
+        hub(existing)
+        fresh = _new(1)
+        fresh["item_is_public"] = [True]
+        out = merge_with_hub_dataset(
+            fresh, "repo", "articles", preserve_existing_ids=["2"],
+        ).set_index("o:id")
+        assert not out.loc["2", "item_is_public"]
+        assert out.loc["1", "item_is_public"]
+
+    def test_preserving_a_row_absent_from_the_baseline_fails_closed(self, hub):
+        hub(_existing(2))
+        with pytest.raises(HubBaselineUnavailableError, match="absent from the Hub"):
+            merge_with_hub_dataset(_new(2), "repo", "articles",
+                                   preserve_existing_ids=["99"])
+
+    def test_preserved_rows_count_towards_the_shrink_guard(self, hub):
+        hub(_existing(20))
+        out = merge_with_hub_dataset(
+            _new(10), "repo", "articles",
+            preserve_existing_ids=[str(i) for i in range(11, 21)],
+        )
+        assert len(out) == 20
+
+    def test_corrupt_baseline_ids_are_not_treated_as_empty(self, hub):
+        hub(pd.DataFrame({"o:id": ["1", None], "title": ["a", "b"]}))
+        with pytest.raises(HubBaselineUnavailableError, match="corrupt baseline"):
+            merge_with_hub_dataset(_new(2), "repo", "articles")
+
+    def test_declared_config_that_fails_to_load_is_never_initialized(self, monkeypatch):
+        monkeypatch.setattr(
+            hub_merge, "load_dataset", lambda *a, **k: (_ for _ in ()).throw(OSError("503"))
+        )
+        monkeypatch.setattr(hub_merge, "get_repo_configs", lambda *a, **k: {"articles"})
+        with pytest.raises(HubBaselineUnavailableError, match="config exists"):
+            merge_with_hub_dataset(_new(), "repo", "articles", allow_initialize=True)
+
+    def test_duplicate_id_error_is_a_data_contract_error(self):
+        from iwac_common.schema import DataContractError
+
+        assert issubclass(DuplicateIdError, DataContractError)
+
+    def test_revision_out_receives_the_baseline_sha(self, monkeypatch, hub):
+        hub(_existing())
+        monkeypatch.setattr(hub_merge, "get_repo_revision", lambda *a, **k: "sha-1")
+        revision = {}
+        merge_with_hub_dataset(_new(), "repo", "articles", revision_out=revision)
+        assert revision == {"revision": "sha-1"}
+
+    def test_preserve_derived_keeps_stale_values_but_reports_them(self, hub):
+        hub(pd.DataFrame({"o:id": ["1"], "OCR": ["old"], "lemma_text": ["old"]}))
+        stale = {}
+        out = merge_with_hub_dataset(
+            pd.DataFrame({"o:id": ["1"], "OCR": ["new"]}), "repo", "articles",
+            derived_from={"OCR": ("lemma_text",)}, invalidate_derived=False, stale_out=stale,
+        )
+        assert out.iloc[0]["lemma_text"] == "old"
+        assert stale == {"OCR": {"ids": ["1"], "derived": ["lemma_text"]}}
+
 
 class TestSchemaStability:
     def test_hub_column_order_survives_an_upload(self, hub):
@@ -477,3 +580,14 @@ class TestStaleDerivedValues:
         out = merge_with_hub_dataset(fresh, "repo", "articles", allow_shrink=True,
                                      derived_from=DERIVED_FROM["articles"])
         assert out["related_articles"].isna().all()
+
+
+def test_visibility_flip_invalidates_neighbour_lists():
+    import pandas as pd
+
+    from iwac_common.hub_merge import _visibility_changed
+
+    base = pd.DataFrame({"o:id": ["1", "2"], "item_is_public": [True, True]})
+    assert not _visibility_changed(base, base.copy())
+    assert _visibility_changed(base.assign(item_is_public=[True, False]), base)
+    assert _visibility_changed(base.drop(columns="item_is_public"), base)

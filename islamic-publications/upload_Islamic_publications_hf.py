@@ -11,13 +11,10 @@ Usage
     python islamic-publications/upload_Islamic_publications_hf.py \
         --max-shard-size 1GB
 
-CLI options (shared, see iwac_common.upload_runner)
----------------------------------------------------
-  --repo            Target Hugging Face repository (default: private full mirror)
-  --max-shard-size  Maximum Parquet shard size (e.g. 500MB, 1GB)
-  --no-cache        Bypass the local Omeka response cache (24h TTL)
-  --dry-run         Fetch, map and merge, but push nothing
-  --force-shrink    Allow pushing a dataset markedly smaller than the Hub's
+CLI options
+-----------
+Shared by every upload script: run with ``--help`` for the full list
+(parser: ``iwac_common.upload_runner.build_parser``).
 
 Environment Variables
 --------------------
@@ -37,13 +34,10 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(script_dir)
 sys.path.insert(0, parent_dir)
 
-from country_mapper import get_country_from_newspaper
+from country_mapper import get_country_from_outlets
 from iwac_common.omeka_client import (
     OmekaApiClient,
-    conn_manager,
-    fetch_iiif_thumbnail_url,
-    fetch_primary_media_url,
-    iiif_manifest_url,
+    fetch_media_pointers,
     item_page_url,
 )
 from iwac_common.field_mappers import (
@@ -56,14 +50,17 @@ from iwac_common.field_mappers import (
     parse_pub_date,
     to_int_or_none,
 )
-from iwac_common.upload_runner import UploadSpec, report_unmapped_values, run_upload
-from iwac_common.schema import SUBSETS
+from iwac_common.upload_runner import (
+    COUNTRY_MAPPER_HINT,
+    UploadSpec,
+    report_unmapped_values,
+    run_upload,
+)
 
 
 
-# Orchestration (fetch → map loop → merge → validate → push), the CLI
-# (--repo, --max-shard-size, --no-cache, --dry-run, --force-shrink) and the
-# Rich console/logging setup live in iwac_common.upload_runner.
+# Orchestration (fetch → map loop → merge → validate → push), the CLI (see
+# --help) and the Rich console/logging setup live in iwac_common.upload_runner.
 # islamic-publications and articles share the default ``.cache_omk`` cache
 # directory (cache keys include the resource class id).
 
@@ -75,23 +72,15 @@ from iwac_common.schema import SUBSETS
 async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item Omeka (publication islamique) en dict plat pour HF datasets."""
 
-    primary_url = await fetch_primary_media_url(
-        item, api, affected_fields=("PDF", "thumbnail", "iiif_manifest")
+    # Thumbnail and IIIF manifest only when there is a PDF behind them.
+    primary_url, thumbnail_url, manifest_url = await fetch_media_pointers(
+        item, api, file_field="PDF"
     )
 
-
     publisher_name = get_value(item, "dcterms:publisher")
-    country = get_country_from_newspaper(publisher_name)  # same outlet index as articles
+    country = get_country_from_outlets(publisher_name)  # same outlet index as articles
     pub_date = get_value(item, "dcterms:date")
     pub_year, pub_date_precision = parse_pub_date(pub_date)
-
-    # Thumbnail and IIIF manifest only when there is a PDF behind them.
-    thumbnail_url = ""
-    manifest_url = ""
-    if primary_url:
-        session = await conn_manager.get()
-        thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
-        manifest_url = iiif_manifest_url(item["o:id"])
 
     return {
         "o:id": item["o:id"],
@@ -133,13 +122,11 @@ async def map_islamic_publication_item(item: Dict[str, Any], api: OmekaApiClient
 
 SPEC = UploadSpec(
     config_name="publications",
-    resource_class_ids=SUBSETS["publications"].resource_class_ids,
     map_item=map_islamic_publication_item,
     title="📚 IWAC Islamic Publications Upload",
     cache_dir=".cache_omk",  # intentionally shared with articles (cache keys include class id)
     description="Upload IWAC Islamic Publications to Hugging Face Hub",
-    int_columns=("nb_pages",),
-    post_map=report_unmapped_values("newspaper", "country"),
+    post_map=report_unmapped_values("newspaper", "country", hint=COUNTRY_MAPPER_HINT),
 )
 
 

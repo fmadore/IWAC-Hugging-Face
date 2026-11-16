@@ -49,12 +49,25 @@ straddles two Gregorian ones, so a missing day is not a rounding problem but a
 genuinely unanswerable question. The run reports how many rows that affects so
 the gap is visible rather than silent.
 
+An ISO datetime (``1999-01-01T00:00:00``, optionally with seconds fraction and
+a ``Z``/offset) is converted from its date part — the calendar date it names —
+and reported on its own row. A complete date outside hijridate's Umm al-Qura
+tables (1924-08-01 to 2077-11-16) and an impossible calendar date
+(``1999-02-30``) stay null and are reported separately too. Only ASCII digits
+in exactly ``YYYY-MM-DD`` count: ``+199-01-01``, ``1_99-01-01`` or
+Arabic-Indic digits are imprecise, not dates.
+
+``--update-mode missing`` (default with ``-y`` or headless) fills only rows
+whose three columns are not all set; ``all`` recomputes every row after a
+confirmation ``-y`` skips. A run that changes no value pushes nothing.
+
 Usage
 -----
     python post-processing/calculate_hijri_dates.py [--config articles] [--dry-run]
 
     python post-processing/calculate_hijri_dates.py                       # interactive
-    python post-processing/calculate_hijri_dates.py --config articles -y  # non-interactive
+    python post-processing/calculate_hijri_dates.py --config articles -y  # non-interactive, missing
+    python post-processing/calculate_hijri_dates.py --config articles --update-mode all -y
 
 Environment
 -----------
@@ -65,7 +78,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -84,6 +99,7 @@ sys.path.insert(0, _THIS_DIR)
 sys.path.insert(0, os.path.dirname(_THIS_DIR))
 from _common import (  # noqa: E402
     PRIVATE_REPO_ID,
+    add_update_mode_args,
     ensure_hf_token,
     load_hub_dataset,
     map_with_progress,
@@ -91,7 +107,9 @@ from _common import (  # noqa: E402
     push_dataset,
     reorder_columns_after,
     resolve_config,
+    resolve_update_mode,
 )
+from iwac_common.enrichment import changed_row_count  # noqa: E402
 
 load_dotenv(workspace_root() / ".env")
 
@@ -133,46 +151,88 @@ def configure_logging() -> None:
     )
 
 
-def parse_gregorian(value: Any) -> Optional[Tuple[int, int, int]]:
-    """``(y, m, d)`` for a complete ISO date, else ``None``.
+_ISO_DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})", re.ASCII)
+_ISO_TIME = re.compile(r"T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?", re.ASCII)
 
-    Deliberately strict: anything that is not exactly ``YYYY-MM-DD`` — a bare
-    year, ``YYYY-MM``, or a ``YYYY-MM/YYYY-MM`` range — has no single day to
-    convert, so it yields ``None`` instead of a guess.
-    """
+# hijridate's Umm al-Qura table range (1343-01-01 to 1500-12-30 AH).
+UMM_AL_QURA_RANGE = ("1924-08-01", "2077-11-16")
+
+
+def _split_date(value: Any) -> Tuple[Optional[Tuple[int, int, int]], bool]:
+    """``((y, m, d) or None, is_datetime)`` for a ``pub_date`` value."""
     if value is None:
-        return None
+        return None, False
     text = str(value).strip()
-    if len(text) != 10 or text[4] != "-" or text[7] != "-":
-        return None
-    try:
-        year, month, day = int(text[:4]), int(text[5:7]), int(text[8:10])
-    except ValueError:
-        return None
+    is_datetime = len(text) > 10 and bool(_ISO_TIME.fullmatch(text[10:]))
+    match = _ISO_DATE.fullmatch(text[:10] if is_datetime else text)
+    if not match:
+        return None, False
+    year, month, day = (int(part) for part in match.groups())
     if not (1 <= month <= 12 and 1 <= day <= 31):
-        return None
-    return year, month, day
+        return None, False
+    return (year, month, day), is_datetime
 
 
-def to_hijri(year: int, month: int, day: int) -> Optional[Tuple[int, int, int]]:
-    """Umm al-Qura ``(year, month, day)``, or ``None`` outside the tables.
+def parse_gregorian(value: Any) -> Optional[Tuple[int, int, int]]:
+    """``(y, m, d)`` for a complete ISO date (or the date part of an ISO
+    datetime), else ``None``.
 
-    The collection runs 1961–2025, comfortably inside hijridate's 1343–1500 AH
-    (1925–2077) range, so ``None`` here means a malformed date slipped past
-    :func:`parse_gregorian` rather than a real limitation — skip the row
-    instead of failing the run. (Same contract as ``to_hijri`` in
-    IwacVisualizations' ``scripts/generate_on_this_day.py``.)
+    Deliberately strict: anything that is not exactly ``YYYY-MM-DD`` in ASCII
+    digits — a bare year, ``YYYY-MM``, a ``YYYY-MM/YYYY-MM`` range, a signed or
+    underscored number, Arabic-Indic digits — has no single day to convert, so
+    it yields ``None`` instead of a guess.
     """
+    return _split_date(value)[0]
+
+
+def _convert(year: int, month: int, day: int) -> Tuple[Optional[Tuple[int, int, int]], str]:
+    """``(hijri or None, status)``; status is ``converted``, ``outside_tables``
+    or ``invalid_date``."""
     from hijridate import Gregorian
 
     try:
         h = Gregorian(year, month, day).to_hijri()
-        return h.year, h.month, h.day
-    except (ValueError, OverflowError) as exc:
+        return (h.year, h.month, h.day), "converted"
+    except OverflowError:
+        return None, "outside_tables"
+    except ValueError as exc:
         logging.getLogger(__name__).debug(
             "Hijri conversion failed for %04d-%02d-%02d: %s", year, month, day, exc
         )
-        return None
+        return None, "invalid_date"
+
+
+def to_hijri(year: int, month: int, day: int) -> Optional[Tuple[int, int, int]]:
+    """Umm al-Qura ``(year, month, day)``, or ``None``.
+
+    ``None`` means either a date outside hijridate's Umm al-Qura tables
+    (:data:`UMM_AL_QURA_RANGE`; ``OverflowError``) or an impossible calendar
+    date such as ``1999-02-30`` (``ValueError``); :func:`date_status` tells the
+    two apart for the report. The row is skipped instead of failing the run.
+    (Same contract as ``to_hijri`` in IwacVisualizations'
+    ``scripts/generate_on_this_day.py``.)
+    """
+    return _convert(year, month, day)[0]
+
+
+def date_status(value: Any) -> str:
+    """Report bucket of one ``pub_date``: ``empty``, ``imprecise``,
+    ``invalid_date``, ``outside_tables``, ``converted`` or
+    ``converted_datetime``."""
+    if value is None or not str(value).strip():
+        return "empty"
+    parsed, is_datetime = _split_date(value)
+    if parsed is None:
+        return "imprecise"
+    status = _convert(*parsed)[1]
+    return "converted_datetime" if status == "converted" and is_datetime else status
+
+
+def hijridate_version() -> str:
+    try:
+        return version("hijridate")
+    except PackageNotFoundError:
+        return "unknown"
 
 
 def add_hijri_batch(batch: Dict[str, List[Any]], *, update_mode: str = "all") -> Dict[str, List[Any]]:
@@ -218,8 +278,11 @@ def report(df: pd.DataFrame, config_name: str) -> None:
     """Coverage table + the lunar-year distribution the columns exist to enable."""
     total = len(df)
     converted = int(df["hijri_year"].notna().sum())
-    parsable = int(df[SOURCE_COLUMN].map(lambda v: parse_gregorian(v) is not None).sum())
-    empty = int(df[SOURCE_COLUMN].astype("string").fillna("").str.strip().eq("").sum())
+    statuses = df[SOURCE_COLUMN].map(date_status).value_counts()
+    start, end = UMM_AL_QURA_RANGE
+
+    def count(status: str) -> int:
+        return int(statuses.get(status, 0))
 
     coverage = Table(title=f"Hijri coverage — {config_name}", box=box.ROUNDED)
     coverage.add_column("Rows", style="cyan")
@@ -227,10 +290,14 @@ def report(df: pd.DataFrame, config_name: str) -> None:
     coverage.add_column("Share", style="dim", justify="right")
     for label, n in (
         ("Total", total),
-        ("Complete YYYY-MM-DD", parsable),
+        ("Complete date (YYYY-MM-DD or ISO datetime)",
+         count("converted") + count("converted_datetime") + count("outside_tables") + count("invalid_date")),
         ("Converted to Hijri", converted),
-        ("Imprecise date (no lunar day)", parsable - converted + (total - parsable - empty)),
-        ("No date at all", empty),
+        ("  of which ISO datetime (date part used)", count("converted_datetime")),
+        (f"Outside Umm al-Qura tables ({start}..{end})", count("outside_tables")),
+        ("Impossible calendar date", count("invalid_date")),
+        ("Imprecise date (no lunar day)", count("imprecise")),
+        ("No date at all", count("empty")),
     ):
         coverage.add_row(label, f"{n:,}", f"{(n / total * 100):.1f}%" if total else "—")
     console.print(coverage)
@@ -280,10 +347,7 @@ def main() -> int:
     parser.add_argument("--repo", default=PRIVATE_REPO_ID)
     parser.add_argument("--config", choices=HIJRI_SUBSETS, default=None,
                         help="Subset to process (skips the interactive menu)")
-    parser.add_argument("-y", "--yes", action="store_true",
-                        help="Recompute without confirmation when the columns already exist")
-    parser.add_argument("--update-mode", choices=["missing", "all"], default="all",
-                        help="'all' recomputes every row (default); 'missing' fills only unconverted rows")
+    add_update_mode_args(parser)
     parser.add_argument("--dry-run", action="store_true",
                         help="Compute and report, but push nothing to the Hub")
     args = parser.parse_args()
@@ -303,6 +367,8 @@ def main() -> int:
         args.repo, token=token, cli_config=args.config, restrict_to=HIJRI_SUBSETS, console=console
     )
     console.print(f"[green]→[/green] Subset: [bold]{config_name}[/bold]")
+    update_mode = resolve_update_mode(args, console=console)
+    console.print(f"[green]✓[/green] Update mode: [cyan]{update_mode}[/cyan]")
 
     ds = load_hub_dataset(args.repo, config_name, token=token, console=console)
     source_revision = getattr(ds, "_iwac_source_revision", None)
@@ -312,10 +378,11 @@ def main() -> int:
         return 1
 
     already = [c for c in HIJRI_COLUMNS if c in ds.column_names]
-    if already and args.update_mode == "all" and not (args.yes or args.dry_run):
+    if (already and update_mode == "all" and not (args.yes or args.dry_run)
+            and sys.stdin.isatty()):
         console.print(f"\n[yellow]⚠[/yellow] Already present: [bold]{', '.join(already)}[/bold]")
         try:
-            if not Confirm.ask("Recompute them?", default=False):
+            if not Confirm.ask("Recompute them for every row?", default=False):
                 console.print("[yellow]ℹ[/yellow] Cancelled; existing values kept.")
                 return 0
         except KeyboardInterrupt:
@@ -324,13 +391,15 @@ def main() -> int:
 
     from datasets import Value
 
+    before = ds
+
     # Declared nullable int64: an imprecise date has no lunar day, and that
     # absence stays a null rather than becoming a 0 that charts would plot.
     # Declaring the type (instead of round-tripping the whole subset through
     # pandas) also leaves every other column's type untouched.
     ds = map_with_progress(
         ds,
-        lambda batch: add_hijri_batch(batch, update_mode=args.update_mode),
+        lambda batch: add_hijri_batch(batch, update_mode=update_mode),
         description="[cyan]Converting pub_date to Umm al-Qura",
         console=console,
         output_types={col: Value("int64") for col in HIJRI_COLUMNS},
@@ -338,15 +407,20 @@ def main() -> int:
     ds = reorder_columns_after(ds, HIJRI_COLUMNS, SOURCE_COLUMN, console=console)
 
     report(ds.select_columns([SOURCE_COLUMN, *HIJRI_COLUMNS]).to_pandas(), config_name)
+    changed = changed_row_count(before, ds, HIJRI_COLUMNS)
+    console.print(f"[blue]→[/blue] Rows whose Hijri date changes: [bold]{changed:,}[/bold]")
 
     if args.dry_run:
         print_dry_run_panel(
             repo_id=args.repo,
             config_name=config_name,
             n_rows=len(ds),
-            extra=f"[dim]Columns: {', '.join(HIJRI_COLUMNS)}[/dim]",
+            extra=f"[dim]Columns: {', '.join(HIJRI_COLUMNS)} · rows that would change: {changed:,}[/dim]",
             console=console,
         )
+        return 0
+    if not changed:
+        console.print("[green]✓[/green] Every Hijri date is already current. Nothing to push.")
         return 0
 
     ok = push_dataset(
@@ -355,8 +429,9 @@ def main() -> int:
         config_name=config_name,
         token=token,
         commit_message=(
-            f"Add Hijri date columns ({', '.join(HIJRI_COLUMNS)}) "
-            f"converted from {SOURCE_COLUMN} with hijridate (Umm al-Qura) — config: {config_name}"
+            f"Add/update Hijri date columns ({', '.join(HIJRI_COLUMNS)}) "
+            f"converted from {SOURCE_COLUMN} with hijridate {hijridate_version()} "
+            f"(Umm al-Qura) — config: {config_name}, mode: {update_mode}"
         ),
         console=console,
         expected_revision=source_revision,

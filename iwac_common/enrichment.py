@@ -12,7 +12,7 @@ from typing import Any, Mapping, Sequence
 
 PROVENANCE_OUTPUTS = (
     "embedding_OCR", "embedding_abstract", "embedding_tableOfContents", "embedding_image",
-    "lemma_text", "Richesse_Lexicale_OCR", "Lisibilite_OCR",
+    "lemma_text", "Richesse_Lexicale_OCR", "Lisibilite_OCR", "nb_mots",
 )
 PRIVATE_PROVENANCE_COLUMNS = frozenset(
     f"{column}_{suffix}" for column in PROVENANCE_OUTPUTS
@@ -73,6 +73,27 @@ def set_provenance(ds, column: str, inputs: Sequence[str], configuration: str,
             ds = ds.remove_columns(name)
         ds = ds.add_column(name, pa.array(value, type=pa.string()))
     return ds
+
+
+def changed_row_count(before, after, columns: Sequence[str]) -> int:
+    """Rows of ``after`` whose value differs from ``before`` in any of ``columns``.
+
+    A column absent from ``before`` counts every row as changed. Stages use
+    this to skip a push that would rewrite the subset without changing a cell.
+    """
+    if len(before) != len(after):
+        raise ValueError("Cannot compare datasets of different lengths")
+    changed = [False] * len(after)
+    for column in columns:
+        if column not in after.column_names:
+            continue
+        if column not in before.column_names:
+            return len(after)
+        for i, (old, new) in enumerate(zip(before[column], after[column], strict=True)):
+            both_nan = isinstance(old, float) and isinstance(new, float) and old != old and new != new
+            if old != new and not both_nan:
+                changed[i] = True
+    return sum(changed)
 
 
 def invalidate_columns(ds, columns: Sequence[str], changed: Sequence[bool]):

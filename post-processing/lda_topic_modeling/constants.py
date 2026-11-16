@@ -23,14 +23,16 @@ DOMAIN_STOPWORDS = {
     "monsieur", "madame", "excellence", "communiqué", "communique",
     "chers", "cher", "chère", "chere",
 
-    # Generic words without topical signal
-    "grand", "mondial", "international",
+    # "grand", "mondial", "international" moved to FRAGMENT_STOPWORDS: noise
+    # alone, but they carry grand_imam, grand_mosquée, ligue_islamique_mondial.
 
-    # Functional words that leak through lemmatization
-    "ledit", "faire", "devoir", "pouvoir",
+    # Functional words that leak through lemmatization ("pouvoir" moved to
+    # FRAGMENT_STOPWORDS: the noun anchors pouvoir_public, pouvoir_coutumier)
+    "ledit", "faire", "devoir",
 
-    # OCR artifacts
-    "lp", "bf", "wa", "adj", "octet", "sem", "at",
+    # OCR artifacts ("wa" moved to FRAGMENT_STOPWORDS: the Arabic conjunction
+    # inside ahl_sunna_wa_jamaa; "at" is in the English list below)
+    "lp", "bf", "adj", "octet", "sem",
 
     # Digitisation watermark. "Scanned by CamScanner" is stamped in the page
     # footer of 16 reference documents (2,220 occurrences in the raw OCR),
@@ -55,8 +57,9 @@ DOMAIN_STOPWORDS = {
     "apres", "après", "avant", "autre", "autres", "même", "meme",
     "selon", "ainsi", "car", "vers", "depuis", "pendant", "contre",
     "sans", "chez", "comme",
-    "aller", "falloir", "vouloir", "savoir", "voir", "celer",
-    # "el" / "al" live in FRAGMENT_STOPWORDS below — see the note there.
+    "aller", "falloir", "vouloir", "voir", "celer",
+    # "el" / "al" live in FRAGMENT_STOPWORDS below — see the note there, as
+    # does "savoir" (the noun: savoir_islamique, transmission_savoir).
 
     # ENGLISH stopwords (critical for filtering non-French documents)
     "the", "of", "to", "and", "in", "for", "is", "on", "that", "by",
@@ -73,16 +76,21 @@ DOMAIN_STOPWORDS = {
     "la", "le", "les", "des", "du", "de", "un", "une", "et", "ou",
     "au", "aux", "dans", "sur", "par", "pour", "que", "qui",
     "sont", "ce", "cette", "ces", "sa", "ses", "leur", "leurs",
-    "de_la", "de_l", "à", "a_la", "en", "ne", "est",
+    "à", "en", "ne", "est",
     "il", "elle", "ils", "pas", "nous",
+    # (de_la / de_l / a_la are compounds and live in JUNK_COMPOUND_STOPWORDS:
+    # nothing underscore-joined exists yet when this set is applied.)
 
     # GERMAN function words: the references corpus quotes German colonial
     # and missionary sources, and neither the French nor the English spaCy
-    # stopword list strips them.
+    # stopword list strips them. "die" is exempted for the English model
+    # (LANGUAGE_PRE_PHRASE_EXEMPTIONS), where it is a verb.
     "und", "der", "von", "das", "die",
 
-    # Bibliographic apparatus abbreviations (reference lists, citations)
-    "ed", "eds", "éd", "dir", "pp", "cit", "op_cit", "ibid", "idem", "fig",
+    # Bibliographic apparatus abbreviations (reference lists, citations).
+    # "op" and "cit" are listed separately because matching happens before
+    # phrase detection; op_cit itself is in JUNK_COMPOUND_STOPWORDS.
+    "ed", "eds", "éd", "dir", "pp", "op", "cit", "ibid", "idem", "fig",
 
     # Publishers and places of publication — footnote apparatus, never a
     # topic. Stripping them here, pre-phrase, is what dissolves the whole
@@ -157,10 +165,48 @@ DOMAIN_STOPWORDS = {
 #
 # Also included in the label stopwords below, so labels regenerated from an
 # already-trained model lose the bare fragment without a full re-fit.
+#
+# The same holds for generic adjectives and nouns that head or modify an
+# Islamic organisation, title, event, place of worship or calendar term:
+# junk alone, the object of study inside a compound. They used to be
+# pre-phrase stopwords and silently prevented every compound listed beside
+# them. A word belongs in the pre-phrase sets only when its WHOLE compound
+# family is noise (digitisation damage, citation apparatus, function words).
 FRAGMENT_STOPWORDS = {
     "al",    # Arabic definite article: al-Azhar, Aïd al-Fitr, al-Qaïda
     "el",    # same, Maghrebi spelling — keeps the title "El Hadj" intact
+    "wa",    # Arabic conjunction: ahl_sunna_wa_jamaa
     "page",  # "suite page 4" apparatus; keeps page_facebook
+
+    # Titles, organisations, places of worship
+    "grand",          # grand_imam, grand_mosquée, grand_marabout
+    "mondial",        # ligue_islamique_mondial
+    "international",  # conférence_islamique_international
+    "national", "régional", "regional",  # conseil_national_islamique
+    "local",          # comité_local, langue_local
+    "social",         # oeuvre_social, action_social
+    "premier", "première", "premiere",   # premier_ministre, premier_imam
+    "dernier", "dernière", "derniere",   # jugement_dernier
+    "nouveau", "nouvelle", "nouveaux",   # nouveau_an, nouveau_testament
+    "petit", "petite",                   # petit_séminaire
+    "lieu",           # lieu_culte
+    "monde",          # monde_musulman, monde_arabe
+    "nom",            # nom_allah, nom_dieu (basmala)
+    "ville",          # ville_sainte
+    "moyen",          # moyen_orient
+    "non",            # non_musulman
+    "pouvoir",        # pouvoir_public, pouvoir_coutumier
+    "savoir",         # savoir_islamique, transmission_savoir
+    "travail",        # travail_forcé (colonial forced labour)
+
+    # Calendar and time: the lunar calendar is part of the subject
+    "mois",           # mois_ramadan, mois_sacré
+    "jour",           # jour_arafat, jour_jugement
+    "an",             # nouveau_an, an_hégire (French only; English "an"
+                      # stays pre-phrase, see LANGUAGE_PRE_PHRASE_EXEMPTIONS)
+    "année", "annee",
+    "heure",          # heure_prière
+    "période", "periode",  # période_coloniale
 }
 
 # ── Junk compounds (also removed AFTER phrase detection) ───────────
@@ -236,6 +282,13 @@ JUNK_COMPOUND_STOPWORDS = {
     # Archival shelfmarks in footnotes ("ANS, carton …, dossier …").
     "carton_dossier_archives_nationales",
     "archives_nationales",
+
+    # Moved here from the pre-phrase sets, where an underscore entry can
+    # never match (nothing is joined yet). Their components are stripped
+    # pre-phrase, so these are a safety net for labels of older models.
+    "op_cit", "de_la", "de_l", "a_la",
+    "burkina_faso", "côte_ivoire", "cote_ivoire",
+    "bobo_dioulasso", "porto_novo",
 }
 
 # What the post-phrase pass actually filters.
@@ -293,7 +346,7 @@ LABEL_ONLY_STOPWORDS = {
     # F. OCR artifacts & abbreviations (garbage tokens)
     "lp", "bf", "dr", "mr", "mme", "mm", "wa",
     "ii", "iii", "iv", "vi", "vii", "viii", "ix", "xi", "xii",
-    "octet", "sem", "at", "adj",
+    "octet", "sem", "adj",
 
     # G. Generic location words (not specific places)
     "place", "rond", "point",
@@ -327,11 +380,23 @@ LABEL_ONLY_STOPWORDS = {
 # Both accented and unaccented forms are needed: accented for
 # tokenization (direct string match), unaccented for label filtering
 # (which normalises/strips accents before comparison).
+#
+# Kept pre-phrase on purpose, unlike the generic adjectives in
+# FRAGMENT_STOPWORDS: stripping the country still lets the generic part of an
+# organisation's name form (conseil_supérieur_imam from "… imams du Bénin"),
+# and only the country, which the metadata already carries, is lost.
+#
+# Hyphenated and apostrophe forms are single lemma tokens (lemmas never
+# contain spaces), so they match here, before phrase detection, as written;
+# both apostrophes are listed because matching is exact. Underscore compounds
+# can only form after this pass and live in JUNK_COMPOUND_STOPWORDS.
 LDA_GEO_STOPWORDS = {
     # West African countries
     "bénin", "benin",
-    "burkina", "faso", "burkina_faso",
-    "côte", "cote", "ivoire", "côte_ivoire", "cote_ivoire",
+    "burkina", "faso", "burkina-faso",
+    "côte", "cote", "ivoire",
+    "côte-d'ivoire", "côte-d’ivoire", "cote-d'ivoire", "cote-d’ivoire",
+    "côte-ivoire", "cote-ivoire",
     "ghana",
     "mali",
     "niger",
@@ -347,13 +412,13 @@ LDA_GEO_STOPWORDS = {
     "bamako",
     "dakar",
     "bouaké", "bouake",
-    "bobo_dioulasso", "bobo",
+    "bobo", "dioulasso", "bobo-dioulasso",
     "abobo",
     "adjamé", "adjame",
     "gagnoa",
     "yamoussoukro",
     "korhogo",
-    "porto_novo",
+    "porto", "novo", "porto-novo",
     # Demonyms
     "ivoirien", "ivoirienne", "ivoiriens",
     "burkinabé", "burkinabe", "burkinabè",
@@ -381,32 +446,51 @@ LDA_GENERIC_STOPWORDS = {
     # Ceremony / discourse verbs
     "recevoir", "remercier", "inviter", "souhaiter",
     "appeler", "demander", "organiser",
-    # Generic nouns
-    "situation", "problème", "probleme", "moyen", "besoin",
-    "niveau", "travail", "temps", "chose", "rien",
-    "fois", "heure", "lieu", "monde", "nom",
+    # Generic nouns (moyen, travail, heure, lieu, monde, nom, ville moved to
+    # FRAGMENT_STOPWORDS: each heads domain compounds)
+    "situation", "problème", "probleme", "besoin",
+    "niveau", "temps", "chose", "rien",
+    "fois",
     "moment", "part", "occasion", "difficulté", "difficulte",
-    "argent", "ville",
-    # Date / time
-    "année", "annee", "an", "jour", "mois",
-    "hier", "demain", "lendemain", "date", "période", "periode",
-    # Generic adjectives
-    "social", "local", "national", "régional", "regional",
-    "dernier", "dernière", "derniere",
-    "premier", "première", "premiere",
-    "nouveau", "nouvelle", "nouveaux",
-    "petit", "petite",
+    "argent",
+    # Date / time (année, an, jour, mois, période moved to FRAGMENT_STOPWORDS:
+    # mois_ramadan, jour_arafat, nouveau_an, période_coloniale)
+    "hier", "demain", "lendemain", "date",
+    # Generic adjectives (social, local, national, régional, dernier,
+    # premier, nouveau, petit moved to FRAGMENT_STOPWORDS)
     "différent", "different",
-    # Other
-    "beaucoup", "non", "oui",
+    # Other ("non" moved to FRAGMENT_STOPWORDS: non_musulman)
+    "beaucoup", "oui",
 }
+
+# ── Language-specific exemptions from the pre-phrase sets ─────────
+# The pre-phrase sets are shared by every model, but a few entries are noise
+# in one language and vocabulary in the other. Exempted words are not
+# stripped before phrase detection for that model's language.
+LANGUAGE_PRE_PHRASE_EXEMPTIONS: dict[str, frozenset[str]] = {
+    # German article, English verb.
+    "Anglais": frozenset({"die"}),
+    # English article, French "year": exempt here and filtered post-phrase
+    # via FRAGMENT_STOPWORDS, so nouveau_an survives and bare "an" does not.
+    "Français": frozenset({"an"}),
+}
+
+
+def modeling_stopwords(language: str | None) -> set[str]:
+    """The pre-phrase stopword set for one model language."""
+    shared = set(DOMAIN_STOPWORDS) | LDA_GEO_STOPWORDS | LDA_GENERIC_STOPWORDS
+    return shared - LANGUAGE_PRE_PHRASE_EXEMPTIONS.get(language or "", frozenset())
 
 # ── Custom collocations ────────────────────────────────────────────
 # Domain-specific multi-word expressions that should ALWAYS be joined,
 # regardless of gensim's statistical phrase detection threshold.
 # Each entry is a tuple of consecutive tokens → joined with "_".
 # Applied after gensim's bigram/trigram phrase detection, so these
-# act as a safety net for collocations the statistics miss.
+# act as a safety net for collocations the statistics miss — and BEFORE the
+# post-phrase fragment filter, so a fragment word ("social") can still be
+# joined here. ``lemma_nostop`` holds lemmas, so the masculine lemma form is
+# the one that fires; the feminine surface forms are kept, harmlessly, for
+# text that escaped lemmatisation.
 CUSTOM_COLLOCATIONS: list[tuple[str, ...]] = [
     # Religious concepts
     ("nuit", "destin"),               # Laylat al-Qadr
@@ -414,34 +498,57 @@ CUSTOM_COLLOCATIONS: list[tuple[str, ...]] = [
     ("école", "coranique"),           # Quranic school
     ("ecole", "coranique"),           # (unaccented variant)
     ("droit", "homme"),               # human rights
-    ("société", "civile"),            # civil society
-    ("societe", "civile"),            # (unaccented variant)
+    ("société", "civil"),             # civil society (lemma)
+    ("societe", "civil"),             # (unaccented variant)
+    ("société", "civile"),            # (surface form)
+    ("societe", "civile"),
     ("conseil", "supérieur"),         # supreme council
     ("conseil", "superieur"),         # (unaccented variant)
-    ("oeuvre", "sociale"),            # social work
+    ("oeuvre", "social"),             # social work (lemma)
+    ("œuvre", "social"),              # (ligature spelling)
+    ("oeuvre", "sociale"),            # (surface form)
     ("voile", "islamique"),           # Islamic veil
     ("état", "civil"),                # civil registry
     ("etat", "civil"),                # (unaccented variant)
-    ("liberté", "religieuse"),        # religious freedom
-    ("liberte", "religieuse"),        # (unaccented variant)
+    ("liberté", "religieux"),         # religious freedom (lemma)
+    ("liberte", "religieux"),         # (unaccented variant)
+    ("liberté", "religieuse"),        # (surface form)
+    ("liberte", "religieuse"),
     ("dialogue", "interreligieux"),   # interfaith dialogue
     ("extrémisme", "violent"),        # violent extremism
     ("extremisme", "violent"),        # (unaccented variant)
-    ("radicalisation", "religieuse"), # religious radicalisation
+    ("radicalisation", "religieux"),  # religious radicalisation (lemma)
+    ("radicalisation", "religieuse"), # (surface form)
 ]
 
 # LDA-specific defaults
 # With geographic and generic stopwords removed, 30 topics avoids the
 # junk / country-dominant topics that appeared at 40.
-# Use --optimize-topics to sweep a range and let C_v decide.
+# --optimize-topics --sweep-only reports a k sweep (C_v with seed sd, seed
+# stability, held-out bound) without fitting or publishing anything; k
+# stays an explicit, pinned choice.
 DEFAULT_NUM_TOPICS = 30
 DEFAULT_PASSES = 25          # more passes = better convergence on CPU
 DEFAULT_ITERATIONS = 600     # allow more iterations per E-step
 DEFAULT_CHUNKSIZE = 2000
 DEFAULT_RANDOM_STATE = 42
 DEFAULT_MINIMUM_PROBABILITY = 0.01
-DEFAULT_NO_BELOW = 10        # ignore tokens in fewer than 10 docs (was 5; stricter removes OCR noise)
-DEFAULT_NO_ABOVE = 0.40      # ignore tokens in more than 40% of docs (was 0.5; removes corpus-wide boilerplate)
+# Dictionary document-frequency bounds are counted in SOURCE documents
+# (distinct values of the group column, o:id by default), not in training
+# chunks: chunked, one book would otherwise pass no_below on its own.
+DEFAULT_NO_BELOW = 10        # ignore tokens in fewer than 10 source documents
+DEFAULT_NO_ABOVE = 0.40      # ignore tokens in more than 40% of source documents
+# Phrase detection counts occurrences, so one thesis repeating a running
+# header twenty times mints a compound (mémoire_maîtrise_kont_drissa). A
+# learned compound is applied only if it occurs in at least this many
+# distinct source documents. Training-only: the pruned phrase models are
+# what the bundle saves, so prediction applies exactly the kept compounds.
+DEFAULT_PHRASE_MIN_DOCS = 5
+# Training drops documents with fewer whitespace tokens than this
+# (--min-train-tokens); prediction leaves the topic columns null for a
+# document with fewer IN-VOCABULARY tokens than its floor, which defaults to
+# the model's training floor (--min-predict-tokens).
+DEFAULT_MIN_TRAIN_TOKENS = 5
 
 # Topic-number optimisation grid (used by --optimize-topics)
 DEFAULT_TOPIC_RANGE_START = 15
@@ -466,18 +573,21 @@ DEFAULT_TOPIC_TOPK = 3
 # behavior (--no-relevance-labels on the CLI).
 DEFAULT_LAMBDA_RELEVANCE = 0.6
 
-# Multi-seed k-sweep stability (--stability-seeds): 1 = single seed
-# (exact legacy behavior). N>1 trains N reduced models per candidate k
-# (seeds 42, 43, ...), selects k by MEAN C_v, and reports the sd plus a
-# topic-stability score (mean best-match Jaccard of top-10 topic words
-# between seed pairs).
+# Multi-seed k-sweep stability (--stability-seeds): 1 = single seed.
+# N>1 trains N reduced models per candidate k (seeds 42, 43, ...) and reports
+# mean C_v with its sd plus a topic-stability score (mean best-match Jaccard
+# of top-10 topic words between seed pairs). The sweep is a diagnostic; it
+# chooses k only with --select-k-from-sweep, and then says when the best and
+# runner-up mean C_v lie within one seed sd of each other.
 DEFAULT_STABILITY_SEEDS = 1
 STABILITY_TOPN_WORDS = 10   # top words per topic compared for the Jaccard score
 
-# Held-out evaluation (--holdout): fraction of (chunked) training docs set
-# aside with seed 42 during the k-sweep; sweep models train on the remainder
-# and report held-out log-perplexity. 0.0 = off. The FINAL model always
-# retrains on ALL documents.
+# Held-out evaluation (--holdout): fraction of independent source-document
+# groups (--holdout-group-column, exact duplicates kept together) set aside
+# with seed 42 BEFORE phrase and vocabulary fitting; sweep models train on
+# the remainder and report gensim's held-out per-word log-perplexity bound.
+# That bound infers each held-out document's topic mixture from the same
+# words it scores — it is not a document-completion estimate. 0.0 = off.
 DEFAULT_HOLDOUT_FRACTION = 0.0
 
 # ── Per-config presets ─────────────────────────────────────────────
@@ -490,8 +600,10 @@ DEFAULT_HOLDOUT_FRACTION = 0.0
 # "num_topics" pins the intended granularity, not topic identity. Even at
 # fixed k, re-fitting can reorder or change topics. Immutable artifact IDs
 # disambiguate every fitted model; downstream keys are (model_id, topic_id).
-# "optimize_topics" re-derives it on every fit and only kicks in when
-# --num-topics is not given; --optimize-topics still forces a sweep.
+# A pinned k (preset or --num-topics) always wins for the production fit:
+# with one, --optimize-topics only reports the sweep and exits.
+#
+# "phrase_min_docs" overrides DEFAULT_PHRASE_MIN_DOCS per subset.
 #
 # "language_overrides" lets one config serve several languages from separate
 # models, keyed by the resolved language and merged over the base preset.
@@ -535,10 +647,11 @@ CONFIG_PRESETS: dict[str, dict] = {
         # (NPMI 0.0512 vs 0.0513), so 20 wins on granularity: ~73 labelled
         # issues per topic against ~97 at k=15.
         #
-        # Re-check with --optimize-topics --stability-seeds 3 if the
-        # corpus grows substantially, and judge by topic stability rather
-        # than C_v — but expect to have to justify renumbering everything
-        # downstream before changing this number.
+        # Re-check with --optimize-topics --sweep-only --stability-seeds 3
+        # if the corpus grows substantially (report only: no bundle, no
+        # push), and judge by topic stability rather than C_v — but expect
+        # to have to justify renumbering everything downstream before
+        # changing this number.
         "model_path": "lda_model_publications",
         "chunk_words": 1000,
         "language": "Français",
@@ -557,8 +670,9 @@ CONFIG_PRESETS: dict[str, dict] = {
         # k rises: 0.395 at k=8 against 0.274 at k=16 in the English model.
         # These values trade that stability off against granularity, giving
         # both models ~16 labelled documents per topic (280/16 and 123/8).
-        # Re-check with --optimize-topics --stability-seeds 3 if the corpus
-        # grows substantially; judge by stability, not by C_v.
+        # Re-check with --optimize-topics --sweep-only --stability-seeds 3
+        # if the corpus grows substantially (report only: no bundle, no
+        # push); judge by stability, not by C_v.
         "model_path": "lda_model_references",
         "chunk_words": 1000,
         # Ten long books and theses supplied 30% of the French training

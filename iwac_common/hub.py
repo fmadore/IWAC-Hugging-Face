@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 import os
 import socket
-from contextlib import contextmanager, nullcontext
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Iterator, Optional, Sequence
 
-from huggingface_hub import HfApi, get_token
+from huggingface_hub import HfApi, HfFileSystem, get_token
 
 
 class HubBaselineUnavailableError(RuntimeError):
@@ -34,7 +35,6 @@ class HubWriteLockedError(RuntimeError):
 class HubWriteResult:
     before_revision: str
     after_revision: str
-    card_already_matched: bool
 
 
 def resolve_hf_token(explicit: Optional[str] = None) -> Optional[str]:
@@ -85,6 +85,35 @@ def get_repo_configs(repo_id: str, *, token: Optional[str] = None) -> set[str]:
     return names
 
 
+def iter_parquet_shards(
+    repo_id: str,
+    config_name: str,
+    *,
+    revision: Optional[str],
+    token: Optional[str] = None,
+    fs=None,
+    error: type[Exception] = HubBaselineUnavailableError,
+) -> Iterator[tuple[str, "object"]]:
+    """Yield ``(path, pyarrow.parquet.ParquetFile)`` for each shard of a config.
+
+    Shards are visited in sorted order at ``revision``; each file stays open
+    only while its item is being consumed, so a caller can read the footer and
+    any column chunks from one open. ``HfFileSystem`` serves byte ranges, so
+    nothing beyond what the caller reads is transferred. No shard raises
+    ``error`` (when iteration starts).
+    """
+    import pyarrow.parquet as pq
+
+    fs = fs or HfFileSystem(token=token)
+    location = f"{repo_id}@{revision}" if revision else repo_id
+    shards = sorted(fs.glob(f"datasets/{location}/{config_name}/*.parquet"))
+    if not shards:
+        raise error(f"No parquet found for '{config_name}' in {repo_id} at {revision}")
+    for shard in shards:
+        with fs.open(shard, "rb") as handle:
+            yield shard, pq.ParquetFile(handle)
+
+
 def read_hub_columns(
     repo_id: str,
     config_name: str,
@@ -104,23 +133,15 @@ def read_hub_columns(
     back to a full load rather than proceed without data.
     """
     import pyarrow as pa
-    import pyarrow.parquet as pq
-    from huggingface_hub import HfFileSystem
 
     from .schema import arrow_to_pandas
 
-    fs = fs or HfFileSystem(token=token)
-    shards = sorted(fs.glob(f"datasets/{repo_id}@{revision}/{config_name}/*.parquet"))
-    if not shards:
-        raise HubBaselineUnavailableError(
-            f"No parquet found for '{config_name}' in {repo_id} at {revision}"
-        )
     tables = []
-    for shard in shards:
-        with fs.open(shard, "rb") as handle:
-            parquet = pq.ParquetFile(handle)
-            available = [c for c in columns if c in parquet.schema_arrow.names]
-            tables.append(parquet.read(columns=available))
+    for _, parquet in iter_parquet_shards(
+        repo_id, config_name, revision=revision, token=token, fs=fs
+    ):
+        available = [c for c in columns if c in parquet.schema_arrow.names]
+        tables.append(parquet.read(columns=available))
     table = pa.concat_tables(tables, promote_options="default")
     return arrow_to_pandas(table)
 
@@ -229,6 +250,12 @@ def _reclaim_if_dead(path: Path, repo_id: str, console=None) -> bool:
 
     Only a lock written by *this* host is ever reclaimed: the lock directory can
     sit on a shared filesystem, where a remote PID says nothing about the owner.
+
+    Reclaiming is atomic. Two processes can both read the same dead owner; if
+    each then unlinked by path, the second would delete the lock the first had
+    just created and both would proceed. Instead the lock is renamed to a
+    unique name (only one rename of a given file can succeed) and re-read: if
+    what was moved is not the dead owner's lock, it is put back, failing closed.
     """
     fields = _lock_owner(path)
     if fields.get("host") != socket.gethostname():
@@ -239,10 +266,27 @@ def _reclaim_if_dead(path: Path, repo_id: str, console=None) -> bool:
         return False
     if _process_alive(pid):
         return False
+    claimed = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.stale")
     try:
-        path.unlink()
+        os.rename(path, claimed)
     except FileNotFoundError:
-        return True
+        return True  # Released or reclaimed meanwhile; the caller retries.
+    except OSError:
+        return False
+    if _lock_owner(claimed) != fields:
+        # Another process reclaimed the dead lock first and this rename moved
+        # its fresh lock. Restore it without clobbering a newer one.
+        try:
+            os.link(claimed, path)
+        except OSError as exc:
+            raise HubWriteLockedError(
+                f"Lost a stale-lock reclaim race for {repo_id!r} and could not "
+                f"restore the winner's lock from {claimed} to {path} ({exc}). "
+                "Another writer may be running; inspect both files before writing."
+            ) from exc
+        claimed.unlink(missing_ok=True)
+        return False
+    claimed.unlink(missing_ok=True)
     if console is not None:
         console.print(
             f"[yellow]⚠[/yellow] Reclaimed a stale write lock for {repo_id} "
@@ -304,56 +348,49 @@ def _dataset_ids(ds) -> list[str]:
     return [str(value) for value in ds["o:id"]]
 
 
-def _published_ids_columnar(
+def _published_columnar(
     repo_id: str, config_name: str, revision: str, token: Optional[str]
-) -> list[str]:
-    """Read only the ``o:id`` column of the published parquet.
+):
+    """``(normalized Arrow schema, o:id list)`` of the published parquet.
 
-    Parquet is columnar, so this transfers one narrow column instead of the
-    whole subset — the difference between a few MB and re-downloading every
-    768-dim embedding on each push. Raises on any problem so the caller can
-    fall back to the exhaustive reload rather than skip verification.
+    One open per shard serves both the footer (for the card check) and the
+    ``o:id`` column chunk. Parquet is columnar, so this transfers one narrow
+    column instead of the whole subset — the difference between a few MB and
+    re-downloading every embedding on each push. Raises on any problem so the
+    caller can fall back to the exhaustive reload rather than skip verification.
     """
-    import pyarrow.parquet as pq
-    from huggingface_hub import HfFileSystem
+    from .card_sync import CardSchemaError, _normalize_schema
 
-    fs = HfFileSystem(token=token)
-    shards = sorted(fs.glob(f"datasets/{repo_id}@{revision}/{config_name}/*.parquet"))
-    if not shards:
-        raise HubWriteError(
-            f"No parquet found for '{config_name}' in {repo_id} at {revision}"
-        )
+    schema = None
     ids: list[str] = []
-    for shard in shards:
-        with fs.open(shard, "rb") as handle:
-            table = pq.ParquetFile(handle).read(columns=["o:id"])
+    for _, parquet in iter_parquet_shards(
+        repo_id, config_name, revision=revision, token=token, error=HubWriteError
+    ):
+        current = _normalize_schema(parquet.schema_arrow)
+        if schema is not None and not schema.equals(current):
+            raise CardSchemaError(
+                f"Inconsistent Parquet schemas in '{config_name}' at {revision}"
+            )
+        schema = current
+        table = parquet.read(columns=["o:id"])
         ids.extend(str(value) for value in table.column("o:id").to_pylist())
-    return ids
+    return schema, ids
 
 
-def _published_ids(
+def _published_ids_full_reload(
     repo_id: str,
     config_name: str,
     revision: str,
     token: Optional[str],
     expected_columns: Sequence[str],
-    console,
 ) -> list[str]:
-    """Return the published row ids, preferring the cheap columnar read.
+    """Exhaustive fallback when the columnar read is unavailable.
 
-    Column-level verification is *not* done here: ``sync_card_features`` has
-    already compared the card's declared features against the parquet footer on
-    the Hub and against ``expected_columns``, which is what the CastError guard
-    needs. What remains is the row-level question — did every row land, exactly
-    once — and that needs one column, not all of them.
+    Column-level verification of the card is *not* done here:
+    ``sync_card_features`` compares the card's declared features against the
+    parquet footer and the prepared schema. What remains is the row-level
+    question — did every row land, exactly once.
     """
-    try:
-        return _published_ids_columnar(repo_id, config_name, revision, token)
-    except Exception as exc:  # noqa: BLE001 - never let a fast path skip verification
-        console.print(
-            f"[dim]ℹ Columnar id verification unavailable ({exc}); "
-            f"falling back to a full reload.[/dim]"
-        )
     from datasets import load_dataset
 
     from .schema import DataContractError, validate_dataset
@@ -480,12 +517,24 @@ def _stage_datasets(prepared, root: Path, card, max_bytes: int):
 def _verify_committed_dataset(ds, *, repo_id, config_name, token, revision, console):
     from .card_sync import sync_card_features
 
+    try:
+        parquet_schema, actual = _published_columnar(repo_id, config_name, revision, token)
+    except Exception as exc:  # noqa: BLE001 - never let a fast path skip verification
+        console.print(
+            f"[dim]ℹ Columnar verification unavailable ({exc}); "
+            f"falling back to a full reload.[/dim]"
+        )
+        parquet_schema, actual = None, None
+    # Without a schema from the fast path, the card check reads the footers itself.
     sync_card_features(
-        repo_id, config_name, token=token, console=console, repair=False,
+        repo_id, config_name, token=token, console=console,
         expected_columns=ds.column_names, expected_schema=ds.features.arrow_schema,
-        revision=revision,
+        revision=revision, parquet_schema=parquet_schema,
     )
-    actual = _published_ids(repo_id, config_name, revision, token, ds.column_names, console)
+    if actual is None:
+        actual = _published_ids_full_reload(
+            repo_id, config_name, revision, token, ds.column_names
+        )
     expected = _dataset_ids(ds)
     if len(actual) != len(set(actual)) or set(actual) != set(expected):
         raise HubWriteError(f"Reloaded '{config_name}' id set differs from the committed dataset")
@@ -500,8 +549,6 @@ def push_datasets_verified(
     max_shard_size: str = "1GB",
     expected_revision: Optional[str] = None,
     console=None,
-    verify_reload: bool = True,
-    acquire_lock: bool = True,
     mode: str = "full",
 ) -> HubWriteResult:
     """Commit all selected configs and their exact card metadata atomically.
@@ -535,8 +582,7 @@ def push_datasets_verified(
     except (DataContractError, PublicationPolicyError) as exc:
         raise HubWriteError(f"Refusing invalid publication: {exc}") from exc
     max_bytes = _shard_bytes(max_shard_size)
-    context = hub_write_lock(repo_id, console=console) if acquire_lock else nullcontext()
-    with context:
+    with hub_write_lock(repo_id, console=console):
         api = HfApi(token=token)
         info = _assert_destination(api, repo_id, mode)
         before = str(info.sha)
@@ -570,24 +616,23 @@ def push_datasets_verified(
         revision = getattr(committed, "oid", None)
         if not revision:
             raise HubWriteError("The commit returned no revision; inspect the repository before retrying")
-        if verify_reload:
-            try:
-                for config_name, ds in prepared.items():
-                    _verify_committed_dataset(
-                        ds, repo_id=repo_id, config_name=config_name, token=token,
-                        revision=revision, console=console,
-                    )
-            except Exception as exc:
-                raise HubWriteError(
-                    f"Commit {revision} landed atomically, but verification failed: {exc}. "
-                    "Inspect this revision before retrying."
-                ) from exc
+        try:
+            for config_name, ds in prepared.items():
+                _verify_committed_dataset(
+                    ds, repo_id=repo_id, config_name=config_name, token=token,
+                    revision=revision, console=console,
+                )
+        except Exception as exc:
+            raise HubWriteError(
+                f"Commit {revision} landed atomically, but verification failed: {exc}. "
+                "Inspect this revision before retrying."
+            ) from exc
         after = get_repo_revision(repo_id, token=token)
         if after != revision:
             raise ConcurrentHubWriteError(
                 f"Committed and verified {revision}, but {repo_id} is now at {after}."
             )
-    return HubWriteResult(before, str(revision), True)
+    return HubWriteResult(before, str(revision))
 
 
 def push_dataset_verified(
@@ -602,8 +647,6 @@ def push_dataset_verified(
     expected_columns: Optional[Sequence[str]] = None,
     expected_ids: Optional[Iterable[object]] = None,
     console=None,
-    verify_reload: bool = True,
-    acquire_lock: bool = True,
     mode: str = "full",
 ) -> HubWriteResult:
     """Compatibility entry point for one config, using the atomic gateway."""
@@ -617,13 +660,14 @@ def push_dataset_verified(
     return push_datasets_verified(
         {config_name: ds}, repo_id=repo_id, token=token, commit_message=commit_message,
         max_shard_size=max_shard_size, expected_revision=expected_revision,
-        console=console, verify_reload=verify_reload, acquire_lock=acquire_lock, mode=mode,
+        console=console, mode=mode,
     )
 
 
 __all__ = [
     "HubBaselineUnavailableError", "ConcurrentHubWriteError", "HubWriteError",
     "HubWriteLockedError", "HubWriteResult", "resolve_hf_token", "get_repo_revision",
-    "get_repo_configs", "read_hub_columns", "load_hub_columns", "hub_write_lock",
+    "get_repo_configs", "iter_parquet_shards", "read_hub_columns", "load_hub_columns",
+    "hub_write_lock",
     "push_dataset_verified", "push_datasets_verified",
 ]

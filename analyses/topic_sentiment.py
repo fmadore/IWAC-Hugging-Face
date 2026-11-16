@@ -21,18 +21,20 @@ retained for missingness denominators. Topics are keyed by immutable model ident
 and topic ID; category shares and ordinal medians are the default summaries.
 
 Outputs (analyses/output/):
-- topic_sentiment_summary.csv     per topic: n, polarity label shares,
-                                  ordinal medians, missingness counts,
-                                  share of Central/Très central rows
+- topic_sentiment_summary.csv     per topic: n, polarity label shares (of all
+                                  assigned rows and of rows with a polarity
+                                  consensus), ordinal medians, missingness
+                                  counts, share of Central/Très central rows
 - topic_sentiment_by_country.csv  topic x country cells (shares, medians, missingness)
-- topic_sentiment_over_time.csv   topic x year cells (+ decade)
+- topic_sentiment_over_time.csv   topic x year cells (+ decade; point dates only)
+- topic_sentiment_summary.json, topic_sentiment.manifest.json
 
 Report-only: this script NEVER pushes anything to the Hub.
 
 Usage
 -----
-    python analyses/topic_sentiment.py [--source hub|csv]
-        [--min-topic-n 50] [--min-cell-n 20] [--min-year-n 10]
+    python analyses/topic_sentiment.py [--source hub|local] [--revision SHA]
+        [--ids-file cohort.csv] [--min-topic-n 50] [--min-cell-n 20] [--min-year-n 10]
 """
 from __future__ import annotations
 
@@ -44,48 +46,29 @@ from typing import List
 
 import pandas as pd
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "post-processing"))
-
 try:
-    from iwac_pipeline.processing._common import (  # noqa: E402
-        PRIVATE_REPO_ID,
-        ensure_hf_token,
-        load_subset_dataframe,
-        write_run_manifest,
+    from iwac_pipeline.analyses._research import (
+        OUTPUT_DIR, add_input_args, apply_ids_filter, date_exclusions, load_input,
+        load_subset_dataframe, point_years, save_reports, write_run_manifest,
     )
-except ModuleNotFoundError:  # source scripts before editable installation
-    from _common import (  # noqa: E402
-        PRIVATE_REPO_ID,
-        ensure_hf_token,
-        load_subset_dataframe,
-        write_run_manifest,
+    # Reuse the canonical sentiment vocabulary + consensus helpers.
+    from iwac_pipeline.processing.sentiment_agreement import (
+        POLARITY_ORDER, majority, models_for, CENTRALITY_ORDER, subjectivite_ordinal, to_ordinal,
     )
-
-# Reuse the canonical sentiment vocabulary + consensus helpers.
-try:
-    from iwac_pipeline.processing.sentiment_agreement import (  # noqa: E402
-        MODELS,
-        POLARITY_ORDER,
-        majority,
-        models_for,
-        CENTRALITY_ORDER,
-        subjectivite_ordinal,
-        to_ordinal,
+except ModuleNotFoundError as exc:
+    if not (exc.name or "").startswith("iwac_pipeline"):
+        raise
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _research import (  # noqa: E402
+        OUTPUT_DIR, add_input_args, apply_ids_filter, date_exclusions, load_input,
+        load_subset_dataframe, point_years, save_reports, write_run_manifest,
     )
-except ModuleNotFoundError:  # source scripts before editable installation
+    # _research put post-processing/ on sys.path.
     from sentiment_agreement import (  # noqa: E402
-        MODELS,
-        POLARITY_ORDER,
-        majority,
-        models_for,
-        CENTRALITY_ORDER,
-        subjectivite_ordinal,
-        to_ordinal,
+        POLARITY_ORDER, majority, models_for, CENTRALITY_ORDER, subjectivite_ordinal, to_ordinal,
     )
 
-
-from iwac_common.sentiment_panel import PANEL, instrument_id
+from iwac_common.sentiment_panel import PANEL, instrument_id  # noqa: E402
 
 from rich import box  # noqa: E402
 from rich.console import Console  # noqa: E402
@@ -93,13 +76,6 @@ from rich.panel import Panel  # noqa: E402
 from rich.table import Table  # noqa: E402
 
 console = Console()
-from iwac_common.paths import workspace_root
-
-OUTPUT_DIR = workspace_root() / "analyses" / "output"
-
-POLARITY_COLS = [f"{m}_polarite" for m in MODELS]
-CENTRALITY_COLS = [f"{m}_centralite_islam_musulmans" for m in MODELS]
-SUBJECTIVITY_COLS = [f"{m}_subjectivite_score" for m in MODELS]
 
 # Centrality labels counted as "central" for the per-topic central share.
 CENTRAL_LABELS = {"Central", "Très central"}
@@ -135,27 +111,9 @@ def consensus_label_series(df: pd.DataFrame, cols: List[str]) -> pd.Series:
     return df[present].apply(_row, axis=1)
 
 
-def consensus_score_series(df: pd.DataFrame, cols: List[str]) -> pd.Series:
-    """Median of the available subjectivité scores per row (NaN when none).
-
-    Goes through ``subjectivite_ordinal`` rather than ``pd.to_numeric``: since
-    generation 2 the column holds a label, and a plain numeric coercion would
-    turn every value into NaN and silently report "no data" instead of failing.
-    """
-    present = [c for c in cols if c in df.columns]
-    scores = pd.DataFrame({c: subjectivite_ordinal(df[c]) for c in present}, index=df.index)
-    return scores.median(axis=1, skipna=True).where(scores.notna().sum(axis=1) >= 2)
-
-
 def polarity_ordinal(labels: pd.Series) -> pd.Series:
     """Map consensus polarity labels onto the 1-5 scale (NaN for '' / 'Non applicable')."""
     return to_ordinal(labels, POLARITY_ORDER)
-
-
-def year_from_pub_date(pub_date: pd.Series) -> pd.Series:
-    """Year from the YYYY prefix of pub_date; NaN when unparsable/implausible."""
-    years = pd.to_numeric(pub_date.astype(str).str.strip().str[:4], errors="coerce")
-    return years.where(years.between(1000, 2100))
 
 
 # ---------------------------------------------------------------------------
@@ -168,9 +126,7 @@ def load_articles(args: argparse.Namespace) -> pd.DataFrame:
     wanted = (["o:id", "lda_model_name", "lda_topic_id", "lda_topic_label", "pub_date", "country"]
               + [f"{m}_{suffix}" for m in models for suffix in
                  ("polarite", "centralite_islam_musulmans", "subjectivite_score")])
-    token = ensure_hf_token(console=console) if args.source == "hub" else None
-    return load_subset_dataframe(args.repo, args.config, token=token, source=args.source,
-                                 columns=wanted, console=console)
+    return load_input(args, columns=wanted, loader=load_subset_dataframe)
 
 
 def abort(message: str) -> None:
@@ -214,7 +170,7 @@ def prepare_articles(df: pd.DataFrame, generation: int) -> pd.DataFrame:
     out["lda_model_name"] = out["lda_model_name"].astype(str).str.strip()
     out["lda_topic_id"] = topic.loc[valid].astype(int)
     out = pd.concat([out, resolve_consensus(out, generation)], axis=1)
-    out["year"] = year_from_pub_date(out["pub_date"])
+    out["year"], out["date_precision"] = point_years(out["pub_date"])
     out["country"] = out["country"].astype("string").str.strip().replace("", pd.NA)
     return out
 
@@ -245,9 +201,19 @@ def summarize_cells(df: pd.DataFrame, dimensions: List[str], *, ordinal_means=Fa
             "median_polarity": group["pol_ord"].median(),
             "median_subjectivity": group["subj_score"].median(),
         })
+        # n_scored: rows whose polarity panel reached a consensus label
+        # (including "Non applicable"). The *_of_scored shares use it as the
+        # denominator, so they do not move just because the panel has covered
+        # more or fewer rows of a topic; the plain shares keep n.
+        n_scored = int(group["pol_label"].ne("").sum())
+        row["n_scored"] = n_scored
         for label in POLARITY_ORDER:
-            row[f"share_{slug(label)}"] = group["pol_label"].eq(label).sum() / n
-        row["share_non_applicable"] = group["pol_label"].eq("Non applicable").sum() / n
+            count = group["pol_label"].eq(label).sum()
+            row[f"share_{slug(label)}"] = count / n
+            row[f"share_{slug(label)}_of_scored"] = count / n_scored if n_scored else None
+        count = group["pol_label"].eq("Non applicable").sum()
+        row["share_non_applicable"] = count / n
+        row["share_non_applicable_of_scored"] = count / n_scored if n_scored else None
         row["share_no_consensus"] = row["n_polarity_no_consensus"] / n
         row["share_insufficient_votes"] = row["n_polarity_insufficient_votes"] / n
         for label in CENTRALITY_ORDER:
@@ -267,15 +233,11 @@ def summarize_cells(df: pd.DataFrame, dimensions: List[str], *, ordinal_means=Fa
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Topic x sentiment analysis (consensus of the annotator panel). Report-only."
     )
-    parser.add_argument("--repo", default=PRIVATE_REPO_ID)
-    parser.add_argument("--config", default="articles",
-                        help="Subset with lda_topic_id + sentiment columns (articles)")
-    parser.add_argument("--source", choices=["hub", "csv"], default="hub",
-                        help="hub = live dataset (default); csv = local data/ mirror")
+    add_input_args(parser, source_default="hub", output_dir=OUTPUT_DIR, cohort=True)
     parser.add_argument("--min-topic-n", type=int, default=50,
                         help="Min scored rows per topic for the ranked tables (default 50)")
     parser.add_argument("--min-cell-n", type=int, default=20,
@@ -286,8 +248,32 @@ def main() -> None:
                         default=max(m.generation for m in PANEL), help="One annotation instrument; newest by default")
     parser.add_argument("--ordinal-means", action="store_true",
                         help="Also report means as an explicit equal-spacing sensitivity summary")
-    args = parser.parse_args()
+    return parser
 
+
+def ranked_topics(summary: pd.DataFrame, min_topic_n: int, limit: int = 25) -> pd.DataFrame:
+    """Console ranking: most polarity-scored articles first (model, topic break ties)."""
+    eligible = summary[summary["n_polarity_scored"] >= min_topic_n]
+    return eligible.sort_values(["n_polarity_scored", "lda_model_name", "lda_topic_id"],
+                                ascending=[False, True, True]).head(limit)
+
+
+def print_ranking(summary: pd.DataFrame, min_topic_n: int) -> None:
+    table = Table(title="Topic sentiment, by number of polarity-scored articles "
+                        "(conditional on this corpus and instrument)", box=box.ROUNDED)
+    for heading in ("Model / topic", "Label", "All articles", "Scored", "Median polarity"):
+        table.add_column(heading)
+    for row in ranked_topics(summary, min_topic_n).to_dict("records"):
+        table.add_row(f"{row['lda_model_name'][-12:]} / {row['lda_topic_id']}", str(row["label"]),
+                      str(row["n"]), str(row["n_polarity_scored"]), str(row["median_polarity"]))
+    console.print(table)
+    console.print("[yellow]share_* columns include missing and disputed rows in the denominator; "
+                  "share_*_of_scored divide by n_scored. Ordinal medians do not assume equal spacing; "
+                  "model agreement is not human validation.[/yellow]")
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     console.print(Panel.fit(
         "[bold cyan]Topic x Sentiment[/bold cyan]\n"
         "[dim]Which topics attract which sentiment, where, and when — "
@@ -295,14 +281,12 @@ def main() -> None:
         border_style="cyan",
     ))
 
-    df = load_articles(args)
-    source_revision = df.attrs.get("iwac_source_revision")
-
+    loaded = apply_ids_filter(load_articles(args), args)
     for col in ("lda_topic_id", "lda_topic_label", "pub_date", "country"):
-        if col not in df.columns:
+        if col not in loaded.columns:
             abort(f"Missing required column: {col}")
     try:
-        df = prepare_articles(df, args.generation)
+        df = prepare_articles(loaded, args.generation)
     except ValueError as exc:
         abort(str(exc))
     if df.empty:
@@ -317,30 +301,21 @@ def main() -> None:
     over_time = over_time[over_time["n_polarity_scored"] >= args.min_year_n]
     over_time["decade"] = (over_time["year"] // 10) * 10
 
-    # --- write outputs ---
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_summary = OUTPUT_DIR / "topic_sentiment_summary.csv"
-    out_country = OUTPUT_DIR / "topic_sentiment_by_country.csv"
-    out_time = OUTPUT_DIR / "topic_sentiment_over_time.csv"
-    summary.to_csv(out_summary, index=False, encoding="utf-8")
-    by_country.to_csv(out_country, index=False, encoding="utf-8")
-    over_time.to_csv(out_time, index=False, encoding="utf-8")
-
-    table = Table(title="Topic sentiment (conditional on this corpus and instrument)", box=box.ROUNDED)
-    for heading in ("Model / topic", "Label", "All articles", "Scored", "Median polarity"):
-        table.add_column(heading)
-    ranked = summary[summary["n_polarity_scored"] >= args.min_topic_n]
-    for row in ranked.head(25).to_dict("records"):
-        table.add_row(f"{row['lda_model_name'][-12:]} / {row['lda_topic_id']}", str(row["label"]),
-                      str(row["n"]), str(row["n_polarity_scored"]), str(row["median_polarity"]))
-    console.print(table)
-    console.print("[yellow]Shares include missing and disputed rows in the denominator. "
-                  "Ordinal medians do not assume equal spacing; model agreement is not human validation.[/yellow]")
-    write_run_manifest(
-        OUTPUT_DIR, script="topic_sentiment", repo_id=args.repo,
-        revision=source_revision, args=args,
-        outputs=[out_summary, out_country, out_time],
-    )
+    print_ranking(summary, args.min_topic_n)
+    report = {
+        "generation": args.generation, "instrument_id": instrument_id(args.generation),
+        "rows_loaded": int(len(loaded)), "rows_with_valid_topic": int(len(df)),
+        "over_time_dates": date_exclusions(df["date_precision"]),
+        "denominators": {"share_*": "n, every assigned article in the cell",
+                         "share_*_of_scored": "n_scored, articles whose polarity panel reached a "
+                                              "consensus label (including Non applicable)"},
+        "console_ranking": "n_polarity_scored descending, then model and topic",
+        "interpretation": "Conditional on this corpus, topic model and annotation instrument; model "
+                          "agreement is not human validation.",
+    }
+    save_reports(args, loaded, "topic_sentiment",
+                 {"topic_sentiment_summary.csv": summary, "topic_sentiment_by_country.csv": by_country,
+                  "topic_sentiment_over_time.csv": over_time}, report, writer=write_run_manifest)
     console.print("[yellow]ℹ[/yellow] Report-only script — nothing is pushed to the Hub.")
 
 

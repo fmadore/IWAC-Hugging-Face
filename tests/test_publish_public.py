@@ -351,3 +351,143 @@ def test_gateway_policy_rejects_unmasked_consensus_of_private_votes():
     })
     with pytest.raises(PublicationPolicyError, match="Private value"):
         validate_public_projection(ds, "articles")
+
+
+# ---------------------------------------------------------------------------
+# Related-item lists may only name published items
+# ---------------------------------------------------------------------------
+
+
+def _neighbour_frame():
+    # 1: public, OCR public. 2: public item whose full text is private.
+    # 3: private item. Rows 1 and 2 were ranked before item 3 turned private.
+    return pd.DataFrame({
+        "o:id": ["1", "2", "3"],
+        "item_is_public": [True, True, False],
+        "private_fields": [[], ["OCR"], []],
+        "OCR_is_public": [True, False, True],
+        "OCR": ["public text", "private text", "text"],
+        "related_articles": ["3:0.9900|2:0.8000", "3:0.9500|1:0.8000", "1:0.9900|2:0.9500"],
+    })
+
+
+def test_projection_strips_neighbours_that_are_not_published():
+    from iwac_common.write_policy import prepare_public_projection
+
+    result, omitted = prepare_public_projection(_neighbour_frame(), "articles")
+    assert omitted == 1
+    # Item 2 (public, private OCR) stays a neighbour; item 3 (private) goes.
+    assert result["related_articles"].tolist() == ["2:0.8000", "1:0.8000"]
+    assert result.attrs["neighbour_entries_removed"] == 2
+
+
+def test_projection_nulls_a_list_left_empty():
+    from iwac_common.write_policy import prepare_public_projection
+
+    frame = _neighbour_frame()
+    frame.loc[0, "related_articles"] = "3:0.9900"
+    result, _ = prepare_public_projection(frame, "articles")
+    assert result["related_articles"].iloc[0] is None
+
+
+@pytest.mark.parametrize("bad", ["3", "3:", ":0.5", "3:high", 42])
+def test_malformed_neighbour_list_is_refused(bad):
+    from iwac_common.write_policy import PublicationPolicyError, prepare_public_projection
+
+    frame = _neighbour_frame().astype({"related_articles": object})
+    frame.at[0, "related_articles"] = bad
+    with pytest.raises(PublicationPolicyError):
+        prepare_public_projection(frame, "articles")
+
+
+def test_gateway_rejects_a_neighbour_naming_an_unpublished_item():
+    from datasets import Dataset
+    from iwac_common.write_policy import PublicationPolicyError, validate_public_projection
+
+    ds = Dataset.from_dict({
+        "o:id": ["1", "2"], "item_is_public": [True, True], "private_fields": [[], ["OCR"]],
+        "OCR_is_public": [True, False], "OCR": ["public text", ""],
+        "related_articles": ["2:0.8000", "3:0.9500|1:0.8000"],
+    })
+    with pytest.raises(PublicationPolicyError, match="unpublished"):
+        validate_public_projection(ds, "articles")
+    # Public item with private OCR remains a valid neighbour.
+    ok = Dataset.from_dict(ds.to_dict() | {"related_articles": ["2:0.8000", "1:0.8000"]})
+    validate_public_projection(ok, "articles")
+
+
+# ---------------------------------------------------------------------------
+# Allowlist approvals are recorded only after a verified publication
+# ---------------------------------------------------------------------------
+
+
+def _approval_main(monkeypatch, tmp_path, argv, push):
+    import sys
+    from datasets import Dataset
+    import iwac_common.repos as repos
+
+    allow = tmp_path / "public_columns.json"
+    allow.write_text(json.dumps({"articles": ["o:id", "item_is_public", "private_fields"]}),
+                     encoding="utf-8")
+    monkeypatch.setattr(repos, "PUBLIC_COLUMNS_FILE", str(allow))
+    monkeypatch.setattr(pp, "PUBLIC_COLUMNS_FILE", str(allow))
+    ds = Dataset.from_dict({"o:id": ["1"], "item_is_public": [True], "private_fields": [[]],
+                            "new_metric": [0.5]})
+    monkeypatch.setattr(sys, "argv", ["publish_public.py", "--config", "articles",
+                                      "--approve-columns", "new_metric", *argv])
+    monkeypatch.setattr(pp, "ensure_hf_token", lambda **k: "fake")
+    monkeypatch.setattr(pp, "get_repo_revision", lambda *a, **k: "before")
+    monkeypatch.setattr(pp, "load_dataset", lambda *a, **k: ds)
+    monkeypatch.setattr(pp, "push_datasets_verified", push)
+    return allow
+
+
+def test_failed_publication_does_not_record_approvals(monkeypatch, tmp_path):
+    from iwac_common.hub import HubWriteError
+
+    def refuse(*args, **kwargs):
+        raise HubWriteError("refused by the gateway")
+
+    allow = _approval_main(monkeypatch, tmp_path, ["-y"], refuse)
+    with pytest.raises(SystemExit):
+        pp.main()
+    assert "new_metric" not in json.loads(allow.read_text(encoding="utf-8"))["articles"]
+
+
+def test_dry_run_does_not_record_approvals(monkeypatch, tmp_path):
+    allow = _approval_main(monkeypatch, tmp_path, ["--dry-run"],
+                           lambda *a, **k: pytest.fail("dry run pushed"))
+    pp.main()
+    assert "new_metric" not in json.loads(allow.read_text(encoding="utf-8"))["articles"]
+
+
+def test_successful_publication_records_approvals(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    allow = _approval_main(monkeypatch, tmp_path, ["-y"],
+                           lambda *a, **k: SimpleNamespace(after_revision="after"))
+    pp.main()
+    assert "new_metric" in json.loads(allow.read_text(encoding="utf-8"))["articles"]
+
+
+def test_numpy_embeddings_give_the_same_arrow_column_as_float_lists():
+    """build_public_dataset no longer converts vectors to Python lists."""
+    import numpy as np
+    import pyarrow as pa
+    from datasets import Dataset, Features
+
+    ds = Dataset.from_dict({
+        "o:id": ["1", "2", "3", "4"],
+        "embedding_OCR": pa.array([[0.1, 0.2], None, [0.3, 1e-8], []], type=pa.list_(pa.float32())),
+    })
+    frame = ds.to_pandas()
+    assert isinstance(frame["embedding_OCR"][0], np.ndarray)
+    features = Features({c: ds.features[c] for c in frame.columns})
+    as_arrays = pp.build_public_dataset(frame, features)
+    as_lists = Dataset.from_pandas(
+        frame.assign(embedding_OCR=frame["embedding_OCR"].map(
+            lambda v: v.tolist() if isinstance(v, np.ndarray) else v)),
+        preserve_index=False, features=features)
+    assert as_arrays.data.schema.equals(as_lists.data.schema, check_metadata=True)
+    assert as_arrays.data.equals(as_lists.data)
+    assert as_arrays.data.column("embedding_OCR").equals(ds.data.column("embedding_OCR"))

@@ -145,9 +145,11 @@ def test_burst_rejects_mentions_outside_exposure():
 def test_cluster_bootstrap_resamples_whole_outlets():
     values = np.array([0.] * 100 + [1.] * 100)
     clusters = ["A"] * 100 + ["B"] * 100
-    lo, hi = st.bootstrap_mean_ci(values, 1000, 42, clusters=clusters)
+    # Two clusters are below the default floor: no band rather than a misleading one.
+    assert all(np.isnan(v) for v in st.bootstrap_mean_ci(values, 1000, 42, clusters=clusters))
+    lo, hi = st.bootstrap_mean_ci(values, 1000, 42, clusters=clusters, min_clusters=2)
     assert lo == 0 and hi == 1
-    assert st.bootstrap_mean_ci(values, 1000, 42, clusters=clusters) == (lo, hi)
+    assert st.bootstrap_mean_ci(values, 1000, 42, clusters=clusters, min_clusters=2) == (lo, hi)
     row_lo, row_hi = st.bootstrap_mean_ci(values, 1000, 42)
     assert row_lo > lo and row_hi < hi
     assert np.isnan(st.bootstrap_mean_ci(values, 100, 42, clusters=["A"] * 200)[0])

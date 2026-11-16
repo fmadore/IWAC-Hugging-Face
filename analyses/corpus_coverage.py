@@ -3,12 +3,83 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 
 import pandas as pd
 
-from iwac_pipeline.analyses._research import (
-    MISSING, add_input_args, dates, load_input, present, save_reports, series, source_link, string,
-)
+try:
+    from iwac_pipeline.analyses._research import (
+        MISSING, POINT_PRECISIONS, add_input_args, date_exclusions, dates, load_input, present,
+        save_reports, series, source_link, string,
+    )
+    from iwac_pipeline.analyses._stats import language_mask
+except ModuleNotFoundError as exc:
+    if not (exc.name or "").startswith("iwac_pipeline"):
+        raise
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _research import (  # noqa: E402
+        MISSING, POINT_PRECISIONS, add_input_args, date_exclusions, dates, load_input, present,
+        save_reports, series, source_link, string,
+    )
+    from _stats import language_mask  # noqa: E402
+
+
+def _access(df: pd.DataFrame) -> pd.Series:
+    """Item privacy wins over text privacy; absent flags stay ``unknown``."""
+    parent_raw = series(df, "o:is_public") if "o:is_public" in df else series(df, "item_is_public")
+    parent = parent_raw.map(lambda v: string(v).lower())
+    text = series(df, "OCR_is_public").map(lambda v: string(v).lower())
+    access = pd.Series("unknown", index=df.index, dtype=object)
+    access[text.isin(("false", "0"))] = "restricted_text"
+    access[text.isin(("true", "1"))] = "public_text"
+    access[parent.isin(("false", "0"))] = "restricted_item"
+    return access
+
+
+def _ledger(df: pd.DataFrame, metrics) -> pd.DataFrame:
+    years, precision = dates(df)
+    ledger = pd.DataFrame({"o:id": df["o:id"].astype(str),
+                           "iwac_url": [source_link(row) for row in df.to_dict("records")]},
+                          index=df.index)
+    for column in ("country", "newspaper", "newspaper_ids", "language"):
+        ledger[column] = series(df, column).map(lambda x: string(x, MISSING))
+    ledger["outlet_key"] = ledger["newspaper_ids"].where(
+        ledger["newspaper_ids"].ne(MISSING), ledger["newspaper"])
+    ledger["pub_date"] = series(df, "pub_date").map(string)
+    ledger["year"] = years
+    ledger["date_precision"] = precision
+    ledger["access"] = _access(df)
+    for column in metrics:
+        ledger[f"has:{column}"] = series(df, column).map(present)
+    return ledger
+
+
+def _exclusion_reasons(df, ledger, *, year_min, year_max, languages, require) -> pd.Series:
+    """One ``|``-joined reason string per row; empty means included."""
+    point = ledger["date_precision"].isin(POINT_PRECISIONS)
+    flags = {"missing_or_ambiguous_date": ~point,
+             "outside_year_window": point & ~ledger["year"].between(year_min, year_max).fillna(False)}
+    if languages:
+        selected = pd.Series(False, index=df.index)
+        for language in languages:
+            selected |= language_mask(series(df, "language"), language)
+        flags["language_not_selected"] = ~selected
+    for column in require:
+        flags[f"missing:{column}"] = ~ledger[f"has:{column}"]
+    reasons = pd.Series("", index=df.index, dtype=object)
+    for name, mask in flags.items():
+        mask = mask.astype(bool)
+        reasons[mask] = reasons[mask].map(lambda r, n=name: f"{r}|{n}" if r else n)
+    return reasons
+
+
+def _stable_outlets(ledger, year_min, year_max, min_outlet_year) -> set:
+    """Outlets meeting the minimum in EVERY year of the window (gaps count as zero)."""
+    n_years = year_max - year_min + 1
+    counts = ledger[ledger["included"]].groupby(["country", "outlet_key", "year"]).size()
+    return {(country, outlet) for (country, outlet), group in counts.groupby(level=[0, 1])
+            if outlet != MISSING and len(group) == n_years and group.min() >= min_outlet_year}
 
 
 def coverage_report(df, *, year_min=1900, year_max=2100, languages=(), require=(),
@@ -24,47 +95,14 @@ def coverage_report(df, *, year_min=1900, year_max=2100, languages=(), require=(
     for column in require:
         if column not in df:
             raise ValueError(f"Required column is absent: {column}")
-    years, precision = dates(df)
-    years = years.where(precision.isin(("year", "month", "day")))
-    ledger = pd.DataFrame({"o:id": df["o:id"].astype(str),
-                           "iwac_url": [source_link(row) for _, row in df.iterrows()]})
-    for column in ("country", "newspaper", "newspaper_ids", "language"):
-        ledger[column] = series(df, column).map(lambda x: string(x, MISSING))
-    ledger["outlet_key"] = ledger["newspaper_ids"].where(
-        ledger["newspaper_ids"].ne(MISSING), ledger["newspaper"])
-    ledger["pub_date"] = series(df, "pub_date").map(string)
-    ledger["year"] = years
-    ledger["date_precision"] = precision
-    def access(row):
-        value = row.get("OCR_is_public")
-        parent = row.get("o:is_public", row.get("item_is_public"))
-        if string(parent).lower() in ("false", "0"):
-            return "restricted_item"
-        if string(value).lower() in ("true", "1"):
-            return "public_text"
-        if string(value).lower() in ("false", "0"):
-            return "restricted_text"
-        return "unknown"
-    ledger["access"] = [access(row) for _, row in df.iterrows()]
-    reasons = [[] for _ in range(len(df))]
-    for pos, (_, row) in enumerate(df.iterrows()):
-        year, prec = years.iloc[pos], precision.iloc[pos]
-        if prec not in ("year", "month", "day"):
-            reasons[pos].append("missing_or_ambiguous_date")
-        elif not year_min <= year <= year_max:
-            reasons[pos].append("outside_year_window")
-        if languages and string(row.get("language")) not in languages:
-            reasons[pos].append("language_not_selected")
-        for column in require:
-            if not present(row.get(column)):
-                reasons[pos].append(f"missing:{column}")
-    ledger["exclusion_reasons"] = ["|".join(r) for r in reasons]
-    ledger["included"] = [not r for r in reasons]
     metrics = list(dict.fromkeys(["OCR", "lemma_nostop", "embedding_OCR", "lda_topic_id", *require,
                                 *(c for c in df if c.endswith(("_polarite", "_subjectivite_score",
                                                               "_centralite_islam_musulmans")))]))
-    for column in metrics:
-        ledger[f"has:{column}"] = series(df, column).map(present)
+    ledger = _ledger(df, metrics)
+    reasons = _exclusion_reasons(df, ledger, year_min=year_min, year_max=year_max,
+                                 languages=languages, require=require)
+    ledger["exclusion_reasons"] = reasons
+    ledger["included"] = reasons.eq("")
     aggregates = []
     for dims in (("country",), ("newspaper",), ("year",), ("language",),
                  ("access",), ("date_precision",), ("country", "outlet_key", "year")):
@@ -76,24 +114,20 @@ def coverage_report(df, *, year_min=1900, year_max=2100, languages=(), require=(
                 record[f"n:{column}"] = int(group[f"has:{column}"].sum())
                 record[f"fraction:{column}"] = float(group[f"has:{column}"].mean())
             aggregates.append(record)
-    included = ledger[ledger["included"]]
-    # An outlet must meet the minimum in EVERY year of the requested window.
-    # Missing years count as zero, preventing a one-year outlet looking stable.
-    n_years = year_max - year_min + 1
-    counts = included.groupby(["country", "outlet_key", "year"]).size()
-    stable = []
-    for (country, outlet), group in counts.groupby(level=[0, 1]):
-        if outlet != MISSING and len(group) == n_years and group.min() >= min_outlet_year:
-            stable.append((country, outlet))
-    stable_set = set(stable)
-    ledger["stable_outlet_cohort"] = [bool(inc and (country, outlet) in stable_set)
-        for inc, country, outlet in zip(ledger["included"], ledger["country"], ledger["outlet_key"])]
+    stable = _stable_outlets(ledger, year_min, year_max, min_outlet_year)
+    ledger["stable_outlet_cohort"] = ledger["included"] & pd.Series(
+        list(zip(ledger["country"], ledger["outlet_key"])), index=ledger.index).isin(stable)
+    ledger = ledger.reset_index(drop=True)
+    exploded = [x for r in reasons if r for x in r.split("|")]
     summary = {"documents": len(df), "included": int(ledger["included"].sum()),
                "excluded": int((~ledger["included"]).sum()),
                "year_window": [year_min, year_max], "stable_outlets": len(stable),
                "stable_outlet_documents": int(ledger["stable_outlet_cohort"].sum()),
+               "date_exclusions": date_exclusions(ledger["date_precision"]),
                "column_available": {c: c in df for c in metrics},
-               "exclusion_counts_overlapping": {str(k): int(v) for k, v in pd.Series([x for r in reasons for x in r], dtype=str).value_counts().items()},
+               "exclusion_counts_overlapping": {str(k): int(v) for k, v in pd.Series(exploded, dtype=str).value_counts().items()},
+               "cohort_reuse": "Pass corpus_coverage_inclusion.csv to another analysis with "
+                               "--ids-file ... --ids-where stable_outlet_cohort (or included).",
                "interpretation": "Corpus coverage, not population representativeness. Missing labels stay missing; ranges are not assigned a point year."}
     return pd.DataFrame(aggregates), ledger, summary
 

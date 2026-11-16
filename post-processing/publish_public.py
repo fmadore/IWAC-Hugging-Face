@@ -28,6 +28,8 @@ existing reviewed policy retains computed embeddings, topics and metrics for
 public items whose OCR is private; this is a disclosure decision, not a claim
 that embeddings cannot reveal text. Private input/configuration hashes are
 removed. Missing item/property visibility metadata requires an Omeka refresh.
+``related_articles`` lists keep only neighbours published in the same subset;
+an entry naming any other id is stripped here and refused by the gateway.
 
 Two guards protect against NEW full-text columns slipping through:
 
@@ -71,7 +73,7 @@ import sys
 
 # Make ``post-processing/_common.py`` importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import ensure_hf_token, PRIVATE_REPO_ID, PUBLIC_REPO_ID  # noqa: E402
+from _common import ensure_hf_token, load_environment, PRIVATE_REPO_ID, PUBLIC_REPO_ID  # noqa: E402
 from iwac_common.hub import (  # noqa: E402
     ConcurrentHubWriteError,
     HubBaselineUnavailableError,
@@ -92,10 +94,7 @@ from iwac_common.write_policy import (  # noqa: E402
     prepare_public_projection,
 )
 
-from dotenv import load_dotenv
-from pathlib import Path
-
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_environment()
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 import pandas as pd  # noqa: E402
@@ -249,7 +248,8 @@ def check_column_allowlist(cfg: str, df, approve: set[str]) -> list[str]:
     ``iwac_common/public_columns.json`` before it reaches the public repo.
 
     Returns the list of columns newly approved for this run. Persistence is
-    deferred until after dry-run/confirmation so previews never edit files.
+    deferred until the verified push has returned, so previews, cancelled runs
+    and refused or failed publications never edit the allowlist.
     Aborts on any unknown column that was not passed via --approve-columns.
     """
     allowlist = load_public_columns()
@@ -293,7 +293,7 @@ def check_column_allowlist(cfg: str, df, approve: set[str]) -> list[str]:
 
 
 def persist_public_column_approvals(approved_by_config: dict[str, list[str]]) -> None:
-    """Persist reviewed allowlist additions after preview/confirmation."""
+    """Persist reviewed allowlist additions once the verified push succeeded."""
     import json
 
     if not any(approved_by_config.values()):
@@ -310,6 +310,19 @@ def persist_public_column_approvals(approved_by_config: dict[str, list[str]]) ->
         f"[yellow]⚠[/yellow] Recorded reviewed public columns in "
         f"{os.path.basename(PUBLIC_COLUMNS_FILE)} — commit this change."
     )
+
+
+def build_public_dataset(public_df, features):
+    """Arrow dataset of one projected subset, with the private schema restored.
+
+    Embedding cells stay numpy arrays: with the explicit ``features`` Arrow
+    converts them to the same ``list<float32>`` column a list of Python floats
+    would give (tests/test_publish_public.py), without the ~8x larger
+    intermediate copy for every subset at once.
+    """
+    from datasets import Dataset
+
+    return Dataset.from_pandas(public_df, preserve_index=False, features=features)
 
 
 def main() -> None:
@@ -398,6 +411,12 @@ def main() -> None:
             sys.exit(1)
         if excluded_items:
             console.print(f"[yellow]ℹ[/yellow] {cfg}: excluded {excluded_items:,} non-public items")
+        stripped = public_df.attrs.get("neighbour_entries_removed", 0)
+        if stripped:
+            console.print(
+                f"[yellow]⚠[/yellow] {cfg}: removed {stripped:,} related-item entries naming "
+                "unpublished items; re-run related_articles.py --push to refill the lists"
+            )
         # The pandas hop below is only for masking and the prose heuristics;
         # the private schema is restored exactly when the frame goes back to
         # Arrow (a bare from_pandas turns nullable ints into float64).
@@ -464,22 +483,11 @@ def main() -> None:
         )
         sys.exit(1)
 
-    persist_public_column_approvals(approved_by_config)
-
-    import numpy as np
-    from datasets import Dataset
-
     try:
-        prepared = {}
-        for cfg, content_cols, kept, blanked, public_df, features in plans:
-            for col in public_df.columns:
-                if col.startswith("embedding"):
-                    public_df[col] = public_df[col].map(
-                        lambda v: v.tolist() if isinstance(v, np.ndarray) else v
-                    )
-            prepared[cfg] = Dataset.from_pandas(
-                public_df, preserve_index=False, features=features
-            )
+        prepared = {
+            cfg: build_public_dataset(public_df, features)
+            for cfg, _content_cols, _kept, _blanked, public_df, features in plans
+        }
         target_revision = get_repo_revision(args.repo_public, token=token)
         with console.status("[bold green]Publishing all selected subsets atomically...", spinner="dots"):
             result = push_datasets_verified(
@@ -495,6 +503,9 @@ def main() -> None:
         console.print(
             f"[green]✓[/green] Published {len(prepared)} subset(s) together at {result.after_revision}"
         )
+        # Only a verified publication makes the reviewed columns part of the
+        # allowlist; a refused or failed push leaves the file untouched.
+        persist_public_column_approvals(approved_by_config)
     except (
         HubBaselineUnavailableError,
         ConcurrentHubWriteError,

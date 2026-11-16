@@ -8,29 +8,35 @@ Two tokenizers with distinct purposes:
   so all four stay in lockstep (they had drifted: keyness skipped
   lowercasing and case-split tokens the LDA side merged).
 
-- :func:`tokenize_words` — a French-aware word tokenizer for RAW text
-  (OCR). Splits off elided clitics (``l'islam`` → ``islam``,
-  ``aujourd'hui`` stays whole via the exception list) so word counts and
-  type counts aren't inflated by ``l``/``d``/``qu`` fragments. Used by the
-  word-count and lexical-richness metrics.
+- :func:`tokenize_words` — a language-aware word tokenizer for RAW text
+  (OCR), used by ``nb_mots`` (:func:`count_words`) and by the MATTR token
+  stream, which therefore agree by construction for the same row language.
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
-from typing import AbstractSet, List
+from typing import AbstractSet, Iterable, List
 
-# Elided clitics that should be separated from the following word.
-# ``aujourd'hui`` is a lexicalized exception handled before splitting.
-_ELISION_RE = re.compile(
-    r"\b(?:qu|jusqu|lorsqu|puisqu|quoiqu|quelqu|[ldjmnstc])[’']", re.IGNORECASE
-)
-TOKENIZER_VERSION = 2
-_APOSTROPHE_WORDS = {
-    "aujourd'hui": "aujourdhui",
-    "aujourd’hui": "aujourdhui",
-}
+# Bump whenever tokenize_words() output changes for identical input: it is
+# part of the persisted provenance of nb_mots and Richesse_Lexicale_OCR.
+# 3 = elided clitics are tokens of their own (``l'église`` = 2, like
+# ``la mosquée``), the split applies only to rows whose language includes
+# French, and apostrophes inside a word keep it whole (``da'wa``).
+TOKENIZER_VERSION = 3
+
+#: Language labels / codes under which the French elision split applies.
+FRENCH_LANGUAGE_LABELS = frozenset({"Français", "fr", "fra"})
+
+# Typographic apostrophes normalised to ASCII. The transliteration letters
+# U+02BC, U+02BE and U+02BF are letters and stay inside the word as-is.
+_APOSTROPHES = str.maketrans({"’": "'", "‘": "'", "‛": "'",
+                              "′": "'", "＇": "'"})
+_ELIDED_CLITIC_RE = re.compile(r"(qu|jusqu|lorsqu|puisqu|quoiqu|quelqu|[ldjmnstc])'(?=.)")
+# Lexicalised forms whose apostrophe follows a clitic-shaped head but which
+# are one word (``aujourd'hui`` never matches: its head is ``aujourd``).
+_LEXICALISED_APOSTROPHE_WORDS = frozenset({"quelqu'un", "quelqu'une"})
 
 
 def simple_tokenize(
@@ -55,47 +61,102 @@ def language_labels(value: object) -> list[str]:
     return list(dict.fromkeys(part.strip() for part in str(value or "").split("|") if part.strip()))
 
 
-def tokenize_words(text: str, language: str = "Français") -> List[str]:
-    """Tokenize raw (French) text into words, handling elision.
+def applies_french_elision(language: object) -> bool:
+    """Whether the French elision split applies to a row.
 
-    ``l'islam`` → ``["islam"]``; ``qu'il`` → ``["il"]``;
-    ``aujourd'hui`` → ``["aujourdhui"]`` (kept as one token).
-    Digits are kept, punctuation dropped. Output is lowercase.
+    ``language`` is the row's ``language`` value (pipe-joined labels), a list
+    of labels, or ``None``. The rule is "the row's languages include French",
+    so a ``Français|Anglais`` row is split like a French one and a Hausa,
+    Ewé or unlabelled row is not.
+    """
+    labels = language if isinstance(language, (list, tuple)) else language_labels(language)
+    return any(label in FRENCH_LANGUAGE_LABELS for label in labels)
+
+
+def _iter_words(text: str) -> Iterable[str]:
+    """Yield the words of lowercased, apostrophe-normalised ``text``.
+
+    A word is a run of letters, digits, ``_`` and (inside a word) combining
+    marks — Python's ``\\w`` excludes those marks, which would split Arabic and
+    African-language words at every vowel or tone mark. An apostrophe stays
+    inside a word when letters follow it (``da'wa``, ``jama'at``,
+    ``aujourd'hui``); one at a word edge is punctuation. Hyphens separate.
+    """
+    current: list[str] = []
+    for index, char in enumerate(text):
+        if char.isalnum() or char == "_" or (current and unicodedata.category(char).startswith("M")):
+            current.append(char)
+            continue
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if char == "'" and current and following.isalnum():
+            current.append(char)
+            continue
+        if current:
+            yield "".join(current)
+            current = []
+    if current:
+        yield "".join(current)
+
+
+_NAME_PREFIX_RE = re.compile(r"(?<!\w)[NM]'[^\W\d_a-zà-ÿ][^\W\d_]*")
+
+
+def _split_elision(word: str) -> List[str]:
+    """``l'église`` → ``["l'", "église"]``; ``jusqu'à`` → ``["jusqu'", "à"]``."""
+    parts: List[str] = []
+    while word not in _LEXICALISED_APOSTROPHE_WORDS:
+        match = _ELIDED_CLITIC_RE.match(word)
+        if not match:
+            break
+        parts.append(word[:match.end()])
+        word = word[match.end():]
+    parts.append(word)
+    return parts
+
+
+def tokenize_words(text: str, language: object = "Français") -> List[str]:
+    """Tokenize raw text into lowercase words (``TOKENIZER_VERSION`` 3).
+
+    For a row whose language includes French (:func:`applies_french_elision`)
+    an elided clitic is a token of its own, so ``l'église`` → ``["l'",
+    "église"]`` counts two words exactly like ``la mosquée``, and ``qu'il`` →
+    ``["qu'", "il"]``. ``aujourd'hui`` and ``quelqu'un`` stay whole. In every
+    other language an apostrophe inside a word keeps it whole (``da'wa``).
+    Transliterations such as ``Jama'at`` / ``Qur'an`` are one token in every
+    language. Digits are kept, punctuation dropped, hyphens separate.
+    ``language`` is the row's raw ``language`` value; pass it explicitly
+    (``None`` means "no language", not French).
     """
     if not text:
         return []
-    lowered = unicodedata.normalize("NFC", str(text)).lower()
-    if language in {"Français", "fr", "fra"}:
-        for src, repl in _APOSTROPHE_WORDS.items():
-            lowered = lowered.replace(src, repl)
-        lowered = _ELISION_RE.sub(" ", lowered)
-    # Python's \w excludes combining marks. Preserve them inside words (for
-    # Arabic and African-language orthographies) rather than splitting a word
-    # into several tokens at every vowel/tonal mark.
-    tokens, current = [], []
-    for char in lowered:
-        if char.isalnum() or char == "_" or (current and unicodedata.category(char).startswith("M")):
-            current.append(char)
-        elif current:
-            tokens.append("".join(current))
-            current = []
-    if current:
-        tokens.append("".join(current))
-    return tokens
+    normalised = unicodedata.normalize("NFC", str(text)).translate(_APOSTROPHES)
+    words = _iter_words(normalised.lower())
+    if not applies_french_elision(language):
+        return list(words)
+    # ``N'Guessan``, ``N'Djamena``, ``M'Bow`` are names, not ne/me + word.
+    names = {match.lower() for match in _NAME_PREFIX_RE.findall(normalised)}
+    return [
+        part
+        for word in words
+        for part in ([word] if word in names else _split_elision(word))
+    ]
 
 
-def count_words(text: object) -> int:
+def count_words(text: object, language: object = "Français") -> int:
     """``nb_mots``: the number of :func:`tokenize_words` tokens (0 if empty).
 
-    The single definition of the word count. It used to exist twice — the
-    references and audiovisual upload mappers counted ``\b\w+\b`` matches
-    (``l'islam`` = 2) while ``calculate_word_count.py`` counted elision-aware
-    tokens (``l'islam`` = 1) — so a references row's ``nb_mots`` depended on
-    which of the two had run last.
+    The single definition of the word count, shared by
+    ``calculate_word_count.py`` and the references/audiovisual upload mappers.
+    Pass the row's ``language`` value so the count matches the MATTR token
+    stream of ``calculate_lexical_richness.py``; the French default exists for
+    backward compatibility with callers that pass none.
     """
     if not text:
         return 0
-    return len(tokenize_words(str(text)))
+    return len(tokenize_words(str(text), language=language))
 
 
-__all__ = ["simple_tokenize", "tokenize_words", "count_words"]
+__all__ = [
+    "simple_tokenize", "tokenize_words", "count_words", "applies_french_elision",
+    "language_labels", "TOKENIZER_VERSION",
+]

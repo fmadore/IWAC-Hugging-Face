@@ -24,19 +24,16 @@ Variables d'environnement
 
 import os
 import sys
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 # Add parent directory to path for country_mapper / iwac_common imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
-from country_mapper import get_country_from_newspaper
+from country_mapper import get_country_from_outlets
 from iwac_common.omeka_client import (
     OmekaApiClient,
-    conn_manager,
-    fetch_iiif_thumbnail_url,
-    fetch_primary_media_url,
-    iiif_manifest_url,
+    fetch_media_pointers,
     item_page_url,
 )
 from iwac_common.field_mappers import (
@@ -53,21 +50,23 @@ from iwac_common.field_mappers import (
 from iwac_common.sentiment_panel import (
     DIMENSION_FIELDS,
     LEGACY_VENDOR_COLUMNS,
-    SUBJECTIVITE_ORDER,
     SUBJECTIVITE_SUFFIX,
     active_models,
     all_columns,
-    numeric_subjectivite_columns,
     prefixes,
 )
-from iwac_common.upload_runner import UploadSpec, report_unmapped_values, run_upload
-from iwac_common.schema import SUBSETS
+from iwac_common.upload_runner import (
+    COUNTRY_MAPPER_HINT,
+    UploadSpec,
+    report_unmapped_values,
+    run_upload,
+)
 
 
 
-# Orchestration (fetch → map loop → merge → validate → push), the CLI
-# (--repo, --max-shard-size, --no-cache, --dry-run, --force-shrink) and the
-# Rich console/logging setup live in iwac_common.upload_runner.
+# Orchestration (fetch → map loop → merge → validate → push), the CLI and the
+# Rich console/logging setup live in iwac_common.upload_runner. For the flags,
+# run this script with --help (parser: iwac_common.upload_runner.build_parser).
 
 
 # ---------------------------------------------------------------------------
@@ -87,44 +86,18 @@ def _get_subjectivity_label(item: Dict[str, Any], field: str) -> str:
     return get_value(item, field).strip()
 
 
-def _get_subjectivity_score(item: Dict[str, Any], field: str) -> Optional[int]:
-    """Subjectivité as the 1-5 ordinal, for models asked for a number.
-
-    Both generations store the value as a ``resource:item`` link to one of the
-    five labelled items (78043-78047), so the label is read first and ranked; the
-    ``int()`` fallback covers a numeric literal, which no live property uses.
-    Unreachable while every active model is generation 2 — kept because it is the
-    other half of ``SentimentModel.subjectivite_is_label`` and the reader for the
-    frozen generation-1 columns' semantics.
-    """
-    label = _get_subjectivity_label(item, field)
-    if label in SUBJECTIVITE_ORDER:
-        return SUBJECTIVITE_ORDER[label]
-    try:
-        return int(label)
-    except (TypeError, ValueError):
-        return None
-
-
 async def map_newspaper_article(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item Omeka en dict plat pour HF datasets."""
 
-    primary_url = await fetch_primary_media_url(
-        item, api, affected_fields=("PDF", "thumbnail", "iiif_manifest")
+    # Thumbnail and IIIF manifest only when there is a PDF behind them.
+    primary_url, thumbnail_url, manifest_url = await fetch_media_pointers(
+        item, api, file_field="PDF"
     )
 
     newspaper_name = get_value(item, "dcterms:publisher")
-    country = get_country_from_newspaper(newspaper_name)
+    country = get_country_from_outlets(newspaper_name)
     pub_date = get_value(item, "dcterms:date")
     pub_year, pub_date_precision = parse_pub_date(pub_date)
-
-    # Thumbnail and IIIF manifest only when there is a PDF behind them.
-    thumbnail_url = ""
-    manifest_url = ""
-    if primary_url:
-        session = await conn_manager.get()
-        thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
-        manifest_url = iiif_manifest_url(item["o:id"])
 
     return {
         "o:id": item["o:id"],
@@ -185,14 +158,16 @@ def _sentiment_columns(item: Dict[str, Any]) -> Dict[str, Any]:
         for suffix, omeka_suffix in DIMENSION_FIELDS:
             prop = model.omeka_property(omeka_suffix)
             if suffix == SUBJECTIVITE_SUFFIX:
-                # Same Omeka storage (a link to a labelled item) either way;
-                # the generation decides whether the column keeps the label or
-                # its 1-5 rank.
-                cols[model.column(suffix)] = (
-                    _get_subjectivity_label(item, prop)
-                    if model.subjectivite_is_label
-                    else _get_subjectivity_score(item, prop)
-                )
+                # Generation 1 stored the 1-5 rank in an int column; its Omeka
+                # properties are retired (frozen models raise in
+                # omeka_property), so no live model may emit that shape.
+                if not model.subjectivite_is_label:
+                    raise ValueError(
+                        f"{model.prefix} is active but asks for a numeric "
+                        "subjectivité score; only label-based (generation >= 2) "
+                        "models can be ingested"
+                    )
+                cols[model.column(suffix)] = _get_subjectivity_label(item, prop)
             else:
                 cols[model.column(suffix)] = get_value(item, prop)
     return cols
@@ -227,19 +202,12 @@ def _sentiment_columns_last(final_df: pd.DataFrame) -> pd.DataFrame:
 
 SPEC = UploadSpec(
     config_name="articles",
-    resource_class_ids=SUBSETS["articles"].resource_class_ids,
     map_item=map_newspaper_article,
     title="📰 IWAC Newspaper Upload",
     cache_dir=".cache_omk",  # shared with islamic-publications (keys include class id)
     description="Publie les articles de journaux IWAC sur le Hub HF",
-    int_columns=(
-        "nb_pages",
-        # Generation-1 subjectivité only: those columns hold the 1-5 integer.
-        # Casting a generation-2 label column to Int64 would blank it entirely.
-        *numeric_subjectivite_columns(),
-    ),
     columns_to_exclude=LEGACY_VENDOR_COLUMNS,
-    post_map=report_unmapped_values("newspaper", "country"),
+    post_map=report_unmapped_values("newspaper", "country", hint=COUNTRY_MAPPER_HINT),
     post_merge=_sentiment_columns_last,
 )
 

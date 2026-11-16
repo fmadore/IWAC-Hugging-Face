@@ -109,13 +109,13 @@ DERIVED_FROM: dict[str, dict[str, tuple[str, ...]]] = {
     "articles": {
         "OCR": ("embedding_OCR", *_LEMMAS, *_OCR_METRICS, *_LDA, "related_articles"),
         "title": ("embedding_OCR", "related_articles"),
-        "language": (*_LEMMAS, "Richesse_Lexicale_OCR", "Lisibilite_OCR", *_LDA),
+        "language": (*_LEMMAS, *_OCR_METRICS, *_LDA),
         "pub_date": _HIJRI,
     },
     "publications": {
         "OCR": (*_LEMMAS, *_OCR_METRICS, *_LDA),
         "title": ("embedding_tableOfContents", "related_articles"),
-        "language": (*_LEMMAS, "Richesse_Lexicale_OCR", "Lisibilite_OCR", *_LDA),
+        "language": (*_LEMMAS, *_OCR_METRICS, *_LDA),
         "tableOfContents": ("embedding_tableOfContents", "related_articles"),
         "pub_date": _HIJRI,
     },
@@ -123,17 +123,17 @@ DERIVED_FROM: dict[str, dict[str, tuple[str, ...]]] = {
         "OCR": (*_LEMMAS, *_OCR_METRICS, *_LDA),
         "abstract": ("embedding_abstract",),
         "title": ("embedding_abstract",),
-        "language": (*_LEMMAS, "Richesse_Lexicale_OCR", "Lisibilite_OCR", *_LDA),
+        "language": (*_LEMMAS, *_OCR_METRICS, *_LDA),
     },
     "documents": {
         "OCR": ("embedding_OCR", *_LEMMAS, *_OCR_METRICS, "related_articles"),
         "title": ("embedding_OCR", "related_articles"),
-        "language": (*_LEMMAS, "Richesse_Lexicale_OCR", "Lisibilite_OCR"),
+        "language": (*_LEMMAS, *_OCR_METRICS),
         "pub_date": _HIJRI,
     },
     "audiovisual": {
         "OCR": _OCR_METRICS,
-        "language": ("Richesse_Lexicale_OCR", "Lisibilite_OCR"),
+        "language": _OCR_METRICS,
         "pub_date": _HIJRI,
     },
     "images": {
@@ -259,21 +259,47 @@ def _spec(config_name: str) -> SubsetDefinition:
     return spec
 
 
-def validate_ids(df: pd.DataFrame, *, label: str = "dataset") -> None:
-    """Require a non-null, non-blank, unique canonical ``o:id`` column."""
-    if "o:id" not in df.columns:
-        raise DataContractError(f"{label} is missing the required 'o:id' column")
-    if df["o:id"].isna().any():
+class DuplicateIdError(DataContractError):
+    """Duplicate ``o:id`` values: merging would fan out rows and multiply
+    records on the Hub. A subclass so callers can tell it apart from the other
+    contract violations."""
+
+
+def _validate_id_values(values, label: str) -> pd.Series:
+    """Shared ``o:id`` checks for frames and datasets; returns the ids as str."""
+    raw = pd.Series(list(values), dtype=object)
+    if raw.isna().any():
         raise DataContractError(f"{label} contains null 'o:id' values")
-    ids = df["o:id"].astype(str)
+    ids = raw.astype(str)
     if ids.str.strip().eq("").any():
         raise DataContractError(f"{label} contains blank 'o:id' values")
     duplicated = ids[ids.duplicated()].unique()
     if len(duplicated):
         sample = ", ".join(duplicated[:5])
-        raise DataContractError(
-            f"{label} contains duplicated 'o:id' values (e.g. {sample})"
+        raise DuplicateIdError(
+            f"{label} contains {len(duplicated)} duplicated 'o:id' value(s) "
+            f"(e.g. {sample}); merging would multiply rows. Deduplicate first."
         )
+    return ids
+
+
+def validate_ids(df: pd.DataFrame, *, label: str = "dataset") -> None:
+    """Require a non-null, non-blank, unique canonical ``o:id`` column.
+
+    Raises :class:`DataContractError`, or its subclass :class:`DuplicateIdError`
+    for duplicates.
+    """
+    if "o:id" not in df.columns:
+        raise DataContractError(f"{label} is missing the required 'o:id' column")
+    _validate_id_values(df["o:id"], label)
+
+
+def with_canonical_ids(df: pd.DataFrame, *, label: str = "dataset") -> pd.DataFrame:
+    """:func:`validate_ids`, then a copy whose ``o:id`` values are ``str``."""
+    validate_ids(df, label=label)
+    out = df.copy()
+    out["o:id"] = out["o:id"].astype(str)
+    return out
 
 
 def _is_missing(value: object) -> bool:
@@ -438,14 +464,7 @@ def validate_dataset(ds, config_name: str) -> None:
     spec = _spec(config_name)
     if "o:id" not in ds.column_names:
         raise DataContractError(f"'{config_name}' dataset is missing 'o:id'")
-    raw_ids = list(ds["o:id"])
-    if any(value is None for value in raw_ids):
-        raise DataContractError(f"'{config_name}' dataset contains null 'o:id' values")
-    ids = [str(value) for value in raw_ids]
-    if any(not value.strip() for value in ids):
-        raise DataContractError(f"'{config_name}' dataset contains blank 'o:id' values")
-    if len(ids) != len(set(ids)):
-        raise DataContractError(f"'{config_name}' dataset contains duplicate 'o:id' values")
+    ids = _validate_id_values(ds["o:id"], f"'{config_name}' dataset").tolist()
     arrow = _is_arrow_dataset(ds)
     for column, expected in (spec.embedding_columns or {}).items():
         if column not in ds.column_names:
@@ -618,7 +637,9 @@ __all__ = [
     "SOURCE_FIELD_COLUMNS",
     "EMBEDDING_VALUE_TYPE",
     "DataContractError",
+    "DuplicateIdError",
     "validate_ids",
+    "with_canonical_ids",
     "normalize_embedding_nulls",
     "validate_embedding_dimensions",
     "validate_frame",

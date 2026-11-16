@@ -82,13 +82,9 @@ def analyze_main(argv: Sequence[str] | None = None) -> int:
 
 
 def mirror_main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="iwac-mirror")
-    parser.add_argument("--dataset", choices=["private", "public"], default=None)
-    parser.add_argument("--format", choices=["parquet", "csv"], default="parquet")
-    args = parser.parse_args(argv)
+    """Create the revision-pinned local mirror (same parser as the script)."""
     module = importlib.import_module("iwac_pipeline.mirror.fetch_datasets")
-    repo_id, label = module.choose_dataset(args.dataset)
-    return int(module.main(dataset_id=repo_id, label=label, fmt=args.format))
+    return int(module.cli(argv, prog="iwac-mirror"))
 
 
 def publish_public_main(argv: Sequence[str] | None = None) -> int:

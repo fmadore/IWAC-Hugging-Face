@@ -28,13 +28,10 @@ Usage
     python audiovisual/upload_audiovisual_hf.py \
         --max-shard-size 1GB
 
-Options CLI (partagées, voir iwac_common.upload_runner)
-------------------------------------------------------
-  --repo            Repository Hugging Face cible (défaut : miroir privé complet)
-  --max-shard-size  Taille max d'un shard Parquet (ex. 500MB, 1GB)
-  --no-cache        Ignore le cache local des réponses Omeka (TTL 24h)
-  --dry-run         Fetch + map + merge, mais ne pousse rien
-  --force-shrink    Autorise un dataset nettement plus petit que celui du Hub
+CLI options
+-----------
+Shared by every upload script: run with ``--help`` for the full list
+(parser: ``iwac_common.upload_runner.build_parser``).
 
 Variables d'environnement
 ------------------------
@@ -55,14 +52,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from iwac_common.omeka_client import (
     OmekaApiClient,
-    conn_manager,
-    fetch_iiif_thumbnail_url,
-    fetch_primary_media_url,
-    iiif_manifest_url,
+    fetch_media_pointers,
     item_page_url,
 )
 from iwac_common.field_mappers import (
     visibility_metadata,
+    countries_from_item_sets,
     extract_added_date,
     get_display_titles,
     get_literal_values,
@@ -76,8 +71,8 @@ from iwac_common.field_mappers import (
 )
 from iwac_common.text_utils import count_words
 from iwac_common.upload_runner import UploadSpec, run_upload
-from iwac_common.schema import COUNTRY_ITEM_SETS, SUBSETS
-from country_mapper import get_country_from_newspaper
+from iwac_common.schema import COUNTRY_ITEM_SETS
+from country_mapper import get_country_from_outlets
 
 
 
@@ -119,9 +114,8 @@ _ISO_DURATION_RE = re.compile(
 )
 
 
-# Orchestration (fetch → map loop → merge → validate → push), the CLI
-# (--repo, --max-shard-size, --no-cache, --dry-run, --force-shrink) and the
-# Rich console/logging setup live in iwac_common.upload_runner.
+# Orchestration (fetch → map loop → merge → validate → push), the CLI (see
+# --help) and the Rich console/logging setup live in iwac_common.upload_runner.
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +132,8 @@ def _source_type(item: Dict[str, Any]) -> str:
     template = item.get("o:resource_template") or {}
     if template.get("o:id") == YOUTUBE_TEMPLATE_ID:
         return "youtube"
-    if "youtube.com/" in get_uri_value(item, "fabio:hasURL") or "youtu.be/" in get_uri_value(
-        item, "fabio:hasURL"
-    ):
+    url = get_uri_value(item, "fabio:hasURL")
+    if "youtube.com/" in url or "youtu.be/" in url:
         return "youtube"
     return "deposited"
 
@@ -183,30 +176,34 @@ def _resolve_country(item: Dict[str, Any]) -> str:
     An unresolved item is left blank on purpose: an empty country is a visible
     gap, a guessed one is a silent error.
     """
-    for item_set in item.get("o:item_set") or []:
-        country = ITEM_SET_COUNTRY.get((item_set or {}).get("o:id"))
-        if country:
-            return country
+    country = countries_from_item_sets(item, ITEM_SET_COUNTRY)
+    if country:
+        return country
 
     for value in item.get("dcterms:spatial") or []:
         country = SPATIAL_COUNTRY.get(str((value or {}).get("display_title") or "").strip())
         if country:
             return country
 
-    for publisher in get_display_titles(item, "dcterms:publisher").split("|"):
-        country = get_country_from_newspaper(publisher.strip())
-        if country:
-            return country
-    return ""
+    return get_country_from_outlets(get_display_titles(item, "dcterms:publisher"))
 
 
 async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item Omeka audiovisuel en dict plat pour HF datasets."""
 
-    primary_url = await fetch_primary_media_url(
-        item, api, affected_fields=("PDF", "thumbnail", "iiif_manifest")
+    # A YouTube media has thumbnail derivatives but no file, so the two
+    # pointers part company: the thumbnail is real and worth keeping, while
+    # the IIIF manifest resolves 200 with **zero canvases** — a link that
+    # opens an empty viewer. Publish the manifest only when there is an actual
+    # file behind it; take the thumbnail whenever the item has any media.
+    primary_url, thumbnail_url, manifest_url = await fetch_media_pointers(
+        item, api, file_field="PDF",
+        thumbnail_fallback=True, thumbnail_requires_file=False,
     )
 
+    # Linked authorities only (the channel's foaf:Organization), unlike the
+    # get_value read on articles/publications/references, which also keeps
+    # literals and URIs; unifying would change existing values.
     publisher = get_display_titles(item, "dcterms:publisher")
     country = _resolve_country(item)
     source_type = _source_type(item)
@@ -219,23 +216,7 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
     # ``nb_mots`` is 0 for them. ``OCR_is_public`` drives the per-row masking
     # in publish_public.py; every upload here targets the PRIVATE repo.
     content_text = get_value(item, "bibo:content")
-    nb_mots = count_words(content_text)
-
-    # A YouTube media has thumbnail derivatives but no file, so the two
-    # pointers part company: the thumbnail is real and worth keeping, while
-    # the IIIF manifest resolves 200 with **zero canvases** — a link that
-    # opens an empty viewer. Publish the manifest only when there is an actual
-    # file behind it; take the thumbnail whenever the item has any media.
-    session = await conn_manager.get()
-    thumbnail_url = ""
-    manifest_url = ""
-
-    if item.get("o:primary_media"):
-        thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
-        if not thumbnail_url:
-            thumbnail_url = (item.get("thumbnail_display_urls") or {}).get("large", "")
-    if primary_url:
-        manifest_url = iiif_manifest_url(item["o:id"])
+    nb_mots = count_words(content_text, language=get_value(item, "dcterms:language"))
 
     extent = get_literal_values(item, "dcterms:extent")
     pub_date = get_value(item, "dcterms:date")
@@ -293,6 +274,9 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
         # "Vidéo sur le web" for an embedded one. Read ``source_type`` to
         # branch on the record's shape; this field states what the object is.
         "medium": get_display_titles(item, "dcterms:medium"),
+        # dcterms:type / dcterms:contributor: linked-only reads here, while
+        # documents use get_value (literals and URIs too); not unified because
+        # either direction changes values for some value type.
         "type": get_display_titles(item, "dcterms:type"),
         "rights": get_rights_label(item),
         # Provenance — who deposited or ingested the item, as on `documents`.
@@ -316,14 +300,10 @@ async def map_audiovisual_document(item: Dict[str, Any], api: OmekaApiClient) ->
 
 SPEC = UploadSpec(
     config_name="audiovisual",
-    resource_class_ids=SUBSETS["audiovisual"].resource_class_ids,
     map_item=map_audiovisual_document,
     title="🎬 IWAC Audiovisual Upload",
     cache_dir=".cache_omk_audiovisual",
     description="Publie les documents audiovisuels IWAC sur le Hub HF",
-    # Nullable: an item whose dcterms:extent is missing or unparseable has no
-    # duration, which is not the same as a duration of zero.
-    int_columns=("duration_seconds",),
 )
 
 

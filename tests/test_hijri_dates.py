@@ -1,9 +1,11 @@
 import pytest
 
+import calculate_hijri_dates as hijri
 from calculate_hijri_dates import (
     HIJRI_COLUMNS,
     HIJRI_MONTHS,
     add_hijri_batch,
+    date_status,
     parse_gregorian,
     to_hijri,
 )
@@ -29,6 +31,58 @@ class TestParseGregorian:
     def test_tolerates_surrounding_whitespace(self):
         assert parse_gregorian("  1998-06-14  ") == (1998, 6, 14)
 
+    @pytest.mark.parametrize("value", [
+        "+199-01-01", "1_99-01-01", "١٩٩٩-٠١-٠١",
+        "1999-01-01 extra", "1999-01-01T",
+    ])
+    def test_only_ascii_digits_in_exact_iso_form(self, value):
+        # int() accepted all of these; they are not dates.
+        assert parse_gregorian(value) is None
+
+    @pytest.mark.parametrize("value", ["1999-01-01T00:00:00", "1999-01-01T10:20:30.5+01:00",
+                                       "1999-01-01T10:20Z"])
+    def test_iso_datetime_uses_its_date_part(self, value):
+        assert parse_gregorian(value) == (1999, 1, 1)
+
+
+class TestDateStatus:
+    @pytest.mark.parametrize("value, status", [
+        ("1999-04-17", "converted"),
+        ("1999-04-17T00:00:00", "converted_datetime"),
+        ("1900-01-01", "outside_tables"),
+        ("2077-11-17", "outside_tables"),
+        ("1924-08-01", "converted"),
+        ("1999-02-30", "invalid_date"),
+        ("1998-06", "imprecise"),
+        ("+199-01-01", "imprecise"),
+        ("", "empty"),
+        (None, "empty"),
+    ])
+    def test_buckets(self, value, status):
+        assert date_status(value) == status
+
+    def test_report_files_out_of_table_dates_on_their_own_row(self):
+        import io
+
+        import pandas as pd
+        from rich.console import Console
+
+        buffer = io.StringIO()
+        original = hijri.console
+        hijri.console = Console(file=buffer, width=200)
+        try:
+            dates = ["1900-01-01", "1999-04-17", "1998", "1999-04-17T00:00:00"]
+            out = add_hijri_batch({"pub_date": list(dates)})
+            hijri.report(pd.DataFrame({"pub_date": dates, **{c: out[c] for c in HIJRI_COLUMNS}}), "t")
+        finally:
+            hijri.console = original
+        lines = {line.split("│")[1].strip(): line.split("│")[2].strip()
+                 for line in buffer.getvalue().splitlines() if line.count("│") >= 3}
+        assert lines["Outside Umm al-Qura tables (1924-08-01..2077-11-16)"] == "1"
+        assert lines["Imprecise date (no lunar day)"] == "1"
+        assert lines["Converted to Hijri"] == "2"
+        assert lines["of which ISO datetime (date part used)"] == "1"
+
 
 class TestToHijri:
     def test_known_conversion(self):
@@ -44,6 +98,25 @@ class TestToHijri:
         # The collection runs 1961-2025; both ends must convert.
         assert to_hijri(1961, 1, 1) is not None
         assert to_hijri(2025, 5, 13) is not None
+
+    def test_outside_the_tables_is_none(self):
+        assert to_hijri(1924, 7, 31) is None
+        assert to_hijri(2077, 11, 17) is None
+
+    @pytest.mark.parametrize("date, expected", [
+        # Pinned stored values: the parser rewrite must not move any of them.
+        ("1961-01-01", (1380, 7, 14)),
+        ("1975-12-31", (1395, 12, 28)),
+        ("1989-06-14", (1409, 11, 11)),
+        ("1999-04-17", (1420, 1, 1)),
+        ("2000-02-29", (1420, 11, 23)),
+        ("2012-08-19", (1433, 10, 1)),
+        ("2024-03-20", (1445, 9, 10)),
+        ("2025-05-13", (1446, 11, 15)),
+    ])
+    def test_regression_on_stored_conversions(self, date, expected):
+        out = add_hijri_batch({"pub_date": [date]})
+        assert tuple(out[c][0] for c in HIJRI_COLUMNS) == expected
 
 
 class TestAddHijriBatch:
@@ -118,3 +191,41 @@ class TestTypedMap:
         assert out["hijri_year"][:] == [None, None, 1420, 1445]
         # Untouched columns keep their type (no pandas round trip).
         assert out.features["nb_pages"].dtype == "int64"
+
+
+class TestStageWiring:
+    def _configure(self, monkeypatch, dataset, argv):
+        import io
+
+        from rich.console import Console
+
+        pushed = []
+        state = {"ds": dataset}
+        monkeypatch.setattr(hijri, "console", Console(file=io.StringIO()))
+        monkeypatch.setattr(hijri, "ensure_hf_token", lambda **kwargs: "offline-placeholder")
+        monkeypatch.setattr(hijri, "load_hub_dataset", lambda *a, **k: state["ds"])
+        monkeypatch.setattr(hijri, "push_dataset", lambda ds, **k: pushed.append((ds, k)) or True)
+        monkeypatch.setattr("sys.argv", ["hijri", *argv])
+        return pushed, state
+
+    def test_unchanged_run_does_not_push_and_commit_names_the_version(self, monkeypatch):
+        from datasets import Dataset
+
+        ds = Dataset.from_dict({"o:id": ["1", "2"], "pub_date": ["1999-04-17", "1998"]})
+        pushed, state = self._configure(monkeypatch, ds, ["--config", "articles", "-y"])
+        assert hijri.main() == 0
+        assert len(pushed) == 1
+        assert f"hijridate {hijri.hijridate_version()}" in pushed[0][1]["commit_message"]
+        state["ds"] = pushed[0][0]
+        monkeypatch.setattr("sys.argv", ["hijri", "--config", "articles", "--update-mode", "all", "-y"])
+        assert hijri.main() == 0
+        assert len(pushed) == 1  # identical values: nothing to push
+
+    def test_yes_alone_means_missing(self, monkeypatch):
+        from datasets import Dataset
+
+        ds = Dataset.from_dict({"o:id": ["1"], "pub_date": ["1999-04-17"],
+                                "hijri_year": [1111], "hijri_month": [2], "hijri_day": [3]})
+        pushed, _ = self._configure(monkeypatch, ds, ["--config", "articles", "-y"])
+        assert hijri.main() == 0
+        assert pushed == []  # complete row kept by 'missing': nothing changed

@@ -86,7 +86,8 @@ SUBJECTIVITE_SUFFIX = "subjectivite_score"
 #: Subjectivité labels, weakest→strongest, and their ordinal rank.
 #:
 #: Doubles as the bridge across the generation boundary: a generation-1 column
-#: already holds this rank as a float (the integer the model returned), and a
+#: already holds this rank as a nullable int64 (the integer the model returned;
+#: ``iwac_common.schema`` declares it in ``int_columns``), and a
 #: generation-2 column holds the label, so mapping the label through this dict
 #: puts both on one scale. ``Non applicable`` is deliberately absent — it is not
 #: a point on the scale. Mirrors ``SUBJECTIVITE_ORDER`` in the annotation
@@ -447,7 +448,10 @@ def label_subjectivite_columns() -> Tuple[str, ...]:
     return tuple(m.subjectivite_column for m in PANEL if m.subjectivite_is_label)
 
 
-CONSENSUS_RULE_VERSION = "strict-majority-min2;subjectivity-median-min2:v1"
+#: v2: a row with fewer than two valid ratings on a dimension now gets a null
+#: consensus (v1 wrote ""), and the disagreement column is null when no
+#: dimension has two ratings, so single-rater rows no longer read as agreement.
+CONSENSUS_RULE_VERSION = "strict-majority-min2;subjectivity-median-min2;null-below-min2:v2"
 
 
 def instrument_id(gen: int) -> str:

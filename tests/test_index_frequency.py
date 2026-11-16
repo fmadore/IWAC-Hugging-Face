@@ -12,8 +12,11 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
+
+from iwac_common.write_policy import PublicationPolicyError
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -31,7 +34,10 @@ idx = _load_module()
 
 
 def _frame(rows):
-    return pd.DataFrame(rows)
+    """Rows default to public items with no private fields."""
+    return pd.DataFrame([
+        {"item_is_public": True, "private_fields": [], **row} for row in rows
+    ])
 
 
 EMPTY = _frame([])
@@ -271,8 +277,103 @@ class TestAuthorityIdJoin:
 
     def test_only_the_needed_columns_are_requested(self):
         cols = idx.frequency_input_columns("references")
-        assert {"o:id", "pub_date", "country", "editor", "editor_ids"} <= set(cols)
+        assert {"o:id", "pub_date", "country", "editor", "editor_ids",
+                "item_is_public", "private_fields"} <= set(cols)
         assert "OCR" not in cols and "embedding_OCR" not in cols
+
+
+class TestPublicItemsOnly:
+    """Every aggregate is on the public allowlist, so only public parent items
+    may contribute, and only through their public columns."""
+
+    ROW = {"subject": "COSIM", "spatial": "", "author": "",
+           "pub_date": "1990-05-01", "country": "Côte d'Ivoire"}
+
+    def test_a_private_item_contributes_nothing(self):
+        stats = _stats(articles=_frame([
+            {**self.ROW, "item_is_public": False, "pub_date": "1970-01-01",
+             "country": "Togo"},
+            self.ROW,
+        ]))
+        assert stats["COSIM"] == {
+            "frequency": 1, "first_occurrence": "1990-05-01",
+            "last_occurrence": "1990-05-01", "countries": "Côte d'Ivoire",
+        }
+
+    def test_a_null_flag_is_private(self):
+        stats = _stats(articles=_frame([{**self.ROW, "item_is_public": None}]))
+        assert stats == {}
+
+    def test_a_public_item_with_private_ocr_still_counts(self):
+        stats = _stats(articles=_frame([
+            {**self.ROW, "OCR_is_public": False, "private_fields": ["OCR"]},
+        ]))
+        assert stats["COSIM"]["frequency"] == 1
+        assert stats["COSIM"]["first_occurrence"] == "1990-05-01"
+
+    def test_a_private_date_counts_without_bounding_the_window(self):
+        stats = _stats(articles=_frame([
+            {**self.ROW, "pub_date": "1960-01-01",
+             "private_fields": ["pub_date", "pub_year"]},
+            {**self.ROW, "pub_date": "1995-01-01"},
+        ]))
+        assert stats["COSIM"]["frequency"] == 2
+        assert stats["COSIM"]["first_occurrence"] == "1995-01-01"
+        assert stats["COSIM"]["last_occurrence"] == "1995-01-01"
+
+    def test_private_subject_and_country_contribute_nothing(self):
+        stats = _stats(articles=_frame([
+            {**self.ROW, "spatial": "Bouaké", "subject_ids": "7",
+             "private_fields": np.array(["country", "subject", "subject_ids"])},
+        ]))
+        assert "COSIM" not in stats and "7" not in stats
+        assert stats["Bouaké"]["frequency"] == 1
+        assert stats["Bouaké"]["countries"] == ""
+        assert stats["Bouaké"]["first_occurrence"] == "1990-05-01"
+
+    def test_a_missing_flag_column_fails_closed(self):
+        frame = pd.DataFrame([{**self.ROW, "private_fields": []}])
+        with pytest.raises(PublicationPolicyError, match="item_is_public"):
+            _stats(articles=frame)
+
+    def test_malformed_private_fields_fail_closed(self):
+        frame = _frame([{**self.ROW, "private_fields": None}])
+        with pytest.raises(PublicationPolicyError, match="private_fields"):
+            _stats(articles=frame)
+
+
+class TestIndexThumbnailGate:
+    """Only an item with media has a IIIF canvas thumbnail to look up."""
+
+    def _map(self, monkeypatch, item):
+        import asyncio
+
+        from iwac_common import omeka_client
+
+        calls = []
+
+        async def fake_thumbnail(omeka_id, session=None):
+            calls.append(omeka_id)
+            return "https://example.test/thumb.jpg"
+
+        monkeypatch.setattr(idx, "fetch_iiif_thumbnail_url", fake_thumbnail)
+        monkeypatch.setattr(omeka_client, "fetch_iiif_thumbnail_url", fake_thumbnail)
+        row = asyncio.run(idx.map_index_item(item, object()))
+        return row, calls
+
+    def test_without_media_no_manifest_is_requested(self, monkeypatch):
+        row, calls = self._map(monkeypatch, {"o:id": 5, "o:title": None})
+        assert calls == [] and row["thumbnail"] == ""
+        assert row["Titre"] == ""  # JSON null title, not None
+
+    def test_with_media_the_thumbnail_is_fetched(self, monkeypatch):
+        row, calls = self._map(monkeypatch, {
+            "o:id": 6, "o:title": "Ramadan",
+            "o:primary_media": {"@id": "https://example.test/api/media/9"},
+        })
+        assert calls == [6]
+        assert row["thumbnail"] == "https://example.test/thumb.jpg"
+        assert row["Titre"] == "Ramadan"
 
 
 class TestColumnPrunedHubRead:

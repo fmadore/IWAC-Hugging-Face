@@ -40,9 +40,7 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
-from .settings import initialize_environment
-
-initialize_environment()
+from . import settings as _settings  # noqa: F401 -- importing it loads .env once
 
 
 logger = logging.getLogger(__name__)
@@ -448,45 +446,37 @@ class OmekaApiClient:
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise _sanitized_transport_error(exc, "items", self._secrets()) from None
 
-    async def fetch_items(
-        self, rcid: int, *, verify_total: bool = True
-    ) -> List[Dict[str, Any]]:
+    async def fetch_items(self, rcid: int) -> List[Dict[str, Any]]:
         """Fetch every item with the given resource_class_id, paginated.
 
-        With ``verify_total`` (default), the fetched count is reconciled
-        against the API's ``Omeka-S-Total-Results`` header: pagination stops
-        on the first short page, so a transient short-but-200 response would
-        otherwise truncate the fetch silently — and a truncated fetch flowing
-        into the Hub merge deletes rows. A shortfall raises
-        :class:`TruncatedFetchError`; note a stale local cache (item added on
-        Omeka within the cache TTL) triggers the same signal — re-run with
-        the cache disabled.
+        The fetched count is always reconciled against the API's
+        ``Omeka-S-Total-Results`` header, which also fixes the number of pages
+        requested: a transient short-but-200 response would otherwise truncate
+        the fetch silently — and a truncated fetch flowing into the Hub merge
+        deletes rows. A shortfall raises :class:`TruncatedFetchError`; note a
+        stale local cache (item added on Omeka within the cache TTL) triggers
+        the same signal — re-run with the cache disabled.
         """
         per = 100
-        expected: Optional[int] = None
-        if verify_total:
-            try:
-                expected = await self.fetch_total_results(rcid)
-            except Exception as exc:  # noqa: BLE001
-                raise TruncatedFetchError(
-                    f"Could not read Omeka-S-Total-Results for class {rcid}: "
-                    f"{redact_secrets(exc, self._secrets())}. Count reconciliation "
-                    "is required for a safe upload."
-                ) from exc
-            if expected is None:
-                raise TruncatedFetchError(
-                    f"Omeka returned no Omeka-S-Total-Results header for class {rcid}; "
-                    "refusing an unreconciled upload."
-                )
+        try:
+            expected = await self.fetch_total_results(rcid)
+        except Exception as exc:  # noqa: BLE001
+            raise TruncatedFetchError(
+                f"Could not read Omeka-S-Total-Results for class {rcid}: "
+                f"{redact_secrets(exc, self._secrets())}. Count reconciliation "
+                "is required for a safe upload."
+            ) from exc
+        if expected is None:
+            raise TruncatedFetchError(
+                f"Omeka returned no Omeka-S-Total-Results header for class {rcid}; "
+                "refusing an unreconciled upload."
+            )
 
         first = await self.fetch_items_page(rcid, 1, per)
         items = list(first)
-        if expected is not None:
-            page_count = max(1, (expected + per - 1) // per)
-        else:
-            page_count = 1 if len(first) < per else None
+        page_count = max(1, (expected + per - 1) // per)
 
-        if page_count and page_count > 1:
+        if page_count > 1:
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[bold blue]Fetching pages..."),
@@ -513,26 +503,15 @@ class OmekaApiClient:
                 )
                 for page, batch in sorted(batches):
                     items.extend(batch)
-        elif page_count is None:
-            page = 2
-            while True:
-                batch = await self.fetch_items_page(rcid, page, per)
-                if not batch:
-                    break
-                items.extend(batch)
-                if len(batch) < per:
-                    break
-                page += 1
 
-        if verify_total:
-            if len(items) != expected:
-                raise TruncatedFetchError(
-                    f"Fetched {len(items)} items for class {rcid} but the API "
-                    f"reports {expected}. Either a page response was truncated "
-                    f"mid-run, or the local cache is stale (items added on Omeka "
-                    f"since it was written). Re-run — with --no-cache if it "
-                    f"persists — instead of pushing a shrunken dataset."
-                )
+        if len(items) != expected:
+            raise TruncatedFetchError(
+                f"Fetched {len(items)} items for class {rcid} but the API "
+                f"reports {expected}. Either a page response was truncated "
+                f"mid-run, or the local cache is stale (items added on Omeka "
+                f"since it was written). Re-run — with --no-cache if it "
+                f"persists — instead of pushing a shrunken dataset."
+            )
 
         self.console.print(
             f"[green]✓[/green] {len(items)} items retrieved for class {rcid}"
@@ -586,15 +565,14 @@ async def fetch_primary_media_url(
 DEFAULT_PUBLIC_BASE_URL = "https://islam.zmo.de"
 #: Omeka S site slug of the public IWAC site.
 SITE_SLUG = "afrique_ouest"
-IIIF_BASE_URL = f"{DEFAULT_PUBLIC_BASE_URL}/iiif/3"  # production default, kept for callers
 
 
 def public_base_url() -> str:
     """Base URL of the public Omeka site, read at call time.
 
     ``IWAC_PUBLIC_BASE_URL`` wins; otherwise ``OMEKA_BASE_URL`` minus its
-    ``/api`` suffix; otherwise the production host. Read lazily because the
-    scripts load ``.env`` after importing this module.
+    ``/api`` suffix; otherwise the production host. Read lazily so a caller
+    (or test) that changes the environment at runtime gets the new host.
     """
     explicit = os.getenv("IWAC_PUBLIC_BASE_URL")
     if explicit:
@@ -615,65 +593,106 @@ def iiif_manifest_url(item_id: Union[str, int]) -> str:
     return f"{public_base_url()}/iiif/3/{item_id}/manifest"
 
 
+#: Attempts per IIIF manifest, with the same 1, 2, 4… s backoff and retryable
+#: statuses as :func:`async_retry`. One unretried timeout used to fail the
+#: whole run through :meth:`MediaFetchStats.check` after the full map phase.
+IIIF_MAX_TRIES = 5
+
+
+def _manifest_thumbnail(manifest: Any) -> str:
+    """First ``thumbnail[].id`` of a IIIF manifest, or ``""``."""
+    thumbnails = manifest.get("thumbnail") if isinstance(manifest, dict) else None
+    if isinstance(thumbnails, list) and thumbnails and isinstance(thumbnails[0], dict):
+        return str(thumbnails[0].get("id") or "")
+    return ""
+
+
 async def fetch_iiif_thumbnail_url(
-    omeka_id: Union[str, int], session: aiohttp.ClientSession
+    omeka_id: Union[str, int],
+    session: Optional[aiohttp.ClientSession] = None,
+    *,
+    max_tries: int = IIIF_MAX_TRIES,
 ) -> str:
     """Fetch the thumbnail URL from an item's IIIF manifest.
 
-    Returns ``""`` for a genuine absence (404/410). Transport, parse, auth,
-    rate-limit, and server failures are recorded for the upload runner's
-    fail-closed guard while still allowing all in-flight mappers to finish.
+    Returns ``""`` for a genuine absence (404/410, or a manifest without a
+    thumbnail). Timeouts, connection errors and :data:`RETRYABLE_STATUSES`
+    are retried with backoff; a failure that persists, or a permanent one
+    (another status, an unparseable manifest), is recorded once for the
+    upload runner's fail-closed guard while all in-flight mappers finish.
+    ``session`` defaults to the shared :data:`conn_manager` session.
     """
     manifest_url = iiif_manifest_url(omeka_id)
-    thumbnail_url = ""
     media_stats.record_attempt()
-    try:
-        # Shorter timeout: this request runs once per item.
-        async with session.get(manifest_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 200:
-                try:
-                    manifest = await resp.json()
-                    thumbnails = manifest.get("thumbnail")
-                    if isinstance(thumbnails, list) and thumbnails:
-                        thumbnail_info = thumbnails[0]
-                        if isinstance(thumbnail_info, dict):
-                            thumbnail_url = thumbnail_info.get("id", "")
-                except json.JSONDecodeError as e_json:
-                    media_stats.record_failure(
-                        omeka_id, ("thumbnail", "iiif_manifest")
+    problem = ""
+    for attempt in range(max_tries):
+        transient = False
+        try:
+            sess = session if session is not None else await conn_manager.get()
+            # Shorter timeout: this request runs once per item.
+            async with sess.get(manifest_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    return _manifest_thumbnail(await resp.json())
+                if resp.status in (404, 410):
+                    logger.info(
+                        "No IIIF manifest for item %s (HTTP %s)", omeka_id, resp.status
                     )
-                    logger.warning(
-                        f"JSON decoding error for IIIF manifest {omeka_id}: {e_json}. URL: {manifest_url}"
-                    )
-            elif resp.status in (404, 410):
-                logger.info(
-                    "No IIIF manifest for item %s (HTTP %s)", omeka_id, resp.status
-                )
-            else:
-                media_stats.record_failure(
-                    omeka_id, ("thumbnail", "iiif_manifest")
-                )
-                logger.warning(
-                    f"IIIF request failed with HTTP {resp.status} for {omeka_id}. "
-                    f"URL: {manifest_url}"
-                )
-    # Only transport-level errors count as failures. A 200 carrying no
-    # thumbnail, or a 404 for an item with no manifest, is a genuine absence
-    # and must not inflate the failure rate.
-    except asyncio.TimeoutError:
-        media_stats.record_failure(omeka_id, ("thumbnail", "iiif_manifest"))
-        logger.warning(f"Timeout fetching IIIF manifest for {omeka_id}. URL: {manifest_url}")
-    except aiohttp.ClientError as e_client:
-        media_stats.record_failure(omeka_id, ("thumbnail", "iiif_manifest"))
+                    return ""
+                problem = f"HTTP {resp.status}"
+                transient = resp.status in RETRYABLE_STATUSES
+        except (json.JSONDecodeError, aiohttp.ContentTypeError) as exc:
+            problem = f"invalid manifest JSON ({exc})"
+        except asyncio.TimeoutError:
+            problem = "timeout"
+            transient = True
+        except aiohttp.ClientError as exc:
+            problem = f"client error ({exc})"
+            transient = True
+        except Exception as exc:  # noqa: BLE001
+            problem = f"unexpected error ({type(exc).__name__}: {exc})"
+        if not transient or attempt == max_tries - 1:
+            break
         logger.warning(
-            f"Client error fetching IIIF manifest for {omeka_id}: {e_client}. URL: {manifest_url}"
+            "IIIF manifest %s: attempt %d/%d failed (%s); retrying",
+            omeka_id, attempt + 1, max_tries, problem,
         )
-    except Exception as e_general:
-        media_stats.record_failure(omeka_id, ("thumbnail", "iiif_manifest"))
-        logger.error(
-            f"Unexpected error fetching IIIF manifest for {omeka_id}: {e_general}. URL: {manifest_url}"
-        )
-    return thumbnail_url
+        await asyncio.sleep(2**attempt)
+    media_stats.record_failure(omeka_id, ("thumbnail", "iiif_manifest"))
+    logger.warning(
+        "IIIF manifest lookup failed for item %s: %s. URL: %s",
+        omeka_id, problem, manifest_url,
+    )
+    return ""
+
+
+async def fetch_media_pointers(
+    item: Dict[str, Any],
+    api: OmekaApiClient,
+    *,
+    file_field: str = "PDF",
+    thumbnail_fallback: bool = False,
+    thumbnail_requires_file: bool = True,
+) -> tuple[str, str, str]:
+    """``(file_url, thumbnail_url, manifest_url)`` of an item's primary media.
+
+    The manifest is published only when a file stands behind it (a media
+    without a file resolves to a manifest with zero canvases). The thumbnail
+    follows the file too, unless ``thumbnail_requires_file`` is false, in which
+    case any primary media suffices (audiovisual: a YouTube media has
+    thumbnails but no file). ``thumbnail_fallback`` uses the item's baked-in
+    ``large`` derivative when the IIIF manifest yields no thumbnail.
+    """
+    file_url = await fetch_primary_media_url(
+        item, api, affected_fields=(file_field, "thumbnail", "iiif_manifest")
+    )
+    has_thumbnail_source = file_url if thumbnail_requires_file else item.get("o:primary_media")
+    thumbnail_url = ""
+    if has_thumbnail_source:
+        thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"])
+        if not thumbnail_url and thumbnail_fallback:
+            thumbnail_url = str((item.get("thumbnail_display_urls") or {}).get("large") or "")
+    manifest_url = iiif_manifest_url(item["o:id"]) if file_url else ""
+    return file_url, thumbnail_url, manifest_url
 
 
 __all__ = [
@@ -687,14 +706,15 @@ __all__ = [
     "RETRYABLE_STATUSES",
     "OmekaApiClient",
     "TruncatedFetchError",
-    "IIIF_BASE_URL",
     "DEFAULT_PUBLIC_BASE_URL",
     "SITE_SLUG",
     "public_base_url",
     "item_page_url",
     "iiif_manifest_url",
     "fetch_iiif_thumbnail_url",
+    "fetch_media_pointers",
     "fetch_primary_media_url",
+    "IIIF_MAX_TRIES",
     "MediaFetchGuardError",
     "media_stats",
 ]

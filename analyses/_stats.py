@@ -40,8 +40,10 @@ def mann_kendall(series: Sequence[float]) -> Tuple[float, float, float]:
     Non-parametric test for a monotonic trend in an ordered series. Returns
     ``(S, z, p_two_sided)`` where S is the Kendall statistic (positive =
     increasing), z the normal-approximation score, and p the two-sided
-    p-value. Series shorter than 4 points, or all-equal, return
-    ``(0.0, 0.0, 1.0)`` — too little signal to reject.
+    p-value. Series shorter than 4 points return ``(nan, nan, nan)`` and an
+    all-equal series ``(0.0, nan, nan)``: the test is undefined there, which is
+    not the same as evidence of no trend, and :func:`bh_adjust` leaves NaN
+    p-values out of the family.
     """
     from scipy import stats
 
@@ -49,7 +51,7 @@ def mann_kendall(series: Sequence[float]) -> Tuple[float, float, float]:
     x = x[np.isfinite(x)]
     n = len(x)
     if n < 4:
-        return 0.0, 0.0, 1.0
+        return float("nan"), float("nan"), float("nan")
 
     # S = sum of signs of all pairwise differences (j > i).
     s = 0
@@ -61,7 +63,7 @@ def mann_kendall(series: Sequence[float]) -> Tuple[float, float, float]:
     tie_term = np.sum(counts * (counts - 1) * (2 * counts + 5))
     var_s = (n * (n - 1) * (2 * n + 5) - tie_term) / 18.0
     if var_s <= 0:
-        return float(s), 0.0, 1.0
+        return float(s), float("nan"), float("nan")
 
     if s > 0:
         z = (s - 1) / np.sqrt(var_s)
@@ -93,9 +95,18 @@ def weighted_least_squares_slope(
     return float(np.sum(w * (x - xbar) * (y - ybar)) / denom)
 
 
+MIN_BOOTSTRAP_CLUSTERS = 10
+"""Fewest clusters for which a percentile cluster bootstrap is reported.
+
+With a handful of clusters the resampling distribution has very few distinct
+values and percentile bands are badly anti-conservative; below this floor the
+bounds are NaN and callers must say "insufficient clusters", not show a band.
+"""
+
+
 def bootstrap_mean_ci(
     values, n_boot: int, seed: int, lo: float = 2.5, hi: float = 97.5,
-    *, clusters=None
+    *, clusters=None, min_clusters: int = MIN_BOOTSTRAP_CLUSTERS
 ) -> Tuple[float, float]:
     """Percentile bootstrap CI for the mean of a 1-D sample (resample rows
     with replacement). ``values`` may be a matrix (rows = observations); the
@@ -104,7 +115,8 @@ def bootstrap_mean_ci(
     For a matrix input this returns the per-column CI as two arrays; for a
     vector it returns two floats. ``clusters`` optionally labels the sampling
     unit (e.g. outlet): sample whole clusters with replacement and recompute
-    the article-weighted mean. At least two distinct clusters are needed.
+    the article-weighted mean. Fewer than ``min_clusters`` distinct clusters
+    return NaN bounds (see :data:`MIN_BOOTSTRAP_CLUSTERS`).
     These intervals are conditional on this corpus and the supplied model;
     neither option estimates archive selection or annotation uncertainty.
     """
@@ -123,7 +135,7 @@ def bootstrap_mean_ci(
             raise ValueError("cluster labels cannot be missing")
         codes, unique = pd.factorize(labels, sort=False)
         groups = [np.flatnonzero(codes == i) for i in range(len(unique))]
-        if len(groups) < 2:
+        if len(groups) < max(2, min_clusters):
             nan = np.full(arr.shape[1:], np.nan) if arr.ndim > 1 else float("nan")
             return nan, nan
     if n_boot <= 0 or arr.shape[0] == 0:
@@ -140,21 +152,51 @@ def bootstrap_mean_ci(
 
 
 
-def french_language_mask(series, *, include_unknown: bool = False):
-    """Explicit French labels; unknown language is excluded unless requested.
+LANGUAGE_ALIASES = {
+    "français": frozenset({"français", "francais", "french", "fr", "fra", "fre"}),
+    "english": frozenset({"english", "anglais", "en", "eng"}),
+}
 
-    Empty strings, whitespace and nulls are all unknown. Mixed-language labels
-    are not silently treated as French-only text.
+
+def language_mask(series, language: str, *, include_unknown: bool = False):
+    """Rows labelled exactly as ``language`` (case-folded, known aliases).
+
+    The one language filter for every analysis. Empty strings, whitespace and
+    nulls are unknown and excluded unless requested. Mixed-language labels
+    (``Français|Arabe``) are not silently treated as monolingual text.
     """
+    import pandas as pd
+
+    series = series if isinstance(series, pd.Series) else pd.Series(series)
     normalized = series.astype("string").str.strip().str.casefold()
-    known = normalized.isin({"français", "francais", "french", "fr", "fra", "fre"})
+    wanted = str(language).strip().casefold()
+    labels = next((aliases for aliases in LANGUAGE_ALIASES.values() if wanted in aliases),
+                  frozenset({wanted}))
+    known = normalized.isin(labels)
     if include_unknown:
         known |= normalized.isna() | normalized.eq("")
-    return known.fillna(False)
+    return known.fillna(False).astype(bool)
+
+
+def french_language_mask(series, *, include_unknown: bool = False):
+    """Explicit French labels; unknown language is excluded unless requested."""
+    return language_mask(series, "Français", include_unknown=include_unknown)
+
+
+def excluded_language_counts(series, mask) -> dict:
+    """Label -> rows dropped by a language mask, so exclusions stay visible."""
+    import pandas as pd
+
+    series = series if isinstance(series, pd.Series) else pd.Series(series)
+    labels = series.astype("string").str.strip().fillna("").replace("", "[missing]")
+    return {str(k): int(v) for k, v in labels[~mask].value_counts().sort_index().items()}
 
 
 __all__ = [
+    "MIN_BOOTSTRAP_CLUSTERS",
+    "excluded_language_counts",
     "french_language_mask",
+    "language_mask",
     "bh_adjust",
     "mann_kendall",
     "weighted_least_squares_slope",

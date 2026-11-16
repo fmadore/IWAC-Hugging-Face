@@ -107,7 +107,7 @@ def test_text_legacy_migration_then_matching_provenance_skips_inference(monkeypa
     pushed, encoder = configure_main(monkeypatch, text, migrated, tmp_path, ['--config', 'articles', '--update-mode', 'missing'])
     assert text.main() == 0
     assert encoder.calls == 1
-    assert pushed[0]['embedding_OCR_config_hash'][0]
+    assert pushed == []
 
 
 def test_text_chunks_carry_the_document_instruction(monkeypatch, tmp_path):
@@ -180,8 +180,8 @@ def test_multilingual_byte_chunks_are_bounded_and_unicode_is_not_split():
 def test_unicode_words_preserve_combining_marks_and_normalize_equivalent_accents():
     assert tokenize_words('mosque\u0301e') == tokenize_words('mosquée')
     assert tokenize_words('جَامِعٌ', language='Arabe') == ['جَامِعٌ']
-    assert tokenize_words("d'amour", language='Anglais') == ['d', 'amour']
-    assert tokenize_words("d'amour", language='Français') == ['amour']
+    assert tokenize_words("d'amour", language='Anglais') == ["d'amour"]
+    assert tokenize_words("d'amour", language='Français') == ["d'", 'amour']
 
 
 @pytest.mark.parametrize('values', [[[1., float('nan')]], [[1., 2.], [1.]], [[[1., 2.]]]])
@@ -200,7 +200,7 @@ def test_neighbors_ties_are_stable_and_candidate_pairs_cover_all_topk():
 
 def test_readability_failure_remains_retryable(monkeypatch):
     import calculate_lexical_richness as lex
-    batch = {'OCR': ['Une phrase française.'], 'language': ['Français']}
+    batch = {'OCR': ['Le conseil des imams a tenu sa réunion annuelle à Ouagadougou. ' * 12], 'language': ['Français']}
     def run():
         return lex.compute_metrics_batch(batch, text_col='OCR', richness_col='Richesse_Lexicale_OCR',
             readability_col='Lisibilite_OCR', update_mode='missing', window_size=50,

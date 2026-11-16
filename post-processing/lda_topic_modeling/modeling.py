@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -31,7 +32,6 @@ except ImportError:  # venv without the editable install
 from .constants import (
     ARTIFACT_LABEL_STOPWORDS,
     DOMAIN_STOPWORDS,
-    FRAGMENT_STOPWORDS,
     POST_PHRASE_STOPWORDS,
     LABEL_ONLY_STOPWORDS,
     LDA_GEO_STOPWORDS,
@@ -58,7 +58,7 @@ from .constants import (
 # rebuilding on every call).  Includes both accented and unaccented
 # forms so the accent-stripped w_norm always finds a match.
 _ALL_LABEL_STOPWORDS = (
-    LABEL_ONLY_STOPWORDS | DOMAIN_STOPWORDS | FRAGMENT_STOPWORDS
+    LABEL_ONLY_STOPWORDS | DOMAIN_STOPWORDS | POST_PHRASE_STOPWORDS
     | LDA_GEO_STOPWORDS | LDA_GENERIC_STOPWORDS
 )
 
@@ -90,6 +90,8 @@ def tokenize_documents(
     phrase_threshold: float = 10.0,
     custom_collocations: List[Tuple[str, ...]] | None = None,
     fragment_stopwords: set[str] | None = None,
+    phrase_min_docs: int = 1,
+    groups: List[Any] | None = None,
 ) -> Tuple[List[List[str]], Tuple[Phraser, Phraser] | None]:
     """Tokenize documents for LDA.
 
@@ -101,7 +103,7 @@ def tokenize_documents(
     frequent collocations (e.g. "el" + "hadj" → "el_hadj", "nuit" +
     "destin" → "nuit_destin").
 
-    *fragment_stopwords* (default :data:`FRAGMENT_STOPWORDS`) are dropped
+    *fragment_stopwords* (default :data:`POST_PHRASE_STOPWORDS`) are dropped
     only once phrase detection and custom collocations have run, so a
     fragment survives inside its compounds and disappears everywhere else.
     Pass an empty set to disable.
@@ -109,9 +111,19 @@ def tokenize_documents(
     Returns ``(tokenized_docs, phraser)`` where *phraser* is the
     ``(bigram_phraser, trigram_phraser)`` pair when phrase detection ran,
     else None.
+
+    *phrase_min_docs* > 1 keeps a learned compound only when it occurs in at
+    least that many distinct source documents (*groups*, one value per doc;
+    default: each doc its own source). gensim's ``min_count`` counts
+    occurrences, so without this a single long document repeating a running
+    header mints a compound on its own. See :func:`prune_rare_phrases`.
     """
     if stopwords is None:
         stopwords = set()
+    if groups is None:
+        groups = list(range(len(docs)))
+    elif len(groups) != len(docs):
+        raise ValueError("Every document needs a source group")
     tokenized: List[List[str]] = []
     for doc in docs:
         if not doc or not str(doc).strip():
@@ -121,15 +133,13 @@ def tokenize_documents(
 
     phraser = None
     if detect_phrases and tokenized:
-        # Bigrams (côte_ivoire, burkina_faso, el_hadj, ...)
-        bigram_model = Phrases(tokenized, min_count=phrase_min_count, threshold=phrase_threshold)
-        bigram_phraser = Phraser(bigram_model)
-        tokenized = [bigram_phraser[doc] for doc in tokenized]
-        # Trigrams (e.g. chained bigrams)
-        trigram_model = Phrases(tokenized, min_count=phrase_min_count, threshold=phrase_threshold)
-        trigram_phraser = Phraser(trigram_model)
-        tokenized = [trigram_phraser[doc] for doc in tokenized]
-        phraser = (bigram_phraser, trigram_phraser)
+        stages = []
+        for _ in ("bigram", "trigram"):  # trigrams chain onto bigrams
+            stage = Phraser(Phrases(tokenized, min_count=phrase_min_count, threshold=phrase_threshold))
+            prune_rare_phrases(stage, tokenized, groups, phrase_min_docs)
+            tokenized = [stage[doc] for doc in tokenized]
+            stages.append(stage)
+        phraser = (stages[0], stages[1])
 
     # Apply custom collocations as a safety net after phrase detection
     collocations = custom_collocations if custom_collocations is not None else CUSTOM_COLLOCATIONS
@@ -141,6 +151,49 @@ def tokenize_documents(
         tokenized = [drop_fragments(doc, fragments) for doc in tokenized]
 
     return tokenized, phraser
+
+
+def prune_rare_phrases(
+    phraser: Phraser,
+    tokenized: List[List[str]],
+    groups: List[Any],
+    min_docs: int,
+) -> List[str]:
+    """Drop learned compounds found in fewer than *min_docs* source documents.
+
+    The phraser is fitted as usual; each learned compound is then counted
+    by the number of distinct *groups* in which its two parts occur side by
+    side in *tokenized* (the phraser's own input), and the rare ones are
+    deleted from the frozen phrase table, so they are never applied —
+    neither now nor at prediction time, because the pruned phraser is what
+    the bundle saves. Their words stay separate tokens instead of vanishing
+    into a compound that no dictionary would keep. Pruning after fitting
+    (rather than refitting on per-document-deduplicated text) leaves
+    gensim's scores and thresholds exactly as they were for every compound
+    that is kept; counting adjacency rather than the phraser's greedy output
+    keeps a compound's support independent of its overlapping neighbours.
+
+    Returns the removed compounds (sorted).
+    """
+    table = getattr(phraser, "phrasegrams", None)
+    if min_docs <= 1 or not table:
+        return []
+    keys = set(table)
+    delimiter = getattr(phraser, "delimiter", "_")
+    holders: set[Tuple[str, Any]] = set()
+    for doc, group in zip(tokenized, groups):
+        pairs = {f"{a}{delimiter}{b}" for a, b in zip(doc, doc[1:])}
+        holders.update((key, group) for key in keys.intersection(pairs))
+    support = Counter(key for key, _ in holders)
+    rare = sorted(k for k in keys if support[k] < min_docs)
+    for key in rare:
+        del table[key]
+    if rare:
+        logging.getLogger(__name__).info(
+            f"Phrase detection: dropped {len(rare)} of {len(keys)} learned compounds "
+            f"found in fewer than {min_docs} source documents"
+        )
+    return rare
 
 
 def drop_fragments(tokens: List[str], fragments: set[str] | None = None) -> List[str]:
@@ -248,10 +301,32 @@ def build_dictionary(
     tokenized_docs: List[List[str]],
     no_below: int = DEFAULT_NO_BELOW,
     no_above: float = DEFAULT_NO_ABOVE,
+    groups: List[Any] | None = None,
+    keep_n: int = 100000,
 ) -> Dictionary:
-    """Build a gensim Dictionary with frequency filtering."""
+    """Build a gensim Dictionary with document-frequency filtering.
+
+    With *groups* (one source-document id per tokenized unit, e.g. per
+    training chunk), *no_below* / *no_above* count distinct SOURCE
+    documents, mirroring gensim's ``filter_extremes`` otherwise (inclusive
+    bounds, ``int(no_above * n)``, the *keep_n* most frequent kept). Without
+    it, gensim counts units — so one book chunked into sixteen training
+    chunks passes ``no_below=10`` alone.
+    """
     dictionary = Dictionary(tokenized_docs)
-    dictionary.filter_extremes(no_below=no_below, no_above=no_above)
+    if groups is None:
+        dictionary.filter_extremes(no_below=no_below, no_above=no_above, keep_n=keep_n)
+        return dictionary
+    if len(groups) != len(tokenized_docs):
+        raise ValueError("Every tokenized unit needs a source group")
+    pairs: set[Tuple[int, Any]] = set()
+    for doc, group in zip(tokenized_docs, groups):
+        pairs.update((dictionary.token2id[t], group) for t in set(doc))
+    source_df = Counter(tid for tid, _ in pairs)
+    no_above_abs = int(no_above * len(set(groups)))
+    good = [tid for tid, n in source_df.items() if no_below <= n <= no_above_abs]
+    good.sort(key=lambda tid: (-source_df[tid], tid))
+    dictionary.filter_tokens(good_ids=good[:keep_n] if keep_n is not None else good)
     return dictionary
 
 
@@ -379,11 +454,15 @@ def _normalize_token(token: str) -> str:
     """Lowercase, strip accents, and treat ``_`` as a word separator.
 
     Phrase tokens arrive underscore-joined (``fête_tabaski``). Normalising
-    the underscore to a space is what lets the ngram-preference and
-    subsumption logic in :func:`get_topic_label` recognise them as
-    multi-word — while it kept the underscore, every phrase counted as a
-    unigram and labels wasted slots on redundant pairs like
-    "fête - tabaski - … - fête_tabaski".
+    the underscore to a space is what lets the subsumption logic in
+    :func:`get_topic_label` recognise them as multi-word — while it kept
+    the underscore, every phrase counted as a unigram and labels wasted
+    slots on redundant pairs like "fête - tabaski - … - fête_tabaski".
+
+    Hyphens and apostrophes inside a lemma (``sous-préfet``, ``jama'at``,
+    ``côte-d'ivoire``) do not split it: the hyphen is kept and apostrophes
+    of either kind are dropped, so ``jama'at`` and ``jama’at`` normalise
+    alike and a hyphenated lemma stays one word.
     """
     if not token:
         return ""
@@ -479,7 +558,8 @@ def get_topic_label(
     so corpus-common words no longer dominate several labels. Re-ranking
     is restricted to the topic's top words by probability (a standard
     practical guard against surfacing ultra-rare noise words), then the
-    existing stopword / dedup / ngram-preference logic applies unchanged.
+    stopword filter and compound deduplication apply in that order (see
+    :func:`_select_label_words`; ranking order is preserved).
     ``lambda_relevance=None`` (the default) is the escape hatch: pure
     top-probability candidates, exactly the old behavior.
     """
@@ -516,20 +596,42 @@ def get_topic_label(
         seen_norms.add(w_norm)
         candidates.append((word, w_norm))
 
-    # Prefer multi-word ngrams; drop unigrams subsumed by them
-    candidates.sort(key=lambda c: c[1].count(" "), reverse=True)
+    return " - ".join(_select_label_words(candidates, top_n)) or f"Topic_{topic_id}"
 
-    selected_words: List[str] = []
-    selected_norms: List[str] = []
+
+def _select_label_words(candidates: List[Tuple[str, str]], top_n: int) -> List[str]:
+    """Pick label words in relevance order, deduplicating against compounds.
+
+    Candidates arrive in relevance (or probability) order and keep it:
+    compound length confers no priority, so a rare four-word string cannot
+    push out the words carrying the topic's mass. Subsumption only removes
+    redundancy: a unigram already contained in a selected compound is
+    skipped, and a compound arriving after one or more of its unigrams were
+    selected takes the first such unigram's slot (the others are dropped) —
+    it says the same thing more specifically, at the rank its word earned.
+    Once *top_n* words are selected, lower-ranked candidates are ignored.
+    """
+    selected: List[Tuple[str, str]] = []
     for word, w_norm in candidates:
-        if _is_subsumed_by_ngram(w_norm, selected_norms):
-            continue
-        selected_words.append(word)
-        selected_norms.append(w_norm)
-        if len(selected_words) >= top_n:
+        if len(selected) >= top_n:
             break
+        if _is_subsumed_by_ngram(w_norm, [n for _, n in selected]):
+            continue
+        parts = set(w_norm.split()) if " " in w_norm else set()
+        covered = [i for i, (_, n) in enumerate(selected) if " " not in n and n in parts]
+        if covered:
+            selected[covered[0]] = (word, w_norm)
+            for i in reversed(covered[1:]):
+                del selected[i]
+        else:
+            selected.append((word, w_norm))
+    return [word for word, _ in selected]
 
-    return " - ".join(selected_words) if selected_words else f"Topic_{topic_id}"
+
+def count_vocab_tokens(dictionary: Dictionary, tokens: List[str]) -> int:
+    """Number of token occurrences the model can see (in its dictionary)."""
+    vocab = dictionary.token2id
+    return sum(1 for t in tokens if t in vocab)
 
 
 def _infer_distribution(model, dictionary, tokens, chunk_words):
@@ -569,8 +671,15 @@ def predict_document(
     word_probs: np.ndarray | None = None,
     return_distribution: bool = False,
     topic_labels: Dict[int, str] | None = None,
+    min_vocab_tokens: int | None = None,
 ) -> Tuple[Any, ...]:
     """Predict topics for a single tokenized document.
+
+    With *min_vocab_tokens*, a document with fewer in-vocabulary tokens
+    than that gets no assignment (topic, probability, label and top-k are
+    None) — a one-word document would otherwise score a confident topic.
+    Its distribution is still returned when *return_distribution* is set,
+    so exports can carry and flag it.
 
     Returns (topic_id, probability, label, topk_str) — the dominant topic
     plus a compact top-k distribution string ``"id:prob|id:prob|..."``
@@ -596,6 +705,8 @@ def predict_document(
     dist = _infer_distribution(model, dictionary, tokens, chunk_words)
     if dist is None:
         return empty
+    if min_vocab_tokens and count_vocab_tokens(dictionary, tokens) < min_vocab_tokens:
+        return empty[:4] + ([float(p) for p in dist],) if return_distribution else empty
     ranked = [(int(tid), float(dist[tid])) for tid in np.argsort(dist)[::-1]]
 
     best_topic_id, best_prob = ranked[0]
@@ -671,6 +782,8 @@ def predict_batch(
     fragment_stopwords: set[str] | None = None,
     topic_labels: Dict[int, str] | None = None,
     include_unknown_language: bool = False,
+    min_vocab_tokens: int | None = None,
+    evidence_col: str | None = None,
 ) -> Dict[str, List[Any]]:
     """Predict topics for a HuggingFace dataset batch (batched map function).
 
@@ -682,15 +795,22 @@ def predict_batch(
     distribution string (``"id:prob|id:prob|..."``) is stored alongside
     the dominant topic.
 
-    When *model_name_col* is set, *model_name* (the model directory's
-    basename) is written for every row this pass computes, so FR/EN models
-    sharing the lda_* columns stay disambiguated; skipped rows keep their
-    existing value (same preserve pattern as the topic columns).
+    When *model_name_col* is set, *model_name* (the model identity,
+    ``lda-sha256:<digest>``) is written for every row this pass computes,
+    so FR/EN models sharing the lda_* columns stay disambiguated; skipped
+    rows keep their existing value (same preserve pattern as the topic
+    columns).
+
+    *min_vocab_tokens* is the minimum-evidence floor: a computed row with
+    fewer in-vocabulary tokens gets null topic columns (it still carries
+    *model_name*, recording that this model declined it). *evidence_col*,
+    when set, receives each computed row's in-vocabulary token count.
 
     When *theta_col* is set, the full document-topic distribution (list of
-    ``num_topics`` floats) is stored for computed rows (None elsewhere) —
-    the caller extracts it into ``doc_topics.parquet`` and drops the
-    column before pushing.
+    ``num_topics`` floats) is stored for computed rows (None elsewhere),
+    including rows below the evidence floor — the caller extracts it into
+    ``predictions/<run>/doc_topics.parquet`` and drops the column before
+    pushing.
 
     *lambda_relevance* / *word_probs* enable relevance-weighted labels
     (see :func:`get_topic_label`); both default to the legacy behavior.
@@ -707,8 +827,9 @@ def predict_batch(
     labels: List[str | None] = _existing(topic_label_col)
     topks: List[str | None] = _existing(topic_topk_col)
     model_names: List[str | None] = _existing(model_name_col)
-    # Theta is per-pass output, never merged from existing data.
+    # Theta and evidence are per-pass outputs, never merged from existing data.
     thetas: List[List[float] | None] = [None] * len(texts)
+    evidence: List[int | None] = [None] * len(texts)
 
     sw = stopwords or set()
 
@@ -731,13 +852,15 @@ def predict_batch(
             lambda_relevance=lambda_relevance, word_probs=word_probs,
             return_distribution=True,
             topic_labels=topic_labels,
+            min_vocab_tokens=min_vocab_tokens,
         )
         topics[i] = tid
         probabilities[i] = prob
-        labels[i] = topic_labels.get(tid, label) if topic_labels is not None else label
+        labels[i] = topic_labels.get(tid, label) if topic_labels is not None and tid is not None else label
         topks[i] = topk_str
         model_names[i] = model_name
         thetas[i] = theta
+        evidence[i] = count_vocab_tokens(dictionary, tokens)
 
     batch[topic_id_col] = topics
     batch[topic_prob_col] = probabilities
@@ -748,6 +871,8 @@ def predict_batch(
         batch[model_name_col] = model_names
     if theta_col is not None:
         batch[theta_col] = thetas
+    if evidence_col is not None:
+        batch[evidence_col] = evidence
     return batch
 
 
@@ -822,7 +947,10 @@ def export_topic_table(
     word_probs: np.ndarray | None = None,
     labels: Dict[int, str] | None = None,
 ) -> Path:
-    """Write ``<model_dir>/topics.csv``: one row per topic of this model.
+    """Write ``topics.csv`` into *model_dir*: one row per topic of this model.
+
+    The caller passes the prediction run directory
+    (``<model root>/predictions/<timestamp>/``), never the sealed bundle.
 
     ``lda_topic_id`` is only meaningful next to the model that produced it; this
     table is the lookup a reader needs — the label the dataset carries, the
@@ -936,6 +1064,43 @@ def save_model_parameters(
     return params_path
 
 
+HOLDOUT_METRIC_NOTE = (
+    "gensim LdaModel.log_perplexity per-word bound on held-out source documents; "
+    "theta is inferred from the same held-out words it scores, so this is not a "
+    "document-completion estimate (optimistic, report-only)"
+)
+
+
+def sweep_ranking(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Best and runner-up k by mean C_v, and whether they are distinguishable.
+
+    The gap counts as distinguishable only when it exceeds the larger of
+    the two seed standard deviations. With a single seed there is no sd and
+    ``distinguishable`` is None (unknown, not "yes").
+    """
+    scored = sorted(
+        (r for r in results if r.get("c_v") is not None),
+        key=lambda r: (-r["c_v"], r["k"]),
+    )
+    if not scored:
+        raise RuntimeError("Every C_v coherence computation failed; no model was selected")
+    best = scored[0]
+    ranking: Dict[str, Any] = {
+        "best_k": best["k"], "best_c_v": best["c_v"],
+        "runner_up_k": None, "runner_up_c_v": None, "gap": None,
+        "seed_sd": None, "distinguishable": None,
+    }
+    if len(scored) > 1:
+        second = scored[1]
+        ranking.update(runner_up_k=second["k"], runner_up_c_v=second["c_v"],
+                       gap=best["c_v"] - second["c_v"])
+        sds = [r.get("c_v_sd") for r in (best, second) if r.get("c_v_sd") is not None]
+        if sds:
+            ranking["seed_sd"] = max(sds)
+            ranking["distinguishable"] = ranking["gap"] > ranking["seed_sd"]
+    return ranking
+
+
 def topic_stability_jaccard(
     models: List[LdaModel],
     topn: int = STABILITY_TOPN_WORDS,
@@ -1004,10 +1169,13 @@ def find_optimal_topics(
     holdout_corpus: List[List[Tuple[int, int]]] | None = None,
     logger: logging.Logger | None = None,
 ) -> Tuple[int, List[Dict[str, Any]]]:
-    """Sweep a range of topic counts and return the k with highest C_v.
+    """Sweep a range of topic counts; return the k with highest mean C_v.
 
-    Coherence is a diagnostic selection rule, not evidence of historical
-    validity. Compare the full curve, seed stability and reviewed documents.
+    The sweep is a diagnostic. The returned k is only used when the caller
+    explicitly opts in (``--select-k-from-sweep``), and
+    :func:`sweep_ranking` says whether it is distinguishable from the
+    runner-up at all. Coherence is not evidence of historical validity.
+    Compare the full curve, seed stability and reviewed documents.
 
     Sweep models train at reduced settings (*sweep_passes* /
     *sweep_iterations*) — enough for a stable *relative* C_v ranking; the
@@ -1024,9 +1192,13 @@ def find_optimal_topics(
     With *holdout_corpus* set (bow docs unseen during training), each k
     also reports held-out ``log_perplexity`` (gensim's per-word likelihood
     bound; higher, i.e. less negative, is better), averaged over seeds.
+    gensim infers each held-out document's topic mixture from the very
+    words it then scores, so this is NOT a document-completion estimate
+    and is optimistic; it is report-only (see :data:`HOLDOUT_METRIC_NOTE`).
 
     Returns:
-        best_k: the number of topics with the highest (mean) C_v score.
+        best_k: the number of topics with the highest (mean) C_v score
+                (ties keep the smallest k).
         results: list of dicts with keys ``k``, ``c_v`` (mean over seeds),
                  ``c_v_sd``, ``c_v_per_seed``, ``stability_jaccard``,
                  ``holdout_log_perplexity``, ``c_npmi``, ``u_mass`` for
@@ -1154,5 +1326,5 @@ def find_optimal_topics(
         raise RuntimeError("Every C_v coherence computation failed; no model was selected")
     else:
         label = "mean C_v" if n_seeds > 1 else "C_v"
-        log.info(f"Best num_topics by {label}: {best_k} ({label}={best_cv:.4f})")
+        log.info(f"Highest {label}: k={best_k} ({label}={best_cv:.4f}); diagnostic, not a selection rule")
     return best_k, results

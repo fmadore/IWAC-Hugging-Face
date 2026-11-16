@@ -151,3 +151,16 @@ _NEWSPAPER_TO_COUNTRY: dict[str, str] = {
 def get_country_from_newspaper(newspaper_name: str) -> str:
     """Return the country for a known newspaper, or ``""`` if unknown."""
     return _NEWSPAPER_TO_COUNTRY.get(newspaper_name, "")
+
+
+def get_country_from_outlets(outlets: str) -> str:
+    """Country of the first known outlet in a pipe-joined publisher string.
+
+    An item with two publishers arrives as ``"A|B"``, which the exact lookup
+    in :func:`get_country_from_newspaper` never matches.
+    """
+    for name in (outlets or "").split("|"):
+        country = get_country_from_newspaper(name.strip())
+        if country:
+            return country
+    return ""
