@@ -42,14 +42,17 @@ changed and which runs apply it to the data.
 |---|---|---|
 | 1 | Resumed enrichments not tied to inputs | Addressed: every cache entry carries a hash of its input; filenames name the repository |
 | 2 | Credentials in error logs | Addressed: transport errors sanitized at the HTTP boundary, raised `from None`; reproduced and tested |
-| 3 | Refreshed text keeps old computed columns | Addressed in part: uploads detect changed source text per `schema.DERIVED_FROM`, record a worklist, and `--invalidate-derived` clears the stale values. No per-row provenance column |
+| 3 | Refreshed text keeps old computed columns | Addressed in part on 2026-09-25: uploads detect changed source text per `schema.DERIVED_FROM`, record a worklist, and `--invalidate-derived` clears the stale values. Since 2026-10-02 invalidation is the default and enrichments persist per-row input/config provenance |
 | 4 | Analysis provenance | Addressed: run manifests with code SHA, dataset revision, arguments and output hashes; `pipeline_version` read from package metadata |
-| 5 | Editable-only packaging | Open |
-| 6 | Publication environment lock | Open |
+| 5 | Editable-only packaging | Open on 2026-09-25; addressed 2026-10-02 (installed `iwac-*` commands, wheel tested in CI) |
+| 6 | Publication environment lock | Open on 2026-09-25; addressed 2026-10-02 (hashed `requirements-lock.txt`) |
 | 7 | Vector validation checks length only | Addressed: flat, finite, numeric vectors; blank ids rejected on every write path |
-| 8 | Non-atomic publication | Open; public commits now name their private source revision |
+| 8 | Non-atomic publication | Open on 2026-09-25; addressed 2026-10-02 (all subsets and card schemas commit together under a parent-revision precondition) |
 
-## Open findings, ordered by priority
+## Findings as reviewed on 2026-09-07, ordered by priority
+
+The headings below keep the review's original wording; the status table above
+and the implementation update at the top record what has since been addressed.
 
 ### 1. High: resumed enrichments are not tied to their source inputs
 
@@ -202,9 +205,11 @@ requirement; this is a larger write-path change requiring dedicated tests.
 - Hub analysis column selection happens after `load_dataset`; it reduces pandas
   materialization but does not guarantee column-pruned downloads. Profile the
   download path before claiming network savings.
-- Coverage is measured only over `iwac_common`, not the complete enrichment and
-  analysis tree. Prioritize cache invalidation, transport failure handling, and
-  real CLI behavior over raising the coverage percentage with shallow tests.
+- At review time coverage was measured only over `iwac_common`. CI now
+  measures the complete production tree (`--cov=.`) and keeps the 70% gate on
+  `iwac_common` only (`scripts/check_coverage.py --core-min 70`). Prioritize
+  cache invalidation, transport failure handling, and real CLI behavior over
+  raising the coverage percentage with shallow tests.
 
 No runtime or peak-memory benchmark was performed; these are code-based
 observations, not measured speedup claims.

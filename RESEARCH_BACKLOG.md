@@ -1,8 +1,8 @@
 # Research backlog
 
 Analyses the dataset can already support but nobody has built. Each is grounded
-in columns that exist today — none needs new computation on the Hub, and none is
-blocked on anything.
+in columns that exist today — none needs new computation on the Hub. Item 2
+depends on human adjudication of reprint candidates.
 
 Carried over from `CODE_AND_METHODS_AUDIT.md` (July 2026), which was deleted once
 its bug list, safety rails, refactoring plan and methodology fixes had all landed.
@@ -29,12 +29,20 @@ than assumed, and is the kind of claim the collection was assembled to support.
 
 Cheapest item here by a wide margin.
 
-## 2. Reprint and wire-copy detection
+## 2. Reprint families and wire-copy circulation
 
-`post-processing/related_articles.py` already computes near-duplicate cosine
-pairs but keeps only each row's top-1 neighbour. Union-find over *all* pairs
-≥ 0.97 (the calibrated EmbeddingGemma 2 near-duplicate cutoff) would give reprint clusters: which stories crossed borders, and with what
-lag.
+The screening half exists. `post-processing/related_articles.py` stores each
+public row's top-k public neighbours (default 10) by embedding cosine.
+`iwac-analyze reprints` (`analyses/reprint_candidates.py`) runs its own
+blockwise search over the snapshot it is given and screens candidate pairs on
+both cosine and word-trigram Jaccard, and `iwac-analyze similarity-calibration` re-derives the
+cosine cutoffs for the current vector space. What is not built is the step
+from pairs to families: which stories crossed borders, and with what lag.
+
+Do not get there by taking connected components of the candidate pairs.
+Similarity is not transitive, so a component is not a verified reprint family
+(`docs/research-validation.md`, section 4). Families need adjudicated pairs
+first; the clustering rule then has to be stated and its sensitivity reported.
 
 Worth doing for a second reason — undetected reprints inflate topic-prevalence
 counts, so every frequency-based analysis in the repo is slightly wrong in a way
@@ -57,7 +65,8 @@ and with it the local-versus-foreign framing question: how much coverage of Isla
 in Benin is actually about Nigeria, Mali, or the Middle East? Pairs naturally
 with the burst detector for event geography.
 
-`index.Coordonnées` is a `"lat, lng"` string, not two floats — split before use.
+`index.Coordonnées` is the verbatim `"lat, lng"` string; use the parsed
+`latitude`/`longitude` columns beside it.
 
 ## 5. Agenda-setting: press versus academy
 
@@ -69,8 +78,8 @@ Few corpora can ask this at all; IWAC holds both sides. Two cautions: the LDA
 topic ids are **not** comparable across the two subsets (different models,
 unrelated numbering — always read `lda_model_name` beside a topic id), so join on
 `subject`/authority terms rather than topics unless you fit a shared model. And
-`references` has no lunar date and a far smaller n (867 rows), so annual bins
-will be sparse.
+`references` has no lunar date and is far smaller than `articles`, so annual
+bins will be sparse; report the row count of the revision you use.
 
 ---
 

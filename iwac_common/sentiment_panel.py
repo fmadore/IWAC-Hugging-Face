@@ -26,7 +26,7 @@ Three rules encoded here:
    Generation 2 runs a rewritten prompt (fingerprint ``d14ace9ac192``) and asks
    for subjectivité as a *label* where generation 1 asked for the integer 1-5,
    so its ``*_subjectivite_score`` column is a string where generation 1's is a
-   float (see :attr:`SentimentModel.subjectivite_is_label`). Any comparison
+   nullable integer (see :attr:`SentimentModel.subjectivite_is_label`). Any comparison
    across the boundary confounds model change with prompt change; convert one
    side with :data:`SUBJECTIVITE_ORDER` and say so.
 
@@ -156,7 +156,7 @@ class SentimentModel:
     def subjectivite_is_label(self) -> bool:
         """True when this model was asked for a subjectivité *label*, so its
         ``*_subjectivite_score`` column is a string and must not be averaged,
-        cast to Int64, or compared to a generation-1 float without conversion
+        cast to Int64, or compared to a generation-1 integer without conversion
         through :data:`SUBJECTIVITE_ORDER`."""
         return self.generation >= 2
 

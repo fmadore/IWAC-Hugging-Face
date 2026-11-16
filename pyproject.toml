@@ -9,7 +9,7 @@ name = "iwac-hugging-face"
 version = "1.0.1"
 description = "Pipeline scripts for the Islam West Africa Collection dataset on Hugging Face Hub"
 # 3.12 is the real floor, not a preference: the pinned numpy line (2.5, capped
-# in requirements.txt) requires >= 3.12. Declaring >= 3.10 while shipping a
+# in requirements-core.txt) requires >= 3.12. Declaring >= 3.10 while shipping a
 # dependency set that cannot install there is a promise the pipeline cannot
 # keep. CI runs 3.12 for the same reason.
 requires-python = ">=3.12"
@@ -62,10 +62,10 @@ iwac-process = "iwac_pipeline.cli:process_main"
 iwac-analyze = "iwac_pipeline.cli:analyze_main"
 
 [tool.ruff]
-# Deliberately not a style gate. These two rules are the ones that catch
+# Deliberately not a style gate. These three rules are the ones that catch
 # breakage the import-smoke tests cannot: F821 for a name used inside main()
 # or a rare branch after a refactor dropped its import, F401 for the imports
-# such a refactor leaves behind. Unlike pyflakes, ruff honours `# noqa: F401`,
+# such a refactor leaves behind, F811 for a name redefined before it is used. Unlike pyflakes, ruff honours `# noqa: F401`,
 # which is what keeps deliberate availability checks (see
 # calculate_hijri_dates.py) out of the report.
 target-version = "py312"

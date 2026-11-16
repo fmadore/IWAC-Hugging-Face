@@ -1,5 +1,10 @@
 # v1.0.1 — Publication review and pipeline fixes
 
+> **Release notes for the `v1.0.1` tag (2026-09-07).** They describe that
+> release only; the code on `main` has moved well past it. For the current
+> state see the [README](../README.md) and the
+> [hardening migration guide](hardening-migration.md).
+
 This patch release improves CLI behavior, input validation, and publication
 documentation.
 

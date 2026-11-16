@@ -29,14 +29,27 @@ closed. A new public column needs an intentional rights review; do not silence
 an unknown-column guard. Private annotation dependencies also restrict their
 consensus. See `iwac_common/write_policy.py`.
 
+Two published columns aggregate across rows, so they draw on public items
+only (`item_is_public` exactly true; a public item with private OCR still
+counts): the `index` aggregates (`frequency`, `first/last_occurrence`,
+`countries`), where a column in the row's `private_fields` contributes
+nothing and a content subset without visibility columns fails the upload; and
+`related_articles`, whose neighbour pool is public items and whose private rows
+are null. The projection strips neighbour entries naming unpublished ids and
+validation refuses any left (`NEIGHBOUR_ID_COLUMNS`); a change of
+`item_is_public` invalidates `related_articles` on upload.
+
 Every Hub write uses `iwac_common.hub.push_dataset_verified` or the batch
 `push_datasets_verified`. Full-data mode verifies that the destination is
 private. Public mode independently validates projection policy. Parquet files
 and exact card metadata commit together under a server-side parent-SHA
-precondition, followed by revision-pinned schema/ID verification. Never call
-`Dataset.push_to_hub` from a script or bypass this gateway.
+precondition, followed by revision-pinned schema/ID verification; locking and
+verification are not optional, and `card_sync` only verifies. Allowlist
+approvals (`--approve-columns`) are recorded only after a verified push. Never
+call `Dataset.push_to_hub` from a script or bypass this gateway.
 
-Uploads require authenticated source access and exact count reconciliation.
+Uploads require authenticated source access and exact count reconciliation;
+the HF token is resolved before the Omeka fetch.
 Mapper/media failures abort by default; explicit overrides preserve affected
 baseline data privately until a successful refresh. Changed inputs invalidate
 `schema.DERIVED_FROM` dependencies by default. `--preserve-derived` stages a
@@ -58,9 +71,11 @@ it permanently. So the order is fixed:
 
 1. Check the published projection first: load each content subset from the
    public repo and confirm no row flagged `OCR_is_public = false` still carries
-   `OCR` / `lemma_text` / `lemma_nostop`. The `publish_public.py` guards cover
-   what gets *written* and say nothing about what is already *there*. Verified
-   clean on 2026-08-05: 14,797 rows, 5,914 source-private, none leaking.
+   `OCR` / `lemma_text` / `lemma_nostop`, and that no `related_articles` entry
+   names an unpublished id. The `publish_public.py` guards cover what gets
+   *written* and say nothing about what is already *there*. Last verified clean
+   on 2026-08-05 (14,797 rows, 5,914 source-private, none leaking) — before the
+   October 2026 projection rework, so re-verify before any mint.
 2. Only then mint, and only on `fmadore/islam-west-africa-collection`.
 
 `publish_public.py --squash` refuses any repo carrying a `doi:` tag (or whose
@@ -73,15 +88,18 @@ that resolve to a superseded revision. Pick a state worth citing — a completed
 enrichment pass, not an incremental column refresh — and mint that.
 
 The **code** DOI is a separate object: Zenodo, on the GitHub repo, whose concept
-DOI always resolves to the newest version. That is what the commented block in
-`CITATION.cff` is reserved for. The dataset DOI belongs on the dataset card.
+DOI always resolves to the newest version. It is live under `identifiers` in
+`CITATION.cff` (`10.5281/zenodo.21805704`). The dataset DOI belongs on the
+dataset card.
 
 ## Non-obvious gotchas
 
 **Code changes never move data.** Editing a computation does nothing to the Hub
-until its stage runs again. Embedding and lemma stages use persisted provenance
-to detect incompatible method/input changes in incremental mode; other stages
-may require `--update-mode all`. Follow `docs/hardening-migration.md`.
+until its stage runs again. Embedding, lemma, word-count and lexical stages
+use persisted provenance to detect incompatible method/input changes in
+`missing` mode; other stages (Hijri, for one) may require `--update-mode all`.
+Follow `docs/hardening-migration.md`, whose dated re-run section gives the
+current order.
 
 **The Hijri converter is a compatibility contract, not an implementation
 detail.** `calculate_hijri_dates.py` uses `hijridate` (Umm al-Qura) because
@@ -104,21 +122,32 @@ a live writer's lock to proceed.
 **LDA stopwords come in tiers, and the tier decides the outcome.** Which set a
 word goes in matters more than whether it is in one at all:
 
-- `DOMAIN_STOPWORDS` — stripped *before* gensim's phrase detection, so nothing
-  here can ever appear inside a compound. Right for digitisation noise
-  (`camscanner`) and for citation apparatus whose whole family you want gone:
-  `paris` alone anchored 32 compounds (`paris_cnrs`, `afrique_noir_paris`).
+- `DOMAIN_STOPWORDS` (with the geo/generic sets, via `modeling_stopwords`) —
+  stripped *before* gensim's phrase detection, so nothing here can ever appear
+  inside a compound. Right only when a word's whole compound family is noise:
+  digitisation damage (`camscanner`), function words, citation apparatus
+  (`paris` alone anchored 32 compounds: `paris_cnrs`, `afrique_noir_paris`).
   Wrong for a fragment like `al`, which is junk alone but carries 82 compounds
   (`al_qadr`, `al_qaïda`, `al_azhar`, `dar_al_hadith`) — the religious events,
   organisations and titles the collection exists to study.
+  `LANGUAGE_PRE_PHRASE_EXEMPTIONS` lifts an entry for one model language
+  (French `an` is a year, English `an` an article).
 - `FRAGMENT_STOPWORDS` — filtered one pass *after* phrasing, so `al`/`el`/`page`
-  vanish alone and survive in `al_azhar`, `el_hadj`, `page_facebook`.
+  vanish alone and survive in `al_azhar`, `el_hadj`, `page_facebook`. Generic
+  words that head domain compounds belong here too (`grand`, `mondial`,
+  `national`, `monde`, `mois`, `jour`, `lieu`, …: `grand_imam`,
+  `ligue_islamique_mondial`, `mois_ramadan`).
 - `JUNK_COMPOUND_STOPWORDS` — the mirror case: whole phrases that are apparatus
   though each part is legitimate (`university_press` goes, `university_medina`
-  stays). Never put a bare word here; it would veto nothing but itself.
+  stays). Never put a bare word here; it would veto nothing but itself. An
+  underscore entry belongs here, never in a pre-phrase set, where nothing is
+  joined yet.
 - `ARTIFACT_LABEL_STOPWORDS` — vetoes a label word-by-word, so compounds from
   models trained before a fix stop surfacing pending a re-fit.
 
+`CUSTOM_COLLOCATIONS` must be written in lemma form (`lemma_nostop` is the
+input). A learned compound needs `phrase_min_docs` source documents, and the
+dictionary's `no_below`/`no_above` count source documents, not chunks.
 Adding a modeling stopword only takes effect on `--mode fit`; prediction uses
 the bundle's frozen preprocessing. Before adding one, check what it costs: a token absent
 from the `articles` (press) dictionary but present in `references` is citation
@@ -135,18 +164,21 @@ the full historical row privately.
 rarely-taken branch. CI runs `ruff check` for exactly that reason — F821 for the
 undefined name a dropped import leaves behind, F401 so the dead imports don't
 accumulate (rules pinned in `pyproject.toml`; a deliberate availability check
-carries `# noqa: F401`). Without it a refactor passes the tests and crashes at
-runtime.
+carries `# noqa: F401`), plus F811 for a redefinition. Without it a refactor
+passes the tests and crashes at runtime. CI pins ruff to the lock's version.
 
-**Caches:** Omeka responses in `.cache_omk*` (gzipped JSON, 24h TTL). Lemma and
-embedding resume caches are deleted on a successful push, so a leftover file
-means an interrupted run. Both are fingerprinted by the config that produced
+**Caches:** Omeka responses in `.cache_omk*` (gzipped JSON, 24h TTL). Lemma
+(SQLite, `.cache_lemmas/*.sqlite3`, checkpointed incrementally) and embedding
+resume caches are deleted on a successful push, so a leftover file means an
+interrupted run. Both are fingerprinted by the config that produced
 them (spaCy model + `LEMMA_LOGIC_VERSION`; embedding model revision + export +
 prompt/chunking settings) and by the repository, and every entry carries a hash
 of its input text (`_embedding_utils.make_entry`), so a cache from a different
 configuration, repo or text version is ignored rather than silently mixed in —
-no manual date-checking needed. Bump `LEMMA_LOGIC_VERSION` whenever the
-lemmatisation output changes for identical input. The text embedding cache
+no manual date-checking needed. Bump `LEMMA_LOGIC_VERSION` (currently 3) whenever
+the lemmatisation output changes for identical input, and `TOKENIZER_VERSION`
+(`iwac_common/text_utils.py`, currently 3) whenever `nb_mots`/MATTR tokenization does;
+both feed persisted provenance, so `missing` mode then recomputes. The text embedding cache
 holds one entry per *chunk*, written after every batch: an interrupted run
 resumes by re-running the same command, in either update mode
 (`--fresh-cache` discards it).
@@ -162,13 +194,16 @@ release as the text columns. The 2026-10 pilot
 published before then were raw-text Gemini vectors that current code cannot
 reproduce. Cosine scales differ between models: on any new vector space, run
 `iwac-analyze similarity-calibration` and update `reprint_candidates.py
---min-cosine` (now 0.91), `related_articles.NEAR_DUP_THRESHOLD` (now 0.97, keyed
-to its config hash) and downstream reprint/related tools. The image resize must stay the Pillow path in
+--min-cosine` (default 0.91), `related_articles.NEAR_DUP_THRESHOLD` (0.97, keyed
+to its config hash) and downstream reprint/related tools. Both defaults came
+from a per-pair split that leaked reprint families across halves; the
+calibration splits by connected component, and its figures for them are
+pending a re-run; do not quote the old recall/precision. The image resize must stay the Pillow path in
 `image_patches`: transformers.js resizes differently (cosine down to 0.92
 against the reference). Consumers embed queries as
 `task: search result | query: {q}` (`_gemma_encoder.QUERY_PREFIX`). On a CPU a
-full text re-embed is ~30 h (~290 tokens/s); `--device cuda` with
-onnxruntime-gpu is the fast path.
+re-embed of every text column is ~30 h (~290 tokens/s), of which `articles`
+alone is ~16 h; `--device cuda` with onnxruntime-gpu is the fast path.
 
 **Never round-trip a whole subset through pandas to fix one column's type.**
 `to_pandas()` turns every nullable int column into `float64`; that is how
@@ -181,7 +216,8 @@ not the method.
 ## Running things
 
 ```
-.venv\Scripts\python script_name.py
+.venv/bin/python script_name.py        # Linux/macOS
+.venv\Scripts\python script_name.py    # Windows
 ```
 
 Editable and wheel installs expose five console entry points, which are the
@@ -199,10 +235,24 @@ iwac-analyze <analysis>
 `iwac-upload articles --dry-run --no-cache` works. They are thin wrappers
 (`iwac_pipeline/cli.py`) that import the same implementations as modules. Setuptools maps the
 historical directories to package names; keep both source and wheel routes tested.
+Subcommand names:
+
+- `iwac-process`: `embeddings`, `image-embeddings`, `lemmas`, `lexical`,
+  `word-count`, `hijri`, `lda`, `sentiment-agreement`, `related`
+- `iwac-analyze`: `topics`, `topic-sentiment`, `keyness`, `entities`,
+  `coverage`, `annotation-review`, `reprints`, `similarity-calibration`,
+  `topic-review`
+
+`word-count`, `lexical`, `lemmas`, `hijri`, `embeddings` and `image-embeddings`
+share `--update-mode {missing,all}` and `-y` (`post-processing/_common.py`):
+explicit flag, else `missing` with `-y` or headless, else a prompt. `-y` never
+means a full recompute — script one with `--update-mode all -y`. Stages push
+nothing when nothing changed. `lda` takes `--mode fit|predict`;
+`sentiment-agreement` and `related` write only with `--push`.
 
 `iwac_common` and `country_mapper` are editable-installed (`pip install -e .
---no-deps`), so they import from any working directory; scripts keep sys.path
-fallbacks for uninstalled venvs.
+--no-deps`), so they import from any working directory; scripts (analyses
+included) keep sys.path fallbacks for uninstalled venvs.
 
 **The local mirror is revision-pinned.** `iwac-mirror` writes typed Parquet
 (`--format csv` for the legacy export) and `data/mirror_manifest.json`,
@@ -217,9 +267,14 @@ requested parquet columns at a pinned revision (full-load fallback);
 analyses write `<script>.manifest.json` (code SHA, dataset revision, arguments,
 output hashes) beside their outputs.
 
-Required in `.env`: `OMEKA_BASE_URL`, `OMEKA_KEY_IDENTITY`,
-`OMEKA_KEY_CREDENTIAL` and `HF_TOKEN`. `IWAC_HF_PRIVATE_REPO` / `IWAC_HF_PUBLIC_REPO` optionally redirect the
-repo IDs at `iwac_common/repos.py` — useful for testing against a scratch repo.
+Uploads require `OMEKA_KEY_IDENTITY` and `OMEKA_KEY_CREDENTIAL` (dry runs too);
+`OMEKA_BASE_URL` defaults to `https://islam.zmo.de/api`. Hub access uses
+`HF_TOKEN`, else the cached `hf auth login` token. `.env` is loaded through
+`iwac_common.settings`, honouring `IWAC_ENV_FILE`. `IWAC_HF_PRIVATE_REPO` /
+`IWAC_HF_PUBLIC_REPO` optionally redirect the repo IDs at `iwac_common/repos.py`
+— useful for testing against a scratch repo. `IWAC_WORK_DIR`,
+`IWAC_PUBLIC_BASE_URL`, `IWAC_LOCK_DIR` and `IWAC_STATE_DIR` are documented in
+`.env.example`.
 
 Development is **CPU only**. Prefer CPU-viable models (spaCy `*_lg`, not
 transformers) and keep batch sizes realistic for it.
@@ -252,7 +307,9 @@ keyed to a French or English lexicon will mis-score the Ewé, Kabiyè, and Dendi
 items. Score them as null rather than as low quality; a metric that ranks
 correctly-transcribed African-language sources as garbage is worse than no metric.
 `Lisibilite_OCR` (French Flesch) is therefore computed for monolingual French rows
-only and nulled everywhere else, in every update mode.
+only and nulled everywhere else, in every update mode — and also nulled below
+the evidence thresholds (`MIN_READABILITY_WORDS`, `MIN_READABILITY_SENTENCES`,
+`MAX_WORDS_PER_SENTENCE`).
 
 **Join authorities on ids, not titles.** Content subsets carry `*_ids` beside
 each linked-authority label column; the index frequency and `entity_networks`
@@ -272,7 +329,11 @@ via `language_overrides`) rather than swept, because k defines what
 `lda_topic_id` means and an auto-sweep renumbers every topic on each re-fit.
 Judge k by the multi-seed *stability* score (mean best-match Jaccard between
 seeds, `--stability-seeds`) and by documents-per-topic; it falls systematically
-as k rises where C_v does not. Re-check only if a corpus grows substantially.
+as k rises where C_v does not. The sweep is therefore a diagnostic:
+`--optimize-topics` and `--sweep-only` report (C_v with seed sd, stability,
+held-out per-word bound) and exit with no bundle and no push;
+`--select-k-from-sweep` is the explicit opt-in and is refused when k is pinned.
+Re-check only if a corpus grows substantially.
 
 **Reproducibility:** fixed seed 42, parameters saved to `training_parameters.json`,
 coherence metrics recorded. Report-only analyses write to `analyses/output/`
@@ -283,8 +344,12 @@ coherence metrics recorded. Report-only analyses write to `analyses/output/`
 Read `docs/hardening-migration.md` before refreshing legacy outputs. LDA bundle
 identity, frozen preprocessing and theta input hashes define topic provenance.
 Holdout groups and exact duplicates must be separated before vocabulary or
-phrase fitting. Consensus is generation-specific; constant-label reliability
-is undefined. Trends are descriptive unless explicit assumptions are selected.
+phrase fitting. Prediction leaves rows below `--min-predict-tokens` with null
+topics but keeps `lda_model_name`. Consensus is generation-specific and null
+below two valid ratings; constant-label reliability is undefined. Trends are
+descriptive unless explicit assumptions are selected. Every analysis dates
+items with `analyses/_research.py:point_years` (day/month/year only; ranges
+excluded and counted).
 
 Use `docs/research-validation.md` for coverage/cohort audits, blinded probability
 sampling, source-linked topic review and reprint calibration. Automated tests
