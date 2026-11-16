@@ -35,6 +35,9 @@ Usage
     python post-processing/semantic_embedding_images.py --update-mode all
     python post-processing/semantic_embedding_images.py --dry-run
 
+``--update-mode`` defaults to ``missing`` with ``-y`` or when not run from a
+terminal; otherwise the mode is asked for.
+
 Environment Variables
 ---------------------
 HF_TOKEN         Personal access token for the Hugging Face Hub.
@@ -53,16 +56,22 @@ import logging
 import os
 import sys
 import urllib.request
-from typing import Any, List, Optional
+from typing import List, Optional
 
-from dotenv import load_dotenv
+import numpy as np
+
 # Make ``post-processing/_common.py`` and ``_embedding_utils.py`` importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (  # noqa: E402
     PRIVATE_REPO_ID,
+    add_update_mode_args,
     ensure_hf_token,
+    load_environment,
     load_hub_dataset,
+    print_dry_run_panel,
     push_dataset,
+    reorder_columns_after,
+    resolve_update_mode,
 )
 from iwac_common.schema import SUBSETS  # noqa: E402
 from iwac_common.paths import workspace_root  # noqa: E402
@@ -78,7 +87,7 @@ from _embedding_utils import (  # noqa: E402
     repo_slug,
     save_cache,
 )
-from _embedding_columns import set_embedding_column  # noqa: E402
+from _embedding_columns import column_vectors, set_embedding_column  # noqa: E402
 from _gemma_encoder import (  # noqa: E402
     DIMENSION,
     IMAGE_PROCESSING,
@@ -92,7 +101,7 @@ from _gemma_encoder import (  # noqa: E402
 )
 from PIL import Image, ImageOps  # noqa: E402
 
-load_dotenv(workspace_root() / ".env")
+load_environment()
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 from rich.console import Console  # noqa: E402
@@ -173,7 +182,88 @@ def display_config_panel(repo_id: str, update_mode: str, dry_run: bool) -> None:
     console.print(Panel(table, title="[bold blue]Multimodal Image Embedding Configuration", border_style="blue"))
 
 
-def main() -> int:
+def embedding_settings() -> dict:
+    """Everything that identifies the vectors; hashed into the provenance."""
+    return {
+        **model_settings(), "image_processing": IMAGE_PROCESSING, "max_soft_tokens": MAX_SOFT_TOKENS,
+        "processing_version": IMAGE_PROCESSING_VERSION,
+        # Resampling can differ across Pillow releases; 30 images are cheap to redo.
+        "pillow": version("Pillow"),
+    }
+
+
+def cache_path(repo_id: str, configuration: str):
+    """The repository is part of the name, and each entry carries a hash of the
+    image bytes and URL it was computed from."""
+    return CACHE_DIR / (
+        f"{CACHE_STEM}_{repo_slug(repo_id)}_"
+        f"{cache_fingerprint(MODEL_ID, DIMENSION, 'image')}_{configuration[:16]}.sqlite3"
+    )
+
+
+def row_urls(ds) -> List[str]:
+    """Per-row image URL: ``image_url``, else ``thumbnail``, else ''."""
+    fallbacks = list(ds[FALLBACK_COLUMN]) if FALLBACK_COLUMN in ds.column_names else [None] * len(ds)
+    out = []
+    for url, fallback in zip(ds[SOURCE_COLUMN], fallbacks):
+        if url is not None and str(url).strip():
+            out.append(str(url))
+        elif fallback is not None and str(fallback).strip():
+            out.append(str(fallback))
+        else:
+            out.append("")
+    return out
+
+
+def embed_images(ds, encoder, update_mode: str, configuration: str, cache_file):
+    """Download every image, reuse proven vectors, embed the rest.
+
+    The actual image bytes are checked on every run: a URL can retain its name
+    while its image changes. Only inference is skipped on a proven match.
+    Returns ``(vectors, fingerprints, failed_downloads, failed_embeddings)``;
+    KeyboardInterrupt propagates after the finished images were cached.
+    """
+    urls = row_urls(ds)
+    row_ids = list(ds["o:id"])
+    existing = column_vectors(ds, EMBEDDING_COLUMN)
+    input_col, config_col = provenance_columns(EMBEDDING_COLUMN)
+    old_inputs = list(ds[input_col]) if input_col in ds.column_names else [None] * len(ds)
+    old_configs = list(ds[config_col]) if config_col in ds.column_names else [None] * len(ds)
+    vectors: List[Optional[np.ndarray]] = [None] * len(ds)
+    fingerprints = [""] * len(ds)
+    cache = load_cache(cache_file)
+    failed_dl = failed_emb = 0
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}"), BarColumn(),
+                  TaskProgressColumn(), TimeElapsedColumn(), console=console) as progress:
+        task = progress.add_task("[cyan]Checking and embedding images", total=len(ds))
+        for idx, url in enumerate(urls):
+            raw = download_image(url) if url else None
+            if url and raw is None:
+                failed_dl += 1
+            elif raw is not None:
+                fingerprints[idx] = input_fingerprint(hashlib.sha256(raw).hexdigest(), url)
+                cached = cached_value(cache, row_ids[idx], fingerprints[idx])
+                if cached is not None:
+                    vectors[idx] = np.asarray(cached, dtype=np.float32)
+                elif (update_mode == "missing" and old_inputs[idx] == fingerprints[idx]
+                      and old_configs[idx] == configuration and not is_empty_embedding(existing[idx])):
+                    vectors[idx] = existing[idx]
+                else:
+                    try:
+                        vector = np.asarray(encoder.encode_image(decode_image(raw)), dtype=np.float32)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("Image %s failed: %s", row_ids[idx], exc)
+                        failed_emb += 1
+                    else:
+                        vectors[idx] = vector
+                        entry = make_entry(vector.tolist(), fingerprints[idx])
+                        cache[str(row_ids[idx])] = entry
+                        save_cache({str(row_ids[idx]): entry}, cache_file)
+            progress.update(task, advance=1)
+    return vectors, fingerprints, failed_dl, failed_emb
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Add a multimodal image embedding column to the 'images' subset "
                     f"using {MODEL_ID}, run locally."
@@ -188,8 +278,7 @@ def main() -> int:
                         help="Maximum Parquet shard size when pushing to Hub.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Compute embeddings but do not push to Hub (the cache is kept).")
-    parser.add_argument("--update-mode", choices=["missing", "all"], default="missing",
-                        help="Update only missing embeddings (default) or recompute all.")
+    add_update_mode_args(parser)
     parser.add_argument("--fresh-cache", action="store_true",
                         help="Discard this configuration's resume cache before starting.")
     parser.add_argument("--resume", action="store_true",
@@ -197,29 +286,24 @@ def main() -> int:
     parser.add_argument("--allow-partial", action="store_true",
                         help="Push despite download/embedding failures. By default "
                              "the cache is kept and the Hub is left untouched.")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
     if args.threads is not None and args.threads < 1:
         parser.error("--threads must be positive")
 
     repo_id = args.repo
-    update_mode = args.update_mode
     dry_run = args.dry_run
-    configuration_settings = {
-        **model_settings(), "image_processing": IMAGE_PROCESSING, "max_soft_tokens": MAX_SOFT_TOKENS,
-        "processing_version": IMAGE_PROCESSING_VERSION,
-        # Resampling can differ across Pillow releases; 30 images are cheap to redo.
-        "pillow": version("Pillow"),
-    }
+    configuration_settings = embedding_settings()
     configuration = config_fingerprint(configuration_settings)
     expected_dimension = (SUBSETS[CONFIG_NAME].embedding_columns or {})[EMBEDDING_COLUMN]
     if DIMENSION != expected_dimension:
         parser.error(f"{MODEL_ID} produces {DIMENSION} dims; schema expects {expected_dimension}")
-    # The repository is part of the name, and each entry carries a hash of the
-    # image bytes and URL it was computed from.
-    cache_file = CACHE_DIR / (
-        f"{CACHE_STEM}_{repo_slug(repo_id)}_"
-        f"{cache_fingerprint(MODEL_ID, DIMENSION, 'image')}_{configuration[:16]}.sqlite3"
-    )
+    update_mode = resolve_update_mode(args, console=console)
+    cache_file = cache_path(repo_id, configuration)
     if args.fresh_cache and cache_file.exists():
         cache_file.unlink()
         console.print("[yellow]ℹ[/yellow] --fresh-cache: deleted the existing resume cache.")
@@ -257,59 +341,9 @@ def main() -> int:
         console.print(f"[yellow]ℹ[/yellow] Available columns: {', '.join(ds.column_names)}")
         return 1
 
-    # Per-row image URL: prefer image_url, fall back to thumbnail.
-    urls = list(ds[SOURCE_COLUMN])
-    fallbacks = list(ds[FALLBACK_COLUMN]) if FALLBACK_COLUMN in ds.column_names else [None] * len(ds)
-    row_ids = list(ds["o:id"])
-
-    def row_url(i: int) -> str:
-        u = urls[i]
-        if u is not None and str(u).strip():
-            return str(u)
-        f = fallbacks[i]
-        return str(f) if f is not None and str(f).strip() else ""
-
-    # Check the actual image bytes on every run: a URL can retain its name
-    # while its image changes. Only inference is skipped on a proven match.
-    existing = list(ds[EMBEDDING_COLUMN]) if EMBEDDING_COLUMN in ds.column_names else [None] * len(ds)
-    input_col, config_col = provenance_columns(EMBEDDING_COLUMN)
-    old_inputs = list(ds[input_col]) if input_col in ds.column_names else [None] * len(ds)
-    old_configs = list(ds[config_col]) if config_col in ds.column_names else [None] * len(ds)
-    all_embeddings: List[Any] = [[] for _ in range(len(ds))]
-    fingerprints = [""] * len(ds)
-    cache = load_cache(cache_file)
-    failed_dl = 0
-    failed_emb = 0
-
     try:
-        with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}"), BarColumn(),
-                      TaskProgressColumn(), TimeElapsedColumn(), console=console) as progress:
-            task = progress.add_task("[cyan]Checking and embedding images", total=len(ds))
-            for idx in range(len(ds)):
-                url = row_url(idx)
-                raw = download_image(url) if url else None
-                if url and raw is None:
-                    failed_dl += 1
-                elif raw is not None:
-                    fingerprints[idx] = input_fingerprint(hashlib.sha256(raw).hexdigest(), url)
-                    cached = cached_value(cache, row_ids[idx], fingerprints[idx])
-                    if cached is not None:
-                        all_embeddings[idx] = cached
-                    elif (update_mode == "missing" and old_inputs[idx] == fingerprints[idx]
-                          and old_configs[idx] == configuration and not is_empty_embedding(existing[idx])):
-                        all_embeddings[idx] = existing[idx]
-                    else:
-                        try:
-                            vector = encoder.encode_image(decode_image(raw)).tolist()
-                        except Exception as exc:  # noqa: BLE001
-                            logger.error("Image %s failed: %s", row_ids[idx], exc)
-                            failed_emb += 1
-                        else:
-                            all_embeddings[idx] = vector
-                            entry = make_entry(vector, fingerprints[idx])
-                            cache[str(row_ids[idx])] = entry
-                            save_cache({str(row_ids[idx]): entry}, cache_file)
-                progress.update(task, advance=1)
+        all_embeddings, fingerprints, failed_dl, failed_emb = embed_images(
+            ds, encoder, update_mode, configuration, cache_file)
     except KeyboardInterrupt:
         console.print(Panel(
             f"[yellow]Interrupted; Hub left untouched.[/yellow]\n\nFinished images are saved in "
@@ -333,27 +367,19 @@ def main() -> int:
     ds_out = set_provenance(ds_out, EMBEDDING_COLUMN, fingerprints, configuration,
                             [not is_empty_embedding(e) for e in all_embeddings], settings=configuration_settings)
 
-    # Place the embedding column right after the image URL column.
-    cols = list(ds_out.column_names)
-    if SOURCE_COLUMN in cols:
-        cols.remove(EMBEDDING_COLUMN)
-        cols.insert(cols.index(SOURCE_COLUMN) + 1, EMBEDDING_COLUMN)
-        ds_out = ds_out.select_columns(cols)
+    ds_out = reorder_columns_after(ds_out, [EMBEDDING_COLUMN], SOURCE_COLUMN, console=console)
 
     valid = sum(1 for e in all_embeddings if not is_empty_embedding(e))
     console.print(f"[green]✓[/green] {valid}/{len(ds_out)} rows have an image embedding.")
-    for i, e in enumerate(ds_out[EMBEDDING_COLUMN]):
+    for i, e in enumerate(all_embeddings):
         if not is_empty_embedding(e):
             console.print(f"  [cyan]sample[/cyan] row {i}: dim={len(e)}, values=[{e[0]:.4f}, {e[1]:.4f}, ...]")
             break
 
     # --- Step 5: Push ---
     if dry_run:
-        console.print(Panel(
-            f"[yellow]Dry run — nothing pushed.[/yellow]\n\n"
-            f"Would push [cyan]{len(ds_out)}[/cyan] rows to [cyan]{repo_id}[/cyan] (config: {CONFIG_NAME}).\n"
-            f"Embeddings cached in {cache_file}.",
-            title="Dry Run Complete", border_style="yellow"))
+        print_dry_run_panel(repo_id=repo_id, config_name=CONFIG_NAME, n_rows=len(ds_out),
+                            extra=f"Embeddings cached in {cache_file}.", console=console)
         return 0
 
     console.print("\n[bold cyan]Step 5:[/bold cyan] Pushing to Hugging Face Hub...")

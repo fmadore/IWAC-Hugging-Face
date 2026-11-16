@@ -8,12 +8,23 @@ These commands create local reports only: they do not upload, deduplicate, label
 retrain or alter the source dataset.
 
 Install the project and analysis dependencies as described in the root README.
-The commands below use a verified local mirror by default. An explicit
+All nine `iwac-analyze` commands share `--input`, `--source local|hub|csv`,
+`--repo`, `--config`, `--revision` and `--output-dir`, and each also runs from
+its script path (`python analyses/<script>.py`). The validation commands on
+this page (`coverage`, `annotation-review`, `topic-review`, `reprints`,
+`similarity-calibration`) read the verified local mirror by default; `topics`,
+`topic-sentiment`, `keyness` and `entities` read the Hub by default. `csv` is
+the historical spelling of `local`. An explicit
 `--input snapshot.parquet` or `--input snapshot.csv` works without network access.
 It records the file's SHA-256; an absent revision is recorded as `unknown`, never
 invented. `--revision` supplied with `--input` is a user declaration, not a verified
 Hub association. Without `--input`, `--revision` pins the Hub or verified mirror
 revision. `--source hub` opts into a read-only remote load using existing credentials.
+
+Every analysis applies one dating rule (`analyses/_research.py:point_years`):
+only day, month and year dates carry a year. Date ranges, unparsed and missing
+dates are excluded and counted by precision in each report, never assigned a
+range's start year.
 
 Every output CSV carries the source repository and revision. A run manifest records
 arguments, input and output hashes, code state and package versions; complete output
@@ -49,8 +60,18 @@ eligible documents **in every year of the requested window**, including years wi
 zero records. Outlet IDs are preferred to names and scoped by country. Select a
 meaningful year window: the broad default 1900–2100 intentionally yields no stable
 outlets in most research corpora. Use the exported source IDs to rerun an analysis on
-that cohort, compare results with the complete cohort, and discuss the difference.
-The flag supports a sensitivity analysis; it does not reweight or repair the archive.
+that cohort, compare results with the complete cohort, and discuss the difference:
+
+```bash
+iwac-analyze topics --input snapshot.parquet \
+  --ids-file analyses/output/corpus_coverage_inclusion.csv --ids-where stable_outlet_cohort
+```
+
+`--ids-file` accepts a CSV with an `o:id` column or a text file with one ID per
+line; `--ids-where COLUMN` keeps only the CSV rows whose column is true. The
+cohort filter is available on `topics`, `topic-sentiment`, `keyness` and
+`entities`. The flag supports a sensitivity analysis; it does not reweight or
+repair the archive.
 
 ## 2. Build an independent annotation exercise
 
@@ -75,10 +96,14 @@ cases have **no probability weight**. A difficult source already selected in the
 probability sample stays there and is not duplicated. `--generation` selects one
 canonical annotation generation; generations and prompts are never pooled.
 
-Reviewers receive blank fields for two independent annotators and adjudication,
-plus evaluation target, quoted stance, negative event, uncertainty and notes.
-Machine predictions and selection reasons are omitted from the annotation sheet;
-a separate selection audit is for study management, not initial annotation.
+The command writes one blank sheet per annotator
+(`annotation_review_annotator_a.csv`, `annotation_review_annotator_b.csv`) and an
+adjudication sheet (`annotation_review_adjudication.csv`), each with the same rows
+in the same hash-ranked order and fields for the labels, evaluation target,
+quoted stance, negative event, uncertainty and notes. Machine predictions,
+sample group, stratum, weights and selection reasons are omitted from all three.
+The design fields live in `annotation_review_selection_audit.csv`, joined on
+`o:id` after annotation; it is for study management, not initial annotation.
 Source links allow close reading in the archive. Excerpts are omitted by default.
 `--excerpt-chars 1500` explicitly includes text from `--text-column OCR`; it may
 export restricted text and should only be used for an authorized review workspace.
@@ -142,10 +167,20 @@ iwac-analyze similarity-calibration --source hub
 
 It scores the stored `related_articles` neighbour pairs by trigram Jaccard, chooses
 the cosine prefilter for recall and the cosine-only near-duplicate cutoff for
-precision on one half of the pairs, and reports both on the other half. For the
-EmbeddingGemma 2 article vectors (2026-10) it chose 0.91 (held-out recall 97.6 %
-of lexical duplicates) and 0.97 (held-out precision 93.7 %, recall 67.5 %); the
-Gemini-era 0.93 and 0.95 now pass only 95 % and are 52 % precise respectively.
+precision on one half of the pairs, and reports both on the other half. The
+halves are whole connected components of the pair graph, so a reprint family
+never sits on both sides, and the held-out figures carry bootstrap intervals
+resampling whole components (none below `MIN_BOOTSTRAP_CLUSTERS` components).
+Because `related_articles` lists public neighbours only, the calibration
+describes the public pool.
+
+The current defaults, 0.91 for the prefilter and 0.97 for the near-duplicate
+cutoff, were chosen in 2026-10 on the EmbeddingGemma 2 article vectors by an
+earlier version of this command that split individual pairs. That split let a
+family sit on both halves, so the recall and precision it reported for those
+thresholds were optimistic and are not quoted here. **Re-run the calibration
+before citing a figure for either threshold**; the thresholds stay the defaults
+until then.
 The label is a lexical proxy over top-k neighbours, not an adjudicated reprint. Semantic similarity without
 lexical overlap suggests shared subject matter, not necessarily copying. OCR errors,
 abridgments, translations and boilerplate can respectively hide or create matches.

@@ -38,6 +38,15 @@ must belong to an account with the intended complete-source access; possession
 of credentials by itself is not proof of that account's permissions.
 `--help` and importing the package do not contact Omeka.
 
+`OMEKA_BASE_URL` defaults to the production API (`https://islam.zmo.de/api`).
+`IWAC_PUBLIC_BASE_URL` sets the public site used for `iwac_url` and
+`iiif_manifest`; without it, `OMEKA_BASE_URL` minus its `/api` suffix is used.
+The Hugging Face token (`HF_TOKEN`, else the cached login, else an interactive
+login) is resolved before the Omeka fetch, dry runs included, because even a dry
+run reads the authenticated Hub baseline; a missing token fails in seconds
+rather than after the fetch. Hub write locks live in `.iwac_locks` below the
+workspace, or in `IWAC_LOCK_DIR`.
+
 ## Source visibility
 
 Each adapter emits:
@@ -64,6 +73,21 @@ withdraw every approved aggregate, embedding or topic output. OCR and
 reconstructive lemma text remain restricted. A new column requires an explicit
 rights review, not merely adding its name to the allowlist to silence an error.
 
+Two published aggregates follow the same visibility rule:
+
+- **`index` aggregates.** `frequency`, `first_occurrence`, `last_occurrence`
+  and `countries` count only public parent items (`item_is_public` exactly
+  true) in articles, publications, references and audiovisual. Within a public
+  row, a column listed in its `private_fields` (or whose `_ids` companion is)
+  contributes nothing, including a private date or country. A public item whose
+  OCR alone is private still counts. The `index` upload fails closed if a
+  content subset on the Hub lacks `item_is_public` or `private_fields`.
+- **`related_articles`.** The neighbour pool is the public items only; a
+  private row gets null, and a public item whose OCR is private remains a
+  neighbour. The public projection strips any neighbour entry naming an
+  unpublished id, and validation refuses one that remains
+  (`NEIGHBOUR_ID_COLUMNS` in `iwac_common/write_policy.py`).
+
 Old datasets do not have sufficient parent/property visibility metadata. Run
 authenticated ingestion for all subsets before the first publication with the
 new policy. Do not fill unknown flags with `True` to bypass migration.
@@ -76,7 +100,10 @@ it private until mapping succeeds; `--allow-media-failures` retains affected
 media pointers in the private mirror and marks them restricted until a
 successful refetch. A failure may reflect newly private upstream data, so old
 visibility is not proof of current visibility. A primary PDF or image failure affects the file URL, thumbnail,
-and IIIF manifest together. Neither option treats a transient network error as
+and IIIF manifest together. IIIF manifest lookups retry up to `IIIF_MAX_TRIES`
+times with the same backoff as other Omeka requests before counting as a
+failure; `index` records without primary media have no manifest thumbnail and
+are not looked up. Neither option treats a transient network error as
 evidence that previously accessible media disappeared. A failed new item with
 no baseline cannot be reconstructed and still aborts.
 
@@ -88,8 +115,9 @@ publication date. Language changes invalidate language-dependent lemmas,
 lexical/readability measures and topic assignments. Associated input/config
 hashes are invalidated with their output. Mapper-produced values are already
 fresh and are not overwritten by invalidation. Related-article rankings are
-invalidated for the whole subset when candidate embeddings or corpus
-membership change; a changed candidate can alter other articles' neighbours.
+invalidated for the whole subset when candidate embeddings, corpus membership
+or any item's `item_is_public` change (a missing visibility column counts as a
+change); a changed candidate can alter other articles' neighbours.
 
 `--preserve-derived` explicitly retains stale cells. Before any remote write,
 the uploader atomically stages affected IDs by derived column in
@@ -108,8 +136,9 @@ separate from the short repository commit lock and the remote expected-revision
 check. A dry run may create the temporary lock but cannot alter its worklist.
 
 After an invalidating upload, rerun the affected enrichment stages. Text/image
-embedding and lemma provenance distinguishes input changes from configuration
-changes and permits selective recomputation. A stale-worklist replay is
+embedding, lemma, word-count and lexical-metric provenance distinguishes input
+changes from configuration changes and permits selective recomputation in the
+default `missing` mode. A stale-worklist replay is
 conservative: if an enrichment was recomputed independently while its queue
 was retained, replay may clear it again. Resolve pending ingest queues before
 running expensive enrichment, and retain the state directory across hosts or

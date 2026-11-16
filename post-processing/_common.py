@@ -5,12 +5,16 @@ These scripts all (a) authenticate against the HF Hub, (b) optionally pick a
 dataset config interactively, then (c) load → compute → push. This module
 holds the canonical versions of that plumbing:
 
+- environment: :func:`load_environment` (``.env``, honouring ``IWAC_ENV_FILE``)
 - auth: :func:`ensure_hf_token`
 - config picking: :func:`get_available_configs` (dynamic, from the Hub),
   :func:`choose_config`, :func:`resolve_config` (CLI flag > interactive)
-- update-mode picking: :func:`choose_update_mode` (missing | all)
+- update-mode picking: :func:`add_update_mode_args` + :func:`resolve_update_mode`
+  (flags, headless default), :func:`choose_update_mode` (missing | all)
 - loading: :func:`load_hub_dataset` (Dataset), :func:`load_subset_dataframe`
-  (pandas, hub or local CSV mirror)
+  (pandas, hub or the revision-pinned local mirror, see
+  :func:`verify_mirror_manifest`)
+- reporting: :func:`display_text_stats`
 - computing: :func:`map_with_progress` (``ds.map`` + Rich bar + cache-busting)
 - column placement: :func:`reorder_columns_after`
 - pushing: :func:`push_dataset`, :func:`print_dry_run_panel`
@@ -39,7 +43,7 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
-from rich.prompt import IntPrompt, Prompt
+from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 from rich import box
 
@@ -69,6 +73,118 @@ from iwac_common.hub import (  # noqa: E402
     load_hub_columns,
     push_dataset_verified,
 )
+
+
+def load_environment() -> None:
+    """Load ``.env`` the same way every installed entry point does.
+
+    Delegates to :func:`iwac_common.settings.initialize_environment`, which
+    honours ``IWAC_ENV_FILE``, then a ``.env`` found from the working
+    directory, then the workspace root. A path derived from ``__file__`` would
+    point into site-packages in a wheel install. Explicit process environment
+    variables always win.
+    """
+    from iwac_common.settings import initialize_environment
+
+    initialize_environment()
+
+
+#: ``--source`` values accepted by the report stages; ``csv`` is the
+#: historical alias of ``local``.
+SOURCE_CHOICES = ("hub", "local", "csv")
+
+
+def normalize_source(source: str) -> str:
+    """Canonical source name: ``csv`` (historical) → ``local``."""
+    if source not in SOURCE_CHOICES:
+        raise ValueError(f"Unknown source '{source}' (expected one of {SOURCE_CHOICES}).")
+    return "local" if source == "csv" else source
+
+
+def verify_mirror_manifest(
+    repo_id: str, config_name: str, *, revision: Optional[str] = None,
+    data_dir: Optional[Path] = None,
+) -> tuple[Path, Dict[str, Any], Dict[str, Any]]:
+    """Resolve and verify one subset of the revision-pinned local mirror.
+
+    Returns ``(path, manifest, entry)`` after checking the manifest schema,
+    repository, requested revision, file name and SHA-256 of the file. The
+    row count is checked by the caller once the file has been read.
+    """
+    import hashlib
+    import json
+
+    data_dir = data_dir or (REPO_ROOT / "data")
+    manifest_path = data_dir / "mirror_manifest.json"
+    if not manifest_path.exists():
+        raise RuntimeError(
+            f"Local mirror manifest not found: {manifest_path}. Re-run "
+            "data/fetch_datasets.py; unversioned mirror files are not a safe baseline."
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entry = manifest["configs"][config_name]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"Invalid mirror manifest for '{config_name}': {exc}") from exc
+    if manifest.get("schema_version") not in (1, 2):
+        raise RuntimeError(
+            f"Unsupported local mirror manifest schema: {manifest.get('schema_version')!r}."
+        )
+    if manifest.get("repository") != repo_id:
+        raise RuntimeError(
+            f"Local mirror belongs to {manifest.get('repository')!r}, not "
+            f"the requested repository {repo_id!r}. Refresh the intended mirror."
+        )
+    if revision is not None and manifest.get("revision") != revision:
+        raise RuntimeError(
+            f"Local mirror revision changed from requested {revision} to "
+            f"{manifest.get('revision')}; restart the multi-subset analysis."
+        )
+    expected = {f"iwac_{config_name}.parquet", f"iwac_{config_name}.csv"}
+    if entry.get("file") not in expected:
+        raise RuntimeError(
+            f"Mirror manifest maps '{config_name}' to "
+            f"{entry.get('file')!r}, expected one of {sorted(expected)}."
+        )
+    path = data_dir / entry["file"]
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Local mirror not found: {path}. Run data/fetch_datasets.py or use --source hub."
+        )
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    if digest.hexdigest() != entry.get("sha256"):
+        raise RuntimeError(
+            f"Local mirror hash mismatch for {path.name}; the refresh may "
+            "have been interrupted. Re-run data/fetch_datasets.py."
+        )
+    return path, manifest, entry
+
+
+def _read_local_mirror(path: Path, columns: Optional[List[str]]):
+    """Read a typed Parquet mirror or a legacy CSV one, keeping requested columns."""
+    import pandas as pd
+
+    if path.suffix == ".parquet":
+        # Typed mirror: nullable ints, bools and embedding lists survive.
+        import pyarrow.parquet as pq
+
+        from iwac_common.schema import arrow_to_pandas
+
+        names = pq.read_schema(path).names
+        wanted = [c for c in columns if c in names] if columns else None
+        return arrow_to_pandas(pq.read_table(path, columns=wanted))
+    # A requested column the mirror lacks (e.g. one added after the mirror was
+    # taken) is skipped, as the Hub path skips it.
+    wanted_set = set(columns) if columns else None
+    return pd.read_csv(
+        path,
+        usecols=(lambda c: c in wanted_set) if wanted_set is not None else None,
+        dtype={"o:id": str},
+        low_memory=False,
+    )
 
 
 def load_subset_dataframe(
@@ -101,81 +217,16 @@ def load_subset_dataframe(
         manifest = None
         if csv_path is not None:
             path = csv_path
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"Local mirror not found: {path}. Run data/fetch_datasets.py or use --source hub."
+                )
         else:
-            import json
-
-            data_dir = REPO_ROOT / "data"
-            manifest_path = data_dir / "mirror_manifest.json"
-            if not manifest_path.exists():
-                raise RuntimeError(
-                    f"Local mirror manifest not found: {manifest_path}. Re-run "
-                    "data/fetch_datasets.py; unversioned mirror files are not a safe baseline."
-                )
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                manifest_entry = manifest["configs"][config_name]
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                raise RuntimeError(
-                    f"Invalid mirror manifest for '{config_name}': {exc}"
-                ) from exc
-            if manifest.get("schema_version") not in (1, 2):
-                raise RuntimeError(
-                    f"Unsupported local mirror manifest schema: "
-                    f"{manifest.get('schema_version')!r}."
-                )
-            if manifest.get("repository") != repo_id:
-                raise RuntimeError(
-                    f"Local mirror belongs to {manifest.get('repository')!r}, not "
-                    f"the requested repository {repo_id!r}. Refresh the intended mirror."
-                )
-            if revision is not None and manifest.get("revision") != revision:
-                raise RuntimeError(
-                    f"Local mirror revision changed from requested {revision} to "
-                    f"{manifest.get('revision')}; restart the multi-subset analysis."
-                )
-            expected = {f"iwac_{config_name}.parquet", f"iwac_{config_name}.csv"}
-            if manifest_entry.get("file") not in expected:
-                raise RuntimeError(
-                    f"Mirror manifest maps '{config_name}' to "
-                    f"{manifest_entry.get('file')!r}, expected one of {sorted(expected)}."
-                )
-            path = data_dir / manifest_entry["file"]
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Local mirror not found: {path}. Run data/fetch_datasets.py or use --source hub."
+            path, manifest, manifest_entry = verify_mirror_manifest(
+                repo_id, config_name, revision=revision,
             )
-        if manifest_entry is not None:
-            import hashlib
-
-            digest = hashlib.sha256()
-            with path.open("rb") as handle:
-                for block in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(block)
-            if digest.hexdigest() != manifest_entry.get("sha256"):
-                raise RuntimeError(
-                    f"Local mirror hash mismatch for {path.name}; the refresh may "
-                    "have been interrupted. Re-run data/fetch_datasets.py."
-                )
         console.print(f"[blue]→[/blue] Loading local mirror [cyan]{path.name}[/cyan]")
-        if path.suffix == ".parquet":
-            # Typed mirror: nullable ints, bools and embedding lists survive.
-            import pyarrow.parquet as pq
-
-            from iwac_common.schema import arrow_to_pandas
-
-            names = pq.read_schema(path).names
-            wanted = [c for c in columns if c in names] if columns else None
-            df = arrow_to_pandas(pq.read_table(path, columns=wanted))
-        else:
-            # A requested column the mirror lacks (e.g. one added after the
-            # mirror was taken) is skipped, as the Hub path skips it.
-            wanted_set = set(columns) if columns else None
-            df = pd.read_csv(
-                path,
-                usecols=(lambda c: c in wanted_set) if wanted_set is not None else None,
-                dtype={"o:id": str},
-                low_memory=False,
-            )
+        df = _read_local_mirror(path, columns)
         if manifest_entry is not None and len(df) != manifest_entry.get("rows"):
             raise RuntimeError(
                 f"Local mirror row count mismatch for {path.name}: read {len(df)}, "
@@ -486,6 +537,48 @@ def choose_update_mode(console: Optional[Console] = None, default: str = "missin
             sys.exit(0)
 
 
+UPDATE_MODES = ("missing", "all")
+
+
+def add_update_mode_args(parser) -> None:
+    """Register the two flags every enrichment stage shares.
+
+    One definition keeps their meaning identical across stages: ``-y`` never
+    selects a mode on its own account, it only accepts the documented default
+    (``missing``) and skips confirmation prompts.
+    """
+    parser.add_argument(
+        "--update-mode", choices=list(UPDATE_MODES), default=None,
+        help="'missing' computes only rows without a current value (default); "
+             "'all' recomputes every row",
+    )
+    parser.add_argument(
+        "-y", "--yes", action="store_true",
+        help="Accept defaults (update mode 'missing') and skip confirmation prompts",
+    )
+
+
+def resolve_update_mode(args, console: Optional[Console] = None) -> str:
+    """Explicit flag, else 'missing' when headless or ``--yes``, else a prompt."""
+    explicit = getattr(args, "update_mode", None)
+    if explicit:
+        return explicit
+    if getattr(args, "yes", False) or not sys.stdin.isatty():
+        return "missing"
+    return choose_update_mode(console=console)
+
+
+def confirm_full_recompute(args, mode: str, what: str) -> bool:
+    """Ask before ``all`` recomputes every row; ``-y``, a dry run or a headless
+    run (whose explicit ``--update-mode all`` is the decision) skip it."""
+    if mode != "all" or args.yes or args.dry_run or not sys.stdin.isatty():
+        return True
+    try:
+        return Confirm.ask(f"Recompute {what} for every row?", default=False)
+    except KeyboardInterrupt:
+        return False
+
+
 def load_hub_dataset(
     repo_id: str,
     config_name: str,
@@ -520,13 +613,20 @@ def load_hub_dataset(
     return ds
 
 
-def add_columns_by_id(ds, values_frame, *, id_column: str = "o:id"):
+def add_columns_by_id(ds, values_frame, *, id_column: str = "o:id", types: Optional[Dict[str, Any]] = None):
     """Return ``ds`` with frame columns aligned to its item-ID order.
 
     Hub parquet row order is not a contract. Require unique IDs and exact set
     equality before assigning computed values, preventing silent row shifts.
+
+    ``types`` maps a column to its ``pyarrow`` type. Declare it for any column
+    that can be entirely null: otherwise Arrow infers the ``null`` type and the
+    column loses its declared type on the Hub.
     """
     import pandas as pd
+    import pyarrow as pa
+
+    types = types or {}
 
     if id_column not in ds.column_names:
         raise ValueError(f"Dataset is missing required ID column '{id_column}'.")
@@ -561,6 +661,8 @@ def add_columns_by_id(ds, values_frame, *, id_column: str = "o:id"):
             updated = updated.remove_columns([column])
         values = indexed.loc[dataset_ids, column].tolist()
         values = [None if pd.isna(value) else value for value in values]
+        if column in types:
+            values = pa.array(values, type=types[column])
         updated = updated.add_column(column, values)
     if revision is not None:
         setattr(updated, "_iwac_source_revision", revision)
@@ -647,6 +749,40 @@ def reorder_columns_after(ds, new_cols: List[str], after_col: str, console: Opti
     return ds
 
 
+def display_text_stats(
+    texts: List[Any],
+    column_name: str,
+    *,
+    chunk_bytes: Optional[int] = None,
+    console: Optional[Console] = None,
+) -> int:
+    """Print a statistics table for a source text column; return the non-empty count.
+
+    With ``chunk_bytes`` it also reports how many texts exceed that UTF-8 byte
+    budget, i.e. will be split by a byte-bounded chunker.
+    """
+    console = console or Console()
+    non_empty = [str(t) for t in texts if t is not None and str(t).strip()]
+
+    table = Table(title=f"Source Column Statistics: '{column_name}'", box=box.ROUNDED)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+    table.add_row("Total entries", str(len(texts)))
+    table.add_row("Non-empty entries", str(len(non_empty)))
+    table.add_row("Empty/None entries", str(len(texts) - len(non_empty)))
+    if non_empty:
+        lengths = [len(t) for t in non_empty]
+        table.add_row("Avg. text length", f"{sum(lengths) / len(lengths):,.1f} characters")
+        table.add_row("Max text length", f"{max(lengths):,} characters")
+        if chunk_bytes is not None:
+            will_chunk = sum(1 for t in non_empty if len(t.encode("utf-8")) > chunk_bytes)
+            if will_chunk:
+                table.add_row("Will be chunked",
+                              f"[yellow]{will_chunk}[/yellow] texts > {chunk_bytes:,} UTF-8 bytes")
+    console.print(table)
+    return len(non_empty)
+
+
 def push_dataset(
     ds,
     *,
@@ -713,6 +849,13 @@ def print_dry_run_panel(
 
 
 __all__ = [
+    "load_environment",
+    "SOURCE_CHOICES",
+    "normalize_source",
+    "verify_mirror_manifest",
+    "display_text_stats",
+    "add_update_mode_args",
+    "resolve_update_mode",
     "write_run_manifest",
     "ensure_hf_token",
     "get_available_configs",

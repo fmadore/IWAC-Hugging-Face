@@ -19,32 +19,47 @@ for the deliberate cross-generation comparison and says so in the report.
 The three dimensions are ordinal 5-point scales:
 
 - polarité      : Très négatif < Négatif < Neutre < Positif < Très positif
-                  ("Non applicable" is treated as missing for scale metrics,
-                  but still counts as a vote for the consensus label)
+                  ("Non applicable" is off the scale: missing for the scale
+                  metrics, but a vote for the consensus label and a category
+                  of the extra nominal α below)
 - centralité    : Non abordé < Marginal < Secondaire < Central < Très central
 - subjectivité  : 1 (très objectif) … 5 (très subjectif)
 
 Metrics reported per dimension:
+- Krippendorff's alpha, N raters, missing-tolerant: **ordinal** (primary — the
+  scales are ordered categories with no claim of equal spacing), with interval
+  and nominal as secondary readings
+- for polarité, a nominal alpha over all labels *including* "Non applicable",
+  so a scale-label vs. "Non applicable" disagreement is not invisible
 - Pairwise Cohen's kappa (unweighted + quadratic-weighted)
-- Krippendorff's alpha (nominal + interval), N raters, missing-tolerant
 - Exact agreement rates (unanimous / pairwise)
 
 Columns added with --push are generation-specific (``consensus_g2_*`` and
 ``sentiment_g2_disagreement`` for generation 2), plus an instrument fingerprint.
-The unqualified names below describe the fields; they are not overwritten:
+The unqualified names below describe the fields; they are not overwritten.
+A row with fewer than two valid ratings on a dimension gets **null** there
+(one vote is not a consensus and cannot be disputed); "" means "rated by at
+least two models, no majority".
 - consensus_polarite            strict-majority label (> half the models that
-                                voted, min 2 voters), else ""
+                                voted), "" without a majority, null with < 2 votes
 - consensus_centralite          strict-majority label, same rule
-- consensus_subjectivite_score  median of at least 2 scores (float; with
-                                exactly two raters the median is their mean,
-                                so .5 values appear by design)
+- consensus_subjectivite_score  median of at least 2 scores (float). With an
+                                even number of raters the median averages the
+                                two middle ranks, so .5 values appear by design
+                                — an interval assumption on an ordinal scale
 - sentiment_disagreement        pipe-joined dimensions in dispute
                                 (polarite/centralite: no majority;
-                                 subjectivite: score range >= 2)
+                                 subjectivite: score range >= 2); "" when no
+                                assessable dimension is disputed; null when no
+                                dimension has two valid ratings
+
+The subjectivité dispute rule (range >= 2) is likelier to fire the more raters
+a row has, so dispute rates are not comparable across generations of
+different panel size; the report JSON records the panel size beside them.
 
 Usage
 -----
-    python post-processing/sentiment_agreement.py [--source hub|csv] [--push]
+    python post-processing/sentiment_agreement.py [--source hub|local] [--push]
 
 The default run is report-only: metrics are printed and saved to
 ``analyses/output/sentiment_agreement_<config>_g<generation>.json``. Nothing is pushed
@@ -68,22 +83,26 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from iwac_pipeline.processing._common import (  # noqa: E402
         PRIVATE_REPO_ID,
-        REPO_ROOT,
+        SOURCE_CHOICES,
         add_columns_by_id,
         ensure_hf_token,
+        load_environment,
         load_hub_dataset,
         load_subset_dataframe,
+        normalize_source,
         push_dataset,
         write_run_manifest,
     )
 except ModuleNotFoundError:  # source scripts before editable installation
     from _common import (  # noqa: E402
         PRIVATE_REPO_ID,
-        REPO_ROOT,
+        SOURCE_CHOICES,
         add_columns_by_id,
         ensure_hf_token,
+        load_environment,
         load_hub_dataset,
         load_subset_dataframe,
+        normalize_source,
         push_dataset,
         write_run_manifest,
     )
@@ -97,13 +116,9 @@ from iwac_common.sentiment_panel import (  # noqa: E402
     latest_generation,
 )
 
-# Read .env by absolute path, as publish_public.py does: this script is run from
-# the repo root but imports resolve relative to its own directory, and without
-# this HF_TOKEN is unset, ensure_hf_token falls through to an interactive
-# login(), and a non-interactive run dies on EOF instead of pushing.
-from dotenv import load_dotenv  # noqa: E402
-
-load_dotenv(REPO_ROOT / ".env")
+# Without .env, HF_TOKEN is unset, ensure_hf_token falls through to an
+# interactive login(), and a non-interactive run dies on EOF instead of pushing.
+load_environment()
 
 from rich import box
 from rich.console import Console
@@ -162,6 +177,19 @@ from iwac_common.paths import workspace_root
 
 OUTPUT_DIR = workspace_root() / "analyses" / "output"
 
+#: Subsets carrying the sentiment panel's columns.
+SENTIMENT_CONFIGS = ["articles"]
+
+#: Declared Arrow types of the pushed columns (unqualified names; renamed per
+#: generation before the push). Any of them can be entirely null in a batch.
+CONSENSUS_TYPES = {
+    "consensus_polarite": "string",
+    "consensus_centralite": "string",
+    "consensus_subjectivite_score": "float64",
+    "sentiment_disagreement": "string",
+    "instrument_id": "string",
+}
+
 
 # ---------------------------------------------------------------------------
 # Agreement metrics (implemented locally — no scipy/sklearn dependency)
@@ -218,9 +246,18 @@ def krippendorff_alpha(units: List[List[float]], metric: str = "interval") -> Op
 
     ``units`` is a list of per-item rating lists (missing already removed);
     items with fewer than 2 ratings are ignored, as per the method.
+
+    ``metric``:
+
+    - ``nominal``: δ = 0 for equal values, else 1 (values need only be equal-comparable
+      and sortable, so string labels work);
+    - ``ordinal``: δ²(c, k) = (Σ_{g=c..k} n_g − (n_c + n_k)/2)², with ``n_g`` the
+      coincidence-matrix marginals — the distance between two ranks is the mass
+      of pairable values between them, so no equal spacing is assumed;
+    - ``interval``: δ² = (c − k)², which assumes equal spacing.
     """
-    if metric not in {"interval", "nominal"}:
-        raise ValueError("metric must be interval or nominal")
+    if metric not in {"interval", "nominal", "ordinal"}:
+        raise ValueError("metric must be interval, ordinal or nominal")
     coincidence: Counter = Counter()
     values: set = set()
     for vals in units:
@@ -240,9 +277,16 @@ def krippendorff_alpha(units: List[List[float]], metric: str = "interval") -> Op
     if n_total <= 1:
         return None
 
+    rank = {c: i for i, c in enumerate(vals_sorted)}
+    cumulative = np.cumsum([n_c[c] for c in vals_sorted])
+
     def delta(c: float, k: float) -> float:
         if metric == "nominal":
             return 0.0 if c == k else 1.0
+        if metric == "ordinal":
+            lo, hi = sorted((rank[c], rank[k]))
+            between = cumulative[hi] - (cumulative[lo - 1] if lo else 0.0)
+            return float((between - (n_c[c] + n_c[k]) / 2) ** 2)
         return float((c - k) ** 2)  # interval
 
     d_obs = sum(coincidence[(c, k)] * delta(c, k) for c in vals_sorted for k in vals_sorted) / n_total
@@ -298,6 +342,10 @@ def majority(votes: List[str]) -> str:
     three raters it is the historical ">= 2", but on a five- or six-model panel
     a hardcoded 2 would call 2-of-6 a consensus. Ties therefore return '' and
     the row is flagged in ``sentiment_disagreement``.
+
+    '' is returned for fewer than two votes too (``topic_sentiment`` relies on
+    that); callers that must tell "insufficient votes" from "no majority" check
+    the vote count, as :func:`label_consensus` does.
     """
     if len(votes) < 2:
         # A lone surviving rater is not a consensus (matches the pre-2026-07
@@ -305,6 +353,42 @@ def majority(votes: List[str]) -> str:
         return ""
     label, count = Counter(votes).most_common(1)[0]
     return label if count > len(votes) / 2 else ""
+
+
+def label_consensus(votes: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """``(consensus, disputed, assessable)`` from per-row vote lists.
+
+    consensus is null below two votes, '' for no strict majority, else the label;
+    disputed is True only for assessable rows without a majority.
+    """
+    assessable = votes.map(len) >= 2
+    consensus = votes.map(majority).astype(object).where(assessable, None)
+    return consensus, assessable & consensus.eq(""), assessable
+
+
+def score_consensus(ordinal: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """``(median, disputed, assessable)`` for a numeric rating frame.
+
+    The median of an even number of ratings averages the two middle ranks
+    (a .5 score): an interval assumption, accepted for this summary column.
+    A dispute is a range of at least 2 scale points, which becomes likelier as
+    the number of raters grows.
+    """
+    assessable = ordinal.notna().sum(axis=1) >= 2
+    median = ordinal.median(axis=1, skipna=True).where(assessable)
+    spread = ordinal.max(axis=1) - ordinal.min(axis=1)
+    return median, assessable & (spread >= 2), assessable
+
+
+def combine_disagreement(flags: Dict[str, pd.Series], assessable: Dict[str, pd.Series],
+                         order: List[str]) -> pd.Series:
+    """Pipe-joined disputed dimensions; null where no dimension is assessable."""
+    index = next(iter(flags.values())).index
+    joined = pd.Series([""] * len(index), index=index, dtype="object")
+    for dim in order:
+        joined = joined.where(~flags[dim], joined + ("|" + dim))
+    any_assessable = pd.concat([assessable[d] for d in order], axis=1).any(axis=1)
+    return joined.str.lstrip("|").astype(object).where(any_assessable, None)
 
 
 # ---------------------------------------------------------------------------
@@ -320,10 +404,11 @@ def main() -> int:
     )
     parser.add_argument("--repo", default=PRIVATE_REPO_ID,
                         help="Repository ID on Hugging Face Hub (default: private full mirror).")
-    parser.add_argument("--config", default="articles",
+    parser.add_argument("--config", default="articles", choices=SENTIMENT_CONFIGS,
                         help="Dataset configuration (subset) with sentiment columns (default: articles).")
-    parser.add_argument("--source", choices=["hub", "csv"], default="hub",
-                        help="hub = live dataset (default); csv = local data/ mirror")
+    parser.add_argument("--source", choices=list(SOURCE_CHOICES), default="hub",
+                        help="hub = live dataset (default); local = revision-pinned data/ mirror "
+                             "(csv is accepted as its historical alias)")
     parser.add_argument("--push", action="store_true",
                         help="Write mode: add consensus/disagreement columns and push to the Hub "
                              "(without this flag the script only reports; nothing is written).")
@@ -337,6 +422,7 @@ def main() -> int:
     )
     parser.add_argument("--max-shard-size", default="1GB")
     args = parser.parse_args()
+    args.source = normalize_source(args.source)
 
     gen = None if args.generation == "all" else int(args.generation)
     models = models_for(gen)
@@ -378,7 +464,7 @@ def main() -> int:
         "n_rows": int(len(df)),
         "generation": args.generation,
         "instrument_id": instrument_id(gen) if gen is not None else None,
-        "interpretation": "Model agreement is not external validation. Coefficients with zero expected disagreement are undefined (null). Interval and quadratic statistics assume equal category spacing.",
+        "interpretation": "Model agreement is not external validation. Coefficients with zero expected disagreement are undefined (null). Ordinal alpha is the primary coefficient; interval alpha and quadratic kappa assume equal category spacing.",
         "models": models,
         "prompt_fingerprints": {
             m.prefix: (m.prompt_fingerprint or "pre-fingerprint (commit 84bf993)")
@@ -389,6 +475,7 @@ def main() -> int:
 
     consensus_frame = pd.DataFrame(index=df.index)
     disagreement_flags: Dict[str, pd.Series] = {}
+    assessable: Dict[str, pd.Series] = {}
 
     for dim_key, tpl, mapping in DIMENSIONS:
         cols = [tpl.format(m=m) for m in models]
@@ -419,11 +506,25 @@ def main() -> int:
             }
 
         units = [row[~np.isnan(row)].tolist() for row in ordinal.to_numpy()]
+        alpha_ordinal = krippendorff_alpha(units, metric="ordinal")
         alpha_interval = krippendorff_alpha(units, metric="interval")
         alpha_nominal = krippendorff_alpha(units, metric="nominal")
 
         full_rows = ordinal.dropna()
         all3 = float((full_rows.nunique(axis=1) == 1).mean()) if len(full_rows) else None
+
+        # --- consensus columns ---
+        raw_votes = None
+        if mapping is not None:
+            valid_labels = {*mapping, "Non applicable"}
+            raw_votes = df[cols].apply(
+                lambda r: [v for v in label_votes(r, cols) if v in valid_labels], axis=1
+            )
+            consensus, disagreement_flags[dim_key], assessable[dim_key] = label_consensus(raw_votes)
+            consensus_frame[f"consensus_{dim_key}"] = consensus
+        else:
+            consensus, disagreement_flags[dim_key], assessable[dim_key] = score_consensus(ordinal)
+            consensus_frame["consensus_subjectivite_score"] = consensus
 
         # Keys say "all", not "all_3": the panel is no longer fixed at three.
         report["dimensions"][dim_key] = {
@@ -432,28 +533,21 @@ def main() -> int:
             "n_less_than_two_ratings": int((ordinal.notna().sum(axis=1) < 2).sum()),
             "n_rated_by_2plus": n_any2,
             "exact_agreement_all": all3,
+            "primary_coefficient": "krippendorff_alpha_ordinal",
+            "krippendorff_alpha_ordinal": alpha_ordinal,
             "krippendorff_alpha_interval": alpha_interval,
             "krippendorff_alpha_nominal": alpha_nominal,
             "pairwise": pair_metrics,
         }
-
-        # --- consensus columns ---
-        if mapping is not None:
-            valid_labels = {*mapping, "Non applicable"}
-            raw_votes = df[cols].apply(
-                lambda r: [v for v in label_votes(r, cols) if v in valid_labels], axis=1
-            )
-            consensus_frame[f"consensus_{dim_key}"] = raw_votes.apply(majority)
-            disagreement_flags[dim_key] = raw_votes.apply(lambda v: len(v) >= 2) & (
-                consensus_frame[f"consensus_{dim_key}"] == ""
-            )
-        else:
-            # Median of the available scores. With exactly two raters the
-            # median is the mean of the two values, so half-point scores
-            # (e.g. 2.5, 3.5) appear by design — they are not an error.
-            consensus_frame["consensus_subjectivite_score"] = ordinal.median(axis=1, skipna=True).where(ordinal.notna().sum(axis=1) >= 2)
-            spread = ordinal.max(axis=1) - ordinal.min(axis=1)
-            disagreement_flags[dim_key] = (ordinal.notna().sum(axis=1) >= 2) & (spread >= 2)
+        alpha_with_na = None
+        if dim_key == "polarite" and raw_votes is not None:
+            # "Non applicable" is off the ordinal scale, so the scale metrics
+            # cannot see a label-vs-"Non applicable" disagreement; this can.
+            alpha_with_na = krippendorff_alpha(list(raw_votes), metric="nominal")
+            report["dimensions"][dim_key].update({
+                "krippendorff_alpha_nominal_incl_non_applicable": alpha_with_na,
+                "n_units_incl_non_applicable": int((raw_votes.map(len) >= 2).sum()),
+            })
 
         # --- display ---
         table = Table(title=f"Dimension: {dim_key}", box=box.ROUNDED)
@@ -462,10 +556,14 @@ def main() -> int:
         table.add_row(f"Rows rated by all {len(models)}", f"{n_full:,}")
         if all3 is not None:
             table.add_row(f"Exact agreement (all {len(models)})", f"{all3:.1%}")
+        if alpha_ordinal is not None:
+            table.add_row("Krippendorff α (ordinal, primary)", f"{alpha_ordinal:.3f}")
         if alpha_interval is not None:
             table.add_row("Krippendorff α (interval)", f"{alpha_interval:.3f}")
         if alpha_nominal is not None:
             table.add_row("Krippendorff α (nominal)", f"{alpha_nominal:.3f}")
+        if alpha_with_na is not None:
+            table.add_row("Krippendorff α (nominal, incl. Non applicable)", f"{alpha_with_na:.3f}")
         for pair, pm in pair_metrics.items():
             kw = pm["kappa_weighted_quadratic"]
             k = pm["kappa"]
@@ -476,14 +574,13 @@ def main() -> int:
             )
         console.print(table)
 
-    # Combined disagreement column: pipe-joined dimensions in dispute
-    disagreement = pd.Series([""] * len(df), index=df.index, dtype="object")
-    for dim_key, _, _ in DIMENSIONS:
-        flag = disagreement_flags[dim_key]
-        disagreement = disagreement.where(~flag, disagreement + ("|" + dim_key))
-    consensus_frame["sentiment_disagreement"] = disagreement.str.lstrip("|")
+    dim_keys = [dim for dim, _, _ in DIMENSIONS]
+    disagreement = combine_disagreement(disagreement_flags, assessable, dim_keys)
+    consensus_frame["sentiment_disagreement"] = disagreement
 
-    n_disputed = int((consensus_frame["sentiment_disagreement"] != "").sum())
+    n_assessable = int(disagreement.notna().sum())
+    n_disputed = int((disagreement.notna() & disagreement.ne("")).sum())
+    share = n_disputed / n_assessable if n_assessable else None
     if gen is not None:
         consensus_frame["instrument_id"] = instrument_id(gen)
         consensus_frame = consensus_frame.rename(columns=consensus_columns(gen))
@@ -493,20 +590,41 @@ def main() -> int:
 
     report["consensus"] = {
         "columns": list(consensus_frame.columns),
+        "panel_size": len(models),
+        "rows_with_two_plus_ratings": n_assessable,
+        "rows_with_fewer_than_two_ratings": int(len(df) - n_assessable),
         "rows_with_any_disagreement": n_disputed,
-        "share_with_any_disagreement": n_disputed / len(df) if len(df) else None,
+        # Denominator: rows with at least two valid ratings on some dimension.
+        "share_with_any_disagreement": share,
         "disagreement_breakdown": {
-            dim: int(disagreement_flags[dim].sum()) for dim, _, _ in DIMENSIONS
+            dim: {"disputed": int(disagreement_flags[dim].sum()),
+                  "assessable": int(assessable[dim].sum()),
+                  "share": (float(disagreement_flags[dim].sum() / assessable[dim].sum())
+                            if assessable[dim].any() else None)}
+            for dim in dim_keys
+        },
+        "dispute_rule": {
+            "polarite/centralite": "no label held by more than half of >= 2 votes",
+            "subjectivite": "score range >= 2 among >= 2 ratings",
+            "comparability": (
+                "The range rule fires more often the more raters a row has, so "
+                "dispute rates are not comparable across generations with "
+                f"different panel sizes (this run: {len(models)} models)."
+            ),
         },
     }
 
     console.print(Panel(
         f"Rows with at least one disputed dimension: [bold]{n_disputed:,}[/bold] "
-        f"({n_disputed / len(df) if len(df) else 0:.1%})\n"
+        f"of {n_assessable:,} rated by ≥ 2 models ({share or 0:.1%}); "
+        f"{len(df) - n_assessable:,} rows with < 2 ratings get no consensus\n"
         + "\n".join(
-            f"  [cyan]{dim}[/cyan]: {int(disagreement_flags[dim].sum()):,} disputed"
-            for dim, _, _ in DIMENSIONS
-        ),
+            f"  [cyan]{dim}[/cyan]: {int(disagreement_flags[dim].sum()):,} disputed "
+            f"of {int(assessable[dim].sum()):,}"
+            for dim in dim_keys
+        )
+        + f"\n[dim]Dispute rates depend on panel size ({len(models)} models); "
+          "do not compare them across generations.[/dim]",
         title="Consensus / Disagreement", border_style="blue",
     ))
 
@@ -546,7 +664,11 @@ def main() -> int:
         [df[["o:id"]].reset_index(drop=True), consensus_frame.reset_index(drop=True)],
         axis=1,
     )
-    updated = add_columns_by_id(ds, values_frame)
+    import pyarrow as pa
+
+    renames = consensus_columns(gen)
+    types = {renames[name]: pa.type_for_alias(alias) for name, alias in CONSENSUS_TYPES.items()}
+    updated = add_columns_by_id(ds, values_frame, types=types)
     if push_dataset(
         updated,
         repo_id=args.repo,

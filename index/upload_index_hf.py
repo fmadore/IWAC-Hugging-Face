@@ -32,11 +32,11 @@ from collections import defaultdict
 # Add parent directory to path for iwac_common import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import numpy as np
 import pandas as pd
 from rich.console import Console
 from iwac_common.omeka_client import (
     OmekaApiClient,
-    conn_manager,
     fetch_iiif_thumbnail_url,
     item_page_url,
 )
@@ -51,20 +51,19 @@ from iwac_common.field_mappers import (
     parse_pub_date,
 )
 from iwac_common.upload_runner import UploadSpec, run_upload
-from iwac_common.schema import SUBSETS
 from iwac_common.hub import (
     ConcurrentHubWriteError,
     HubBaselineUnavailableError,
     get_repo_revision,
     load_hub_columns,
 )
+from iwac_common.write_policy import PublicationPolicyError, strict_public_flag
 
 logger = logging.getLogger("upload")
-console = Console()
 
 
-
-# Orchestration + CLI + Rich console/logging live in
+# Orchestration + CLI (see --help; parser:
+# iwac_common.upload_runner.build_parser) + Rich console/logging live in
 # iwac_common.upload_runner. Index keeps a `post_map` hook for its
 # cross-subset frequency statistics (computed from the articles /
 # publications / references subsets before merging).
@@ -113,19 +112,26 @@ def _get_resource_class_type(item: Dict[str, Any]) -> str:
 async def map_index_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item d'index Omeka en dict plat pour HF datasets."""
     
-    session = await conn_manager.get()
-    thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
+    # An item without media has no canvas, hence no manifest thumbnail.
+    thumbnail_url = ""
+    if item.get("o:primary_media"):
+        thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"])
+    # get_value (linked/URI values too) where images reads literals only;
+    # unifying either way would change values for some value type.
     coordinates = get_value(item, "curation:coordinates")
     latitude, longitude = parse_coordinates(coordinates)
 
     return {
         "o:id": item["o:id"],
         **visibility_metadata(item, "index"),
+        # Literals only, where the content subsets use get_value (which also
+        # admits linked and URI values); unifying would change values.
         "identifier": get_literal_values(item, "dcterms:identifier"),
         "added_date": extract_added_date(item),  # Date when item was added to Omeka
         "iwac_url": item_page_url(item["o:id"]),
         "thumbnail": thumbnail_url,
-        "Titre": item.get("o:title", ""),
+        # ``or ""``: the key can be present with JSON null.
+        "Titre": item.get("o:title") or "",
         "Titre alternatif": get_value(item, "dcterms:alternative"),
         "Type": _get_resource_class_type(item),
         # fallback=True: an authority record's description is of unpredictable
@@ -218,11 +224,36 @@ def _occurrence_bounds(date_value: Any) -> Tuple[str, str]:
     return parts[0], parts[-1]
 
 
+#: Source-visibility columns every frequency input must carry.
+VISIBILITY_COLUMNS = ("item_is_public", "private_fields")
+
+
+def _public_row_restrictions(row: Mapping[str, Any]) -> Optional[frozenset]:
+    """Private column names of a public row, or ``None`` for a non-public row.
+
+    The aggregates are published, so only explicitly public parent items may
+    contribute: a null or missing flag is private, as in the public
+    projection. A public item whose OCR alone is private still counts.
+    """
+    if not strict_public_flag(row.get("item_is_public"), field="item_is_public"):
+        return None
+    fields = row.get("private_fields")
+    if isinstance(fields, np.ndarray):
+        fields = fields.tolist()
+    if not isinstance(fields, (list, tuple)) or not all(isinstance(f, str) for f in fields):
+        raise PublicationPolicyError(
+            f"private_fields of item {row.get('o:id')} must be a list of column "
+            f"names, got {fields!r}; refresh that subset from Omeka"
+        )
+    return frozenset(fields)
+
+
 def _accumulate_term_stats(
     term_stats: Dict[str, Dict[str, Any]],
     row: Mapping[str, Any],
     fields: List[str],
     resolve: TermResolver = title_terms,
+    private: frozenset = frozenset(),
 ) -> None:
     """Met à jour fréquence / première-dernière occurrence / pays pour toutes
     les autorités des colonnes ``fields`` d'une ligne.
@@ -237,9 +268,17 @@ def _accumulate_term_stats(
 
     ``country`` peut être multiple (``Benin|Nigeria`` sur une référence) : chaque
     pays est compté séparément, au lieu d'entrer comme une seule valeur composée.
+
+    ``private`` names the row's private columns (its ``private_fields``): a
+    private field, its ``_ids`` companion, date or country contributes nothing.
     """
-    first, last = _occurrence_bounds(row.get('pub_date') or row.get('date'))
-    countries = extract_terms_from_field(row.get('country'))
+    date_value = next(
+        (row.get(c) for c in ('pub_date', 'date') if c not in private and row.get(c)),
+        None,
+    )
+    first, last = _occurrence_bounds(date_value)
+    countries = [] if 'country' in private else extract_terms_from_field(row.get('country'))
+    fields = [f for f in fields if f not in private and f"{f}_ids" not in private]
     terms = set().union(*(resolve(row, field) for field in fields)) if fields else set()
     for term in terms:
         stats = term_stats[term]
@@ -278,7 +317,8 @@ FREQUENCY_SOURCE_FIELDS: Dict[str, List[str]] = {
 def frequency_input_columns(config_name: str) -> List[str]:
     """Columns the frequency pass reads from one content subset."""
     fields = FREQUENCY_SOURCE_FIELDS[config_name]
-    return ["o:id", "pub_date", "country", *fields, *(f"{f}_ids" for f in fields)]
+    return ["o:id", *VISIBILITY_COLUMNS, "pub_date", "country",
+            *fields, *(f"{f}_ids" for f in fields)]
 
 
 def calculate_frequency_stats(
@@ -296,7 +336,13 @@ def calculate_frequency_stats(
     ``o:id`` d'index avec :func:`make_authority_resolver`.
 
     ``frequency`` est un nombre d'items : voir :func:`_accumulate_term_stats`
-    pour la déduplication par ligne."""
+    pour la déduplication par ligne.
+
+    Only public parent items contribute, and only through their public
+    columns (see :func:`_public_row_restrictions`): every output is on the
+    public allowlist, so a private item's date must not surface as an
+    authority's ``first_occurrence``. A frame without the visibility columns
+    fails closed."""
     term_stats = defaultdict(lambda: {
         'frequency': 0,
         'first_occurrence': None,
@@ -319,8 +365,23 @@ def calculate_frequency_stats(
         logger.info(f"Calculating frequency stats from {name} dataset...")
         if df.empty:
             continue
+        missing = [c for c in VISIBILITY_COLUMNS if c not in df.columns]
+        if missing:
+            raise PublicationPolicyError(
+                f"'{name}' lacks visibility metadata {missing}; refresh it from "
+                "Omeka before computing public index aggregates"
+            )
+        excluded = 0
         for row in df.to_dict("records"):
-            _accumulate_term_stats(term_stats, row, fields, resolve)
+            private = _public_row_restrictions(row)
+            if private is None:
+                excluded += 1
+                continue
+            _accumulate_term_stats(term_stats, row, fields, resolve, private)
+        logger.info(
+            "Excluded %d non-public of %d %s rows from the index aggregates",
+            excluded, len(df), name,
+        )
 
     # Convertir les sets en chaînes séparées par |
     result = {}
@@ -337,7 +398,7 @@ def calculate_frequency_stats(
 
 
 async def load_reference_datasets(
-    token: Optional[str], repo: str
+    token: Optional[str], repo: str, *, console: Optional[Console] = None
 ) -> Dict[str, pd.DataFrame]:
     """Load every mandatory input from one stable Hub revision.
 
@@ -369,7 +430,7 @@ async def load_reference_datasets(
                 f"Index enrichment requires '{config_name}', but it could not be "
                 f"loaded from {repo} at {before}: {exc}"
             ) from exc
-        missing = [c for c in ("o:id", *FREQUENCY_SOURCE_FIELDS[config_name])
+        missing = [c for c in ("o:id", *VISIBILITY_COLUMNS, *FREQUENCY_SOURCE_FIELDS[config_name])
                    if c not in frame.columns]
         if missing:
             raise HubBaselineUnavailableError(
@@ -425,14 +486,13 @@ async def _attach_frequency_stats(
     content subset in FREQUENCY_SOURCE_FIELDS, joined on authority ``o:id``
     (title fallback, see :func:`make_authority_resolver`). Runs after mapping,
     before the Hub merge."""
-    frames = await load_reference_datasets(token, repo)
-    console.print("[blue]→[/blue] Attaching frequency statistics to index records...")
+    frames = await load_reference_datasets(token, repo, console=api.console)
+    api.console.print("[blue]→[/blue] Attaching frequency statistics to index records...")
     return attach_frequency_stats(new_df, frames)
 
 
 SPEC = UploadSpec(
     config_name="index",
-    resource_class_ids=SUBSETS["index"].resource_class_ids,
     map_item=map_index_item,
     title="🗂️ IWAC Index Upload",
     cache_dir=".cache_omk_index",

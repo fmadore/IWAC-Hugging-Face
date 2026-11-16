@@ -11,13 +11,10 @@ Usage
 -----
     python document/upload_documents_hf.py --max-shard-size 1GB
 
-CLI options (shared, see iwac_common.upload_runner)
----------------------------------------------------
-  --repo            Target Hugging Face repository (default: private full mirror)
-  --max-shard-size  Maximum Parquet shard size (e.g. 500MB, 1GB)
-  --no-cache        Bypass the local Omeka response cache (24h TTL)
-  --dry-run         Fetch, map and merge, but push nothing
-  --force-shrink    Allow pushing a dataset markedly smaller than the Hub's
+CLI options
+-----------
+Shared by every upload script: run with ``--help`` for the full list
+(parser: ``iwac_common.upload_runner.build_parser``).
 
 Environment Variables
 --------------------
@@ -32,14 +29,11 @@ import sys
 from typing import Dict, Any
 
 # Add parent directory to path to import from root
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from iwac_common.omeka_client import (
     OmekaApiClient,
-    conn_manager,
-    fetch_iiif_thumbnail_url,
-    fetch_primary_media_url,
-    iiif_manifest_url,
+    fetch_media_pointers,
     item_page_url,
 )
 from iwac_common.field_mappers import (
@@ -55,13 +49,12 @@ from iwac_common.field_mappers import (
     to_int_or_none,
 )
 from iwac_common.upload_runner import UploadSpec, run_upload
-from iwac_common.schema import COUNTRY_ITEM_SETS, SUBSETS
+from iwac_common.schema import COUNTRY_ITEM_SETS
 
 
 
-# Orchestration (fetch → map loop → merge → validate → push), the CLI
-# (--repo, --max-shard-size, --no-cache, --dry-run, --force-shrink) and the
-# Rich console/logging setup live in iwac_common.upload_runner.
+# Orchestration (fetch → map loop → merge → validate → push), the CLI (see
+# --help) and the Rich console/logging setup live in iwac_common.upload_runner.
 
 
 # ---------------------------------------------------------------------------
@@ -71,19 +64,12 @@ from iwac_common.schema import COUNTRY_ITEM_SETS, SUBSETS
 async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, Any]:
     """Transforme un item Omeka en dict plat pour HF datasets."""
 
-    primary_url = await fetch_primary_media_url(
-        item, api, affected_fields=("PDF", "thumbnail", "iiif_manifest")
+    # Thumbnail and IIIF manifest only when there is a PDF behind them.
+    primary_url, thumbnail_url, manifest_url = await fetch_media_pointers(
+        item, api, file_field="PDF"
     )
     pub_date = get_value(item, "dcterms:date")
     pub_year, pub_date_precision = parse_pub_date(pub_date)
-
-    # Thumbnail and IIIF manifest only when there is a PDF behind them.
-    thumbnail_url = ""
-    manifest_url = ""
-    if primary_url:
-        session = await conn_manager.get()
-        thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], session)
-        manifest_url = iiif_manifest_url(item["o:id"])
 
     return {
         "o:id": item["o:id"],
@@ -97,6 +83,7 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
         "title": get_value(item, "dcterms:title"),
         "author": get_value(item, "dcterms:creator"),
         "author_ids": get_resource_ids(item, "dcterms:creator"),
+        # get_value (literals included), unlike audiovisual's linked-only read.
         "contributor": get_value(item, "dcterms:contributor"),
         # Country from the item's country-specific collection.
         "country": countries_from_item_sets(item, COUNTRY_ITEM_SETS["documents"]),
@@ -118,6 +105,8 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
         "spatial": get_value(item, "dcterms:spatial"),
         "spatial_ids": get_resource_ids(item, "dcterms:spatial"),
         "language": get_value(item, "dcterms:language"),
+        # get_value keeps literal and URI values too; images/audiovisual's
+        # linked-only get_display_titles would drop them, changing values.
         "type": get_value(item, "dcterms:type"),
         "nb_pages": to_int_or_none(get_value(item, "bibo:numPages")),
         "source": get_value(item, "dcterms:source"),
@@ -135,12 +124,10 @@ async def map_document(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, A
 
 SPEC = UploadSpec(
     config_name="documents",
-    resource_class_ids=SUBSETS["documents"].resource_class_ids,
     map_item=map_document,
     title="📄 IWAC Documents Upload",
     cache_dir=".cache_omk_documents",
     description="Upload IWAC documents to Hugging Face Hub",
-    int_columns=("nb_pages",),
 )
 
 

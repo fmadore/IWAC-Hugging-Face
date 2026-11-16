@@ -32,7 +32,7 @@ import pandas as pd
 from typing import Dict, Any, List
 
 # Add parent directory to path to import from root
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 from iwac_common.omeka_client import OmekaApiClient, item_page_url
@@ -49,20 +49,14 @@ from iwac_common.field_mappers import (
 )
 from iwac_common.text_utils import count_words
 from iwac_common.upload_runner import UploadSpec, run_upload
-from iwac_common.schema import COUNTRY_ITEM_SETS, SUBSETS
+from iwac_common.schema import COUNTRY_ITEM_SETS
 
 
 # Orchestration (fetch of all 9 reference classes → map loop → outer merge →
-# validate → push), the CLI (--repo/--max-shard-size/--no-cache/--dry-run/
-# --force-shrink/--stale-rows) and the Rich console/logging setup live in
-# iwac_common.upload_runner.
+# validate → push), the CLI (see --help; parser:
+# iwac_common.upload_runner.build_parser) and the Rich console/logging setup
+# live in iwac_common.upload_runner.
 
-
-# Reference resource classes. The shared runner fetches each in turn and
-# aborts the whole run on any class fetch failure or truncation — safer than
-# the old continue-on-error, which could silently drop a class (and, via the
-# outer merge, hide it as blank-Omeka rows).
-RESOURCE_CLASSES = SUBSETS["references"].resource_class_ids
 
 # Resource class mapping
 RESOURCE_CLASS_MAPPING = {
@@ -137,11 +131,11 @@ def _get_iwac_identifier(item: Dict[str, Any], field: str) -> str:
     val = item[field]
     if isinstance(val, list):
         for v in val:
-            identifier = str(v.get("display_title") or v.get("@value") or v.get("@id", ""))
+            identifier = str(v.get("display_title") or v.get("@value") or v.get("@id") or "")
             if identifier.startswith("iwac-reference"):
                 return identifier
     elif isinstance(val, dict):
-        identifier = val.get("display_title", "") or val.get("@value", "")
+        identifier = str(val.get("display_title") or val.get("@value") or "")
         if identifier.startswith("iwac-reference"):
             return identifier
     else:
@@ -206,6 +200,8 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
         "pub_date": pub_date,
         "pub_year": pub_year,
         "pub_date_precision": pub_date_precision,
+        # get_value keeps literal and URI values too; images/audiovisual's
+        # linked-only get_display_titles would drop them, changing values.
         "type": get_value(item, "dcterms:type"),
         "book_title": get_value(item, "dcterms:alternative"),
         # Bibliographic numbers stay verbatim strings: the source holds ranges
@@ -232,7 +228,7 @@ async def map_reference(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str, 
         "URL": "|".join(url_parts),
         "OCR": content_text,
         "OCR_is_public": is_content_public(item),
-        "nb_mots": count_words(content_text),
+        "nb_mots": count_words(content_text, language=get_value(item, "dcterms:language")),
         "country": countries_from_item_sets(
             item, COUNTRY_ITEM_SETS["references"], first_only=False
         ),
@@ -257,7 +253,6 @@ def _blank_missing_bibliographic_numbers(final_df: pd.DataFrame) -> pd.DataFrame
 
 SPEC = UploadSpec(
     config_name="references",
-    resource_class_ids=RESOURCE_CLASSES,  # 9 bibliographic classes
     map_item=map_reference,
     title="📚 IWAC References Upload",
     cache_dir=".cache_omk_references",
@@ -266,7 +261,6 @@ SPEC = UploadSpec(
     # Deleted rows are dropped by default; --stale-rows keep retains complete
     # private historical records.
     merge_how="outer",
-    merge_suffixes=("", "_old"),
     columns_to_exclude=("o:item_set", "o:media/file", "iiif_manifest", "thumbnail"),
     supports_stale_rows=True,
     post_merge=_blank_missing_bibliographic_numbers,

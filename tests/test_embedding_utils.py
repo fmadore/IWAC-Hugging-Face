@@ -5,9 +5,9 @@ import pytest
 from _embedding_utils import (
     average_embeddings,
     cache_fingerprint,
-    chunk_text,
     delete_cache,
     is_empty_embedding,
+    iter_cache,
     load_cache,
     save_cache,
 )
@@ -62,24 +62,20 @@ class TestCacheRoundTrip:
         assert load_cache(f) == {}
 
 
-class TestChunkText:
-    @pytest.mark.parametrize("chunk_size,overlap", [(0, 0), (-1, 0), (10, -1), (10, 10), (10, 11)])
-    def test_invalid_window_rejected_even_for_short_text(self, chunk_size, overlap):
-        with pytest.raises(ValueError, match="chunk_size"):
-            chunk_text("abc", chunk_size=chunk_size, overlap=overlap)
+class TestIterCache:
+    def test_sqlite_entries_stream_one_at_a_time(self, tmp_path):
+        f = tmp_path / "cache.sqlite3"
+        save_cache({"1": {"h": "a", "v": [0.5]}}, f)
+        save_cache({"2": {"h": "b", "v": [0.25]}}, f)  # checkpoints append
+        assert dict(iter_cache(f)) == {"1": {"h": "a", "v": [0.5]}, "2": {"h": "b", "v": [0.25]}}
+        assert load_cache(f) == dict(iter_cache(f))
 
-    def test_short_text_single_chunk(self):
-        assert chunk_text("abc", chunk_size=10, overlap=2) == ["abc"]
-
-    def test_chunks_cover_text_with_overlap(self):
-        text = "abcdefghij" * 10  # 100 chars
-        chunks = chunk_text(text, chunk_size=40, overlap=10)
-        assert chunks[0] == text[:40]
-        assert chunks[1][:10] == chunks[0][-10:]  # overlap preserved
-        # Reconstruct: stripping the overlap from every chunk after the first
-        # must give back the original text.
-        rebuilt = chunks[0] + "".join(c[10:] for c in chunks[1:])
-        assert rebuilt == text
+    def test_missing_or_corrupt_file_yields_nothing(self, tmp_path):
+        assert list(iter_cache(tmp_path / "absent.sqlite3")) == []
+        bad = tmp_path / "bad.json.gz"
+        bad.write_bytes(b"not gzip")
+        assert list(iter_cache(bad)) == []
+        assert load_cache(bad) == {}
 
 
 class TestIsEmptyEmbedding:
@@ -88,3 +84,38 @@ class TestIsEmptyEmbedding:
         assert is_empty_embedding([])
         assert is_empty_embedding([0.0, 0.0])
         assert not is_empty_embedding([0.0, 0.1])
+
+    def test_numpy_arrays(self):
+        import numpy as np
+
+        assert is_empty_embedding(np.zeros(0, dtype=np.float32))
+        assert is_empty_embedding(np.zeros(4, dtype=np.float32))
+        assert not is_empty_embedding(np.array([0.0, 0.1], dtype=np.float32))
+
+
+def test_sqlite_checkpoint_leaves_no_open_connection(tmp_path, monkeypatch):
+    """Windows cannot delete a cache whose connection is still open."""
+    import sqlite3
+
+    opened = []
+    real_connect = sqlite3.connect
+
+    class Tracking(sqlite3.Connection):
+        closed = False
+
+        def close(self):
+            self.closed = True
+            super().close()
+
+    def connect(*args, **kwargs):
+        connection = real_connect(*args, factory=Tracking, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    cache_file = tmp_path / "cache.sqlite3"
+    import _embedding_utils
+
+    _embedding_utils.save_cache({"a": {"v": 1}}, cache_file)
+    assert _embedding_utils.load_cache(cache_file) == {"a": {"v": 1}}
+    assert opened and all(connection.closed for connection in opened)

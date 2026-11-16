@@ -39,7 +39,7 @@ IMAGE_PROCESSING = "gemma4-aspect-preserving-pil-bicubic"
 
 
 def document_text(text: str, title: str = "none") -> str:
-    """The model card's document prompt; also what the Gemini column used."""
+    """The model card's document prompt."""
     return f"title: {title or 'none'} | text: {text}"
 
 

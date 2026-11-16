@@ -60,18 +60,17 @@ def atomic_hub(monkeypatch, tmp_path):
         assert revision == state["head"]
         return DatasetCard(state["files"]["README.md"].decode())
 
-    def read_ids(repo, config, revision, token):
-        assert revision == "after"
+    def read_columnar(repo, config, revision, token):
         values = []
         for path, data in sorted(state["files"].items()):
             if path.startswith(config + "/") and path.endswith(".parquet"):
                 values.extend(pq.read_table(pa.BufferReader(data), columns=["o:id"])["o:id"].to_pylist())
-        return values
+        return read_schema(repo, config, token, revision), values
 
     monkeypatch.setattr(hub, "HfApi", Api)
     monkeypatch.setattr(card_sync, "_parquet_schema", read_schema)
     monkeypatch.setattr(card_sync, "_load_card", read_card)
-    monkeypatch.setattr(hub, "_published_ids_columnar", read_ids)
+    monkeypatch.setattr(hub, "_published_columnar", read_columnar)
     return state
 
 
@@ -168,8 +167,14 @@ def test_explicit_public_projection_is_revalidated_and_committed(atomic_hub):
 
 
 def test_columnar_verification_catches_short_write(monkeypatch, atomic_hub):
-    monkeypatch.setattr(hub, "_published_ids_columnar", lambda *a, **k: ["1"])
-    with pytest.raises(hub.HubWriteError, match="id set differs"):
+    original = hub._published_columnar
+
+    def short(*args, **kwargs):
+        schema, _ = original(*args, **kwargs)
+        return schema, ["1"]
+
+    monkeypatch.setattr(hub, "_published_columnar", short)
+    with pytest.raises(hub.HubWriteError, match="landed atomically.*id set differs"):
         push()
 
 
@@ -184,10 +189,65 @@ def test_columnar_failure_falls_back_to_pinned_full_reload(monkeypatch, atomic_h
         calls.append(kwargs)
         return sample()
 
-    monkeypatch.setattr(hub, "_published_ids_columnar", fail)
+    monkeypatch.setattr(hub, "_published_columnar", fail)
     monkeypatch.setattr(datasets, "load_dataset", load)
     push()
     assert calls[0]["revision"] == "after"
+
+
+def test_one_open_per_shard_serves_footer_and_ids(monkeypatch):
+    """The fast path must not open each shard twice (once for the card check,
+    once for the ids)."""
+    import io
+
+    from rich.console import Console
+
+    monkeypatch.setattr(card_sync, "resolve_hf_token", lambda *a, **k: "t")
+    opened = []
+    bodies = {}
+    for index, ids in enumerate((["1"], ["2"])):
+        out = io.BytesIO()
+        pq.write_table(pa.table({"o:id": ids, "title": ["x"]}), out)
+        bodies[f"shard-{index}"] = out.getvalue()
+
+    class Files:
+        def __init__(self, **kwargs):
+            pass
+
+        def glob(self, pattern):
+            assert "owner/repo@rev/articles" in pattern
+            return sorted(bodies)
+
+        def open(self, path, mode):
+            opened.append(path)
+            return io.BytesIO(bodies[path])
+
+    monkeypatch.setattr(hub, "HfFileSystem", Files)
+    card = DatasetCard("---\n{}\n---\n")
+    monkeypatch.setattr(card_sync, "_load_card", lambda *a, **k: card)
+    ds = sample()
+    hub._verify_committed_dataset(
+        ds, repo_id="owner/repo", config_name="articles", token="t",
+        revision="rev", console=Console(),
+    )
+    assert opened == ["shard-0", "shard-1"]
+
+
+def test_iter_parquet_shards_raises_the_requested_error_when_empty():
+    import fsspec
+
+    with pytest.raises(hub.HubWriteError, match="No parquet found"):
+        list(hub.iter_parquet_shards("owner/none", "articles", revision="r",
+                                     fs=fsspec.filesystem("memory"), error=hub.HubWriteError))
+
+
+def test_gateway_has_no_lock_or_verification_bypass():
+    import inspect
+
+    for function in (hub.push_dataset_verified, hub.push_datasets_verified):
+        parameters = inspect.signature(function).parameters
+        assert "verify_reload" not in parameters
+        assert "acquire_lock" not in parameters
 
 
 def test_gateway_conforms_types_before_staging(atomic_hub):
@@ -246,6 +306,60 @@ def test_stale_lock_from_dead_local_process_is_reclaimed(monkeypatch, atomic_hub
     with hub.hub_write_lock("owner/repo"):
         pass
     assert not path.exists()
+
+
+def test_reclaim_race_loser_restores_the_winners_fresh_lock(monkeypatch, atomic_hub):
+    """Two processes read the same dead owner. The winner reclaims it and
+    writes its own lock; the loser, acting on its stale read, must not delete
+    that fresh lock and must not acquire."""
+    import hashlib
+    import os
+    import socket
+
+    host = socket.gethostname()
+    root = hub._lock_root()
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / (hashlib.sha256(b"owner/repo").hexdigest()[:16] + ".lock")
+    dead = {"repo": "owner/repo", "pid": "999999", "host": host, "started": "x"}
+    winner = f"repo=owner/repo\npid={os.getpid()}\nhost={host}\nstarted=fresh\n"
+    path.write_text(winner)  # the winner already reclaimed and holds the lock
+
+    real_owner = hub._lock_owner
+    reads = iter([dead])  # the loser's first read predates the winner's reclaim
+    monkeypatch.setattr(hub, "_lock_owner", lambda p: next(reads, None) or real_owner(p))
+    monkeypatch.setattr(hub, "_process_alive", lambda pid: pid != 999999)
+
+    assert hub._reclaim_if_dead(path, "owner/repo") is False
+    assert path.read_text() == winner
+    assert list(root.glob("*.stale")) == []
+
+    reads = iter([dead])
+    with pytest.raises(hub.HubWriteLockedError):
+        with hub.hub_write_lock("owner/repo"):
+            pass
+    assert path.read_text() == winner
+
+
+def test_reclaim_race_with_occupied_slot_fails_closed(monkeypatch, atomic_hub):
+    import hashlib
+    import os
+    import socket
+
+    host = socket.gethostname()
+    root = hub._lock_root()
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / (hashlib.sha256(b"owner/repo").hexdigest()[:16] + ".lock")
+    dead = {"repo": "owner/repo", "pid": "999999", "host": host, "started": "x"}
+    path.write_text(f"repo=owner/repo\npid={os.getpid()}\nhost={host}\nstarted=fresh\n")
+    monkeypatch.setattr(hub, "_lock_owner", lambda p: dead if p == path else {})
+    monkeypatch.setattr(hub, "_process_alive", lambda pid: pid != 999999)
+
+    def occupied(src, dst):
+        raise FileExistsError(dst)
+
+    monkeypatch.setattr(hub.os, "link", occupied)
+    with pytest.raises(hub.HubWriteLockedError, match="reclaim race"):
+        hub._reclaim_if_dead(path, "owner/repo")
 
 
 def test_stale_lock_from_another_host_is_not_reclaimed(monkeypatch, atomic_hub):

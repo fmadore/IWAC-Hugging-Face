@@ -17,9 +17,10 @@ Modules:
                    preserving computed columns.
     upload_runner: The shared CLI/async driver behind the seven upload scripts;
                    each script contributes only an ``UploadSpec``.
-    card_sync:     Post-push guard: keep the Hub card's declared schema in step
-                   with the parquet, because push_to_hub updates the card's byte
-                   sizes but not its feature list.
+    card_sync:     Read-only post-commit check: the gateway commits Parquet and
+                   card metadata atomically in one create_commit; this verifies,
+                   at the new revision, that the card's declared features match
+                   the published Parquet and the prepared dataset.
     sentiment_panel: Canonical definition of the AI sentiment annotator panel
                    (model-keyed column prefixes, Omeka property mapping,
                    which models are frozen history).

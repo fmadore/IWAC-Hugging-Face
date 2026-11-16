@@ -15,21 +15,39 @@ The reference label is a lexical proxy, not a human judgement: word-trigram
 Jaccard of the two texts at or above ``--label-jaccard`` (the reprint screen's
 own lexical test). OCR errors hide copies and shared boilerplate creates them.
 Only top-k neighbour pairs are scored, so a copy that is not among an item's
-nearest neighbours is invisible here. Thresholds are chosen on one half of the
-pairs and reported on the other; adjudicated pairs remain the validation step
+nearest neighbours is invisible here. Thresholds are chosen on one half and
+reported on the other; adjudicated pairs remain the validation step
 (docs/research-validation.md).
+
+The halves are whole connected components of the pair graph, so every pair of
+one reprint family lands on the same side; held-out recall and precision carry
+a bootstrap interval over held-out components. Runs before
+``SPLIT_VERSION`` 2 split individual pairs, which leaks a family across both
+halves: their held-out figures are optimistic and not comparable.
 """
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from iwac_pipeline.analyses._research import add_input_args, load_input, save_reports, stable_rank, string
-from iwac_pipeline.analyses.reprint_candidates import shingles
+try:
+    from iwac_pipeline.analyses._research import (
+        ShingleJaccard, add_input_args, load_input, save_reports, stable_rank,
+    )
+    from iwac_pipeline.analyses._stats import MIN_BOOTSTRAP_CLUSTERS
+except ModuleNotFoundError as exc:
+    if not (exc.name or "").startswith("iwac_pipeline"):
+        raise
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _research import ShingleJaccard, add_input_args, load_input, save_reports, stable_rank  # noqa: E402
+    from _stats import MIN_BOOTSTRAP_CLUSTERS  # noqa: E402
 
 GRID = np.round(np.arange(0.80, 0.9951, 0.005), 3)
+SPLIT_VERSION = 2  # 1 = per-pair split (leaked families), 2 = connected components
 
 
 def neighbor_pairs(df: pd.DataFrame, related_column: str = "related_articles") -> pd.DataFrame:
@@ -50,18 +68,36 @@ def neighbor_pairs(df: pd.DataFrame, related_column: str = "related_articles") -
 
 def add_lexical_jaccard(pairs: pd.DataFrame, texts: dict[str, str], shingle_size: int = 3) -> pd.DataFrame:
     """Score each pair by word-shingle Jaccard; pairs lacking text on either side are dropped."""
-    cache: dict[str, set] = {}
-
-    def grams(item_id: str) -> set:
-        if item_id not in cache:
-            cache[item_id] = shingles(string(texts.get(item_id)), shingle_size)
-        return cache[item_id]
-
-    scores = []
-    for a, b in zip(pairs["id_a"], pairs["id_b"], strict=True):
-        left, right = grams(a), grams(b)
-        scores.append(len(left & right) / len(left | right) if left and right else np.nan)
+    jaccard = ShingleJaccard(texts, shingle_size)
+    scores = [jaccard(a, b) for a, b in zip(pairs["id_a"], pairs["id_b"], strict=True)]
     return pairs.assign(lexical_jaccard=scores).dropna(subset=["lexical_jaccard"]).reset_index(drop=True)
+
+
+def pair_components(pairs: pd.DataFrame) -> pd.Series:
+    """Connected-component key (smallest member ID) of each pair's endpoints."""
+    parent: dict[str, str] = {}
+
+    def find(item: str) -> str:
+        parent.setdefault(item, item)
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    for a, b in zip(pairs["id_a"].astype(str), pairs["id_b"].astype(str), strict=True):
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            # The smaller ID always becomes the root: keys do not depend on row order.
+            low, high = sorted((root_a, root_b))
+            parent[high] = low
+    return pd.Series([find(a) for a in pairs["id_a"].astype(str)], index=pairs.index, dtype=object)
+
+
+def component_halves(pairs: pd.DataFrame, seed: int) -> pd.Series:
+    """0 = calibration, 1 = held out; one deterministic side per component."""
+    components = pair_components(pairs)
+    side = {key: int(stable_rank(seed, key), 16) % 2 for key in components.unique()}
+    return components.map(side).astype(int)
 
 
 def curve(pairs: pd.DataFrame, label: pd.Series, grid=GRID) -> pd.DataFrame:
@@ -78,26 +114,84 @@ def curve(pairs: pd.DataFrame, label: pd.Series, grid=GRID) -> pd.DataFrame:
 
 
 def choose(table: pd.DataFrame, *, target_recall: float, target_precision: float, min_selected: int = 20) -> dict:
-    """Highest cutoff meeting the recall target; lowest meeting the precision target."""
+    """Highest cutoff meeting the recall target; lowest *stable* precision cutoff.
+
+    The near-duplicate cutoff must reach the precision target with at least
+    ``min_selected`` pairs AND keep precision at or above target at every
+    higher grid threshold that selects any pair, so a lucky dip in the curve
+    cannot be chosen when stricter cutoffs are less precise.
+    """
     recall_ok = table[table["recall"].fillna(0) >= target_recall]
-    precise = table[(table["precision"].fillna(0) >= target_precision) & (table["selected"] >= min_selected)]
+    ordered = table.sort_values("threshold").reset_index(drop=True)
+    defined = ordered["precision"].notna()
+    meets = ordered["precision"].fillna(0) >= target_precision
+    # For each row: does every higher threshold with a defined precision meet target?
+    failing_above = (defined & ~meets)[::-1].cumsum()[::-1].shift(-1, fill_value=0)
+    stable = meets & (ordered["selected"] >= min_selected) & failing_above.eq(0)
+    precise = ordered[stable]
     return {"prefilter": float(recall_ok["threshold"].max()) if not recall_ok.empty else None,
             "near_duplicate": float(precise["threshold"].min()) if not precise.empty else None}
 
 
-def calibrate(pairs: pd.DataFrame, *, label_jaccard=0.45, target_recall=0.98, target_precision=0.90, seed=42):
-    """Choose cutoffs on a calibration half and evaluate them on the held-out half."""
+def _rates(selected: np.ndarray, label: np.ndarray) -> tuple[float, float]:
+    true_positive = float((selected & label).sum())
+    chosen, positives = float(selected.sum()), float(label.sum())
+    return (true_positive / chosen if chosen else np.nan,
+            true_positive / positives if positives else np.nan)
+
+
+def component_bootstrap(pairs: pd.DataFrame, label: pd.Series, components: pd.Series, threshold: float,
+                        *, n_boot: int = 1000, seed: int = 42,
+                        min_components: int = MIN_BOOTSTRAP_CLUSTERS) -> dict:
+    """Percentile 95 % intervals of precision/recall, resampling whole components."""
+    keys, codes = np.unique(components.to_numpy(dtype=str), return_inverse=True)
+    result = {"n_components": int(len(keys)), "ci_status": "ok",
+              "precision_ci": [None, None], "recall_ci": [None, None]}
+    if n_boot <= 0:
+        result["ci_status"] = "disabled"
+        return result
+    if len(keys) < min_components:
+        result["ci_status"] = "insufficient_components"
+        return result
+    selected = (pairs["cosine"] >= threshold).to_numpy()
+    positive = label.to_numpy(dtype=bool)
+    members = [np.flatnonzero(codes == i) for i in range(len(keys))]
+    rng = np.random.default_rng(seed)
+    draws = np.empty((n_boot, 2))
+    for b in range(n_boot):
+        idx = np.concatenate([members[i] for i in rng.integers(0, len(keys), size=len(keys))])
+        draws[b] = _rates(selected[idx], positive[idx])
+    for column, name in enumerate(("precision_ci", "recall_ci")):
+        values = draws[:, column][np.isfinite(draws[:, column])]
+        if len(values):
+            result[name] = [float(np.percentile(values, 2.5)), float(np.percentile(values, 97.5))]
+    return result
+
+
+def calibrate(pairs: pd.DataFrame, *, label_jaccard=0.45, target_recall=0.98, target_precision=0.90,
+              seed=42, n_boot=1000):
+    """Choose cutoffs on calibration components and evaluate on held-out components."""
     if pairs.empty:
         raise ValueError("No scored neighbour pairs; run related_articles first")
-    half = pairs.apply(lambda row: int(stable_rank(seed, f"{row.id_a}|{row.id_b}"), 16) % 2, axis=1)
+    components = pair_components(pairs)
+    half = component_halves(pairs, seed)
     label = pairs["lexical_jaccard"] >= label_jaccard
     fit, held = half == 0, half == 1
     chosen = choose(curve(pairs[fit], label[fit]), target_recall=target_recall,
                     target_precision=target_precision)
     held_curve = curve(pairs[held], label[held], grid=[t for t in chosen.values() if t is not None])
-    held_out = {row.threshold: {"selected": row.selected, "precision": row.precision, "recall": row.recall}
-                for row in held_curve.itertuples()}
-    return chosen, held_out, curve(pairs, label)
+    held_out = {}
+    for row in held_curve.itertuples():
+        held_out[row.threshold] = {
+            "selected": row.selected, "precision": row.precision, "recall": row.recall,
+            **component_bootstrap(pairs[held], label[held], components[held], row.threshold,
+                                  n_boot=n_boot, seed=seed)}
+    split = {"split_version": SPLIT_VERSION, "unit": "connected component of the pair graph",
+             "components": int(components.nunique()),
+             "calibration_components": int(components[fit].nunique()),
+             "held_out_components": int(components[held].nunique()),
+             "calibration_pairs": int(fit.sum()), "held_out_pairs": int(held.sum())}
+    return chosen, held_out, curve(pairs, label), split
 
 
 def main():
@@ -112,6 +206,8 @@ def main():
     parser.add_argument("--target-recall", type=float, default=0.98)
     parser.add_argument("--target-precision", type=float, default=0.90)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--bootstrap", type=int, default=1000,
+                        help="Component bootstrap replicates for held-out intervals (0 disables)")
     args = parser.parse_args()
     config_column = f"{args.embedding_column}_config_hash"
     df = load_input(args, columns=["o:id", args.text_column, args.related_column, config_column])
@@ -120,16 +216,22 @@ def main():
         raise SystemExit(f"Expected one embedding configuration, found {configurations or 'none'}")
     texts = dict(zip(df["o:id"].astype(str), df[args.text_column], strict=True))
     pairs = add_lexical_jaccard(neighbor_pairs(df, args.related_column), texts, args.shingle_size)
-    chosen, held_out, table = calibrate(pairs, label_jaccard=args.label_jaccard, target_recall=args.target_recall,
-                                        target_precision=args.target_precision, seed=args.seed)
+    chosen, held_out, table, split = calibrate(
+        pairs, label_jaccard=args.label_jaccard, target_recall=args.target_recall,
+        target_precision=args.target_precision, seed=args.seed, n_boot=args.bootstrap)
     summary = {
         "embedding_configuration": configurations[0], "scored_pairs": len(pairs),
         "lexical_duplicates": int((pairs["lexical_jaccard"] >= args.label_jaccard).sum()),
         "label": f"word {args.shingle_size}-gram Jaccard >= {args.label_jaccard}",
+        "split": split,
         "chosen_on_calibration_half": chosen, "held_out_half": held_out,
+        "comparability": "Held-out figures from runs before split_version 2 split individual pairs, "
+                         "leaking reprint families across halves; they are optimistic and not "
+                         "comparable with these.",
         "interpretation": "Lexical-proxy calibration over top-k neighbour pairs only. It fixes a cosine "
                           "scale, not a validated reprint operating point; adjudicate pairs before citing "
-                          "reprint counts.",
+                          "reprint counts. Intervals resample held-out components and exclude "
+                          "label and neighbour-list (top-k) uncertainty.",
     }
     print(summary)
     save_reports(args, df, "similarity_calibration", {"curve": table}, summary)

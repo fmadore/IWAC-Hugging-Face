@@ -24,6 +24,7 @@ def _load(rel, name):
 
 ts = _load("analyses/topic_sentiment.py", "topic_sentiment_ut")
 en = _load("analyses/entity_networks.py", "entity_networks_ut")
+POLARITY_COLS = [f"{m}_polarite" for m in ts.models_for(None)]
 
 
 class TestTopicSentimentHelpers:
@@ -36,14 +37,14 @@ class TestTopicSentimentHelpers:
     # from the panel size rather than hardcoded, because the majority threshold
     # is now "> half the voters" rather than a fixed 2.
     def test_consensus_label_majority(self):
-        cols = ts.POLARITY_COLS
+        cols = POLARITY_COLS
         n_majority = len(cols) // 2 + 1
         votes = ["Négatif"] * n_majority + ["Positif"] * (len(cols) - n_majority)
         df = pd.DataFrame([votes], columns=cols)
         assert ts.consensus_label_series(df, cols).iloc[0] == "Négatif"
 
     def test_consensus_label_no_majority(self):
-        cols = ts.POLARITY_COLS
+        cols = POLARITY_COLS
         # Spread votes across distinct labels so no label clears half.
         labels = list(ts.POLARITY_ORDER)
         votes = [labels[i % len(labels)] for i in range(len(cols))]
@@ -51,7 +52,7 @@ class TestTopicSentimentHelpers:
         assert ts.consensus_label_series(df, cols).iloc[0] == ""
 
     def test_consensus_label_needs_two_voters(self):
-        cols = ts.POLARITY_COLS
+        cols = POLARITY_COLS
         votes = ["Négatif"] + [None] * (len(cols) - 1)
         df = pd.DataFrame([votes], columns=cols)
         assert ts.consensus_label_series(df, cols).iloc[0] == ""
@@ -60,10 +61,11 @@ class TestTopicSentimentHelpers:
         s = ts.polarity_ordinal(pd.Series(list(ts.POLARITY_ORDER)))
         assert s.notna().all()
 
-    def test_year_from_pub_date(self):
-        s = ts.year_from_pub_date(pd.Series(["2015-03-01", "1998", "n/a", None]))
+    def test_point_years_exclude_ranges_and_garbage(self):
+        s, precision = ts.point_years(pd.Series(["2015-03-01", "1998", "n/a", None, "1998/1999"]))
         assert s.iloc[0] == 2015 and s.iloc[1] == 1998
-        assert pd.isna(s.iloc[2]) and pd.isna(s.iloc[3])
+        assert s.iloc[2:].isna().all()
+        assert precision.tolist() == ["day", "year", "other", "[missing]", "range"]
 
 
 class TestEntityNetworkHelpers:
@@ -75,12 +77,15 @@ class TestEntityNetworkHelpers:
         assert en.split_subjects(None) == set()
         assert en.split_subjects(float("nan")) == set()
 
-    def test_parse_year(self):
-        assert en.parse_year("2010-05") == 2010
-        assert en.parse_year("2010") == 2010
-        assert en.parse_year("") is None
-        assert en.parse_year(None) is None
-        assert en.parse_year("abcd") is None
+    def test_year_filter_uses_point_dates_only(self):
+        df = pd.DataFrame({"pub_date": ["2010-05", "2010", "", None, "abcd", "2010/2011"],
+                           "country": ["Bénin"] * 6})
+        args = type("Args", (), {"country": None, "year_from": 2010, "year_to": 2010})()
+        kept, years, counts = en.filter_articles(df, args)
+        assert kept.index.tolist() == [0, 1]
+        assert counts["dates"]["by_precision"] == {"[missing]": 2, "other": 1, "range": 1}
+        args.year_from = args.year_to = None
+        assert len(en.filter_articles(df, args)[0]) == 6
 
     def test_pmi_positive_when_associated(self):
         # a and b each in 10 articles, co-occur in all 10, out of 100 → strong +.

@@ -142,13 +142,17 @@ class TestUploaderReadsOnlyLiveProperties:
         assert not set(uploader.SPEC.int_columns) & set(label_subjectivite_columns())
         assert set(numeric_subjectivite_columns()) <= set(uploader.SPEC.int_columns)
 
-    def test_score_reader_ranks_the_label_it_reads(self):
-        """The generation-1 reader is unexercised by the live panel but is the
-        other half of ``subjectivite_is_label``; keep it honest."""
-        item = _omeka_item("iwac:whatever", "Très subjectif")
-        assert uploader._get_subjectivity_score(item, "iwac:whateverSubjectiviteScore") == 5
-        assert uploader._get_subjectivity_score({}, "iwac:missing") is None
+    def test_an_active_numeric_subjectivite_model_fails_closed(self, monkeypatch):
+        """Generation 1's 1-5 reader is gone with its Omeka properties; an
+        active model asking for a number must not slip labels into an int
+        column."""
+        import dataclasses
+
+        gen1 = dataclasses.replace(active_models()[0], generation=1)
+        monkeypatch.setattr(uploader, "active_models", lambda: (gen1,))
         assert SUBJECTIVITE_ORDER["Très subjectif"] == 5
+        with pytest.raises(ValueError, match="numeric"):
+            uploader._sentiment_columns(_omeka_item(gen1.omeka_prefix, "Très subjectif"))
 
 
 class FakeDataset:

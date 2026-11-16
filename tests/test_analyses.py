@@ -175,12 +175,19 @@ class TestMannKendall:
         s, z, p = _stats.mann_kendall(list(range(12, 0, -1)))
         assert s < 0 and p < 0.05
 
-    def test_flat_not_significant(self):
+    def test_flat_is_undefined_not_insignificant(self):
         s, z, p = _stats.mann_kendall([5.0] * 10)
-        assert p == 1.0
+        assert s == 0 and np.isnan(z) and np.isnan(p)
 
-    def test_too_short(self):
-        assert _stats.mann_kendall([1, 2, 3]) == (0.0, 0.0, 1.0)
+    def test_too_short_is_undefined(self):
+        assert all(np.isnan(v) for v in _stats.mann_kendall([1, 2, 3]))
+
+    def test_undefined_tests_leave_the_bh_family(self):
+        p = [_stats.mann_kendall(list(range(12)))[2], _stats.mann_kendall([1, 2])[2], 0.04]
+        q = _stats.bh_adjust(p)
+        assert np.isnan(q[1])
+        # m = 2 defined tests, not 3.
+        assert q[2] == pytest.approx(0.04)
 
 
 class TestWeightedSlope:
@@ -227,15 +234,6 @@ class TestLogRatio:
 
     def test_zero_count_finite(self):
         assert np.isfinite(kb.log_ratio(0, 10, 1000, 1000))
-
-
-class TestUniqueSubjects:
-    def test_dedup_and_split(self):
-        assert kb.unique_subjects("Islam|Islam|Paix") == {"Islam", "Paix"}
-
-    def test_empty_and_nan(self):
-        assert kb.unique_subjects("") == set()
-        assert kb.unique_subjects(None) == set()
 
 
 class TestContiguousYearIndex:

@@ -1,12 +1,13 @@
-"""Pure helpers for embedding workflows: chunking, mean-pooling, and a
+"""Pure helpers for embedding workflows: mean-pooling, and a
 JSON/transactional SQLite cache keyed by ``o:id``, whose entries carry a
 hash of the input they were computed from.
 
 Extracted from ``semantic_embedding.py`` to keep that script focused on
-orchestration. None of these helpers know about Gemini, datasets, or the
+orchestration. None of these helpers know about the encoder, datasets, or the
 script's CLI surface; they're plain utilities. The cache helpers store any
 JSON-serializable value — ``lemmatize_update_hf.py`` caches string pairs
-through them, the embedding scripts cache float vectors.
+through them, the embedding scripts cache float vectors (as lists on disk;
+callers convert to ``float32`` arrays on restore).
 
 Note on stored embeddings: vectors are cached and pushed to the Hub RAW,
 NOT L2-normalized. Consumers computing cosine similarity must normalize at
@@ -21,7 +22,7 @@ import json
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, Iterator, List, Sequence, Tuple
 
 
 logger = logging.getLogger(__name__)
@@ -82,23 +83,41 @@ def cached_value(cache: Dict[str, Any], key: Any, fingerprint: str) -> Any:
     return None
 
 
+def iter_cache(cache_file: Path) -> Iterator[Tuple[str, Any]]:
+    """Yield ``(key, entry)`` one at a time, decoding each entry lazily.
+
+    For the SQLite cache only one decoded entry is alive at a time, so a
+    caller can keep the entries it needs (as compact arrays) without holding
+    every decoded vector at once. Yields nothing for a missing file; stops
+    with a warning on an unreadable one (entries already yielded carry their
+    own input hash and remain valid).
+    """
+    if not cache_file.exists():
+        return
+    try:
+        if cache_file.suffix == ".sqlite3":
+            connection = sqlite3.connect(cache_file)
+            try:
+                for key, value in connection.execute("SELECT key, value FROM entries"):
+                    yield key, json.loads(value)
+            finally:
+                connection.close()
+            return
+        with gzip.open(cache_file, "rt", encoding="utf-8") as f:
+            data = json.load(f)
+        logger.info(f"Loaded {len(data)} cached entries from {cache_file}")
+        yield from data.items()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Failed to load cache ({e}), starting fresh.")
+
+
 def load_cache(cache_file: Path) -> Dict[str, Any]:
     """Load a legacy gzipped JSON cache or transactional SQLite cache.
 
     Returns an empty dict if the file is missing or unreadable.
     """
-    if not cache_file.exists():
-        return {}
     try:
-        if cache_file.suffix == ".sqlite3":
-            with sqlite3.connect(cache_file) as connection:
-                return {key: json.loads(value) for key, value in connection.execute(
-                    "SELECT key, value FROM entries"
-                )}
-        with gzip.open(cache_file, "rt", encoding="utf-8") as f:
-            data = json.load(f)
-        logger.info(f"Loaded {len(data)} cached embeddings from {cache_file}")
-        return data
+        return dict(iter_cache(cache_file))
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Failed to load cache ({e}), starting fresh.")
         return {}
@@ -114,12 +133,19 @@ def save_cache(cache: Dict[str, Any], cache_file: Path) -> None:
     if cache_file.suffix == ".sqlite3":
         # The caller supplies only newly completed entries. Transactions make
         # each checkpoint atomic without reserializing every previous vector.
-        with sqlite3.connect(cache_file) as connection:
-            connection.execute("CREATE TABLE IF NOT EXISTS entries (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            connection.executemany(
-                "INSERT OR REPLACE INTO entries(key, value) VALUES (?, ?)",
-                ((str(key), json.dumps(value, allow_nan=False)) for key, value in cache.items()),
-            )
+        # ``with connection`` only commits. Close explicitly: Windows cannot
+        # delete a file that still has an open handle, so the cache would
+        # survive a successful push.
+        connection = sqlite3.connect(cache_file)
+        try:
+            with connection:
+                connection.execute("CREATE TABLE IF NOT EXISTS entries (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                connection.executemany(
+                    "INSERT OR REPLACE INTO entries(key, value) VALUES (?, ?)",
+                    ((str(key), json.dumps(value, allow_nan=False)) for key, value in cache.items()),
+                )
+        finally:
+            connection.close()
         return
     tmp = cache_file.with_suffix(".tmp.gz")
     try:
@@ -143,7 +169,8 @@ def delete_cache(cache_file: Path) -> None:
 
 
 def is_empty_embedding(emb: Any) -> bool:
-    """Return ``True`` for missing, empty, or all-zero embedding values."""
+    """Return ``True`` for missing, empty, or all-zero embedding values
+    (lists or numpy arrays)."""
     if emb is None:
         return True
     if isinstance(emb, list):
@@ -151,28 +178,9 @@ def is_empty_embedding(emb: Any) -> bool:
             return True
         if all(x == 0.0 for x in emb):
             return True
+    elif hasattr(emb, "shape") and hasattr(emb, "any"):
+        return emb.size == 0 or not emb.any()
     return False
-
-
-def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
-    """Split ``text`` into overlapping fixed-size character chunks.
-
-    Short texts pass through as a single-element list. Long texts are split
-    at ``chunk_size`` boundaries with ``overlap`` characters of overlap
-    between consecutive chunks to preserve context continuity.
-    """
-    if chunk_size <= 0 or not 0 <= overlap < chunk_size:
-        raise ValueError("Require chunk_size > 0 and 0 <= overlap < chunk_size")
-    if len(text) <= chunk_size:
-        return [text]
-
-    chunks: List[str] = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - overlap
-    return chunks
 
 
 def average_embeddings(
@@ -217,7 +225,7 @@ __all__ = [
     "load_cache",
     "save_cache",
     "delete_cache",
+    "iter_cache",
     "is_empty_embedding",
-    "chunk_text",
     "average_embeddings",
 ]

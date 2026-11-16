@@ -1,6 +1,7 @@
 """Fetch-truncation reconciliation (safety rail B1) — no network involved."""
 
 import asyncio
+import json
 import os
 
 import pytest
@@ -66,11 +67,207 @@ class TestFetchReconciliation:
         with pytest.raises(TruncatedFetchError, match="no Omeka-S-Total-Results"):
             asyncio.run(client.fetch_items(36))
 
-    def test_verify_can_be_disabled(self):
-        pages = [_items(10)]
-        client = StubClient(pages, total=999)
-        items = asyncio.run(client.fetch_items(36, verify_total=False))
-        assert len(items) == 10
+    def test_reconciliation_has_no_opt_out(self):
+        client = StubClient([_items(10)], total=999)
+        with pytest.raises(TypeError):
+            asyncio.run(client.fetch_items(36, verify_total=False))
+
+    def test_the_reported_total_fixes_the_pages_requested(self):
+        requested = []
+
+        class Recording(StubClient):
+            async def fetch_items_page(self, rcid, page, per=100):
+                requested.append(page)
+                return await super().fetch_items_page(rcid, page, per)
+
+        pages = [_items(100), _items(100, start=100), _items(5, start=200), _items(9)]
+        items = asyncio.run(Recording(pages, total=205).fetch_items(36))
+        assert len(items) == 205
+        assert sorted(requested) == [1, 2, 3]
+
+
+class _FakeResponse:
+    def __init__(self, status, payload=None, error=None):
+        self.status = status
+        self._payload = payload
+        self._error = error
+
+    async def json(self):
+        if self._error is not None:
+            raise self._error
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    """Plays one scripted outcome per request: a response or an exception."""
+
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def get(self, url, timeout=None):
+        self.calls += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+MANIFEST = {"thumbnail": [{"id": "https://example.test/thumb.jpg"}]}
+
+
+class TestIIIFThumbnailRetry:
+    @pytest.fixture(autouse=True)
+    def _no_backoff(self, monkeypatch):
+        from iwac_common import omeka_client as oc
+
+        self.sleeps = []
+
+        async def no_sleep(seconds):
+            self.sleeps.append(seconds)
+
+        monkeypatch.setattr(oc.asyncio, "sleep", no_sleep)
+        oc.media_stats.reset()
+        yield
+        oc.media_stats.reset()
+
+    def _fetch(self, session, **kwargs):
+        from iwac_common import omeka_client as oc
+
+        return asyncio.run(oc.fetch_iiif_thumbnail_url(7, session, **kwargs))
+
+    def test_transient_failures_are_retried_before_success(self):
+        import aiohttp
+
+        from iwac_common import omeka_client as oc
+
+        session = _FakeSession(
+            asyncio.TimeoutError(),
+            aiohttp.ClientConnectionError("reset"),
+            _FakeResponse(503),
+            _FakeResponse(429),
+            _FakeResponse(200, MANIFEST),
+        )
+        assert self._fetch(session) == "https://example.test/thumb.jpg"
+        assert session.calls == 5
+        assert self.sleeps == [1, 2, 4, 8]
+        assert (oc.media_stats.attempted, oc.media_stats.failed) == (1, 0)
+
+    def test_persistent_transient_failure_is_recorded_once(self):
+        from iwac_common import omeka_client as oc
+
+        session = _FakeSession(*(_FakeResponse(502) for _ in range(3)))
+        assert self._fetch(session, max_tries=3) == ""
+        assert session.calls == 3
+        assert oc.media_stats.failed == 1
+        assert oc.media_stats.failed_fields_by_item == {"7": {"thumbnail", "iiif_manifest"}}
+
+    @pytest.mark.parametrize("status", [404, 410])
+    def test_absence_is_not_retried_or_failed(self, status):
+        from iwac_common import omeka_client as oc
+
+        session = _FakeSession(_FakeResponse(status))
+        assert self._fetch(session) == ""
+        assert session.calls == 1
+        assert oc.media_stats.failed == 0
+
+    @pytest.mark.parametrize("outcome", [
+        _FakeResponse(403),
+        _FakeResponse(200, error=json.JSONDecodeError("bad", "x", 0)),
+    ])
+    def test_permanent_failure_is_recorded_without_retry(self, outcome):
+        from iwac_common import omeka_client as oc
+
+        session = _FakeSession(outcome)
+        assert self._fetch(session) == ""
+        assert session.calls == 1
+        assert oc.media_stats.failed == 1
+
+    def test_manifest_without_thumbnail_is_an_absence(self):
+        from iwac_common import omeka_client as oc
+
+        assert self._fetch(_FakeSession(_FakeResponse(200, {"thumbnail": [{"id": None}]}))) == ""
+        assert oc.media_stats.failed == 0
+
+    def test_session_defaults_to_the_connection_manager(self, monkeypatch):
+        from iwac_common import omeka_client as oc
+
+        session = _FakeSession(_FakeResponse(200, MANIFEST))
+
+        async def shared():
+            return session
+
+        monkeypatch.setattr(oc.conn_manager, "get", shared)
+        assert asyncio.run(oc.fetch_iiif_thumbnail_url(7)) == "https://example.test/thumb.jpg"
+        assert session.calls == 1
+
+
+class TestMediaPointers:
+    """One helper for the file / thumbnail / manifest triple of five mappers."""
+
+    class _Api:
+        def __init__(self, original_url):
+            self.original_url = original_url
+
+        async def fetch_media_data(self, media_id):
+            return {"o:is_public": True, "o:original_url": self.original_url}
+
+    def _run(self, monkeypatch, item, api, thumbnail="", **kwargs):
+        from iwac_common import omeka_client as oc
+
+        monkeypatch.setenv("OMEKA_BASE_URL", "https://staging.example/api")
+        monkeypatch.delenv("IWAC_PUBLIC_BASE_URL", raising=False)
+        calls = []
+
+        async def fake_thumbnail(omeka_id, session=None):
+            calls.append(omeka_id)
+            return thumbnail
+
+        monkeypatch.setattr(oc, "fetch_iiif_thumbnail_url", fake_thumbnail)
+        result = asyncio.run(oc.fetch_media_pointers(item, api, **kwargs))
+        return result, calls
+
+    MEDIA_ITEM = {
+        "o:id": 3,
+        "o:primary_media": {"@id": "https://staging.example/api/media/4"},
+        "thumbnail_display_urls": {"large": "https://staging.example/large.jpg"},
+    }
+    MANIFEST_URL = "https://staging.example/iiif/3/3/manifest"
+
+    def test_no_media_no_lookups(self, monkeypatch):
+        result, calls = self._run(monkeypatch, {"o:id": 3}, self._Api("x"))
+        assert result == ("", "", "") and calls == []
+
+    def test_file_gives_all_three_pointers(self, monkeypatch):
+        result, calls = self._run(
+            monkeypatch, dict(self.MEDIA_ITEM), self._Api("https://f/a.pdf"), thumbnail="T"
+        )
+        assert result == ("https://f/a.pdf", "T", self.MANIFEST_URL)
+        assert calls == [3]
+
+    def test_fallback_only_when_enabled(self, monkeypatch):
+        api = self._Api("https://f/a.jpg")
+        off, _ = self._run(monkeypatch, dict(self.MEDIA_ITEM), api)
+        on, _ = self._run(monkeypatch, dict(self.MEDIA_ITEM), api, thumbnail_fallback=True)
+        assert off[1] == ""
+        assert on[1] == "https://staging.example/large.jpg"
+
+    def test_media_without_file(self, monkeypatch):
+        """A YouTube media: thumbnail only if the caller does not require a file."""
+        api = self._Api(None)
+        strict, strict_calls = self._run(monkeypatch, dict(self.MEDIA_ITEM), api, thumbnail="T")
+        assert strict == ("", "", "") and strict_calls == []
+        loose, _ = self._run(
+            monkeypatch, dict(self.MEDIA_ITEM), api, thumbnail="T",
+            thumbnail_requires_file=False,
+        )
+        assert loose == ("", "T", "")
 
 
 class TestMediaFetchGuard:

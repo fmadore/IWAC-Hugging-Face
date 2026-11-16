@@ -78,6 +78,7 @@ def mapped(monkeypatch):
         async def no_thumbnail(*args, **kwargs):
             return ""
 
+        monkeypatch.setattr(omeka_client, "fetch_iiif_thumbnail_url", no_thumbnail)
         monkeypatch.setattr(module, "fetch_iiif_thumbnail_url", no_thumbnail, raising=False)
         return asyncio.run(module.SPEC.map_item(dict(ITEM), _Api()))
 

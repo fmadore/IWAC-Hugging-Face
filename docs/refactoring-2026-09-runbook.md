@@ -1,5 +1,12 @@
 # Refactoring pass, September 2026 — what to run after merging
 
+> **Historical record.** This runbook describes the September 2026 refactoring
+> pass and the state of the code at that time. It is superseded by
+> [the hardening migration guide](hardening-migration.md), which holds the
+> current re-run order. Statements that later work made false are corrected
+> in place below and marked *(superseded)*; do not follow this page as a
+> current procedure.
+
 Code changes never move data. This branch changes how columns are typed,
 computed and joined, but the Hub keeps its current values until the owning
 script runs again. This page lists what changes, which runs apply it, and
@@ -14,7 +21,7 @@ what can only be done by hand.
 | Stable column order (the Hub's order is kept; new columns slot in beside their mapper neighbour) | the next upload |
 | `index.frequency` joined on authority ids; multi-country rows counted per country; unparseable dates excluded from `first_occurrence`/`last_occurrence` | the next `index` upload, **after** the content subsets carry `*_ids` |
 | `nb_mots` single definition (references, audiovisual changed; the other subsets already used it) | the next references/audiovisual upload |
-| `Lisibilite_OCR` only for primary-French rows | `calculate_lexical_richness.py --update-mode all`, per subset |
+| `Lisibilite_OCR` only for primary-French rows *(superseded: readability is now computed only for rows whose sole language is French, with minimum-evidence thresholds)* | `calculate_lexical_richness.py --update-mode all`, per subset |
 | references bibliographic numbers kept verbatim (`"iv, 250"` was blanked) | the next references upload |
 
 ## Recommended order
@@ -45,6 +52,9 @@ what can only be done by hand.
    `--invalidate-derived` (clear the stale values, then re-run the affected
    stages in `missing` mode) and keeping them (they are recorded in
    `.iwac_state/stale_derived/`).
+   *(Superseded: invalidation is now the default, and `--preserve-derived` is
+   the explicit opt-out that stages the worklist; see
+   [the ingestion contract](ingest-contract.md).)*
 4. Re-score readability, one subset at a time (pushes must stay sequential):
 
    ```
@@ -52,7 +62,9 @@ what can only be done by hand.
    ```
 
    Repeat for `publications`, `documents`, `references` and `audiovisual`.
-   Word counts and Hijri dates need no re-run.
+   Word counts and Hijri dates need no re-run. *(Superseded: the tokenizer and
+   the Hijri date parser changed afterwards, and both now need a re-run; see
+   the migration guide.)*
 5. Publish the projection. The new columns are already allowlisted in
    `iwac_common/public_columns.json`; the plan table should show no surprises.
 
@@ -66,7 +78,8 @@ what can only be done by hand.
 ## By hand — outside this repository
 
 - **Dataset card** (`README.md` on both Hub repos; `card_sync` only repairs the
-  feature list):
+  feature list — *superseded: `card_sync` now only verifies, and the gateway
+  commits the exact card schema with the data*):
   - document the new columns listed above;
   - replace `float64` with `int64` for the integer columns, and describe the
     embeddings as float32 sequences;
@@ -77,8 +90,11 @@ what can only be done by hand.
     `pub_date`, whose precision varies (not always `YYYY-MM-DD`);
   - `Lisibilite_OCR`: French rows only, null elsewhere.
 - **`iwac-data` skill**: update `references/omeka-to-hf-mapping.md` with the new
-  columns, the `*_ids` join and the canonical types (CLAUDE.md requires it; the
-  skill does not live in this repository).
+  columns, the `*_ids` join and the canonical types (the skill does not live in
+  this repository). *(Superseded: the canonical mapping contract is now
+  `docs/ingest-contract.md`, `iwac_common/schema.py` and
+  `iwac_common/public_columns.json`; CLAUDE.md treats the external skill as
+  optional supplementary documentation.)*
 - **Consumers** (IwacVisualizations, the MCP server): embeddings arrive as
   float32; integer columns as `int64` with nulls instead of `float64`; the
   `entity_networks` node `Id` is now the authority `o:id` (the label is in
@@ -88,9 +104,14 @@ what can only be done by hand.
 
 ## Not done in this pass
 
-- Packaging the upload scripts as importable modules (review finding 5).
-- A locked, archived publication environment (finding 6).
-- Atomic multi-subset publication (finding 8); public commits now name their
-  private source revision, which makes a partial publish traceable.
+The first three items were done by the October 2026 hardening work and are
+struck through here; the last remains open.
+
+- ~~Packaging the upload scripts as importable modules (review finding 5).~~
+  Done: installed `iwac-*` commands and a tested wheel.
+- ~~A locked, archived publication environment (finding 6).~~ Done:
+  `requirements-lock.txt` with hashes.
+- ~~Atomic multi-subset publication (finding 8).~~ Done: all subsets and card
+  schemas commit together under a parent-revision precondition.
 - A long-format sentiment config, and native list columns in place of the
   pipe-joined label columns — both are schema changes consumers must opt into.

@@ -21,7 +21,6 @@ from _embedding_utils import (
     repo_slug,
     save_cache,
 )
-from _embedding_columns import restore_from_cache
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -47,18 +46,25 @@ def test_only_a_matching_entry_is_reused(tmp_path):
     assert cached_value(cache, 4, input_fingerprint("x")) is None
 
 
-def test_restore_skips_rows_whose_text_changed():
-    cache = {
-        "1": make_entry([1.0], input_fingerprint("kept")),
-        "2": make_entry([2.0], input_fingerprint("edited before the re-run")),
-    }
-    embeddings = [[], []]
-    restored = restore_from_cache(
-        embeddings, ["1", "2"], cache,
-        [input_fingerprint("kept"), input_fingerprint("corrected OCR")],
+def test_restore_skips_rows_whose_text_changed(tmp_path):
+    """The text stage restores a chunk only when its row's input hash matches."""
+    import semantic_embedding as text
+
+    cache_file = tmp_path / "chunks.sqlite3"
+    save_cache({
+        text.chunk_key("1", 0): make_entry([1.0], input_fingerprint("kept")),
+        text.chunk_key("2", 0): make_entry([2.0], input_fingerprint("edited before the re-run")),
+    }, cache_file)
+    plan = text.RowPlan(
+        texts=["kept", "corrected OCR"], titles=["none", "none"],
+        fingerprints=[input_fingerprint("kept"), input_fingerprint("corrected OCR")],
+        compatible=[False, False], existing=[None, None], vectors=[None, None], indices=[0, 1],
     )
-    assert restored == 1
-    assert embeddings == [[1.0], []]
+    _, chunk_vectors, queue, n_cached = text.restore_chunks(plan, ["1", "2"], cache_file)
+    assert n_cached == 2
+    assert list(chunk_vectors) == [(0, 0)]
+    assert chunk_vectors[(0, 0)].dtype.name == "float32"
+    assert queue == [(1, 0)]
 
 
 def test_repo_slug_separates_repositories():

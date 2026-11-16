@@ -29,9 +29,16 @@ filename embeds the repository and a fingerprint of the configuration, and each
 entry carries a hash of its row's text, title and chunking, so a changed row is
 embedded afresh. ``--fresh-cache`` discards the cache explicitly.
 
+When no vector or provenance cell would change (and no retired column needs
+removing), nothing is pushed: the run says so and exits successfully.
+
 Usage
 -----
     python post-processing/semantic_embedding.py [--config articles|publications|references|documents]
+                                                 [--update-mode missing|all] [-y]
+
+``--update-mode`` defaults to ``missing`` with ``-y`` or when not run from a
+terminal; otherwise the mode is asked for.
 
 Example:
     python post-processing/semantic_embedding.py --config publications --dry-run
@@ -50,32 +57,44 @@ import logging
 import os
 import sys
 import time
-from typing import List, Dict, Any
-from dotenv import load_dotenv
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Sequence
+
+import numpy as np
+
 # Make ``post-processing/_common.py`` and ``_embedding_utils.py`` importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (  # noqa: E402
     PRIVATE_REPO_ID,
+    add_update_mode_args,
+    choose_config,
+    display_text_stats,
     ensure_hf_token,
+    load_environment,
     load_hub_dataset,
+    print_dry_run_panel,
     push_dataset,
+    reorder_columns_after,
+    resolve_update_mode,
 )
 from iwac_common.schema import SUBSETS  # noqa: E402
 from iwac_common.paths import workspace_root  # noqa: E402
-from iwac_common.enrichment import compatible_rows, config_fingerprint, set_provenance, invalidate_columns  # noqa: E402
+from iwac_common.enrichment import (  # noqa: E402
+    compatible_rows, config_fingerprint, invalidate_columns, provenance_columns, set_provenance,
+)
 from _embedding_utils import (  # noqa: E402
     average_embeddings,
     cache_fingerprint,
-    cached_value,
     delete_cache,
     input_fingerprint,
     is_empty_embedding,
-    load_cache,
+    iter_cache,
     make_entry,
     repo_slug,
     save_cache,
 )
-from _embedding_columns import set_embedding_column  # noqa: E402
+from _embedding_columns import column_vectors, set_embedding_column  # noqa: E402
 from _gemma_encoder import (  # noqa: E402
     DIMENSION,
     MODEL_ID,
@@ -87,8 +106,7 @@ from _gemma_encoder import (  # noqa: E402
     token_batches,
 )
 
-# Load .env from project root
-load_dotenv(workspace_root() / ".env")
+load_environment()
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -101,7 +119,6 @@ from rich.progress import (  # noqa: E402
     TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn,
 )
 from rich.logging import RichHandler  # noqa: E402
-from rich.prompt import Prompt  # noqa: E402
 from rich import box  # noqa: E402
 
 console = Console()
@@ -189,51 +206,6 @@ def load_encoder(args, token: str) -> GemmaEncoder:
     return GemmaEncoder(providers=providers, threads=args.threads, token=token)
 
 
-def choose_config() -> str:
-    """Prompt the user to choose which dataset configuration to process."""
-    console.print("\n[bold]Dataset Configuration:[/bold]")
-    table = Table(box=box.SIMPLE)
-    table.add_column("#", style="cyan", justify="center")
-    table.add_column("Config", style="green")
-    table.add_column("Source Column", style="white")
-    table.add_column("Embedding Column", style="white")
-
-    config_keys = list(CONFIG_SETTINGS.keys())
-    for i, (name, (text_col, emb_col, _)) in enumerate(CONFIG_SETTINGS.items(), 1):
-        table.add_row(str(i), name, text_col, emb_col)
-
-    console.print(table)
-
-    choice = Prompt.ask(
-        "Choose configuration",
-        choices=[str(i) for i in range(1, len(config_keys) + 1)],
-        default="1",
-    )
-    return config_keys[int(choice) - 1]
-
-
-def choose_update_mode() -> str:
-    """Prompt the user to choose the embedding update mode."""
-    console.print("\n[bold]Update Mode:[/bold]")
-    table = Table(box=box.SIMPLE)
-    table.add_column("#", style="cyan", justify="center")
-    table.add_column("Mode", style="green")
-    table.add_column("Description", style="white")
-
-    table.add_row("1", "missing", "Update only rows without compatible embeddings (recommended)")
-    table.add_row("2", "all", "Recalculate all embeddings (may take longer)")
-
-    console.print(table)
-
-    while True:
-        try:
-            choice = Prompt.ask("Choose update mode", choices=["1", "2"], default="1")
-            return "missing" if choice == "1" else "all"
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Operation cancelled.[/yellow]")
-            raise SystemExit(0)
-
-
 def display_config_panel(
     repo_id: str, config_name: str, text_column: str, embedding_column: str,
     update_mode: str, batch_tokens: int, providers: List[str], dry_run: bool,
@@ -262,33 +234,6 @@ def display_config_panel(
     console.print(Panel(table, title="[bold blue]Semantic Embedding Configuration", border_style="blue"))
 
 
-def display_text_stats(texts: List[Any], column_name: str) -> int:
-    """Display statistics about the text column and return count of non-empty texts."""
-    non_empty_texts = [t for t in texts if t is not None and str(t).strip() != ""]
-    empty_count = len(texts) - len(non_empty_texts)
-
-    table = Table(title=f"Source Column Statistics: '{column_name}'", box=box.ROUNDED)
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="green")
-
-    table.add_row("Total entries", str(len(texts)))
-    table.add_row("Non-empty entries", str(len(non_empty_texts)))
-    table.add_row("Empty/None entries", str(empty_count))
-
-    if non_empty_texts:
-        lengths = [len(str(t)) for t in non_empty_texts]
-        avg_length = sum(lengths) / len(lengths)
-        max_length = max(lengths)
-        will_chunk = sum(1 for l in lengths if l > CHUNK_SIZE)
-        table.add_row("Avg. text length", f"{avg_length:,.0f} characters")
-        table.add_row("Max text length", f"{max_length:,} characters")
-        if will_chunk > 0:
-            table.add_row("Will be chunked", f"[yellow]{will_chunk}[/yellow] texts > {CHUNK_SIZE:,} chars")
-
-    console.print(table)
-    return len(non_empty_texts)
-
-
 def text_fingerprint(text: Any, title: str = "none") -> str:
     """Input identity of one row's embedding: its text plus the chunking
     settings that shape the pooled vector."""
@@ -301,7 +246,192 @@ def resume_hint(cache_file, config_name: str, update_mode: str) -> str:
             f"  iwac-process embeddings --config {config_name} --update-mode {update_mode}")
 
 
-def main() -> int:
+def _has_text(text: Any) -> bool:
+    return text is not None and bool(str(text).strip())
+
+
+def embedding_settings() -> Dict[str, Any]:
+    """Everything that identifies the vectors; hashed into the provenance."""
+    return {
+        **model_settings(), "document_format": "title: {title} | text: {text}",
+        "format_version": FORMAT_VERSION, "chunk_bytes": CHUNK_SIZE,
+        "overlap_chars": CHUNK_OVERLAP, "pooling": "character-weighted-mean",
+    }
+
+
+def cache_path(repo_id: str, cache_stem: str, configuration: str) -> Path:
+    """The resume cache of one repository and embedding configuration.
+
+    The repository is part of the name: a scratch run and a production run
+    must not share results for identical o:id values. Entries inside carry a
+    hash of their row's input (see text_fingerprint).
+    """
+    return CACHE_DIR / (
+        f"{cache_stem}_{repo_slug(repo_id)}_"
+        f"{cache_fingerprint(MODEL_ID, DIMENSION, 'document')}_{configuration[:16]}.sqlite3"
+    )
+
+
+@dataclass
+class RowPlan:
+    """Per-row inputs and outputs of one run; ``vectors`` is filled in place."""
+
+    texts: List[Any]
+    titles: List[str]
+    fingerprints: List[str]
+    compatible: List[bool]
+    existing: List[Optional[np.ndarray]]
+    vectors: List[Optional[np.ndarray]]
+    indices: List[int]  # rows to (re)compute
+
+
+def plan_rows(ds, text_column: str, embedding_column: str, update_mode: str,
+              configuration: str) -> RowPlan:
+    """Keep compatible vectors (missing mode) and list the rows to compute.
+
+    Provenance establishes compatibility; legacy vectors are recomputed.
+    """
+    texts = ds[text_column]
+    # Titles affect retrieval input and must participate in invalidation.
+    titles = ([str(t or "none")[:200] for t in ds["title"]] if "title" in ds.column_names
+              else ["none"] * len(ds))
+    fingerprints = [text_fingerprint(t, title) for t, title in zip(texts, titles, strict=True)]
+    compatible = compatible_rows(ds, embedding_column, fingerprints, configuration)
+    existing = column_vectors(ds, embedding_column)
+    vectors: List[Optional[np.ndarray]] = [
+        emb if update_mode == "missing" and ok and _has_text(text) and not is_empty_embedding(emb) else None
+        for emb, ok, text in zip(existing, compatible, texts, strict=True)
+    ]
+    indices = [i for i, (text, vector) in enumerate(zip(texts, vectors))
+               if _has_text(text) and vector is None]
+    return RowPlan(texts, titles, fingerprints, compatible, existing, vectors, indices)
+
+
+def restore_chunks(plan: RowPlan, row_ids: Sequence[Any], cache_file: Path):
+    """Chunk every row to compute; reuse cached chunk vectors for its current input.
+
+    Returns ``(row_chunks, chunk_vectors, queue, n_cached)``. The cache is read
+    one entry at a time and only matching entries are kept, as float32 arrays.
+    """
+    row_chunks: Dict[int, List[str]] = {i: chunk_text(str(plan.texts[i])) for i in plan.indices}
+    wanted = {chunk_key(row_ids[i], c): (i, c)
+              for i, chunks in row_chunks.items() for c in range(len(chunks))}
+    chunk_vectors: Dict[tuple[int, int], np.ndarray] = {}
+    n_cached = 0
+    for key, entry in iter_cache(cache_file):
+        n_cached += 1
+        target = wanted.get(key)
+        if (target is not None and isinstance(entry, dict)
+                and entry.get("h") == plan.fingerprints[target[0]] and entry.get("v") is not None):
+            chunk_vectors[target] = np.asarray(entry["v"], dtype=np.float32)
+    queue = [target for target in wanted.values() if target not in chunk_vectors]
+    return row_chunks, chunk_vectors, queue, n_cached
+
+
+def embed_queue(encoder, queue, row_chunks, plan: RowPlan, row_ids, chunk_vectors,
+                cache_file: Path, batch_tokens: int) -> int:
+    """Embed queued chunks batch by batch, checkpointing each finished batch.
+
+    Returns the number of failed chunks; KeyboardInterrupt propagates after the
+    last finished batch has been saved.
+    """
+    queued_texts = [document_text(row_chunks[i][c], plan.titles[i]) for i, c in queue]
+    lengths = encoder.token_lengths(queued_texts)
+    started = time.time()
+    done_tokens = 0
+    failed = 0
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("{task.fields[rate]}"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("[cyan]Embedding tokens", total=sum(lengths), rate="")
+        for batch in token_batches(lengths, batch_tokens):
+            try:
+                vectors = encoder.encode([queued_texts[k] for k in batch])
+            except Exception as e:
+                logger.error(f"Batch of {len(batch)} chunks failed: {e}")
+                failed += len(batch)
+            else:
+                # Checkpoint this batch before starting the next one.
+                completed = {}
+                for k, vector in zip(batch, vectors, strict=True):
+                    i, c = queue[k]
+                    chunk_vectors[(i, c)] = np.asarray(vector, dtype=np.float32)
+                    completed[chunk_key(row_ids[i], c)] = make_entry(
+                        chunk_vectors[(i, c)].tolist(), plan.fingerprints[i])
+                save_cache(completed, cache_file)
+            n_tokens = sum(lengths[k] for k in batch)
+            done_tokens += n_tokens
+            rate = done_tokens / max(time.time() - started, 1e-9)
+            progress.update(task, advance=n_tokens, rate=f"{rate:,.0f} tok/s")
+    return failed
+
+
+def pool_rows(plan: RowPlan, row_chunks, chunk_vectors) -> tuple[int, int]:
+    """Length-weighted mean of each row's chunk vectors; ``(partial, multi_chunk)``.
+
+    Rows with any failed chunk end EMPTY — never a truncated average, never a
+    stale pre-existing vector — so a re-run retries them.
+    """
+    partial_rows = multi_chunk = 0
+    for i, chunks in row_chunks.items():
+        vectors = [chunk_vectors.get((i, c)) for c in range(len(chunks))]
+        if any(v is None for v in vectors):
+            plan.vectors[i] = None
+            partial_rows += 1
+            continue
+        multi_chunk += len(chunks) > 1
+        plan.vectors[i] = np.asarray(
+            average_embeddings(vectors, weights=[len(c) for c in chunks]), dtype=np.float32)
+    return partial_rows, multi_chunk
+
+
+def apply_outputs(ds, plan: RowPlan, embedding_column: str, configuration: str,
+                  settings: Dict[str, Any], config_name: str, update_mode: str):
+    """The dataset with vectors, provenance, invalidated neighbours and retired
+    columns removed; returns ``(dataset, retired_columns)``."""
+    ds_out = set_embedding_column(ds, embedding_column, plan.vectors)
+    ds_out = set_provenance(ds_out, embedding_column, plan.fingerprints, configuration,
+                            [not is_empty_embedding(e) for e in plan.vectors], settings=settings)
+    vector_changed = any(
+        (not is_empty_embedding(old) or not is_empty_embedding(new))
+        and (not ok or update_mode == "all" or is_empty_embedding(new))
+        for old, new, ok in zip(plan.existing, plan.vectors, plan.compatible, strict=True)
+    )
+    # A neighbor rank depends on all vectors, not just on its own document.
+    ds_out = invalidate_columns(ds_out, ["related_articles"], [vector_changed] * len(ds))
+    return drop_retired_columns(ds_out, config_name)
+
+
+def changed_columns(before, after, columns: Sequence[str]) -> List[str]:
+    """Columns added or removed, plus listed columns whose Arrow values differ."""
+    import pyarrow as pa
+
+    changed = set(before.column_names) ^ set(after.column_names)
+    for column in columns:
+        if column in changed or column not in after.column_names:
+            continue
+        old, new = (before.with_format("arrow")[column], after.with_format("arrow")[column])
+        old = old if isinstance(old, pa.ChunkedArray) else pa.chunked_array([old])
+        new = new if isinstance(new, pa.ChunkedArray) else pa.chunked_array([new])
+        if old.type != new.type or not old.equals(new):
+            changed.add(column)
+    return sorted(changed)
+
+
+def touched_columns(embedding_column: str) -> List[str]:
+    """Every column this stage writes."""
+    return [embedding_column, *provenance_columns(embedding_column),
+            f"{embedding_column}_config_json", "related_articles"]
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Add a semantic embedding column to a dataset subset using "
                     f"{MODEL_ID}, run locally."
@@ -345,12 +475,7 @@ def main() -> int:
         action="store_true",
         help="Compute embeddings but do not push to Hub (the cache is kept for the real run).",
     )
-    parser.add_argument(
-        "--update-mode",
-        choices=["missing", "all"],
-        default=None,
-        help="Update only missing embeddings or recompute all (skips the interactive prompt).",
-    )
+    add_update_mode_args(parser)
     parser.add_argument(
         "--fresh-cache",
         action="store_true",
@@ -368,41 +493,35 @@ def main() -> int:
              "and the Hub is left untouched for a safe retry.",
     )
 
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
     if args.batch_tokens < 1 or (args.threads is not None and args.threads < 1):
         parser.error("--batch-tokens and --threads must be positive")
 
     repo_id = args.repo
-    configuration_settings = {
-        **model_settings(), "document_format": "title: {title} | text: {text}",
-        "format_version": FORMAT_VERSION, "chunk_bytes": CHUNK_SIZE,
-        "overlap_chars": CHUNK_OVERLAP, "pooling": "character-weighted-mean",
-    }
+    configuration_settings = embedding_settings()
     configuration = config_fingerprint(configuration_settings)
     dry_run = args.dry_run
 
     # --- Configuration selection ---
-    if args.config:
-        config_name = args.config
-    else:
-        config_name = choose_config()
+    config_name = args.config or choose_config(list(CONFIG_SETTINGS), console=console)
     console.print(f"[green]✓[/green] Configuration: [cyan]{config_name}[/cyan]")
 
-    # Resolve per-config settings
     text_column, embedding_column, cache_stem = CONFIG_SETTINGS[config_name]
     expected_dimension = (SUBSETS[config_name].embedding_columns or {})[embedding_column]
     if DIMENSION != expected_dimension:
         parser.error(f"{MODEL_ID} produces {DIMENSION} dims; schema expects {expected_dimension}")
-    # The repository is part of the name: a scratch run and a production run
-    # must not share results for identical o:id values. Entries inside carry a
-    # hash of their row's input (see text_fingerprint).
-    cache_file = CACHE_DIR / (
-        f"{cache_stem}_{repo_slug(repo_id)}_"
-        f"{cache_fingerprint(MODEL_ID, DIMENSION, 'document')}_{configuration[:16]}.sqlite3"
-    )
+    cache_file = cache_path(repo_id, cache_stem, configuration)
     if args.fresh_cache and cache_file.exists():
         cache_file.unlink()
         console.print("[yellow]ℹ[/yellow] --fresh-cache: deleted the existing resume cache.")
+
+    update_mode = resolve_update_mode(args, console=console)
+    console.print(f"[green]✓[/green] Update mode: [cyan]{update_mode}[/cyan]")
 
     # --- Step 1: Authentication ---
     console.print("\n[bold cyan]Step 1:[/bold cyan] Authenticating...")
@@ -424,14 +543,6 @@ def main() -> int:
         console.print(f"[red]✗[/red] Failed to load the encoder: {e}")
         return 1
 
-    # --- Update mode selection ---
-    if args.update_mode:
-        update_mode = args.update_mode
-    else:
-        update_mode = choose_update_mode()
-    console.print(f"[green]✓[/green] Update mode: [cyan]{update_mode}[/cyan]")
-
-    # --- Display configuration ---
     console.print()
     display_config_panel(repo_id, config_name, text_column, embedding_column, update_mode,
                          args.batch_tokens, encoder.providers, dry_run)
@@ -440,116 +551,47 @@ def main() -> int:
     console.print("\n[bold cyan]Step 3:[/bold cyan] Loading dataset...")
     ds = load_hub_dataset(repo_id, config_name, token=hf_token, console=console)
     source_revision = getattr(ds, "_iwac_source_revision", None)
-
-    # --- Column checks ---
     if text_column not in ds.column_names:
         console.print(f"[red]✗[/red] Source column '{text_column}' not found in dataset.")
         console.print(f"[yellow]ℹ[/yellow] Available columns: {', '.join(ds.column_names)}")
         return 1
-
-    # Provenance below establishes compatibility; legacy vectors are recomputed.
-    if embedding_column in ds.column_names:
-        if update_mode == "all":
-            console.print(f"[yellow]⚠[/yellow] Embedding column '{embedding_column}' exists and will be overwritten.")
-        else:
-            console.print(f"[yellow]ℹ[/yellow] Embedding column '{embedding_column}' exists. "
-                          "Rows without compatible provenance will be computed.")
-    else:
+    if embedding_column not in ds.column_names:
         console.print(f"[blue]→[/blue] Embedding column '{embedding_column}' will be created.")
+    elif update_mode == "all":
+        console.print(f"[yellow]⚠[/yellow] Embedding column '{embedding_column}' exists and will be overwritten.")
+    else:
+        console.print(f"[yellow]ℹ[/yellow] Embedding column '{embedding_column}' exists. "
+                      "Rows without compatible provenance will be computed.")
 
-    # --- Step 4: Analyze source data ---
+    # --- Step 4: Plan the rows and restore finished chunks ---
     console.print("\n[bold cyan]Step 4:[/bold cyan] Analyzing source data...")
-    texts = ds[text_column]
-    display_text_stats(texts, text_column)
-
-    cache = load_cache(cache_file)
-    if cache:
-        console.print(f"[green]✓[/green] Resume cache holds [cyan]{len(cache)}[/cyan] chunk vectors")
-
-    # --- Identify rows to process ---
-    # Use [] instead of None for missing embeddings so PyArrow infers a consistent list<float> type
-    existing_embeddings = ds[embedding_column] if embedding_column in ds.column_names else [[] for _ in range(len(ds))]
+    plan = plan_rows(ds, text_column, embedding_column, update_mode, configuration)
+    display_text_stats(plan.texts, text_column, chunk_bytes=CHUNK_SIZE, console=console)
     row_ids = ds["o:id"]  # stable row identifier for cache keys
-    # Titles affect retrieval input and must participate in invalidation.
-    titles = [str(t or "none")[:200] for t in ds["title"]] if "title" in ds.column_names else ["none"] * len(ds)
-    fingerprints = [text_fingerprint(t, title) for t, title in zip(texts, titles, strict=True)]
-    compatible = compatible_rows(ds, embedding_column, fingerprints, configuration)
-    all_embeddings: List[Any] = [
-        emb if update_mode == "missing" and ok and text is not None and str(text).strip()
-        and not is_empty_embedding(emb) else []
-        for emb, ok, text in zip(existing_embeddings, compatible, texts, strict=True)
-    ]
-    indices_to_process = [
-        i for i, (text, emb) in enumerate(zip(texts, all_embeddings))
-        if text is not None and str(text).strip() and is_empty_embedding(emb)
-    ]
-
-    # Every chunk of every row to process; those already in the cache for the
-    # row's current input are reused, the rest are queued.
-    row_chunks: Dict[int, List[str]] = {i: chunk_text(str(texts[i])) for i in indices_to_process}
-    chunk_vectors: Dict[tuple[int, int], Any] = {}
-    queue: List[tuple[int, int]] = []
-    for i, chunks in row_chunks.items():
-        for c in range(len(chunks)):
-            vector = cached_value(cache, chunk_key(row_ids[i], c), fingerprints[i])
-            if vector is None:
-                queue.append((i, c))
-            else:
-                chunk_vectors[(i, c)] = vector
-    cache.clear()  # vectors needed are now in chunk_vectors
-
-    failed = 0
-    if not indices_to_process:
+    row_chunks, chunk_vectors, queue, n_cached = restore_chunks(plan, row_ids, cache_file)
+    if n_cached:
+        console.print(f"[green]✓[/green] Resume cache holds [cyan]{n_cached}[/cyan] chunk vectors")
+    if not plan.indices:
         console.print(Panel(
             "[green]No rows to process![/green]\n\n"
-            "Every row has a compatible embedding. Proceeding to update dataset and push.",
+            "Every row has a compatible embedding; checking whether anything else changed.",
             title="Up to Date",
             border_style="green",
         ))
     else:
         console.print(
-            f"[blue]→[/blue] [cyan]{len(indices_to_process)}[/cyan] rows, "
+            f"[blue]→[/blue] [cyan]{len(plan.indices)}[/cyan] rows, "
             f"{sum(len(c) for c in row_chunks.values())} chunks; "
             f"[cyan]{len(chunk_vectors)}[/cyan] restored from cache, [cyan]{len(queue)}[/cyan] to embed"
         )
 
+    failed = 0
     if queue:
         # --- Step 5: Compute embeddings ---
         console.print(f"\n[bold cyan]Step 5:[/bold cyan] Computing embeddings with {MODEL_ID}...")
-        queued_texts = [document_text(row_chunks[i][c], titles[i]) for i, c in queue]
-        lengths = encoder.token_lengths(queued_texts)
-        started = time.time()
-        done_tokens = 0
         try:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                TextColumn("{task.fields[rate]}"),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-                console=console,
-            ) as progress:
-                task = progress.add_task("[cyan]Embedding tokens", total=sum(lengths), rate="")
-                for batch in token_batches(lengths, args.batch_tokens):
-                    try:
-                        vectors = encoder.encode([queued_texts[k] for k in batch])
-                    except Exception as e:
-                        logger.error(f"Batch of {len(batch)} chunks failed: {e}")
-                        failed += len(batch)
-                    else:
-                        # Checkpoint this batch before starting the next one.
-                        completed = {}
-                        for k, vector in zip(batch, vectors, strict=True):
-                            i, c = queue[k]
-                            chunk_vectors[(i, c)] = vector.tolist()
-                            completed[chunk_key(row_ids[i], c)] = make_entry(chunk_vectors[(i, c)], fingerprints[i])
-                        save_cache(completed, cache_file)
-                    batch_tokens = sum(lengths[k] for k in batch)
-                    done_tokens += batch_tokens
-                    rate = done_tokens / max(time.time() - started, 1e-9)
-                    progress.update(task, advance=batch_tokens, rate=f"{rate:,.0f} tok/s")
+            failed = embed_queue(encoder, queue, row_chunks, plan, row_ids, chunk_vectors,
+                                 cache_file, args.batch_tokens)
         except KeyboardInterrupt:
             console.print(Panel(
                 "[yellow]Interrupted; Hub left untouched.[/yellow]\n\n"
@@ -560,18 +602,8 @@ def main() -> int:
             return 130
         console.print("[green]✓[/green] Embedding computation complete.")
 
-    # Rows with any failed chunk must end EMPTY — never a truncated average,
-    # never a stale pre-existing vector — so a re-run retries them.
-    partial_rows = 0
-    multi_chunk = 0
-    for i, chunks in row_chunks.items():
-        vectors = [chunk_vectors.get((i, c)) for c in range(len(chunks))]
-        if any(v is None for v in vectors):
-            all_embeddings[i] = []
-            partial_rows += 1
-            continue
-        multi_chunk += len(chunks) > 1
-        all_embeddings[i] = average_embeddings(vectors, weights=[len(c) for c in chunks])
+    partial_rows, multi_chunk = pool_rows(plan, row_chunks, chunk_vectors)
+    chunk_vectors.clear()
     if multi_chunk:
         console.print(f"[yellow]ℹ[/yellow] {multi_chunk} long texts were averaged from several chunks.")
     if partial_rows:
@@ -589,59 +621,37 @@ def main() -> int:
 
     # --- Update the dataset ---
     console.print("\n[bold cyan]Step 6:[/bold cyan] Updating dataset...")
-
-    # Build the column as a typed PyArrow array (nulls + float lists coexist)
-    # to avoid type-inference issues with sparse embeddings.
-    ds_processed = set_embedding_column(ds, embedding_column, all_embeddings)
-    ds_processed = set_provenance(ds_processed, embedding_column, fingerprints, configuration,
-                                  [not is_empty_embedding(e) for e in all_embeddings], settings=configuration_settings)
-    vector_changed = any(
-        (not is_empty_embedding(old) or not is_empty_embedding(new))
-        and (not ok or update_mode == "all" or is_empty_embedding(new))
-        for old, new, ok in zip(existing_embeddings, all_embeddings, compatible, strict=True)
-    )
-    # A neighbor rank depends on all vectors, not just on its own document.
-    ds_processed = invalidate_columns(ds_processed, ["related_articles"], [vector_changed] * len(ds))
-    ds_processed, retired = drop_retired_columns(ds_processed, config_name)
+    ds_processed, retired = apply_outputs(ds, plan, embedding_column, configuration,
+                                          configuration_settings, config_name, update_mode)
     if retired:
         console.print(f"[blue]→[/blue] Removing retired columns: {', '.join(retired)}")
+    changed = changed_columns(ds, ds_processed, touched_columns(embedding_column))
 
-    # --- Verify results ---
     console.print("\n[bold]Sample embeddings (first 3 non-empty):[/bold]")
-    shown = 0
-    for i, emb in enumerate(ds_processed[embedding_column]):
-        if shown >= 3:
-            break
-        if not is_empty_embedding(emb):
-            console.print(f"  [cyan]#{i+1}[/cyan]: dim={len(emb)}, values=[{emb[0]:.4f}, {emb[1]:.4f}, ...]")
-            shown += 1
+    samples = [(i, v) for i, v in enumerate(plan.vectors) if not is_empty_embedding(v)][:3]
+    for i, emb in samples:
+        console.print(f"  [cyan]#{i+1}[/cyan]: dim={len(emb)}, values=[{emb[0]:.4f}, {emb[1]:.4f}, ...]")
 
-    # --- Reorder columns: place embedding column after source text column ---
-    if text_column in ds_processed.column_names:
-        existing_columns = list(ds_processed.column_names)
-        insert_index = existing_columns.index(text_column) + 1
-
-        new_columns = existing_columns[:insert_index]
-        if embedding_column in existing_columns and embedding_column not in new_columns:
-            new_columns.append(embedding_column)
-        for col in existing_columns[insert_index:]:
-            if col not in new_columns:
-                new_columns.append(col)
-
-        ds_processed = ds_processed.select_columns(new_columns)
-        console.print(f"[blue]→[/blue] Columns reordered ('{embedding_column}' after '{text_column}')")
+    ds_processed = reorder_columns_after(ds_processed, [embedding_column], text_column, console=console)
 
     # --- Step 7: Push to Hub ---
     if dry_run:
+        print_dry_run_panel(
+            repo_id=repo_id, config_name=config_name, n_rows=len(ds_processed), console=console,
+            extra=(f"Changed columns: {', '.join(changed) or 'none (nothing would be pushed)'}\n"
+                   f"[yellow]Chunk vectors are cached in {cache_file}[/yellow]\n"
+                   "Re-run without --dry-run to push; cached results are reused."),
+        )
+        return 0
+    if not changed:
         console.print(Panel(
-            "[yellow]Dry run mode — no changes pushed to Hub.[/yellow]\n\n"
-            f"Would have pushed [cyan]{len(ds_processed)}[/cyan] rows to "
-            f"[cyan]{repo_id}[/cyan] (config: {config_name}).\n\n"
-            f"[yellow]Chunk vectors are cached in {cache_file}[/yellow]\n"
-            "Re-run without --dry-run to push; cached results are reused.",
-            title="Dry Run Complete",
-            border_style="yellow",
+            "[green]Nothing changed: every vector and provenance cell already matches the Hub.[/green]\n\n"
+            "No commit was made.",
+            title="Push skipped",
+            border_style="green",
         ))
+        if not failed:  # partial rows keep their finished chunks for a retry
+            delete_cache(cache_file)
         return 0
 
     console.print("\n[bold cyan]Step 7:[/bold cyan] Pushing to Hugging Face Hub...")
@@ -664,7 +674,7 @@ def main() -> int:
     ):
 
         action = "updated" if embedding_column in ds.column_names else "created"
-        total_valid = sum(1 for e in all_embeddings if not is_empty_embedding(e))
+        total_valid = sum(1 for e in plan.vectors if not is_empty_embedding(e))
 
         summary = (
             f"[bold green]Dataset successfully published![/bold green]\n\n"

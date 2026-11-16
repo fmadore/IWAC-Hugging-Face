@@ -25,15 +25,12 @@ from .settings import get_private_repo_id, get_public_repo_id
 PUBLIC_REPO_ID = get_public_repo_id()
 PRIVATE_REPO_ID = get_private_repo_id()
 
-# Full-text-derived columns, per subset. These are NOT dropped wholesale:
-# publish_public.py masks them PER ROW by the ``OCR_is_public`` flag — the
-# text stays public for items whose ``bibo:content`` is public on Omeka
-# (verified: ~61% of articles, ~89% of publications, 25/26 documents, 7/867
-# references) and is blanked only for items whose full text is private on
-# the source. Lemmas derive from OCR, so they follow the same per-row mask.
-# Subsets not listed have no full-text columns.
-# Back-compat alias (older docs/scripts referenced PRIVATE_COLUMNS).
-PRIVATE_COLUMNS = CONTENT_COLUMNS
+# Full-text-derived columns per subset live in ``schema.CONTENT_COLUMNS``
+# (re-exported here). They are NOT dropped wholesale: the public projection
+# masks them PER ROW by the ``OCR_is_public`` flag, so the text stays public
+# for items whose ``bibo:content`` is public on Omeka and is blanked only for
+# items whose full text is private on the source. Lemmas derive from OCR, so
+# they follow the same per-row mask.
 
 # Path of the per-subset public-column allowlist consumed by
 # publish_public.py (see the "_readme" key inside the file).
@@ -54,7 +51,6 @@ __all__ = [
     "PUBLIC_REPO_ID",
     "PRIVATE_REPO_ID",
     "CONTENT_COLUMNS",
-    "PRIVATE_COLUMNS",
     "PUBLIC_COLUMNS_FILE",
     "load_public_columns",
     "get_private_repo_id",

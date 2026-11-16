@@ -2,30 +2,42 @@
 
 ## Local setup
 
-Use Python 3.12 or newer and an editable checkout:
+Use Python 3.12 or newer and an editable checkout. With the virtual
+environment activated (`source .venv/bin/activate` on Linux or macOS,
+`.\.venv\Scripts\Activate.ps1` in Windows PowerShell), the commands are the
+same in both shells:
 
-```powershell
+```bash
 python -m venv .venv
-.venv\Scripts\python -m pip install --require-hashes -r requirements-lock.txt
-.venv\Scripts\python -m pip install -e . --no-deps
+# activate it, then:
+python -m pip install --require-hashes -r requirements-lock.txt
+python -m pip install -e . --no-deps
 ```
 
-Before opening a pull request, run:
+Before opening a pull request, run the same checks as CI:
 
-```powershell
-.venv\Scripts\python -m compileall -q iwac_common iwac_pipeline post-processing articles audiovisual document images index islamic-publications reference data analyses country_mapper.py lemmatize_update_hf.py
-.venv\Scripts\python -m ruff check .
-.venv\Scripts\python -m pytest tests -q --cov=. --cov-report=json
-.venv\Scripts\python scripts/check_coverage.py coverage.json --core-min 70
-.venv\Scripts\python -m pip check
+```bash
+python -m compileall -q . -x '(^|/)(\.venv|\.git|\.cache[^/]*|build|dist)/'
+python -m ruff check .
+python -m pytest tests -q --cov=. --cov-report=json
+python scripts/check_coverage.py coverage.json --core-min 70
+python -m pip check
 ```
+
+Without activating, call the environment's interpreter directly:
+`.venv/bin/python` on Linux or macOS, `.venv\Scripts\python` on Windows.
 
 CI repeats the locked environment on Linux/Python 3.12, Linux/Python 3.13, and
 Windows/Python 3.12. A separate Linux job tests the latest supported dependency
 ranges. Coverage measures the complete production tree while retaining the
 70% shared-core gate. A wheel job installs into a separate environment and runs
-every command's help from an empty directory; no source-path imports can rescue
-an incomplete distribution.
+every command's `--help` from an empty directory (`scripts/wheel_smoke.py`); no
+source-path imports can rescue an incomplete distribution.
+
+The static-check job installs ruff at the exact version pinned in
+`requirements-lock.txt`; the pin lives in `.github/workflows/ci.yml`, and
+`tests/test_docs_consistency.py` fails when the two drift. Update both when the
+lock is regenerated.
 
 Regenerate the dependency lock deliberately, then validate it in a clean environment:
 

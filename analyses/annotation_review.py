@@ -3,22 +3,110 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import pandas as pd
 
-from iwac_pipeline.analyses._research import (
-    MISSING, METADATA, add_input_args, dates, load_input, metadata, present, save_reports,
-    series, stable_rank, string,
-)
-from iwac_common.sentiment_panel import generation, latest_generation
+try:
+    from iwac_pipeline.analyses._research import (
+        MISSING, METADATA, add_input_args, dates, load_input, metadata, save_reports,
+        series, stable_rank, string,
+    )
+except ModuleNotFoundError as exc:
+    if not (exc.name or "").startswith("iwac_pipeline"):
+        raise
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _research import (  # noqa: E402
+        MISSING, METADATA, add_input_args, dates, load_input, metadata, save_reports,
+        series, stable_rank, string,
+    )
+from iwac_common.sentiment_panel import generation, latest_generation  # noqa: E402
 
 DIMENSIONS = ("polarite", "subjectivite_score", "centralite_islam_musulmans")
+LABEL_FIELDS = ("polarity", "subjectivity", "centrality")
+CODING_FIELDS = ("evaluation_target", "quoted_stance", "negative_event", "uncertain", "notes")
+ANNOTATORS = ("annotator_a", "annotator_b")
+AUDIT_COLUMNS = ("o:id", "stable_rank", "sample_group", "selection_reason", "stratum",
+                 "stratum_population", "stratum_sampled", "inclusion_probability",
+                 "design_weight", "annotation_generation")
+DESIGN_COLUMNS = frozenset(AUDIT_COLUMNS) - {"o:id"}
+
+
+def _strata_frame(df, strata, seed):
+    years, _ = dates(df)
+    work = df.copy()
+    work["decade"] = [str((int(y) // 10) * 10) if pd.notna(y) else MISSING for y in years]
+    for column in strata:
+        if column != "decade" and column not in df:
+            raise ValueError(f"Stratum column is absent: {column}")
+        work[column] = series(work, column).map(lambda value: string(value, MISSING))
+    work["_rank"] = work["o:id"].astype(str).map(lambda item_id: stable_rank(seed, item_id))
+    return work
+
+
+def _probability_sample(work, strata, per_stratum):
+    """Up to ``per_stratum`` lowest hash ranks per stratum, with design weights."""
+    selected = []
+    for _, group in work.groupby(list(strata), dropna=False, sort=True):
+        sampled = group.sort_values(["_rank", "o:id"]).head(per_stratum)
+        for idx in sampled.index:
+            selected.append((idx, "stratified_probability", "stratified_hash_sample",
+                             len(group), len(sampled)))
+    return selected
+
+
+def _challenge_sample(work, models, chosen, difficult, challenge_size):
+    """Expert-flagged first, then within-generation model disagreement, by hash rank."""
+    disagreement = {}
+    for dimension in DIMENSIONS:
+        columns = [m.column(dimension) for m in models]
+        votes = work.reindex(columns=columns).apply(lambda col: col.map(string))
+        voted = votes.ne("")
+        distinct = votes.where(voted).nunique(axis=1)
+        disagreement[dimension] = voted.sum(axis=1).ge(2) & distinct.gt(1)
+    candidates = []
+    for idx, item_id, rank in zip(work.index, work["o:id"].astype(str), work["_rank"]):
+        if item_id in chosen:
+            continue
+        reasons = ["expert_flagged"] if item_id in difficult else []
+        reasons += [f"model_disagreement:{d}" for d in DIMENSIONS if disagreement[d].loc[idx]]
+        if reasons:
+            candidates.append((0 if item_id in difficult else 1, rank, idx, "|".join(reasons)))
+    return [(idx, "challenge_nonprobability", reason, None, None)
+            for _, _, idx, reason in sorted(candidates)[:challenge_size]]
+
+
+def _sheets(work, selected, *, excerpt_chars, text_column):
+    """Blind per-annotator forms and an adjudication form, ordered by hash rank.
+
+    Probability and challenge cases are interleaved and carry no design or
+    selection field, so neither annotator can tell why a source is present.
+    """
+    order = sorted(selected, key=lambda item: (work.at[item[0], "_rank"], str(work.at[item[0], "o:id"])))
+    base = [metadata(work.loc[idx], excerpt_chars=excerpt_chars, text_column=text_column)
+            for idx, *_ in order]
+    meta_columns = [*METADATA, *(["text_excerpt"] if excerpt_chars else [])]
+    sheets = {}
+    for annotator in ANNOTATORS:
+        fields = ["annotator_id", *LABEL_FIELDS, *CODING_FIELDS]
+        sheets[annotator] = pd.DataFrame([{**record, **{f: "" for f in fields}} for record in base],
+                                         columns=[*meta_columns, *fields])
+    fields = ["adjudicator_id", *(f"adjudicated_{f}" for f in LABEL_FIELDS), *CODING_FIELDS]
+    sheets["adjudication"] = pd.DataFrame([{**record, **{f: "" for f in fields}} for record in base],
+                                          columns=[*meta_columns, *fields])
+    return sheets, order
 
 
 def annotation_sample(df, *, per_stratum=3, challenge_size=30, seed=42,
                       strata=("country", "decade", "newspaper", "language"),
                       models=None, difficult_ids=(), excerpt_chars=0, text_column="OCR"):
+    """Return ``(sheets, audit, summary)``.
+
+    ``sheets`` maps ``annotator_a``/``annotator_b``/``adjudication`` to blank
+    forms with identical rows; ``audit`` holds every design and selection field
+    keyed by ``o:id`` and is for study management only.
+    """
     if per_stratum < 1 or challenge_size < 0 or excerpt_chars < 0:
         raise ValueError("Sample sizes must be positive (challenge and excerpts may be zero)")
     if not strata or len(set(strata)) != len(strata):
@@ -28,72 +116,34 @@ def annotation_sample(df, *, per_stratum=3, challenge_size=30, seed=42,
     models = tuple(latest_generation() if models is None else models)
     if not models or len({m.generation for m in models}) != 1:
         raise ValueError("Select exactly one annotation generation")
-    years, precision = dates(df)
-    work = df.copy()
-    work["decade"] = [str((int(y) // 10) * 10) if pd.notna(y) and p in ("year", "month", "day") else MISSING
-                      for y, p in zip(years, precision)]
-    for column in strata:
-        if column != "decade" and column not in df:
-            raise ValueError(f"Stratum column is absent: {column}")
-        work[column] = series(work, column).map(lambda value: string(value, MISSING))
-    work["_rank"] = work["o:id"].astype(str).map(lambda item_id: stable_rank(seed, item_id))
-    records, audit, chosen = [], [], set()
-    def append(row, group, reason, population=None, sampled=None):
-        item_id = str(row["o:id"])
-        record = metadata(row, excerpt_chars=excerpt_chars, text_column=text_column)
-        record["sample_group"] = group
-        record["stratum"] = "|".join(string(row.get(c), MISSING) for c in strata)
-        record["stratum_population"] = population
-        record["stratum_sampled"] = sampled
-        record["inclusion_probability"] = sampled / population if population else None
-        record["design_weight"] = population / sampled if sampled else None
-        for reviewer in ("annotator_a", "annotator_b", "adjudicated"):
-            for dimension in ("polarity", "subjectivity", "centrality"):
-                record[f"{reviewer}_{dimension}"] = ""
-        record.update({"evaluation_target": "", "quoted_stance": "", "negative_event": "",
-                       "uncertain": "", "notes": ""})
-        records.append(record)
-        audit.append({"o:id": item_id, "sample_group": group, "selection_reason": reason,
-                      "annotation_generation": models[0].generation})
-        chosen.add(item_id)
-    for _, group in work.groupby(list(strata), dropna=False, sort=True):
-        sampled = group.sort_values(["_rank", "o:id"]).head(per_stratum)
-        for _, row in sampled.iterrows():
-            append(row, "stratified_probability", "stratified_hash_sample", len(group), len(sampled))
+    work = _strata_frame(df, strata, seed)
     difficult = set(map(str, difficult_ids))
     unknown = difficult - set(work["o:id"].astype(str))
     if unknown:
         raise ValueError(f"Difficult IDs absent from this snapshot: {sorted(unknown)[:10]}")
-    candidates = []
-    for idx, row in work.iterrows():
-        item_id = str(row["o:id"])
-        if item_id in chosen:
-            continue
-        reasons = []
-        if item_id in difficult:
-            reasons.append("expert_flagged")
-        for dimension in DIMENSIONS:
-            values = [string(row.get(m.column(dimension))) for m in models
-                      if present(row.get(m.column(dimension)))]
-            if len(values) >= 2 and len(set(values)) > 1:
-                reasons.append(f"model_disagreement:{dimension}")
-        if reasons:
-            candidates.append((0 if item_id in difficult else 1, row["_rank"], idx, "|".join(reasons)))
-    for _, _, idx, reason in sorted(candidates)[:challenge_size]:
-        append(work.loc[idx], "challenge_nonprobability", reason)
-    columns = [*METADATA, *( ["text_excerpt"] if excerpt_chars else []), "sample_group", "stratum",
-               "stratum_population", "stratum_sampled", "inclusion_probability", "design_weight",
-               *(f"{reviewer}_{dimension}" for reviewer in ("annotator_a", "annotator_b", "adjudicated")
-                 for dimension in ("polarity", "subjectivity", "centrality")),
-               "evaluation_target", "quoted_stance", "negative_event", "uncertain", "notes"]
-    sheet = pd.DataFrame(records, columns=columns)
+    selected = _probability_sample(work, strata, per_stratum)
+    chosen = {str(work.at[idx, "o:id"]) for idx, *_ in selected}
+    selected += _challenge_sample(work, models, chosen, difficult, challenge_size)
+    sheets, order = _sheets(work, selected, excerpt_chars=excerpt_chars, text_column=text_column)
+    audit = pd.DataFrame([{
+        "o:id": str(work.at[idx, "o:id"]), "stable_rank": work.at[idx, "_rank"],
+        "sample_group": group, "selection_reason": reason,
+        "stratum": "|".join(string(work.at[idx, c], MISSING) for c in strata),
+        "stratum_population": population, "stratum_sampled": sampled,
+        "inclusion_probability": sampled / population if population else None,
+        "design_weight": population / sampled if sampled else None,
+        "annotation_generation": models[0].generation,
+    } for idx, group, reason, population, sampled in order], columns=AUDIT_COLUMNS)
     summary = {"seed": seed, "strata": list(strata), "population": len(df),
-               "probability_sample": sum(r["sample_group"] == "stratified_probability" for r in records),
-               "challenge_sample": sum(r["sample_group"] == "challenge_nonprobability" for r in records),
+               "probability_sample": int(audit["sample_group"].eq("stratified_probability").sum()),
+               "challenge_sample": int(audit["sample_group"].eq("challenge_nonprobability").sum()),
                "annotation_generation": models[0].generation,
                "models": [{"id": m.model_id, "prompt_fingerprint": m.prompt_fingerprint} for m in models],
+               "blinding": "Annotator and adjudication sheets share one hash-ranked order and omit sample "
+                           "group, stratum, weights and selection reasons; join the selection audit on o:id "
+                           "only after annotation.",
                "interpretation": "Blank independent annotation forms; no gold labels or accuracy estimates. Analyze challenge set separately; use design weights for probability-sample estimates."}
-    return sheet, pd.DataFrame(audit, columns=("o:id", "sample_group", "selection_reason", "annotation_generation")), summary
+    return sheets, audit, summary
 
 
 def main():
@@ -112,12 +162,12 @@ def main():
         *([args.text_column] if args.excerpt_chars else [])]))
     df = load_input(args, columns=columns)
     difficult = args.difficult_ids.read_text(encoding="utf-8").splitlines() if args.difficult_ids else []
-    sheet, audit, summary = annotation_sample(df, per_stratum=args.per_stratum,
+    sheets, audit, summary = annotation_sample(df, per_stratum=args.per_stratum,
         challenge_size=args.challenge_size, seed=args.seed, strata=tuple(args.strata),
         models=models,
         difficult_ids=[x.strip() for x in difficult if x.strip()],
         excerpt_chars=args.excerpt_chars, text_column=args.text_column)
-    save_reports(args, df, "annotation_review", {"sheet": sheet, "selection_audit": audit}, summary)
+    save_reports(args, df, "annotation_review", {**sheets, "selection_audit": audit}, summary)
 
 
 if __name__ == "__main__":

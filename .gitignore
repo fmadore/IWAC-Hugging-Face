@@ -1,7 +1,6 @@
 .env
 .venv
 .cache_omk*
-.cache_word_count
 .cache_embeddings
 .cache_lemmas
 __pycache__
@@ -15,13 +14,10 @@ data/iwac_images.csv
 data/iwac_*.parquet
 data/mirror_manifest.json
 data/.iwac-mirror-*/
-bertopic_model/
 lda_model*/
-nul
 .agents/
 analyses/output/
 *.egg-info/
-logs/
 .pytest_cache/
 .iwac_locks/
 .iwac_state/

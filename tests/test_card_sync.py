@@ -1,13 +1,10 @@
-"""The post-push card guard.
+"""The read-only post-commit card check.
 
-What this protects: ``push_to_hub`` refreshes a config's byte sizes but not its
-``features`` list, so a schema change leaves the card declaring the old columns
-and ``load_dataset`` raises ``CastError`` — the subset becomes unloadable for
-every consumer, including this pipeline's own next run. It happened twice on
-2026-08-06, on the private mirror and then on the public citable dataset.
-
-The guard has to *repair*, not merely abort: by the time it runs the push has
-already landed, so refusing to continue would leave the dataset broken.
+What this protects: a card whose declared ``features`` disagree with the
+parquet makes ``load_dataset`` raise ``CastError`` — the subset becomes
+unloadable for every consumer, including this pipeline's own next run. The
+gateway commits card and parquet atomically; this check verifies the result at
+the committed revision and raises (never writes) on any mismatch.
 """
 
 import pyarrow as pa
@@ -55,27 +52,12 @@ def _card(*, articles_cols, with_info=True) -> str:
 
 @pytest.fixture
 def hub(monkeypatch):
-    """Serve a canned card + parquet schema; capture any card upload."""
-    state = {"uploads": [], "card": None, "schema": None}
+    """Serve a canned card + parquet schema."""
+    state = {"card": None, "schema": None}
 
-    def _install(card_text: str, schema: pa.Schema, *, repair_writes=True):
+    def _install(card_text: str, schema: pa.Schema):
         state["card"] = card_text
         state["schema"] = card_sync._normalize_schema(schema)
-
-        class FakeApi:
-            def __init__(self, *a, **k):
-                pass
-
-            def upload_file(self, *, path_or_fileobj, path_in_repo, repo_id,
-                            repo_type, commit_message, parent_commit):
-                text = path_or_fileobj.decode("utf-8")
-                state["uploads"].append(text)
-                if repair_writes:  # the Hub now serves what we wrote
-                    state["card"] = text
-                from types import SimpleNamespace
-                return SimpleNamespace(oid="after")
-
-        monkeypatch.setattr(card_sync, "HfApi", FakeApi)
         monkeypatch.setattr(
             card_sync, "_load_card",
             lambda *a, **k: DatasetCard(state["card"]),
@@ -111,97 +93,68 @@ class TestNarrow:
 
 
 class TestMatchingCard:
-    def test_no_upload_when_already_correct(self, hub):
-        st = hub(_card(articles_cols=["o:id", "title"]), _schema(["o:id", "title"]))
-        assert sync_card_features("repo", "articles") is True
-        assert st["uploads"] == []
+    def test_passes_when_already_correct(self, hub):
+        hub(_card(articles_cols=["o:id", "title"]), _schema(["o:id", "title"]))
+        sync_card_features("repo", "articles")
 
     def test_large_string_parquet_is_not_a_mismatch(self, hub):
         """The real parquet is large_string while the card says string; that must
-        read as a match, not trigger a repair on every single push."""
-        st = hub(_card(articles_cols=["o:id", "title"]),
-                 _schema(["o:id", "title"], pa.large_string()))
-        assert sync_card_features("repo", "articles") is True
-        assert st["uploads"] == []
+        read as a match, not fail verification on every single push."""
+        hub(_card(articles_cols=["o:id", "title"]),
+            _schema(["o:id", "title"], pa.large_string()))
+        sync_card_features("repo", "articles")
 
     def test_card_without_dataset_info_passes(self, hub):
-        st = hub(_card(articles_cols=[], with_info=False), _schema(["o:id"]))
-        assert sync_card_features("repo", "articles") is True
-        assert st["uploads"] == []
-
-
-class TestRepair:
-    def test_stale_card_is_repaired_and_reports_false(self, hub):
-        st = hub(_card(articles_cols=["o:id", "title"]),
-                 _schema(["o:id", "title", SENTIMENT]))
-        assert sync_card_features("repo", "articles") is False
-        assert len(st["uploads"]) == 1
-        declared = [f["name"] for f in
-                    DatasetCard(st["uploads"][0]).data["dataset_info"][0]["features"]]
-        assert declared == ["o:id", "title", SENTIMENT]
-
-    def test_repair_is_idempotent(self, hub):
-        """A second run right after must be a no-op, not another commit."""
-        st = hub(_card(articles_cols=["o:id"]), _schema(["o:id", SENTIMENT]))
-        assert sync_card_features("repo", "articles") is False
-        assert sync_card_features("repo", "articles") is True
-        assert len(st["uploads"]) == 1
-
-    def test_other_configs_and_prose_survive(self, hub):
-        st = hub(_card(articles_cols=["o:id"]), _schema(["o:id", SENTIMENT]))
+        hub(_card(articles_cols=[], with_info=False), _schema(["o:id"]))
         sync_card_features("repo", "articles")
-        written = DatasetCard(st["uploads"][0])
-        index_entry = written.data["dataset_info"][1]
-        assert index_entry["config_name"] == "index"
-        assert [f["name"] for f in index_entry["features"]] == ["o:id"]
-        assert "Prose that must survive." in written.text
-        # Sizes belong to push_to_hub; the guard must not invent new ones.
-        articles = written.data["dataset_info"][0]
-        assert articles["splits"][0]["num_examples"] == 2
-        assert articles["download_size"] == 50
 
-    def test_dropped_column_is_also_repaired(self, hub):
-        st = hub(_card(articles_cols=["o:id", "gone"]), _schema(["o:id"]))
-        assert sync_card_features("repo", "articles") is False
-        declared = [f["name"] for f in
-                    DatasetCard(st["uploads"][0]).data["dataset_info"][0]["features"]]
-        assert declared == ["o:id"]
+    def test_supplied_footer_schema_skips_the_shard_read(self, hub, monkeypatch):
+        hub(_card(articles_cols=["o:id", "title"]), _schema(["o:id"]))
 
-    def test_reordering_is_repaired(self, hub):
-        """Column order is part of the declared schema; a silent reorder still
-        needs the card rewritten so declared and actual agree exactly."""
-        st = hub(_card(articles_cols=["title", "o:id"]), _schema(["o:id", "title"]))
-        assert sync_card_features("repo", "articles") is False
-        declared = [f["name"] for f in
-                    DatasetCard(st["uploads"][0]).data["dataset_info"][0]["features"]]
-        assert declared == ["o:id", "title"]
+        def unexpected(*args, **kwargs):
+            pytest.fail("the caller already read the footers")
+
+        monkeypatch.setattr(card_sync, "_parquet_schema", unexpected)
+        sync_card_features("repo", "articles",
+                           parquet_schema=_schema(["o:id", "title"], pa.large_string()))
+
+
+class TestMismatchFailsClosed:
+    """The check never writes: any disagreement raises, card left untouched."""
+
+    @pytest.mark.parametrize("card_cols, parquet", [
+        (["o:id", "title"], _schema(["o:id", "title", SENTIMENT])),
+        (["o:id", "gone"], _schema(["o:id"])),
+        (["title", "o:id"], _schema(["o:id", "title"])),  # order is schema too
+        (["o:id", "nb_mots"], pa.schema([("o:id", pa.string()), ("nb_mots", pa.int64())])),
+        (["o:id", "embedding_OCR"],
+         pa.schema([("o:id", pa.string()), ("embedding_OCR", pa.list_(pa.float32()))])),
+    ])
+    def test_mismatch_raises_without_writing(self, hub, card_cols, parquet):
+        card = _card(articles_cols=card_cols)
+        state = hub(card, parquet)
+        with pytest.raises(CardSchemaError, match=f"declares {len(card_cols)} columns"):
+            sync_card_features("repo", "articles")
+        assert state["card"] == card
+
+    def test_check_has_no_repair_parameter(self):
+        import inspect
+
+        assert "repair" not in inspect.signature(sync_card_features).parameters
+        assert not hasattr(card_sync, "HfApi")
 
 
 class TestFailureModes:
-    def test_repair_false_raises_without_writing(self, hub):
-        st = hub(_card(articles_cols=["o:id"]), _schema(["o:id", SENTIMENT]))
-        with pytest.raises(CardSchemaError, match="declares 1 columns"):
-            sync_card_features("repo", "articles", repair=False)
-        assert st["uploads"] == []
-
-    def test_raises_when_the_rewrite_does_not_take(self, hub):
-        """If the Hub still serves the stale card after the write, the subset is
-        still unloadable — that must not be reported as success."""
-        st = hub(_card(articles_cols=["o:id"]), _schema(["o:id", SENTIMENT]),
-                 repair_writes=False)
-        with pytest.raises(CardSchemaError, match="still does not match"):
-            sync_card_features("repo", "articles")
-        assert len(st["uploads"]) == 1
-
     def test_expected_columns_guard_catches_the_wrong_frame(self, hub):
         """The parquet on the Hub not matching what the caller pushed means
-        something else wrote the repo; never paper over that with a card edit."""
-        st = hub(_card(articles_cols=["o:id"]), _schema(["o:id", "surprise"]))
+        something else wrote the repo."""
+        hub(_card(articles_cols=["o:id"]), _schema(["o:id", "surprise"]))
         with pytest.raises(CardSchemaError, match="does not match the frame"):
             sync_card_features("repo", "articles", expected_columns=["o:id"])
-        assert st["uploads"] == []
 
     def test_missing_parquet_raises(self, monkeypatch):
+        import iwac_common.hub as hub_module
+
         monkeypatch.setattr(card_sync, "resolve_hf_token", lambda *a, **k: "tok")
         monkeypatch.setattr(card_sync, "get_repo_revision", lambda *a, **k: "before")
 
@@ -212,13 +165,13 @@ class TestFailureModes:
             def glob(self, *a, **k):
                 return []
 
-        monkeypatch.setattr(card_sync, "HfFileSystem", EmptyFs)
+        monkeypatch.setattr(hub_module, "HfFileSystem", EmptyFs)
         with pytest.raises(CardSchemaError, match="No parquet found"):
             sync_card_features("repo", "articles")
 
 
 class TestWiredIntoSingleWriter:
-    """All scripts delegate to the one gateway that owns card repair."""
+    """All scripts delegate to the one gateway that commits and verifies cards."""
 
     def test_verified_writer_calls_guard(self):
         import inspect
@@ -251,21 +204,6 @@ class TestWiredIntoSingleWriter:
         assert offenders == []
 
 
-def test_same_names_different_scalar_type_are_repaired(hub):
-    state = hub(_card(articles_cols=["o:id", "nb_mots"]),
-                pa.schema([("o:id", pa.string()), ("nb_mots", pa.int64())]))
-    assert sync_card_features("repo", "articles") is False
-    entry = DatasetCard(state["card"]).data["dataset_info"][0]
-    assert entry["features"][1]["dtype"] == "int64"
-
-
-def test_same_names_different_nested_type_are_repaired(hub):
-    state = hub(_card(articles_cols=["o:id", "embedding_OCR"]),
-                pa.schema([("o:id", pa.string()), ("embedding_OCR", pa.list_(pa.float32()))]))
-    assert sync_card_features("repo", "articles") is False
-    assert len(state["uploads"]) == 1
-
-
 def test_expected_types_are_checked_even_if_names_match(hub):
     hub(_card(articles_cols=["o:id", "nb_mots"]),
         pa.schema([("o:id", pa.string()), ("nb_mots", pa.string())]))
@@ -293,6 +231,8 @@ def test_parquet_verification_reads_every_shard_at_pinned_revision(monkeypatch):
         def open(self, path, mode):
             return io.BytesIO(bodies[path])
 
-    monkeypatch.setattr(card_sync, "HfFileSystem", Files)
+    import iwac_common.hub as hub_module
+
+    monkeypatch.setattr(hub_module, "HfFileSystem", Files)
     with pytest.raises(CardSchemaError, match="Inconsistent"):
         card_sync._parquet_schema("repo", "articles", "token", "revision")

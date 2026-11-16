@@ -19,6 +19,15 @@ formula applied to an African-language source ranks correct text as
 unreadable, which is worse than no score. MATTR is kept for every language:
 it counts types over tokens and carries no lexicon.
 
+A Flesch score also needs enough evidence to mean anything: a text with fewer
+than ``MIN_READABILITY_WORDS`` words or ``MIN_READABILITY_SENTENCES``
+sentences, more than ``MAX_WORDS_PER_SENTENCE`` words per sentence (OCR that
+lost its full stops), or no letters at all is stored as null. The thresholds
+are part of the readability configuration hash, so changing them recomputes.
+
+MATTR tokenizes through :func:`iwac_common.text_utils.tokenize_words` with the
+row's ``language``, exactly as ``nb_mots`` does, so both count the same tokens.
+
 Usage
 -----
     python post-processing/calculate_lexical_richness.py [--repo USER/DATASET]
@@ -26,8 +35,8 @@ Usage
 
 Examples:
     python post-processing/calculate_lexical_richness.py          # fully interactive
-    python post-processing/calculate_lexical_richness.py --config articles --update-mode missing   # headless
-    python post-processing/calculate_lexical_richness.py --config articles -y --dry-run
+    python post-processing/calculate_lexical_richness.py --config articles -y   # headless, missing
+    python post-processing/calculate_lexical_richness.py --config articles --update-mode all -y --dry-run
 
 Environment Variables
 ---------------------
@@ -42,28 +51,35 @@ import argparse
 import logging
 import os
 import sys
-import uuid
 from importlib.metadata import version
 from collections import Counter
 from typing import List, Dict, Any, Optional
 
-import textstat
 from datasets import Value
+from textstat.textstat import textstatistics
 
 # Make ``post-processing/_common.py`` and ``iwac_common`` importable.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _THIS_DIR)
 sys.path.insert(0, os.path.dirname(_THIS_DIR))
 from _common import (  # noqa: E402
+    display_text_stats,
+    confirm_full_recompute,
     PRIVATE_REPO_ID,
-    choose_update_mode,
+    add_update_mode_args,
     ensure_hf_token,
     load_hub_dataset,
+    map_with_progress,
+    print_dry_run_panel,
     push_dataset,
+    reorder_columns_after,
     resolve_config,
+    resolve_update_mode,
 )
 from iwac_common.text_utils import tokenize_words, language_labels, TOKENIZER_VERSION  # noqa: E402
-from iwac_common.enrichment import config_fingerprint, fingerprint, provenance_columns, config_json  # noqa: E402
+from iwac_common.enrichment import (  # noqa: E402
+    changed_row_count, config_fingerprint, fingerprint, provenance_columns, config_json,
+)
 
 # Disable symlinks warning from huggingface_hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -72,7 +88,6 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.logging import RichHandler
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich import box
 from dotenv import load_dotenv
 from iwac_common.paths import workspace_root
@@ -92,15 +107,40 @@ logging.basicConfig(
 
 logger = logging.getLogger("lexical_richness")
 
+TEXT_COLUMN = "OCR"
+RICHNESS_COLUMN = "Richesse_Lexicale_OCR"
+READABILITY_COLUMN = "Lisibilite_OCR"
+LANGUAGE_COLUMN = "language"
+METRIC_COLUMNS = [RICHNESS_COLUMN, READABILITY_COLUMN]
+#: Subsets with an OCR column; ``index`` and ``images`` have none.
+LEXICAL_SUBSETS = ["articles", "publications", "documents", "references", "audiovisual"]
 
-def calculate_mattr(text: str, window_size: int = 50, language: str = "Français") -> Optional[float]:
+#: The only language the Flesch column is defined for (the label Omeka uses).
+READABILITY_LANGUAGE = "Français"
+READABILITY_TEXTSTAT_LANG = "fr"
+# Minimum evidence for a Flesch score. Flesch averages words per sentence and
+# syllables per word; below these counts one OCR glitch dominates the mean,
+# and beyond 100 words per sentence the full stops were lost, not the reader.
+MIN_READABILITY_WORDS = 100
+MIN_READABILITY_SENTENCES = 3
+MAX_WORDS_PER_SENTENCE = 100
+
+# A private instance: the language is set here, where the score is computed,
+# never through textstat's process-wide ``set_lang``. With "fr", textstat's
+# flesch_reading_ease applies the Kandel–Moles French constants and French
+# syllabification, not the English Flesch formula.
+_FRENCH_TEXTSTAT = textstatistics()
+_FRENCH_TEXTSTAT.set_lang(READABILITY_TEXTSTAT_LANG)
+
+
+def calculate_mattr(text: str, window_size: int = 50, language: Any = "Français") -> Optional[float]:
     """Compute Moving Average Type-Token Ratio (MATTR).
 
     Unlike raw TTR, MATTR is not biased by text length because it uses a
-    fixed-size sliding window. Tokenization is French-aware
-    (``tokenize_words``): elided clitics are split off (``l'islam`` counts
-    one type, not two), so type counts are not inflated by ``l``/``d``/``qu``
-    fragments.
+    fixed-size sliding window. ``language`` is the row's raw ``language``
+    value and goes to :func:`tokenize_words` unchanged, as in ``nb_mots``:
+    for a French row an elided clitic is its own token (``l'``), counted
+    like ``le``/``la``; other languages keep ``da'wa`` whole.
 
     Texts with fewer tokens than ``window_size`` return None — a plain TTR
     fallback would mix two incomparable metrics in the same column.
@@ -141,37 +181,56 @@ def calculate_mattr(text: str, window_size: int = 50, language: str = "Français
     return ttr_sum / num_windows
 
 
-def calculate_readability(text: str) -> Optional[float]:
-    """Compute the Flesch Reading Ease score.
+def readability_evidence(text: Any) -> Optional[str]:
+    """Why ``text`` is too thin for a Flesch score, or ``None`` when it is not.
 
-    Returns None if the text is missing or computation fails.
-    textstat.set_lang('fr') must be called beforehand.
+    Reasons: ``"no_letters"``, ``"too_few_words"``, ``"too_few_sentences"``,
+    ``"implausible_sentence_length"``. Words and sentences are counted with
+    textstat's own counters, the ones the score itself uses.
     """
-    if not text or not isinstance(text, str):
+    if not isinstance(text, str) or not any(char.isalpha() for char in text):
+        return "no_letters"
+    words = _FRENCH_TEXTSTAT.lexicon_count(text)
+    if words < MIN_READABILITY_WORDS:
+        return "too_few_words"
+    sentences = _FRENCH_TEXTSTAT.sentence_count(text)
+    if sentences < MIN_READABILITY_SENTENCES:
+        return "too_few_sentences"
+    if words / sentences > MAX_WORDS_PER_SENTENCE:
+        return "implausible_sentence_length"
+    return None
+
+
+def calculate_readability(text: str) -> Optional[float]:
+    """French Flesch Reading Ease of ``text``.
+
+    Returns None when the text lacks the evidence :func:`readability_evidence`
+    requires, or when textstat fails.
+    """
+    if readability_evidence(text) is not None:
         return None
     try:
-        # With set_lang('fr'), textstat's flesch_reading_ease applies the
-        # French-calibrated constants (Kandel–Moles adaptation) — verified in
-        # textstat's source (get_lang_cfg(lang_root, "fre_base") etc.) — NOT
-        # the English Flesch formula.
-        return textstat.flesch_reading_ease(text)
+        return _FRENCH_TEXTSTAT.flesch_reading_ease(text)
     except Exception:
         return None
 
 
-#: The only language the Flesch column is defined for (the label Omeka uses).
-READABILITY_LANGUAGE = "Français"
+def metric_settings(window_size: int) -> Dict[str, Dict[str, Any]]:
+    """The configuration each metric's ``*_config_hash`` is computed from."""
+    return {
+        RICHNESS_COLUMN: {"metric": "MATTR", "window": window_size, "tokenizer": TOKENIZER_VERSION,
+                          "tokenizer_language": "row language"},
+        READABILITY_COLUMN: {
+            "metric": "French Flesch", "language_policy": "monolingual-fr",
+            "textstat": version("textstat"), "textstat_lang": READABILITY_TEXTSTAT_LANG,
+            "min_words": MIN_READABILITY_WORDS, "min_sentences": MIN_READABILITY_SENTENCES,
+            "max_words_per_sentence": MAX_WORDS_PER_SENTENCE,
+        },
+    }
 
 
-def primary_language(value: Any) -> str:
-    """First pipe-separated ``language`` value, stripped (``""`` if none).
-
-    Same rule as the lemmatiser's per-language passes, so a bilingual row
-    belongs to exactly one language everywhere in the pipeline.
-    """
-    if value is None:
-        return ""
-    return str(value).split("|")[0].strip()
+def _bump(counter: Dict[str, int], key: str) -> None:
+    counter[key] = counter.get(key, 0) + 1
 
 
 def compute_metrics_batch(
@@ -197,8 +256,11 @@ def compute_metrics_batch(
         error_counter: Mutable dict to accumulate counts. 'richness_too_short'
             counts non-empty texts shorter than the MATTR window (stored as
             None by design, not an error); 'readability_failed' counts
-            readability computation failures; 'readability_not_french' counts
-            rows nulled because their language is unknown, multilingual, or not French.
+            readability computation failures (no provenance, retried next
+            run); 'readability_insufficient' counts French texts below the
+            evidence thresholds (null with valid provenance);
+            'readability_not_french' counts rows nulled because their
+            language is unknown, multilingual, or not French.
         language_col: Column holding the pipe-joined ``language`` labels.
             Without it no row can be shown to be French, so readability is
             null throughout.
@@ -214,11 +276,8 @@ def compute_metrics_batch(
 
     richness_results = list(existing_richness)
     readability_results = list(existing_readability)
-    settings = {
-        richness_col: {"metric": "MATTR", "window": window_size, "tokenizer": TOKENIZER_VERSION},
-        readability_col: {"metric": "French Flesch", "language_policy": "monolingual-fr",
-                          "textstat": version("textstat")},
-    }
+    settings = metric_settings(window_size)
+    settings = {richness_col: settings[RICHNESS_COLUMN], readability_col: settings[READABILITY_COLUMN]}
     configs = {column: config_fingerprint(value) for column, value in settings.items()}
     descriptions = {column: config_json(value) for column, value in settings.items()}
     for column in configs:
@@ -229,6 +288,12 @@ def compute_metrics_batch(
     for name in previous:
         batch[name] = list(previous[name])
 
+    def needs(column: str, row: int, input_hash: str) -> bool:
+        if update_mode != "missing":
+            return True
+        input_col, config_col = hashes[column]
+        return previous[input_col][row] != input_hash or previous[config_col][row] != configs[column]
+
     for i, text in enumerate(texts):
         text_str = str(text) if text is not None else ""
         has_content = text is not None and text_str.strip()
@@ -237,38 +302,30 @@ def compute_metrics_batch(
         input_hash = fingerprint(text_str, labels)
         readability_failed = False
 
-        # Determine whether to process this row
-        if update_mode == "missing":
-            def needs(column):
-                input_col, config_col = hashes[column]
-                return previous[input_col][i] != input_hash or previous[config_col][i] != configs[column]
-            richness_needed = needs(richness_col)
-            readability_needed = needs(readability_col)
-        else:
-            richness_needed = True
-            readability_needed = True
-
-        if richness_needed:
-            result = calculate_mattr(text_str, window_size, language=labels[0] if len(labels) == 1 else "")
+        if needs(richness_col, i, input_hash):
+            result = calculate_mattr(text_str, window_size, language=languages[i])
             if result is None and has_content:
                 # Non-empty text without a MATTR value means it has fewer
                 # tokens than the window — too short for MATTR, not an error.
-                error_counter["richness_too_short"] += 1
+                _bump(error_counter, "richness_too_short")
             richness_results[i] = result
 
         if not is_french:
             # Regardless of update mode: a French formula applied to another
             # language is not a stale value to keep, it is a wrong one.
             if has_content:
-                error_counter["readability_not_french"] = (
-                    error_counter.get("readability_not_french", 0) + 1
-                )
+                _bump(error_counter, "readability_not_french")
             readability_results[i] = None
-        elif readability_needed:
-            result = calculate_readability(text_str)
-            if result is None and has_content:
-                error_counter["readability_failed"] += 1
-                readability_failed = True
+        elif needs(readability_col, i, input_hash):
+            if has_content and readability_evidence(text_str) is not None:
+                # Deterministically too thin: a null with valid provenance.
+                _bump(error_counter, "readability_insufficient")
+                result = None
+            else:
+                result = calculate_readability(text_str)
+                if result is None and has_content:
+                    _bump(error_counter, "readability_failed")
+                    readability_failed = True
             readability_results[i] = result
         for column in configs:
             input_col, config_col = hashes[column]
@@ -302,60 +359,78 @@ def display_config_panel(
     console.print(Panel(table, title="[bold blue]Lexical Richness Configuration", border_style="blue"))
 
 
-def display_text_stats(texts: List[Any], column_name: str) -> int:
-    """Display statistics about the text column and return count of non-empty texts."""
-    non_empty = [t for t in texts if t is not None and str(t).strip()]
-    empty_count = len(texts) - len(non_empty)
+def output_columns() -> List[str]:
+    """The metric columns plus the private provenance columns written with them."""
+    names = list(METRIC_COLUMNS)
+    for column in METRIC_COLUMNS:
+        names += [*provenance_columns(column), f"{column}_config_json"]
+    return names
 
-    table = Table(title=f"Source Column Statistics: '{column_name}'", box=box.ROUNDED)
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="green")
 
-    table.add_row("Total entries", str(len(texts)))
-    table.add_row("Non-empty entries", str(len(non_empty)))
-    table.add_row("Empty/None entries", str(empty_count))
+def compute_metrics(ds, *, update_mode: str, window_size: int, batch_size: int):
+    """Map :func:`compute_metrics_batch` over ``ds``; return ``(dataset, counters)``."""
+    error_counter: Dict[str, int] = {
+        "richness_too_short": 0, "readability_failed": 0,
+        "readability_insufficient": 0, "readability_not_french": 0,
+    }
+    if LANGUAGE_COLUMN not in ds.column_names:
+        console.print(
+            f"[yellow]⚠[/yellow] No '{LANGUAGE_COLUMN}' column: no row can be shown to be "
+            f"French, so {READABILITY_COLUMN} will be null throughout."
+        )
+    # Declared, not inferred: a first batch of non-French rows is all None
+    # and would otherwise fix the column's type as null.
+    output_types = {name: Value("string") for name in output_columns()}
+    output_types.update({column: Value("float64") for column in METRIC_COLUMNS})
+    processed = map_with_progress(
+        ds,
+        lambda batch: compute_metrics_batch(
+            batch, text_col=TEXT_COLUMN, richness_col=RICHNESS_COLUMN,
+            readability_col=READABILITY_COLUMN, update_mode=update_mode,
+            window_size=window_size, error_counter=error_counter,
+            language_col=LANGUAGE_COLUMN,
+        ),
+        batch_size=batch_size,
+        description="[cyan]Computing metrics",
+        console=console,
+        output_types=output_types,
+    )
+    console.print("[green]✓[/green] Metrics computation complete.")
+    return processed, error_counter
 
-    if non_empty:
-        avg_length = sum(len(str(t)) for t in non_empty) / len(non_empty)
-        table.add_row("Avg. text length", f"{avg_length:.1f} characters")
 
+def report_counters(error_counter: Dict[str, int], window_size: int) -> None:
+    messages = (
+        ("richness_too_short", "ℹ", f"texts too short for MATTR (< {window_size} tokens) — stored as None."),
+        ("readability_insufficient", "ℹ",
+         f"French texts below the readability evidence thresholds (< {MIN_READABILITY_WORDS} "
+         f"words, < {MIN_READABILITY_SENTENCES} sentences or > {MAX_WORDS_PER_SENTENCE} "
+         f"words/sentence) — {READABILITY_COLUMN} stored as None."),
+        ("readability_not_french", "ℹ",
+         f"non-French texts: {READABILITY_COLUMN} stored as None (the French Flesch formula does not apply)."),
+        ("readability_failed", "⚠", "readability failures (stored as None, retried next run)."),
+    )
+    for key, icon, message in messages:
+        if error_counter.get(key):
+            console.print(f"[yellow]{icon}[/yellow] {error_counter[key]:,} {message}")
+
+
+def print_sample(ds, limit: int = 5) -> None:
+    table = Table(title="Sample results", box=box.SIMPLE)
+    table.add_column("#", style="cyan", justify="center")
+    table.add_column("MATTR", style="green", justify="right")
+    table.add_column("Flesch", style="green", justify="right")
+    sample = ds.select(range(min(limit, len(ds))))
+    for i, (r, f) in enumerate(zip(sample[RICHNESS_COLUMN], sample[READABILITY_COLUMN]), 1):
+        table.add_row(
+            str(i),
+            f"{r:.4f}" if r is not None else "[dim]None[/dim]",
+            f"{f:.2f}" if f is not None else "[dim]None[/dim]",
+        )
     console.print(table)
-    return len(non_empty)
 
 
-def display_existing_stats(
-    ds, richness_col: str, readability_col: str
-) -> tuple[int, int]:
-    """Display stats on existing metrics. Returns (richness_missing, readability_missing)."""
-    total = len(ds)
-
-    if richness_col in ds.column_names:
-        richness_vals = ds[richness_col]
-        richness_missing = sum(1 for v in richness_vals if v is None)
-    else:
-        richness_missing = total
-
-    if readability_col in ds.column_names:
-        readability_vals = ds[readability_col]
-        readability_missing = sum(1 for v in readability_vals if v is None)
-    else:
-        readability_missing = total
-
-    table = Table(title="Existing Metrics Statistics", box=box.ROUNDED)
-    table.add_column("Column", style="cyan")
-    table.add_column("Valid", style="green")
-    table.add_column("Missing", style="yellow")
-
-    table.add_row(richness_col, str(total - richness_missing), str(richness_missing))
-    table.add_row(readability_col, str(total - readability_missing), str(readability_missing))
-
-    console.print(table)
-    return richness_missing, readability_missing
-
-
-def main() -> int:
-    textstat.set_lang('fr')
-
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Add lexical richness (MATTR) and readability (Flesch) columns "
                    "to a Hugging Face dataset, based on the 'OCR' column."
@@ -384,272 +459,98 @@ def main() -> int:
     )
     parser.add_argument(
         "--config",
+        choices=LEXICAL_SUBSETS,
         default=None,
         help="Dataset configuration/subset to process (skips the interactive picker)."
     )
-    parser.add_argument(
-        "--update-mode",
-        choices=["missing", "all"],
-        default=None,
-        help="'missing' computes only rows without values; 'all' recalculates "
-             "everything (skips the interactive prompt)."
-    )
+    add_update_mode_args(parser)
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Compute metrics but do not push to Hub."
+        help="Compute metrics and report how many rows would change, but do not push to Hub."
     )
-    parser.add_argument(
-        "-y", "--yes",
-        action="store_true",
-        help="Skip confirmations/prompts by accepting defaults (update mode: "
-             "missing). Combine with --config for a fully non-interactive run."
-    )
-
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.window_size < 1 or args.batch_size < 1:
         parser.error("--window-size and --batch-size must be positive")
+    return args
 
-    repo_id = args.repo
-    text_column_name = "OCR"
-    richness_column_name = "Richesse_Lexicale_OCR"
-    readability_column_name = "Lisibilite_OCR"
-    max_shard_size = args.max_shard_size
-    batch_size = args.batch_size
-    window_size = args.window_size
-    dry_run = args.dry_run
 
-    # --- Authentication ---
-    console.print("\n[bold cyan]Step 1:[/bold cyan] Authenticating with Hugging Face Hub...")
-    token = ensure_hf_token(console=console)
-    console.print("[green]✓[/green] Authenticated successfully.")
-
-    # --- Configuration selection (CLI flag or interactive picker) ---
-    console.print("\n[bold cyan]Step 2:[/bold cyan] Selecting configuration...")
-    config_name_choice = resolve_config(repo_id, token=token, cli_config=args.config, console=console)
-    console.print(f"[green]✓[/green] Selected configuration: [cyan]{config_name_choice}[/cyan]")
-
-    # --- Update mode selection (CLI flag, --yes default, or interactive) ---
-    if args.update_mode:
-        update_mode = args.update_mode
-    elif args.yes:
-        update_mode = "missing"
-        console.print("[green]→[/green] Update mode defaulted to 'missing' via --yes.")
-    else:
-        update_mode = choose_update_mode(console=console)
-    console.print(f"[green]✓[/green] Update mode: [cyan]{update_mode}[/cyan]")
-
-    # --- Display configuration ---
-    console.print()
-    display_config_panel(repo_id, config_name_choice, update_mode, batch_size, window_size, dry_run)
-
-    # --- Load dataset ---
-    console.print(f"\n[bold cyan]Step 3:[/bold cyan] Loading dataset...")
-    ds = load_hub_dataset(repo_id, config_name_choice, token=token, console=console)
-    source_revision = getattr(ds, "_iwac_source_revision", None)
-
-    # --- Column checks ---
-    if text_column_name not in ds.column_names:
-        console.print(f"[red]✗[/red] Source column '{text_column_name}' not found in dataset.")
-        console.print(f"[yellow]ℹ[/yellow] Available columns: {', '.join(ds.column_names)}")
-        return 1
-
-    has_richness = richness_column_name in ds.column_names
-    has_readability = readability_column_name in ds.column_names
-
-    if has_richness or has_readability:
-        existing = []
-        if has_richness:
-            existing.append(richness_column_name)
-        if has_readability:
-            existing.append(readability_column_name)
-        if update_mode == "all":
-            console.print(f"[yellow]⚠[/yellow] Existing columns will be overwritten: {', '.join(existing)}")
-        else:
-            console.print(f"[yellow]ℹ[/yellow] Existing columns found: {', '.join(existing)}. Only missing values will be computed.")
-    else:
-        console.print(f"[blue]→[/blue] Columns '{richness_column_name}' and '{readability_column_name}' will be created.")
-
-    # --- Source data statistics ---
-    console.print(f"\n[bold cyan]Step 4:[/bold cyan] Analyzing source data...")
-    texts = ds[text_column_name]
-    display_text_stats(texts, text_column_name)
-
-    # --- Existing metrics statistics ---
-    if update_mode == "missing" and (has_richness or has_readability):
-        richness_missing, readability_missing = display_existing_stats(
-            ds, richness_column_name, readability_column_name
-        )
-
-        # Non-null values alone do not establish current input/configuration
-        # provenance, and legacy non-French readability must still be cleared.
-
-    # --- Compute metrics ---
-    console.print(f"\n[bold cyan]Step 5:[/bold cyan] Computing lexical metrics...")
-
-    mode_desc = "all rows" if update_mode == "all" else "missing rows only"
-    console.print(f"[blue]→[/blue] Processing {mode_desc}...")
-
-    error_counter: Dict[str, int] = {
-        "richness_too_short": 0, "readability_failed": 0, "readability_not_french": 0,
-    }
-    if "language" not in ds.column_names:
-        console.print(
-            "[yellow]⚠[/yellow] No 'language' column: no row can be shown to be "
-            "French, so Lisibilite_OCR will be null throughout."
-        )
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("[cyan]Computing metrics", total=len(ds))
-
-        def compute_with_progress(batch):
-            result = compute_metrics_batch(
-                batch,
-                text_col=text_column_name,
-                richness_col=richness_column_name,
-                readability_col=readability_column_name,
-                update_mode=update_mode,
-                window_size=window_size,
-                error_counter=error_counter,
-            )
-            progress.update(task, advance=len(batch[text_column_name]))
-            return result
-
-        # Declared, not inferred: a first batch of non-French rows is all None
-        # and would otherwise fix the column's type as null.
-        features = ds.features.copy()
-        features[richness_column_name] = Value("float64")
-        features[readability_column_name] = Value("float64")
-        for column in (richness_column_name, readability_column_name):
-            for name in (*provenance_columns(column), f"{column}_config_json"):
-                features[name] = Value("string")
-        ds_processed = ds.map(
-            compute_with_progress,
-            batched=True,
-            batch_size=batch_size,
-            desc=None,
-            load_from_cache_file=False,
-            new_fingerprint=str(uuid.uuid4()),
-            features=features,
-        )
-
-    console.print("[green]✓[/green] Metrics computation complete.")
-
-    too_short = error_counter["richness_too_short"]
-    total_failures = error_counter["readability_failed"]
-    if too_short > 0:
-        console.print(
-            f"[yellow]ℹ[/yellow] {too_short} texts too short for MATTR "
-            f"(< {window_size} tokens) — stored as None."
-        )
-    if total_failures > 0:
-        console.print(
-            f"[yellow]⚠[/yellow] Failures: {total_failures} readability (stored as None)."
-        )
-    not_french = error_counter["readability_not_french"]
-    if not_french > 0:
-        console.print(
-            f"[yellow]ℹ[/yellow] {not_french} non-French texts: Lisibilite_OCR "
-            "stored as None (the French Flesch formula does not apply)."
-        )
-
-    # --- Verify results ---
-    console.print("\n[bold]Sample results (first 5):[/bold]")
-    table = Table(box=box.SIMPLE)
-    table.add_column("#", style="cyan", justify="center")
-    table.add_column("MATTR", style="green", justify="right")
-    table.add_column("Flesch", style="green", justify="right")
-
-    for i in range(min(5, len(ds_processed))):
-        r = ds_processed[richness_column_name][i]
-        f = ds_processed[readability_column_name][i]
-        table.add_row(
-            str(i + 1),
-            f"{r:.4f}" if r is not None else "[dim]None[/dim]",
-            f"{f:.2f}" if f is not None else "[dim]None[/dim]",
-        )
-
-    console.print(table)
-
-    # --- Reorder columns ---
-    insert_after_col = "nb_mots"
-    existing_columns = list(ds_processed.column_names)
-    metric_cols = [richness_column_name, readability_column_name]
-
-    if insert_after_col in existing_columns:
-        ordered = []
-        for col in existing_columns:
-            if col in metric_cols:
-                continue
-            ordered.append(col)
-            if col == insert_after_col:
-                for mc in metric_cols:
-                    if mc in existing_columns:
-                        ordered.append(mc)
-
-        if set(ordered) == set(existing_columns) and len(ordered) == len(existing_columns):
-            ds_processed = ds_processed.select_columns(ordered)
-            console.print(f"[blue]→[/blue] Columns reordered (metrics after '{insert_after_col}')")
-        else:
-            console.print(f"[yellow]⚠[/yellow] Column reordering skipped due to mismatch.")
-    else:
-        console.print(f"[yellow]ℹ[/yellow] Column '{insert_after_col}' not found; metrics appended at end.")
-
-    # --- Push to Hub ---
-    if dry_run:
-        console.print(Panel(
-            "[yellow]Dry run mode — no changes pushed to Hub.[/yellow]\n\n"
-            f"Would have pushed [cyan]{len(ds_processed)}[/cyan] rows to "
-            f"[cyan]{repo_id}[/cyan] (config: {config_name_choice}).",
-            title="Dry Run Complete",
-            border_style="yellow"
-        ))
-        return 0
-
-    console.print(f"\n[bold cyan]Step 6:[/bold cyan] Pushing to Hugging Face Hub...")
-
+def push_metrics(ds, *, args, config_name: str, update_mode: str, token: str,
+                 source_revision: Optional[str], changed: int) -> int:
     commit_message = (
-        f"Add/update '{richness_column_name}' (MATTR, window={window_size}) and "
-        f"'{readability_column_name}' (French Flesch, monolingual-French rows only) "
-        f"from '{text_column_name}' "
-        f"(config: {config_name_choice}, mode: {update_mode})"
+        f"Add/update '{RICHNESS_COLUMN}' (MATTR, window={args.window_size}, tokenizer "
+        f"v{TOKENIZER_VERSION}) and '{READABILITY_COLUMN}' (French Flesch, textstat "
+        f"{version('textstat')}, monolingual-French rows with >= {MIN_READABILITY_WORDS} words) "
+        f"from '{TEXT_COLUMN}' (config: {config_name}, mode: {update_mode})"
     )
-    if push_dataset(
-        ds_processed,
-        repo_id=repo_id,
-        config_name=config_name_choice,
+    if not push_dataset(
+        ds,
+        repo_id=args.repo,
+        config_name=config_name,
         commit_message=commit_message,
         token=token,
-        max_shard_size=max_shard_size,
+        max_shard_size=args.max_shard_size,
         console=console,
         expected_revision=source_revision,
     ):
+        return 1
+    console.print(Panel(
+        f"[green]✓[/green] {RICHNESS_COLUMN}, {READABILITY_COLUMN} written for "
+        f"[bold]{config_name}[/bold]\n"
+        f"[dim]Rows changed: {changed:,} of {len(ds):,} · MATTR window: {args.window_size} tokens · "
+        f"Repository: {args.repo}\n"
+        "Remember: the public dataset only changes when "
+        "post-processing/publish_public.py is re-run.[/dim]",
+        title="[bold green]Done[/bold green]",
+        border_style="green",
+    ))
+    return 0
 
-        action = "updated" if (has_richness or has_readability) else "created"
-        summary = (
-            f"[bold green]Dataset successfully published![/bold green]\n\n"
-            f"Repository: [cyan]{repo_id}[/cyan]\n"
-            f"Configuration: [cyan]{config_name_choice}[/cyan]\n"
-            f"Columns: [cyan]{richness_column_name}[/cyan], "
-            f"[cyan]{readability_column_name}[/cyan] ({action})\n"
-            f"MATTR window: [cyan]{window_size}[/cyan] tokens\n"
-            f"Records: [cyan]{len(ds_processed)}[/cyan]"
-        )
-        if too_short > 0:
-            summary += f"\n[yellow]Too short for MATTR: {too_short}[/yellow]"
-        if total_failures > 0:
-            summary += f"\n[yellow]Total failures: {total_failures}[/yellow]"
 
-        console.print(Panel(summary, title="Upload Complete", border_style="green"))
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+
+    token = ensure_hf_token(console=console)
+    config_name = resolve_config(
+        args.repo, token=token, cli_config=args.config,
+        restrict_to=LEXICAL_SUBSETS, console=console,
+    )
+    update_mode = resolve_update_mode(args, console=console)
+    display_config_panel(args.repo, config_name, update_mode, args.batch_size,
+                         args.window_size, args.dry_run)
+
+    ds = load_hub_dataset(args.repo, config_name, token=token, console=console)
+    source_revision = getattr(ds, "_iwac_source_revision", None)
+    if TEXT_COLUMN not in ds.column_names:
+        console.print(f"[red]✗[/red] Source column '{TEXT_COLUMN}' not found in dataset.")
+        console.print(f"[yellow]ℹ[/yellow] Available columns: {', '.join(ds.column_names)}")
+        return 1
+    if not confirm_full_recompute(args, update_mode, f"{RICHNESS_COLUMN} and {READABILITY_COLUMN}"):
+        console.print("[yellow]ℹ[/yellow] Cancelled; existing metrics kept.")
         return 0
-    return 1
+    if update_mode == "missing":
+        console.print("[blue]→[/blue] Rows whose provenance matches the current text, language "
+                      "and configuration are kept; every other row is recomputed.")
+    display_text_stats(ds[TEXT_COLUMN], TEXT_COLUMN, console=console)
+
+    processed, error_counter = compute_metrics(
+        ds, update_mode=update_mode, window_size=args.window_size, batch_size=args.batch_size,
+    )
+    report_counters(error_counter, args.window_size)
+    processed = reorder_columns_after(processed, METRIC_COLUMNS, "nb_mots", console=console)
+    print_sample(processed)
+    changed = changed_row_count(ds, processed, output_columns())
+    console.print(f"[blue]→[/blue] Rows whose metrics or provenance change: [bold]{changed:,}[/bold]")
+
+    if args.dry_run:
+        print_dry_run_panel(repo_id=args.repo, config_name=config_name, n_rows=len(processed),
+                            extra=f"[dim]Rows that would change: {changed:,}[/dim]", console=console)
+        return 0
+    if not changed:
+        console.print("[green]✓[/green] Every metric and its provenance are already current. Nothing to push.")
+        return 0
+    return push_metrics(processed, args=args, config_name=config_name, update_mode=update_mode,
+                        token=token, source_revision=source_revision, changed=changed)
 
 
 if __name__ == "__main__":

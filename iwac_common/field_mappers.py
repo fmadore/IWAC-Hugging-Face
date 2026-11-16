@@ -29,15 +29,18 @@ def get_value(item: Dict[str, Any], field: str) -> str:
     val = item[field]
     if isinstance(val, list):
         parts = [
-            str(v.get("display_title") or v.get("@value") or v.get("@id", ""))
+            # ``or ""``: a key present with JSON null would otherwise become
+            # the literal string "None".
+            str(v.get("display_title") or v.get("@value") or v.get("@id") or "")
             for v in val
         ]
         return "|".join(filter(None, parts))
     if isinstance(val, dict):
-        return (
-            val.get("display_title", "")
-            or val.get("@value", "")
-            or val.get("@id", "")
+        return str(
+            val.get("display_title")
+            or val.get("@value")
+            or val.get("@id")
+            or ""
         )
     return str(val)
 
@@ -400,13 +403,6 @@ def parse_coordinates(value: Any) -> Tuple[Optional[float], Optional[float]]:
     return lat, lng
 
 
-def get_media_ids(item: Dict[str, Any]) -> str:
-    """Pipe-joined ``o:media`` IDs, or ``""`` if none."""
-    if "o:media" in item and isinstance(item["o:media"], list):
-        return "|".join(str(m["o:id"]) for m in item["o:media"])
-    return ""
-
-
 def to_int_or_none(value: Any) -> Optional[int]:
     """Best-effort int conversion. Returns ``None`` for empty / unparseable input."""
     if value is None:
@@ -463,7 +459,6 @@ __all__ = [
     "get_rights_label",
     "is_content_public",
     "visibility_metadata",
-    "get_media_ids",
     "to_int_or_none",
     "extract_added_date",
 ]

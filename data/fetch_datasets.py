@@ -17,6 +17,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -27,8 +28,6 @@ os.environ.setdefault("DO_NOT_TRACK", "1")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
 
 from datasets import load_dataset  # noqa: E402
-from dotenv import load_dotenv  # noqa: E402
-from huggingface_hub import get_token  # noqa: E402
 from rich import box  # noqa: E402
 from rich.console import Console  # noqa: E402
 from rich.panel import Panel  # noqa: E402
@@ -47,21 +46,28 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from iwac_common.hub import get_repo_revision  # noqa: E402
+from iwac_common.hub import get_repo_revision, resolve_hf_token  # noqa: E402
 from iwac_common.paths import workspace_root  # noqa: E402
-from iwac_common.repos import PRIVATE_REPO_ID, PUBLIC_REPO_ID  # noqa: E402
 from iwac_common.schema import ALL_CONFIGS  # noqa: E402
+from iwac_common.settings import (  # noqa: E402
+    get_private_repo_id,
+    get_public_repo_id,
+    initialize_environment,
+)
 
-REPO_ROOT = workspace_root()
-load_dotenv(REPO_ROOT / ".env")
+# Same precedence as every entry point: process env, then IWAC_ENV_FILE or the
+# discovered .env (never overriding the process environment).
+initialize_environment()
 
 console = Console()
-DATA_DIR = REPO_ROOT / "data"
+DATA_DIR = workspace_root() / "data"
 MANIFEST_NAME = "mirror_manifest.json"
+MIRROR_FORMATS = ("parquet", "csv")
 
 
 def choose_dataset(cli_choice: str | None = None) -> tuple[str, str]:
     """Resolve which repo to mirror: private full or public projection."""
+    private_repo, public_repo = get_private_repo_id(), get_public_repo_id()
     choice = cli_choice
     if choice is None:
         console.print("\n[bold]Which dataset do you want to mirror locally?[/bold]")
@@ -70,12 +76,12 @@ def choose_dataset(cli_choice: str | None = None) -> tuple[str, str]:
         table.add_column("Dataset", style="green")
         table.add_column("Repo", style="white")
         table.add_column("Full text", style="white")
-        table.add_row("1", "private (full)", PRIVATE_REPO_ID, "complete OCR + lemmas")
-        table.add_row("2", "public", PUBLIC_REPO_ID, "OCR masked per row")
+        table.add_row("1", "private (full)", private_repo, "complete OCR + lemmas")
+        table.add_row("2", "public", public_repo, "OCR masked per row")
         console.print(table)
         selected = Prompt.ask("Choose dataset", choices=["1", "2"], default="1")
         choice = "private" if selected == "1" else "public"
-    return (PUBLIC_REPO_ID, "public") if choice == "public" else (PRIVATE_REPO_ID, "private")
+    return (public_repo, "public") if choice == "public" else (private_repo, "private")
 
 
 def _sha256(path: Path) -> str:
@@ -92,9 +98,6 @@ def _json_safe(value):
     if isinstance(value, (list, tuple)):
         return json.dumps(list(value))
     return value
-
-
-MIRROR_FORMATS = ("parquet", "csv")
 
 
 def _write_config(dataset, path: Path, fmt: str) -> tuple[int, int]:
@@ -116,13 +119,14 @@ def _write_config(dataset, path: Path, fmt: str) -> tuple[int, int]:
 
 
 def main(
-    dataset_id: str = PRIVATE_REPO_ID, label: str = "private", fmt: str = "parquet"
+    dataset_id: str | None = None, label: str = "private", fmt: str = "parquet"
 ) -> int:
     """Download every config at one Hub revision and publish the mirror atomically."""
     if fmt not in MIRROR_FORMATS:
         console.print(f"[red]✗[/red] Unknown mirror format {fmt!r}; use one of {MIRROR_FORMATS}.")
         return 2
-    token = (os.getenv("HF_TOKEN") or get_token()) if label == "private" else None
+    dataset_id = dataset_id or get_private_repo_id()
+    token = resolve_hf_token() if label == "private" else None
     if label == "private" and not token:
         console.print(
             "[red]✗[/red] The private mirror needs HF_TOKEN (set it in .env or "
@@ -198,7 +202,7 @@ def main(
         console.print(Panel(
             f"[bold red]Mirror refresh aborted[/bold red]\n\n{exc}\n\n"
             "The previous verified manifest remains authoritative; do not use "
-            "partially replaced CSVs until the next successful refresh.",
+            f"partially replaced {fmt} files until the next successful refresh.",
             title="No mixed-revision mirror published",
             border_style="red",
         ))
@@ -222,8 +226,8 @@ def main(
     return 0
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=prog, description=__doc__)
     parser.add_argument(
         "--dataset",
         choices=["private", "public"],
@@ -236,6 +240,15 @@ if __name__ == "__main__":
         default="parquet",
         help="Mirror file format (default: parquet; csv for spreadsheet use).",
     )
-    parsed = parser.parse_args()
+    return parser
+
+
+def cli(argv: Sequence[str] | None = None, prog: str | None = None) -> int:
+    """Command-line entry point shared by ``python fetch_datasets.py`` and ``iwac-mirror``."""
+    parsed = build_parser(prog).parse_args(argv)
     resolved_id, resolved_label = choose_dataset(parsed.dataset)
-    raise SystemExit(main(dataset_id=resolved_id, label=resolved_label, fmt=parsed.format))
+    return main(dataset_id=resolved_id, label=resolved_label, fmt=parsed.format)
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

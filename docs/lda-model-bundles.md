@@ -23,20 +23,72 @@ not a fully recovered historical instrument. Changed reconstructed settings
 produce a new legacy identity.
 Refitting is the route to a complete frozen bundle.
 
+## Source-document units
+
+Long subsets train on chunks (`--chunk-words`), but evidence is counted per
+**source document**, the `--holdout-group-column` unit (default `o:id`):
+
+- the dictionary's `--no-below` and `--no-above` count source documents, not
+  chunks, so one long book cannot push a term over the floor by repetition;
+- a compound learned by phrase detection is applied only if it occurs in at
+  least `--phrase-min-docs` source documents (`DEFAULT_PHRASE_MIN_DOCS` in
+  `constants.py`, overridable per preset).
+
+Fits that record `phrase_min_docs` carry frozen preprocessing version 2 with
+`document_frequency_unit: source_document`. Bundles fitted before keep their
+recorded behaviour at prediction; the rule applies from the next `--mode fit`.
+
+## Choosing k: the sweep is a diagnostic
+
+k is pinned per subset in `CONFIG_PRESETS` (`num_topics`, with
+`language_overrides` for the English references model). The sweep reports and
+exits; it does not fit, write a bundle or push:
+
+```bash
+iwac-process lda --config references --mode fit --sweep-only --stability-seeds 3 --holdout 0.1
+```
+
+`--optimize-topics` behaves the same as `--sweep-only` unless
+`--select-k-from-sweep` is also given. That flag is the explicit opt-in to fit
+the production model at the sweep's highest mean C_v, and it is refused when k
+is pinned by a preset or `--num-topics`. The report, written under
+`<model root>/sweeps/<timestamp>/sweep_report.json`, gives per k the mean C_v
+with its seed standard deviation, the multi-seed stability (mean best-match
+Jaccard of top words) and, with `--holdout`, the held-out bound.
+
 ## Held-out evaluation
 
-`--optimize-topics --holdout 0.1` splits source documents **before** fitting
+`--holdout 0.1` on a sweep splits source documents **before** fitting
 phrases, vocabulary or model parameters. Holdout texts are transformed by the
 training-only phrase models and dictionary. Chunking follows this split, so
 one source cannot leak through different chunks. Exact duplicate texts remain
 together; `--holdout-group-column <column>` additionally keeps known reprint or
 source groups together. Its default is `o:id`. The fraction applies to grouped
-units; actual held-out document counts and IDs are recorded in the bundle.
+units; actual held-out document counts and IDs are recorded in the sweep
+report (and in the bundle when `--select-k-from-sweep` fits a model).
 
-The sweep's held-out scores describe these evaluation models. The chosen
-specification is subsequently refitted on the full eligible corpus for use in
-discovery. That production fit is not a held-out test. A pinned-topic fit with
-no sweep does not perform held-out evaluation, and records that fact.
+The held-out figure is gensim's `LdaModel.log_perplexity` per-word bound on the
+held-out documents. Theta is inferred from the same held-out words it scores,
+so it is an optimistic, report-only number, not a document-completion
+estimate. A production fit trained on the full eligible corpus is not a
+held-out test. A pinned-topic fit with no sweep does not perform held-out
+evaluation, and records that fact.
+
+## Labels
+
+Topic labels keep relevance order (LDAvis-style, λ = 0.6, unless
+`--no-relevance-labels`); compound length confers no priority. Subsumption only
+removes redundancy: a unigram contained in an already selected compound is
+skipped, and a compound arriving after one of its unigrams takes that
+unigram's slot, at the rank the unigram earned.
+
+## Minimum evidence at prediction
+
+A document with fewer in-vocabulary tokens than `--min-predict-tokens` (default:
+the model's training floor, `--min-train-tokens`) receives null topic columns
+but keeps `lda_model_name`, so a reader can tell "assessed, too little
+evidence" from "not processed". The theta export records `n_vocab_tokens` and
+`below_min_evidence` for every document.
 
 Coherence is a diagnostic, not a universal quality grade. Inspect seed
 stability, alternative preprocessing, representative documents and borderline
@@ -45,15 +97,17 @@ replace expert validation or an account of archive selection.
 
 ## Prediction exports and prevalence
 
-Each prediction pass writes a separate directory under `predictions/`, with
-`topics.csv`, full distributions in `doc_topics.parquet`, input/model metadata
+Each prediction pass writes a separate directory under
+`<model root>/predictions/<timestamp>/`, with `topics.csv` (the label, top words
+and document counts per `lda_topic_id`), full distributions in
+`doc_topics.parquet`, input/model metadata
 and an archived run manifest. Exported distributions carry per-document text
 hashes. They are never merged with a prior model's distributions.
 
 To reuse a particular export in prevalence analysis, pass:
 
 ```bash
-python analyses/topic_prevalence.py --model-path lda_model \
+iwac-analyze topics --model-path lda_model \
   --theta-path lda_model/predictions/<run>/doc_topics.parquet
 ```
 
@@ -75,7 +129,8 @@ choices condition on the fitted model and exclude archive-selection, OCR and
 model-estimation uncertainty. Frequency tables describe eligible archived
 documents, not all press coverage or public opinion.
 
-Only valid single-year, month or day dates enter annual prevalence. Date ranges,
+Only valid single-year, month or day dates enter annual prevalence, under the
+rule every analysis shares (`analyses/_research.py:point_years`). Date ranges,
 invalid dates and missing dates are counted as exclusions instead of being
 assigned to a guessed start year. Cluster bootstrap prefers authority outlet
 IDs; when only labels exist, it scopes them by country to separate homonyms.
