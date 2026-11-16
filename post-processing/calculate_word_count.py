@@ -46,7 +46,6 @@ from rich import box
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
-from rich.prompt import Confirm
 from rich.table import Table
 
 # Make ``post-processing/_common.py`` and ``iwac_common`` importable.
@@ -54,6 +53,7 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _THIS_DIR)
 sys.path.insert(0, os.path.dirname(_THIS_DIR))
 from _common import (  # noqa: E402
+    confirm_full_recompute,
     PRIVATE_REPO_ID,
     add_update_mode_args,
     ensure_hf_token,
@@ -157,17 +157,6 @@ def print_summary(counts: List[Any], config_name: str) -> None:
         table.add_row("Mean words/row", f"{sum(values) / len(values):.1f}")
         table.add_row("Max words", f"{max(values):,}")
     console.print(table)
-
-
-def confirm_full_recompute(args, mode: str, what: str) -> bool:
-    """Ask before ``all`` recomputes every row; ``-y``, a dry run or a headless
-    run (whose explicit ``--update-mode all`` is the decision) skip it."""
-    if mode != "all" or args.yes or args.dry_run or not sys.stdin.isatty():
-        return True
-    try:
-        return Confirm.ask(f"Recompute {what} for every row?", default=False)
-    except KeyboardInterrupt:
-        return False
 
 
 def word_count_output_types() -> Dict[str, Any]:

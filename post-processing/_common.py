@@ -43,7 +43,7 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
-from rich.prompt import IntPrompt, Prompt
+from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 from rich import box
 
@@ -566,6 +566,17 @@ def resolve_update_mode(args, console: Optional[Console] = None) -> str:
     if getattr(args, "yes", False) or not sys.stdin.isatty():
         return "missing"
     return choose_update_mode(console=console)
+
+
+def confirm_full_recompute(args, mode: str, what: str) -> bool:
+    """Ask before ``all`` recomputes every row; ``-y``, a dry run or a headless
+    run (whose explicit ``--update-mode all`` is the decision) skip it."""
+    if mode != "all" or args.yes or args.dry_run or not sys.stdin.isatty():
+        return True
+    try:
+        return Confirm.ask(f"Recompute {what} for every row?", default=False)
+    except KeyboardInterrupt:
+        return False
 
 
 def load_hub_dataset(

@@ -66,6 +66,7 @@ from iwac_common.paths import workspace_root
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "post-processing"))
 try:
     from iwac_pipeline.processing._common import (
+    confirm_full_recompute,
         PRIVATE_REPO_ID,
         add_update_mode_args,
         ensure_hf_token,
@@ -87,6 +88,7 @@ except ModuleNotFoundError as exc:
     if exc.name not in {"iwac_pipeline", "iwac_pipeline.processing"}:
         raise
     from _common import (
+    confirm_full_recompute,
         PRIVATE_REPO_ID,
         add_update_mode_args,
         ensure_hf_token,
@@ -111,7 +113,6 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich.logging import RichHandler
-from rich.prompt import Confirm
 from rich import box
 from dotenv import load_dotenv
 
@@ -622,17 +623,6 @@ LANGUAGE_MODEL_DEFAULTS = {
 
 # Every subset carrying an OCR column; accepted by --config.
 OCR_SUBSETS = [*LEMMATIZABLE_SUBSETS, "audiovisual"]
-
-
-def confirm_full_recompute(args, mode: str, what: str) -> bool:
-    """Ask before ``all`` recomputes every row; ``-y``, a dry run or a headless
-    run (whose explicit ``--update-mode all`` is the decision) skip it."""
-    if mode != "all" or args.yes or args.dry_run or not sys.stdin.isatty():
-        return True
-    try:
-        return Confirm.ask(f"Recompute {what} for every row?", default=False)
-    except KeyboardInterrupt:
-        return False
 
 
 def main() -> int:

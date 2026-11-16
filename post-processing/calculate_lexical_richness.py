@@ -63,6 +63,8 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _THIS_DIR)
 sys.path.insert(0, os.path.dirname(_THIS_DIR))
 from _common import (  # noqa: E402
+    display_text_stats,
+    confirm_full_recompute,
     PRIVATE_REPO_ID,
     add_update_mode_args,
     ensure_hf_token,
@@ -84,7 +86,6 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm
 from rich.table import Table
 from rich.logging import RichHandler
 from rich import box
@@ -358,44 +359,12 @@ def display_config_panel(
     console.print(Panel(table, title="[bold blue]Lexical Richness Configuration", border_style="blue"))
 
 
-def display_text_stats(texts: List[Any], column_name: str) -> int:
-    """Display statistics about the text column and return count of non-empty texts."""
-    non_empty = [t for t in texts if t is not None and str(t).strip()]
-    empty_count = len(texts) - len(non_empty)
-
-    table = Table(title=f"Source Column Statistics: '{column_name}'", box=box.ROUNDED)
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="green")
-
-    table.add_row("Total entries", str(len(texts)))
-    table.add_row("Non-empty entries", str(len(non_empty)))
-    table.add_row("Empty/None entries", str(empty_count))
-
-    if non_empty:
-        avg_length = sum(len(str(t)) for t in non_empty) / len(non_empty)
-        table.add_row("Avg. text length", f"{avg_length:.1f} characters")
-
-    console.print(table)
-    return len(non_empty)
-
-
 def output_columns() -> List[str]:
     """The metric columns plus the private provenance columns written with them."""
     names = list(METRIC_COLUMNS)
     for column in METRIC_COLUMNS:
         names += [*provenance_columns(column), f"{column}_config_json"]
     return names
-
-
-def confirm_full_recompute(args, mode: str, what: str) -> bool:
-    """Ask before ``all`` recomputes every row; ``-y``, a dry run or a headless
-    run (whose explicit ``--update-mode all`` is the decision) skip it."""
-    if mode != "all" or args.yes or args.dry_run or not sys.stdin.isatty():
-        return True
-    try:
-        return Confirm.ask(f"Recompute {what} for every row?", default=False)
-    except KeyboardInterrupt:
-        return False
 
 
 def compute_metrics(ds, *, update_mode: str, window_size: int, batch_size: int):
@@ -562,7 +531,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if update_mode == "missing":
         console.print("[blue]→[/blue] Rows whose provenance matches the current text, language "
                       "and configuration are kept; every other row is recomputed.")
-    display_text_stats(ds[TEXT_COLUMN], TEXT_COLUMN)
+    display_text_stats(ds[TEXT_COLUMN], TEXT_COLUMN, console=console)
 
     processed, error_counter = compute_metrics(
         ds, update_mode=update_mode, window_size=args.window_size, batch_size=args.batch_size,
