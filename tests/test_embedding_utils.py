@@ -91,3 +91,31 @@ class TestIsEmptyEmbedding:
         assert is_empty_embedding(np.zeros(0, dtype=np.float32))
         assert is_empty_embedding(np.zeros(4, dtype=np.float32))
         assert not is_empty_embedding(np.array([0.0, 0.1], dtype=np.float32))
+
+
+def test_sqlite_checkpoint_leaves_no_open_connection(tmp_path, monkeypatch):
+    """Windows cannot delete a cache whose connection is still open."""
+    import sqlite3
+
+    opened = []
+    real_connect = sqlite3.connect
+
+    class Tracking(sqlite3.Connection):
+        closed = False
+
+        def close(self):
+            self.closed = True
+            super().close()
+
+    def connect(*args, **kwargs):
+        connection = real_connect(*args, factory=Tracking, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    cache_file = tmp_path / "cache.sqlite3"
+    import _embedding_utils
+
+    _embedding_utils.save_cache({"a": {"v": 1}}, cache_file)
+    assert _embedding_utils.load_cache(cache_file) == {"a": {"v": 1}}
+    assert opened and all(connection.closed for connection in opened)

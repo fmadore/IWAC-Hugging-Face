@@ -133,12 +133,19 @@ def save_cache(cache: Dict[str, Any], cache_file: Path) -> None:
     if cache_file.suffix == ".sqlite3":
         # The caller supplies only newly completed entries. Transactions make
         # each checkpoint atomic without reserializing every previous vector.
-        with sqlite3.connect(cache_file) as connection:
-            connection.execute("CREATE TABLE IF NOT EXISTS entries (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            connection.executemany(
-                "INSERT OR REPLACE INTO entries(key, value) VALUES (?, ?)",
-                ((str(key), json.dumps(value, allow_nan=False)) for key, value in cache.items()),
-            )
+        # ``with connection`` only commits. Close explicitly: Windows cannot
+        # delete a file that still has an open handle, so the cache would
+        # survive a successful push.
+        connection = sqlite3.connect(cache_file)
+        try:
+            with connection:
+                connection.execute("CREATE TABLE IF NOT EXISTS entries (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                connection.executemany(
+                    "INSERT OR REPLACE INTO entries(key, value) VALUES (?, ?)",
+                    ((str(key), json.dumps(value, allow_nan=False)) for key, value in cache.items()),
+                )
+        finally:
+            connection.close()
         return
     tmp = cache_file.with_suffix(".tmp.gz")
     try:
