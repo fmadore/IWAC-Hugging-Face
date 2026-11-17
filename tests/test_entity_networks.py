@@ -73,18 +73,18 @@ def test_offline_run_records_provenance_and_requires_explicit_index(tmp_path):
     output = tmp_path / "out"
     base = [sys.executable, "-m", "iwac_pipeline.analyses.entity_networks", "--input", str(articles),
             "--output-dir", str(output), "--min-node-count", "1", "--min-edge-weight", "1"]
-    refused = subprocess.run(base, capture_output=True, text=True)
+    refused = subprocess.run(base, capture_output=True, encoding="utf-8")
     assert refused.returncode != 0 and "--index-input" in refused.stderr
     done = subprocess.run([*base, "--index-input", str(index), "--revision", "rev-1",
-                           "--types", "Organisations", "Événements"], capture_output=True, text=True)
+                           "--types", "Organisations", "Événements"], capture_output=True, encoding="utf-8")
     assert done.returncode == 0, done.stderr
     edges = pd.read_csv(output / "entity_edges.csv", dtype={"Source": str, "Target": str})
     assert edges[["Source", "Target"]].values.tolist() == [["1", "2"]]
     assert set(edges.source_revision) == {"rev-1"}
-    summary = json.loads((output / "entity_networks_summary.json").read_text())
+    summary = json.loads((output / "entity_networks_summary.json").read_text(encoding="utf-8"))
     assert summary["n_with_matched_authorities"] == 3
     assert "cataloguing density" in summary["degree_caveat"]
-    manifest = json.loads((output / "entity_networks.manifest.json").read_text())
+    manifest = json.loads((output / "entity_networks.manifest.json").read_text(encoding="utf-8"))
     assert manifest["dataset"]["revision"] == "rev-1"
     assert len(manifest["inputs"]["index_input"]["sha256"]) == 64
 
@@ -98,9 +98,9 @@ def test_cohort_ids_file_filters_and_is_recorded(tmp_path):
                            "--input", str(articles), "--index-input", str(index), "--output-dir", str(output),
                            "--min-node-count", "1", "--min-edge-weight", "1",
                            "--ids-file", str(tmp_path / "ledger.csv"), "--ids-where", "stable_outlet_cohort"],
-                          capture_output=True, text=True)
+                          capture_output=True, encoding="utf-8")
     assert done.returncode == 0, done.stderr
-    summary = json.loads((output / "entity_networks_summary.json").read_text())
+    summary = json.loads((output / "entity_networks_summary.json").read_text(encoding="utf-8"))
     assert summary["ids_filter"]["rows_kept"] == 3 and summary["ids_filter"]["rows_dropped"] == 3
-    manifest = json.loads((output / "entity_networks.manifest.json").read_text())
+    manifest = json.loads((output / "entity_networks.manifest.json").read_text(encoding="utf-8"))
     assert manifest["inputs"]["ids_filter"]["ids_in_file"] == 3

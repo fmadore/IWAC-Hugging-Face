@@ -198,15 +198,15 @@ def test_offline_cli_records_unknown_revision_and_input_hash(tmp_path, corpus):
     output = tmp_path / "reports"
     result = subprocess.run([sys.executable, "-m", "iwac_pipeline.analyses.corpus_coverage",
         "--input", str(source), "--year-min", "2000", "--year-max", "2001",
-        "--output-dir", str(output)], capture_output=True, text=True)
+        "--output-dir", str(output)], capture_output=True, encoding="utf-8")
     assert result.returncode == 0, result.stderr
-    manifest = json.loads((output / "corpus_coverage.manifest.json").read_text())
+    manifest = json.loads((output / "corpus_coverage.manifest.json").read_text(encoding="utf-8"))
     assert manifest["dataset"]["revision"] is None
     assert manifest["inputs"]["revision_status"] == "unknown"
     assert len(manifest["inputs"]["sha256"]) == 64
     ledger = pd.read_csv(output / "corpus_coverage_inclusion.csv")
     assert set(ledger.source_revision) == {"unknown"}
-    assert "private text" not in (output / "corpus_coverage_inclusion.csv").read_text()
+    assert "private text" not in (output / "corpus_coverage_inclusion.csv").read_text(encoding="utf-8")
 
 
 def test_reprint_missing_provenance_requires_explicit_exploratory_choice(corpus):
@@ -233,9 +233,9 @@ def test_review_cli_metadata_only_end_to_end(tmp_path, corpus, module, arguments
     corpus.to_parquet(source, index=False)
     output = tmp_path / "reports"
     result = subprocess.run([sys.executable, "-m", f"iwac_pipeline.analyses.{module}",
-        "--input", str(source), "--output-dir", str(output), *arguments], capture_output=True, text=True)
+        "--input", str(source), "--output-dir", str(output), *arguments], capture_output=True, encoding="utf-8")
     assert result.returncode == 0, result.stderr
-    content = (output / report).read_text()
+    content = (output / report).read_text(encoding="utf-8")
     assert "private text" not in content and "private lemma" not in content
     assert "source_revision" in content
 
