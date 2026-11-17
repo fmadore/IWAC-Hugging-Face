@@ -10,27 +10,6 @@ from typing import Sequence
 from iwac_common.schema import ALL_CONFIGS
 from iwac_common.upload_runner import run_upload
 
-
-def _force_utf8_stdio() -> None:
-    """Render rich's box drawing and emoji on a non-UTF-8 stdout.
-
-    Every command prints through rich, and ``_setup_console_logging`` routes
-    logging through a ``RichHandler``. On Windows a redirected stdout defaults
-    to cp1252, where rich's legacy renderer raises ``UnicodeEncodeError`` on the
-    first emoji. Raised inside a logging handler, ``logging`` swallows it: the
-    run loses the rest of its output and still exits 0, so a broken run looks
-    exactly like a clean one. Reconfiguring here covers every entry point and
-    every ``Console()`` they build.
-    """
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is None:  # a replaced stream that is not a TextIOWrapper
-            continue
-        try:
-            reconfigure(encoding="utf-8", errors="replace")
-        except (ValueError, OSError):  # detached or already-closed stream
-            pass
-
 UPLOAD_MODULES = {
     "articles": "iwac_pipeline.uploads.articles.upload_newspaper_hf",
     "publications": "iwac_pipeline.uploads.publications.upload_Islamic_publications_hf",
@@ -85,7 +64,6 @@ def _run_module(module_name: str, argv: Sequence[str]) -> int:
 
 def upload_main(argv: Sequence[str] | None = None) -> int:
     """Refresh one subset from Omeka into a verified private destination."""
-    _force_utf8_stdio()
     command, remaining = _dispatch_args("iwac-upload", ALL_CONFIGS, argv)
     module = importlib.import_module(UPLOAD_MODULES[command])
     return run_upload(module.SPEC, remaining)
@@ -93,25 +71,21 @@ def upload_main(argv: Sequence[str] | None = None) -> int:
 
 def process_main(argv: Sequence[str] | None = None) -> int:
     """Run an enrichment; install the nlp/analysis extras for its dependencies."""
-    _force_utf8_stdio()
     command, remaining = _dispatch_args("iwac-process", PROCESS_MODULES, argv)
     return _run_module(PROCESS_MODULES[command], remaining)
 
 
 def analyze_main(argv: Sequence[str] | None = None) -> int:
     """Run an analysis or prepare a source-linked research validation report."""
-    _force_utf8_stdio()
     command, remaining = _dispatch_args("iwac-analyze", ANALYSIS_MODULES, argv)
     return _run_module(ANALYSIS_MODULES[command], remaining)
 
 
 def mirror_main(argv: Sequence[str] | None = None) -> int:
     """Create the revision-pinned local mirror (same parser as the script)."""
-    _force_utf8_stdio()
     module = importlib.import_module("iwac_pipeline.mirror.fetch_datasets")
     return int(module.cli(argv, prog="iwac-mirror"))
 
 
 def publish_public_main(argv: Sequence[str] | None = None) -> int:
-    _force_utf8_stdio()
     return _run_module("iwac_pipeline.processing.publish_public", sys.argv[1:] if argv is None else argv)
