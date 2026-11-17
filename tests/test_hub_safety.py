@@ -302,7 +302,7 @@ def test_stale_lock_from_dead_local_process_is_reclaimed(monkeypatch, atomic_hub
     root = hub._lock_root()
     root.mkdir(parents=True, exist_ok=True)
     path = root / (hashlib.sha256(b"owner/repo").hexdigest()[:16] + ".lock")
-    path.write_text(f"repo=owner/repo\npid=999999\nhost={socket.gethostname()}\nstarted=x\n")
+    path.write_text(f"repo=owner/repo\npid=999999\nhost={socket.gethostname()}\nstarted=x\n", encoding="utf-8")
     with hub.hub_write_lock("owner/repo"):
         pass
     assert not path.exists()
@@ -322,7 +322,7 @@ def test_reclaim_race_loser_restores_the_winners_fresh_lock(monkeypatch, atomic_
     path = root / (hashlib.sha256(b"owner/repo").hexdigest()[:16] + ".lock")
     dead = {"repo": "owner/repo", "pid": "999999", "host": host, "started": "x"}
     winner = f"repo=owner/repo\npid={os.getpid()}\nhost={host}\nstarted=fresh\n"
-    path.write_text(winner)  # the winner already reclaimed and holds the lock
+    path.write_text(winner, encoding="utf-8")  # the winner already reclaimed and holds the lock
 
     real_owner = hub._lock_owner
     reads = iter([dead])  # the loser's first read predates the winner's reclaim
@@ -330,14 +330,14 @@ def test_reclaim_race_loser_restores_the_winners_fresh_lock(monkeypatch, atomic_
     monkeypatch.setattr(hub, "_process_alive", lambda pid: pid != 999999)
 
     assert hub._reclaim_if_dead(path, "owner/repo") is False
-    assert path.read_text() == winner
+    assert path.read_text(encoding="utf-8") == winner
     assert list(root.glob("*.stale")) == []
 
     reads = iter([dead])
     with pytest.raises(hub.HubWriteLockedError):
         with hub.hub_write_lock("owner/repo"):
             pass
-    assert path.read_text() == winner
+    assert path.read_text(encoding="utf-8") == winner
 
 
 def test_reclaim_race_with_occupied_slot_fails_closed(monkeypatch, atomic_hub):
@@ -350,7 +350,7 @@ def test_reclaim_race_with_occupied_slot_fails_closed(monkeypatch, atomic_hub):
     root.mkdir(parents=True, exist_ok=True)
     path = root / (hashlib.sha256(b"owner/repo").hexdigest()[:16] + ".lock")
     dead = {"repo": "owner/repo", "pid": "999999", "host": host, "started": "x"}
-    path.write_text(f"repo=owner/repo\npid={os.getpid()}\nhost={host}\nstarted=fresh\n")
+    path.write_text(f"repo=owner/repo\npid={os.getpid()}\nhost={host}\nstarted=fresh\n", encoding="utf-8")
     monkeypatch.setattr(hub, "_lock_owner", lambda p: dead if p == path else {})
     monkeypatch.setattr(hub, "_process_alive", lambda pid: pid != 999999)
 
@@ -368,7 +368,7 @@ def test_stale_lock_from_another_host_is_not_reclaimed(monkeypatch, atomic_hub):
     root = hub._lock_root()
     root.mkdir(parents=True, exist_ok=True)
     path = root / (hashlib.sha256(b"owner/repo").hexdigest()[:16] + ".lock")
-    path.write_text("repo=owner/repo\npid=999999\nhost=elsewhere\n")
+    path.write_text("repo=owner/repo\npid=999999\nhost=elsewhere\n", encoding="utf-8")
     with pytest.raises(hub.HubWriteLockedError):
         with hub.hub_write_lock("owner/repo"):
             pass

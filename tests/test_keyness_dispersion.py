@@ -130,7 +130,7 @@ def test_keyness_run_exports_dispersion_and_manifest(monkeypatch, tmp_path):
     assert set(country.token) == {"mosquée", "marché"}
     assert {"n_docs", "n_outlets", "log_ratio_ci_low"}.issubset(country.columns)
     assert set(country.source_revision) == {"abc"}
-    summary = json.loads((tmp_path / "keyness_bursts_summary.json").read_text())
+    summary = json.loads((tmp_path / "keyness_bursts_summary.json").read_text(encoding="utf-8"))
     assert summary["keyness"]["eligibility"]["excluded_language_labels"] == {"Ewé": 1}
     assert calls["revision"] == "abc"
     # The authority file is read at the analysed subset's revision.

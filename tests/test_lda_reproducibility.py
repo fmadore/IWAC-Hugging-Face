@@ -168,7 +168,7 @@ def test_fit_cli_sweep_receives_only_training_documents(fitted_model, monkeypatc
     # articles pins k, so the sweep is report-only: no bundle, no push.
     assert not (root / "bundles").exists() and not (root / "current.json").exists()
     assert state.get("push") is pushes_before
-    report = json.loads(next((root / "sweeps").glob("*/sweep_report.json")).read_text())
+    report = json.loads(next((root / "sweeps").glob("*/sweep_report.json")).read_text(encoding="utf-8"))
     assert report["k_pinned"] and report["pinned_k"] == 30
     assert "not a document-completion" in report["holdout_metric"]
     split = report["evaluation_split"]
@@ -239,7 +239,7 @@ def test_evidence_floor_nulls_assignments_and_is_recorded(fitted_model, monkeypa
     run = max((model_root / "predictions").iterdir())
     theta = pd.read_parquet(run / "doc_topics.parquet")
     assert theta["below_min_evidence"].all() and (theta["n_vocab_tokens"] > 0).all()
-    metadata = json.loads((run / "doc_topics.metadata.json").read_text())
+    metadata = json.loads((run / "doc_topics.metadata.json").read_text(encoding="utf-8"))
     assert metadata["min_vocab_tokens"] == 1000
 
 
@@ -300,7 +300,7 @@ def test_prevalence_cli_uses_frozen_model_and_conditional_output(fitted_model, t
         "--theta-path", str(next((root / "predictions").glob("*/doc_topics.parquet"))),
     ])
     prevalence.main()
-    summary = json.loads((prevalence.OUTPUT_DIR / "topic_prevalence_summary.json").read_text())
+    summary = json.loads((prevalence.OUTPUT_DIR / "topic_prevalence_summary.json").read_text(encoding="utf-8"))
     assert summary["trend_test"] == "none"
     assert summary["theta_rows_reused"] == len(frame)
     assert summary["bootstrap_unit"] == "newspaper"

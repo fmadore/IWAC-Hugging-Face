@@ -17,19 +17,19 @@ def test_each_run_archives_its_actual_output_bytes(tmp_path, monkeypatch):
         tmp_path, script="study", repo_id="owner/data", revision="dataset-sha",
         outputs=[output],
     )
-    first = json.loads(manifest.read_text())
+    first = json.loads(manifest.read_text(encoding="utf-8"))
     output.write_bytes(b"year,value\n2000,2\n")
     _common.write_run_manifest(
         tmp_path, script="study", repo_id="owner/data", revision="new-sha",
         outputs=[output],
     )
-    second = json.loads(manifest.read_text())
+    second = json.loads(manifest.read_text(encoding="utf-8"))
     assert first["archive"] != second["archive"]
     archived = tmp_path / first["archive"] / "result.csv"
     assert archived.read_bytes() == b"year,value\n2000,1\n"
     assert hashlib.sha256(archived.read_bytes()).hexdigest() == first["outputs"]["result.csv"]["sha256"]
     assert (archived.parent / "environment.json").is_file()
-    assert json.loads((archived.parent / "manifest.json").read_text()) == first
+    assert json.loads((archived.parent / "manifest.json").read_text(encoding="utf-8")) == first
 
 
 def test_manifest_refuses_missing_output(tmp_path):
