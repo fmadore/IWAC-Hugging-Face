@@ -194,6 +194,9 @@ def merge_with_hub_dataset(
         allow_initialize=allow_initialize, console=console,
     )
     if existing_df.empty:
+        # Nothing to restore from: a failed item here could only ship with
+        # blank, unrestricted fields, so the contract is to abort.
+        _refuse_unrecoverable_failures(preserve_fields_by_id or {}, set())
         console.print("[yellow]ℹ[/yellow] No existing data on Hub; using new Omeka data directly.")
         return new_df
     validate_ids(existing_df, label=f"existing Hub dataset '{config_name}'")
@@ -338,17 +341,36 @@ def _load_baseline(
     return existing_df
 
 
+def _refuse_unrecoverable_failures(
+    preserve_fields_by_id: Mapping[object, Iterable[str]], baseline_ids: set[str],
+) -> None:
+    """Abort when a media failure hit an item the baseline does not hold.
+
+    ``--allow-media-failures`` keeps the previous value of a failed field; a
+    new item has none, so it would ship blank or with a fallback value never
+    marked private (an audiovisual thumbnail, for one). The ingestion contract
+    says such an item aborts the upload.
+    """
+    new_items = sorted(str(i) for i in preserve_fields_by_id if str(i) not in baseline_ids)
+    if new_items:
+        raise HubBaselineUnavailableError(
+            f"Media lookups failed for {len(new_items)} item(s) absent from the Hub baseline "
+            f"({', '.join(new_items[:10])}); a new item cannot be reconstructed, even with "
+            "--allow-media-failures. Re-run once the media resolve."
+        )
+
+
 def _restore_failed_fields(
     new_df: pd.DataFrame,
     existing_by_id: pd.DataFrame,
     preserve_fields_by_id: Mapping[object, Iterable[str]],
 ) -> None:
     """Put the Hub value back into fields whose fresh fetch failed (in place),
-    and mark those fields private."""
+    and mark those fields private. A failed item absent from the baseline
+    aborts (:func:`_refuse_unrecoverable_failures`)."""
+    _refuse_unrecoverable_failures(preserve_fields_by_id, set(existing_by_id.index.astype(str)))
     for raw_id, raw_fields in preserve_fields_by_id.items():
         row_id, fields = str(raw_id), set(raw_fields)
-        if row_id not in existing_by_id.index:
-            continue
         mask = new_df["o:id"] == row_id
         for field in fields:
             if field in new_df.columns and field in existing_by_id.columns:

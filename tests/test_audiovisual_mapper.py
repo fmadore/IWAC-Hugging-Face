@@ -143,6 +143,10 @@ class TestCountry:
     def test_youtube_item_resolves_burkina_faso_from_its_item_set(self):
         assert av._resolve_country(YOUTUBE_ITEM) == "Burkina Faso"
 
+    def test_youtube_item_resolves_togo_from_its_item_set(self):
+        # Live item set 110812 "Vidéos YouTube (Togo)": its items carry no spatial.
+        assert av._resolve_country({"o:id": 1, "o:item_set": [{"o:id": 110812}]}) == "Togo"
+
     def test_deposited_item_resolves_nigeria_from_the_french_place_label(self):
         # 'Nigéria' → 'Nigeria': the authority is French-labelled, the dataset's
         # country column is not.

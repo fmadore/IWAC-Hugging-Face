@@ -25,14 +25,22 @@ def test_load_environment_honours_iwac_env_file(monkeypatch, tmp_path):
 
 
 def test_stage_modules_use_the_shared_loader():
+    """Every iwac-process stage (and publication) loads .env through the shared
+    loader, which honours IWAC_ENV_FILE; a direct load_dotenv would backfill
+    keys from the checkout's .env into a scratch-repo run."""
+    import importlib.util
     from pathlib import Path
 
-    root = Path(__file__).resolve().parent.parent / "post-processing"
-    for name in ("publish_public.py", "related_articles.py", "sentiment_agreement.py",
-                 "semantic_embedding.py", "semantic_embedding_images.py"):
-        source = (root / name).read_text(encoding="utf-8")
-        assert "load_environment()" in source, name
-        assert "load_dotenv" not in source, name
+    from iwac_pipeline.cli import PROCESS_MODULES
+
+    root = Path(__file__).resolve().parent.parent
+    paths = [Path(importlib.util.find_spec(module).origin) for module in PROCESS_MODULES.values()]
+    paths.append(root / "post-processing" / "publish_public.py")
+    assert len(paths) == len(PROCESS_MODULES) + 1
+    for path in paths:
+        source = path.read_text(encoding="utf-8")
+        assert "load_environment()" in source, path.name
+        assert "load_dotenv" not in source, path.name
 
 
 @pytest.mark.parametrize("given,expected", [("hub", "hub"), ("local", "local"), ("csv", "local")])
@@ -69,3 +77,16 @@ def test_display_text_stats_counts_bytes_for_chunking():
     # 4 characters but 8 UTF-8 bytes: chunked by a byte budget of 6.
     assert _common.display_text_stats(["éééé", "", None, "ab"], "OCR", chunk_bytes=6, console=console) == 2
     assert "Will be chunked" in out.getvalue()
+
+
+def test_full_hub_load_keeps_nullable_ints(monkeypatch):
+    """columns=None must give the same dtypes as a column-pruned Hub read."""
+    import pyarrow as pa
+    from datasets import Dataset
+
+    ds = Dataset(pa.table({"o:id": ["1", "2"], "pub_year": pa.array([1995, None], pa.int64())}))
+    monkeypatch.setattr(_common, "get_repo_revision", lambda *a, **k: "rev")
+    monkeypatch.setattr("datasets.load_dataset", lambda *a, **k: ds)
+    df = _common.load_subset_dataframe("owner/repo", "articles", source="hub", revision="rev")
+    assert str(df["pub_year"].dtype) == "Int64"
+    assert df["pub_year"].tolist()[0] == 1995

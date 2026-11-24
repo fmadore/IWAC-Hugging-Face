@@ -79,8 +79,9 @@ def test_stratified_sample_reproducible_blinded_and_weighted(corpus):
     assert set(probability["o:id"]).isdisjoint(challenge["o:id"])
     assert probability.design_weight.sum() == 12
     assert challenge.design_weight.isna().all()
-    # Every sheet lists the same sources, in hash-rank order, interleaving both groups.
-    assert audit["stable_rank"].is_monotonic_increasing
+    # Every sheet lists the same sources, in display-hash order (independent of the
+    # selection rank), interleaving both groups.
+    assert audit["display_rank"].is_monotonic_increasing
     for sheet in sheets.values():
         assert sheet["o:id"].tolist() == audit["o:id"].tolist()
     assert all(sheets["adjudication"].adjudicated_polarity.eq(""))
@@ -105,6 +106,41 @@ def test_annotator_sheets_are_blind_and_independent(corpus):
     # Each annotator sees only their own form; neither sees the other's or the adjudication fields.
     assert "polarity" in sheets["annotator_a"] and "annotator_b_polarity" not in sheets["annotator_a"]
     assert not any(col.startswith("adjudicated_") for col in sheets["annotator_b"])
+
+
+def test_sheet_order_does_not_reveal_the_selection_group():
+    """One stratum: probability items are the five lowest selection ranks, the
+    expert-flagged ones are rank-blind. Sorting by the selection rank put all
+    probability rows first; the display hash must interleave them."""
+    df = pd.DataFrame({"o:id": [str(i) for i in range(200)], "title": "t", "country": "Togo",
+                       "newspaper": "J", "language": "Français", "pub_date": "2000-01-01"})
+    work_rank = {i: __import__("hashlib").sha256(f"42\0{i}".encode()).hexdigest() for i in df["o:id"]}
+    highest = sorted(work_rank, key=work_rank.get)[-20:]  # flagged items with the worst selection ranks
+    sheets, audit, _ = annotation_sample(df, per_stratum=5, challenge_size=20, seed=42,
+                                         strata=("country",), difficult_ids=highest)
+    order = audit["sample_group"].tolist()
+    assert order.count("stratified_probability") == 5
+    assert order[:5] != ["stratified_probability"] * 5
+    assert audit["display_rank"].is_monotonic_increasing
+    assert sheets["annotator_a"]["o:id"].tolist() == audit["o:id"].tolist()
+    assert "display_rank" not in sheets["annotator_a"]
+
+
+def test_float_typed_subjectivity_is_not_a_disagreement():
+    models = latest_generation()
+    df = pd.DataFrame({"o:id": ["1", "2"], "title": "t", "country": "Togo", "newspaper": "J",
+                       "language": "Français", "pub_date": "2000-01-01"})
+    for k, m in enumerate(models):
+        df[m.column("polarite")] = "Neutre"
+        df[m.column("centralite_islam_musulmans")] = "Central"
+        df[m.subjectivite_column] = ["3.0" if k % 2 else "3", "2" if k else "4"]
+    _, audit, _ = annotation_sample(df, per_stratum=1, challenge_size=5, seed=1,
+                                    strata=("country",), models=models)
+    challenge = audit[audit["sample_group"] == "challenge_nonprobability"]
+    reasons = dict(zip(challenge["o:id"], challenge["selection_reason"]))
+    assert "1" not in reasons or "subjectivite" not in reasons["1"]
+    if "2" in reasons:
+        assert "model_disagreement:subjectivite_score" in reasons["2"]
 
 
 def test_expert_challenge_unknown_ids_rejected(corpus):

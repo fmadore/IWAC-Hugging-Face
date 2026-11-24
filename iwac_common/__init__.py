@@ -24,6 +24,13 @@ Modules:
     sentiment_panel: Canonical definition of the AI sentiment annotator panel
                    (model-keyed column prefixes, Omeka property mapping,
                    which models are frozen history).
+    enrichment:    Persisted per-row provenance (input/config hashes) for
+                   computed columns, and their invalidation.
+    write_policy:  Publication policy shared by the public projection and the
+                   write gateway (item/property visibility, neighbour lists).
+    settings:      Startup .env loading (honours ``IWAC_ENV_FILE``) and the
+                   lazy repository-id getters.
+    paths:         The writable workspace root, kept apart from installed code.
 
 Installable via ``pip install -e . --no-deps`` (see pyproject.toml), which
 makes ``iwac_common`` and ``country_mapper`` importable without sys.path

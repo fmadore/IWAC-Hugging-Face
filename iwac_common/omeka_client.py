@@ -612,6 +612,7 @@ async def fetch_iiif_thumbnail_url(
     session: Optional[aiohttp.ClientSession] = None,
     *,
     max_tries: int = IIIF_MAX_TRIES,
+    affected_fields: Iterable[str] = ("thumbnail", "iiif_manifest"),
 ) -> str:
     """Fetch the thumbnail URL from an item's IIIF manifest.
 
@@ -621,6 +622,8 @@ async def fetch_iiif_thumbnail_url(
     (another status, an unparseable manifest), is recorded once for the
     upload runner's fail-closed guard while all in-flight mappers finish.
     ``session`` defaults to the shared :data:`conn_manager` session.
+    ``affected_fields`` are the columns a failure restricts; a subset without
+    an ``iiif_manifest`` column (``index``) passes only ``("thumbnail",)``.
     """
     manifest_url = iiif_manifest_url(omeka_id)
     media_stats.record_attempt()
@@ -657,7 +660,7 @@ async def fetch_iiif_thumbnail_url(
             omeka_id, attempt + 1, max_tries, problem,
         )
         await asyncio.sleep(2**attempt)
-    media_stats.record_failure(omeka_id, ("thumbnail", "iiif_manifest"))
+    media_stats.record_failure(omeka_id, tuple(affected_fields))
     logger.warning(
         "IIIF manifest lookup failed for item %s: %s. URL: %s",
         omeka_id, problem, manifest_url,
