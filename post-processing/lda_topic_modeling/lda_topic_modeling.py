@@ -38,6 +38,23 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
+try:
+    import iwac_pipeline.processing  # noqa: F401
+except ModuleNotFoundError:  # direct run in a venv without the install
+    # ``iwac_pipeline.processing`` is a setuptools mapping onto
+    # ``post-processing/``; recreate it so the imports below (and this
+    # package's relative imports) resolve from the source tree.
+    import types
+
+    _POST_PROCESSING = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(_POST_PROCESSING.parent))
+    import iwac_pipeline
+
+    _processing = types.ModuleType("iwac_pipeline.processing")
+    _processing.__path__ = [str(_POST_PROCESSING)]
+    sys.modules["iwac_pipeline.processing"] = _processing
+    iwac_pipeline.processing = _processing
+
 from iwac_pipeline.processing._common import (  # type: ignore  # noqa: E402
     PRIVATE_REPO_ID,
     choose_config,

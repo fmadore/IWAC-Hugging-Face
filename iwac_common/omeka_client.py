@@ -613,6 +613,7 @@ async def fetch_iiif_thumbnail_url(
     *,
     max_tries: int = IIIF_MAX_TRIES,
     affected_fields: Iterable[str] = ("thumbnail", "iiif_manifest"),
+    cache: Optional[Cache] = None,
 ) -> str:
     """Fetch the thumbnail URL from an item's IIIF manifest.
 
@@ -624,9 +625,20 @@ async def fetch_iiif_thumbnail_url(
     ``session`` defaults to the shared :data:`conn_manager` session.
     ``affected_fields`` are the columns a failure restricts; a subset without
     an ``iiif_manifest`` column (``index``) passes only ``("thumbnail",)``.
+
+    ``cache`` (normally the client's 24 h response cache, ``None`` under
+    ``--no-cache``) keeps resolved answers, absences included, so a re-run
+    or dry run within the TTL sends no request. Failures are never cached.
     """
     manifest_url = iiif_manifest_url(omeka_id)
+    # The manifest is anonymous, so the host-qualified URL is the whole key.
+    cache_key = f"iiif-thumbnail|{manifest_url}"
+    if cache is not None:
+        cached = await cache.get(cache_key)
+        if isinstance(cached, dict) and isinstance(cached.get("thumbnail"), str):
+            return cached["thumbnail"]
     media_stats.record_attempt()
+    thumbnail: Optional[str] = None
     problem = ""
     for attempt in range(max_tries):
         transient = False
@@ -635,12 +647,14 @@ async def fetch_iiif_thumbnail_url(
             # Shorter timeout: this request runs once per item.
             async with sess.get(manifest_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
-                    return _manifest_thumbnail(await resp.json())
+                    thumbnail = _manifest_thumbnail(await resp.json())
+                    break
                 if resp.status in (404, 410):
                     logger.info(
                         "No IIIF manifest for item %s (HTTP %s)", omeka_id, resp.status
                     )
-                    return ""
+                    thumbnail = ""
+                    break
                 problem = f"HTTP {resp.status}"
                 transient = resp.status in RETRYABLE_STATUSES
         except (json.JSONDecodeError, aiohttp.ContentTypeError) as exc:
@@ -660,12 +674,28 @@ async def fetch_iiif_thumbnail_url(
             omeka_id, attempt + 1, max_tries, problem,
         )
         await asyncio.sleep(2**attempt)
+    if thumbnail is not None:
+        if cache is not None:
+            await cache.set(cache_key, {"thumbnail": thumbnail})
+        return thumbnail
     media_stats.record_failure(omeka_id, tuple(affected_fields))
     logger.warning(
         "IIIF manifest lookup failed for item %s: %s. URL: %s",
         omeka_id, problem, manifest_url,
     )
     return ""
+
+
+def iiif_thumbnail_visible(item: Dict[str, Any]) -> bool:
+    """Whether an anonymous manifest request can yield this item's thumbnail.
+
+    A private item is not served to an anonymous client, and a private
+    primary media (flagged by :func:`fetch_primary_media_url`) yields a
+    manifest with no ``thumbnail`` (verified live, 2026-11: HTTP 200, no
+    key). Skipping both saves a request per item and keeps an unverified
+    403 on a private manifest away from the fail-closed media guard.
+    """
+    return item.get("o:is_public") is not False and not item.get("_iwac_private_media")
 
 
 async def fetch_media_pointers(
@@ -684,6 +714,9 @@ async def fetch_media_pointers(
     case any primary media suffices (audiovisual: a YouTube media has
     thumbnails but no file). ``thumbnail_fallback`` uses the item's baked-in
     ``large`` derivative when the IIIF manifest yields no thumbnail.
+
+    The lookup is skipped where :func:`iiif_thumbnail_visible` already knows
+    the anonymous answer, and goes through ``api.cache`` otherwise.
     """
     file_url = await fetch_primary_media_url(
         item, api, affected_fields=(file_field, "thumbnail", "iiif_manifest")
@@ -691,7 +724,10 @@ async def fetch_media_pointers(
     has_thumbnail_source = file_url if thumbnail_requires_file else item.get("o:primary_media")
     thumbnail_url = ""
     if has_thumbnail_source:
-        thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"])
+        if iiif_thumbnail_visible(item):
+            thumbnail_url = await fetch_iiif_thumbnail_url(
+                item["o:id"], cache=getattr(api, "cache", None)
+            )
         if not thumbnail_url and thumbnail_fallback:
             thumbnail_url = str((item.get("thumbnail_display_urls") or {}).get("large") or "")
     manifest_url = iiif_manifest_url(item["o:id"]) if file_url else ""
@@ -715,6 +751,7 @@ __all__ = [
     "item_page_url",
     "iiif_manifest_url",
     "fetch_iiif_thumbnail_url",
+    "iiif_thumbnail_visible",
     "fetch_media_pointers",
     "fetch_primary_media_url",
     "IIIF_MAX_TRIES",

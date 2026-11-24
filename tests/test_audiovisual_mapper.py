@@ -109,8 +109,9 @@ class _FakeApi:
     """
 
     MEDIA = {
-        "108264": {"o:ingester": "youtube", "o:original_url": None, "o:media_type": None},
+        "108264": {"o:is_public": True, "o:ingester": "youtube", "o:original_url": None, "o:media_type": None},
         "15851": {
+            "o:is_public": True,
             "o:ingester": "upload",
             "o:original_url": "https://islam.zmo.de/files/original/sermon.mp4",
             "o:media_type": "video/mp4",
@@ -126,7 +127,7 @@ def _map(item, monkeypatch, *, thumbnail="https://islam.zmo.de/iiif-thumb.jpg"):
 
     from iwac_common import omeka_client
 
-    async def fake_thumbnail(_omeka_id, _session=None):
+    async def fake_thumbnail(_omeka_id, _session=None, **_kwargs):
         return thumbnail
 
     monkeypatch.setattr(omeka_client, "fetch_iiif_thumbnail_url", fake_thumbnail)

@@ -168,8 +168,10 @@ iwac-process sentiment-agreement --generation 2 --push
 iwac-process sentiment-agreement --generation 1 --push
 ```
 
-What changes: `CONSENSUS_RULE_VERSION` (in `iwac_common/sentiment_panel.py`)
-changes each generation's instrument fingerprint. Consensus and disagreement
+What changes: `CONSENSUS_RULE_VERSION` (in `iwac_common/sentiment_panel.py`,
+now v3) changes each generation's instrument fingerprint, which also hashes
+only the instrument-defining fields of each model, so every stored
+`consensus_g<n>_instrument_id` is stale until this step runs. Consensus and disagreement
 columns are null for rows with fewer than two valid ratings; `""` means "rated
 by at least two models, no strict majority" for a label and "no assessable
 dimension disputed" for the disagreement column. Ordinal Krippendorff alpha is

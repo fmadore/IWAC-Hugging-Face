@@ -50,6 +50,30 @@ def test_instrument_ids_and_storage_are_generation_specific():
     assert set(consensus_columns(1).values()).isdisjoint(consensus_columns(2).values())
 
 
+def test_instrument_id_ignores_operational_fields(monkeypatch):
+    """Issue #44: freezing or relabelling a member keeps the instrument's id."""
+    import dataclasses
+
+    from iwac_common import sentiment_panel as sp
+
+    before = sp.instrument_id(2)
+    frozen = tuple(
+        dataclasses.replace(m, omeka_prefix=None, label=m.label + " (frozen)",
+                            campaign="archived", prefix=m.prefix + "_old")
+        if m.generation == 2 else m
+        for m in reversed(sp.PANEL)
+    )
+    monkeypatch.setattr(sp, "PANEL", frozen)
+    assert sp.instrument_id(2) == before
+
+    changed = tuple(
+        dataclasses.replace(m, run_config=m.run_config + ";temperature=0") if m.generation == 2 else m
+        for m in frozen
+    )
+    monkeypatch.setattr(sp, "PANEL", changed)
+    assert sp.instrument_id(2) != before
+
+
 def test_cross_generation_push_rejected_before_any_read(monkeypatch):
     monkeypatch.setattr("sys.argv", ["sentiment_agreement.py", "--generation", "all", "--push"])
     monkeypatch.setattr(sa, "load_subset_dataframe", lambda *a, **k: pytest.fail("read before rejection"))

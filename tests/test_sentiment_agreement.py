@@ -174,7 +174,7 @@ def test_push_declares_types_for_all_null_columns(monkeypatch):
 
 
 def test_consensus_rule_version_was_bumped():
-    assert CONSENSUS_RULE_VERSION.endswith(":v2") and "null-below-min2" in CONSENSUS_RULE_VERSION
+    assert CONSENSUS_RULE_VERSION.endswith(":v3") and "null-below-min2" in CONSENSUS_RULE_VERSION
 
 
 def test_config_and_source_choices(monkeypatch):
