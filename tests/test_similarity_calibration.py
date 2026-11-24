@@ -5,8 +5,8 @@ import pandas as pd
 import pytest
 
 from iwac_pipeline.analyses.similarity_calibration import (
-    add_lexical_jaccard, calibrate, choose, component_bootstrap, component_halves, curve,
-    neighbor_pairs, pair_components,
+    add_lexical_jaccard, calibrate, choose, component_bootstrap, curve, family_halves,
+    neighbor_pairs, pair_components, scored_configurations,
 )
 from related_articles import NEAR_DUP_CALIBRATION, near_dup_label
 
@@ -47,7 +47,9 @@ def test_calibration_reports_held_out_metrics_for_chosen_cutoffs():
     assert result["ci_status"] == "ok" and result["precision_ci"] == [1.0, 1.0]
     low, high = result["recall_ci"]
     assert low <= result["recall"] <= high
-    assert split["split_version"] == 2 and split["components"] == 200
+    assert split["split_version"] == 3 and split["families"] == 100
+    assert split["calibration_positives"] + split["held_out_positives"] == 100
+    assert abs(split["calibration_positives"] - split["held_out_positives"]) <= 1
     assert len(table) > 0
     with pytest.raises(ValueError):
         calibrate(pd.DataFrame(columns=["id_a", "id_b", "cosine", "lexical_jaccard"]))
@@ -61,20 +63,52 @@ def test_reprint_families_never_straddle_the_split():
         rows += [{"id_a": a, "id_b": b, "cosine": 0.95, "lexical_jaccard": 0.9}
                  for i, a in enumerate(members) for b in members[i + 1:]]
     pairs = pd.DataFrame(rows)
-    components = pair_components(pairs)
-    assert components.nunique() == 10
-    halves = component_halves(pairs, seed=42)
-    assert halves.groupby(components).nunique().eq(1).all()
+    label = pairs["lexical_jaccard"] >= 0.45
+    halves = family_halves(pairs, label, seed=42)
+    assert halves["family"].nunique() == 10
+    assert halves.groupby("family")["side"].nunique().eq(1).all()
+    assert set(halves["side"]) == {0, 1}
     # Deterministic and independent of row order.
     shuffled = pairs.sample(frac=1, random_state=3)
-    assert component_halves(shuffled, seed=42).sort_index().equals(halves)
+    again = family_halves(shuffled, label.loc[shuffled.index], seed=42).sort_index()
+    pd.testing.assert_frame_equal(again, halves)
+
+
+def test_a_giant_thematic_component_still_splits_into_families():
+    """The real top-10 graph percolates into one component: thematic
+    neighbours chain every item together. Families must still split."""
+    rows = []
+    hub_items = [f"t{i}" for i in range(300)]
+    for i, item in enumerate(hub_items):  # a ring plus chords: one connected component
+        for step in (1, 7, 31):
+            rows.append({"id_a": item, "id_b": hub_items[(i + step) % 300],
+                         "cosine": 0.86, "lexical_jaccard": 0.05})
+    for family in range(12):  # reprint families embedded in the thematic graph
+        members = [f"t{family * 20}", f"r{family}a", f"r{family}b"]
+        rows += [{"id_a": a, "id_b": b, "cosine": 0.98, "lexical_jaccard": 0.9}
+                 for i, a in enumerate(members) for b in members[i + 1:]]
+    pairs = pd.DataFrame(rows)
+    assert pair_components(pairs).nunique() == 1  # what split_version 2 relied on
+    label = pairs["lexical_jaccard"] >= 0.45
+    halves = family_halves(pairs, label, seed=42)
+    sides = halves["side"]
+    assert (sides == 0).any() and (sides == 1).any()
+    positives = label.groupby(sides).sum()
+    assert positives[0] == positives[1] == 18  # 12 families x 3 pairs, balanced
+    # No item appears on both sides.
+    item_sides = pd.concat([pd.DataFrame({"item": pairs[c], "side": sides}) for c in ("id_a", "id_b")])
+    item_sides = item_sides[item_sides["side"] >= 0]
+    assert item_sides.groupby("item")["side"].nunique().eq(1).all()
+    _, held_out, _, split = calibrate(pairs, n_boot=50)
+    assert split["held_out_pairs"] > 0 and split["calibration_pairs"] > 0
+    assert split["pairs_excluded_straddling"] == int((sides == -1).sum())
 
 
 def test_component_bootstrap_requires_enough_components():
     pairs = pd.DataFrame({"id_a": ["1", "3"], "id_b": ["2", "4"], "cosine": [0.99, 0.99],
                           "lexical_jaccard": [0.9, 0.9]})
     result = component_bootstrap(pairs, pairs["lexical_jaccard"] >= 0.45, pair_components(pairs), 0.97)
-    assert result["ci_status"] == "insufficient_components"
+    assert result["ci_status"] == "insufficient_units"
     assert result["precision_ci"] == [None, None]
 
 
@@ -99,3 +133,24 @@ def test_near_duplicate_cutoff_is_only_calibrated_for_its_own_space():
     assert near_dup_label("documents", [digest]).startswith("uncalibrated")
     assert near_dup_label(config, ["other-space"]).startswith("uncalibrated")
     assert near_dup_label(config, [digest, "other-space"]).startswith("uncalibrated")
+
+
+def test_component_bootstrap_reports_finite_replicates():
+    # 12 components; only one holds a positive, so many replicates have no recall.
+    ids = [(str(2 * i), str(2 * i + 1)) for i in range(12)]
+    pairs = pd.DataFrame({"id_a": [a for a, _ in ids], "id_b": [b for _, b in ids],
+                          "cosine": [0.99] + [0.5] * 11, "lexical_jaccard": [0.9] + [0.1] * 11})
+    label = pairs["lexical_jaccard"] >= 0.45
+    result = component_bootstrap(pairs, label, pair_components(pairs), 0.97, n_boot=200, seed=1)
+    assert result["ci_status"] == "ok"
+    finite = result["finite_replicates"]
+    assert 0 < finite["recall"] < 200 and 0 < finite["precision"] < 200
+
+
+def test_scored_configurations_need_one_non_blank_hash_on_scored_items():
+    pairs = pd.DataFrame({"id_a": ["1"], "id_b": ["2"]})
+    good = pd.DataFrame({"o:id": ["1", "2", "3"], "h": ["abc", "abc", None]})
+    assert scored_configurations(good, pairs, "h") == ["abc"]  # unscored item 3 is irrelevant
+    for values in (["abc", ""], ["abc", None], ["abc", "def"]):
+        with pytest.raises(SystemExit):
+            scored_configurations(pd.DataFrame({"o:id": ["1", "2"], "h": values}), pairs, "h")

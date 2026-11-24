@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import socket
 import uuid
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Iterable, Iterator, Optional, Sequence
 
 from huggingface_hub import HfApi, HfFileSystem, get_token
+
+logger = logging.getLogger(__name__)
 
 
 class HubBaselineUnavailableError(RuntimeError):
@@ -196,6 +199,59 @@ def _lock_root() -> Path:
     return workspace_root() / ".iwac_locks"
 
 
+_ERROR_INVALID_PARAMETER = 87  # OpenProcess on a pid that names no process
+
+
+def _windows_process_alive(pid: int) -> bool:  # pragma: no cover - Windows only
+    """Only "no such process" counts as dead. Access denied (error 5) means a
+    live process we may not query, such as an elevated writer seen from an
+    unelevated run, so it keeps the lock held like the POSIX branch does."""
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ctypes.get_last_error() != _ERROR_INVALID_PARAMETER
+    try:
+        code = wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return code.value == STILL_ACTIVE
+        return True
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _remove_lock_file(path: Path, attempts: int = 5, delay: float = 0.2) -> None:
+    """Delete the lock after the write. On Windows a concurrent reader of the
+    owner details can hold the file open for a moment, so a PermissionError
+    is retried; if it persists, the stale file is reported rather than raised,
+    since the commit itself has already succeeded."""
+    import time
+
+    for attempt in range(attempts):
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if attempt + 1 < attempts:
+                time.sleep(delay)
+    logger.warning(
+        "Could not remove the write lock %s; its owner has finished, so the next "
+        "run will reclaim it as stale.", path,
+    )
+
+
 def _process_alive(pid: int) -> bool:
     """Best-effort liveness check, biased towards reporting "alive".
 
@@ -207,21 +263,7 @@ def _process_alive(pid: int) -> bool:
     if pid <= 0:
         return True
     if os.name == "nt":  # pragma: no cover - exercised on the Windows CI leg
-        import ctypes
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        try:
-            code = ctypes.c_ulong()
-            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return code.value == STILL_ACTIVE
-            return True
-        finally:
-            kernel32.CloseHandle(handle)
+        return _windows_process_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -336,10 +378,7 @@ def hub_write_lock(repo_id: str, *, console=None, root_dir: Optional[Path] = Non
             handle.write(payload)
         yield
     finally:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        _remove_lock_file(path)
 
 
 def _dataset_ids(ds) -> list[str]:

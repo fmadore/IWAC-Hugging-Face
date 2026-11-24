@@ -79,6 +79,49 @@ def test_yearly_frame_marks_insufficient_clusters_and_keeps_raw_series():
     assert set(rows.ci_status) == {"disabled"}
 
 
+def test_standardisation_tolerates_documents_without_a_country():
+    theta = np.array([[1, 0], [0, 1], [1, 0]], dtype=float)
+    years = pd.Series([2000, 2000, 2000])
+    countries = pd.Series(["Bénin", "Togo", pd.NA], dtype="string")
+    weights = tp.standard_weights(countries)
+    series = tp.standardized_series(theta, years, countries, weights)
+    assert series[2000][1] == pytest.approx(1.0)
+    assert series[2000][0][0] == pytest.approx(0.5)
+
+
+def test_single_document_year_has_no_zero_width_band():
+    theta = np.array([[0.7, 0.3]] + [[0.5, 0.5]] * 5)
+    years = pd.Series([1999] + [2000] * 5)
+    bundle = {"n_topics": 2, "id": "lda-sha256:x", "labels": {0: "a", 1: "b"}}
+    frame = tp.yearly_prevalence(theta, years, None, bundle, SimpleNamespace(bootstrap=20, seed=42))
+    status = frame.drop_duplicates("year").set_index("year")["ci_status"]
+    assert status[1999] == "insufficient_docs" and status[2000] == "ok"
+    assert frame[frame.year == 1999].ci_low.isna().all()
+
+
+def test_document_vectors_apply_the_evidence_floor_to_reused_theta_too(monkeypatch):
+    df = pd.DataFrame({"o:id": ["1", "2", "3"], "lemma_nostop": ["a b c d e f", "a", "a b c d e f"]})
+    monkeypatch.setattr(tp, "prediction_tokenizer_kwargs", lambda preprocessing: {})
+    monkeypatch.setattr(tp, "tokenize_for_prediction", lambda text, phraser: text.split())
+    monkeypatch.setattr(tp, "count_vocab_tokens", lambda dictionary, tokens: len(tokens))
+    monkeypatch.setattr(tp, "predict_document",
+                        lambda *a, **k: (0, 0.6, "a", "0:0.6", [0.6, 0.4]))
+    bundle = {"preprocessing": {"chunk_words": None}, "phraser": None, "dictionary": None,
+              "model": None, "labels": {0: "a", 1: "b"}, "n_topics": 2}
+    reused = {"2": np.array([0.9, 0.1])}  # below the floor although its theta is reused
+    kept, theta, below = tp.document_vectors(df, df.index, bundle, reused, min_vocab_tokens=5)
+    assert kept == [0, 2] and below == 1 and theta.shape == (2, 2)
+    kept, _, below = tp.document_vectors(df, df.index, bundle, reused, min_vocab_tokens=0)
+    assert kept == [0, 1, 2] and below == 0
+
+
+def test_mann_kendall_p_value_does_not_underflow():
+    from iwac_pipeline.analyses._stats import mann_kendall
+
+    _, z, p = mann_kendall(np.arange(200, dtype=float))
+    assert z > 20 and 0 < p < 1e-90  # 1 - cdf gives exactly 0 beyond z of about 8.3
+
+
 def test_eligibility_reports_language_and_date_exclusions():
     df = pd.DataFrame({"pub_date": ["2000", "2000/2001", "2001", "2001"],
                        "language": ["Français", "Français", "Kabiyè", "Français"],

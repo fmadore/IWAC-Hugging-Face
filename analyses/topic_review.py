@@ -85,9 +85,15 @@ def topic_review(df, *, representatives=5, borderline=5, excerpt_chars=0,
             exclusions.append({"o:id": string(row["o:id"]), "reason": reason})
             continue
         topk = parse_topk(row.get("lda_topic_topk"))
+        # top-k is rounded to four decimals, so a dominant topic tied with the
+        # runner-up there may sort second (ties order by id). Find it anywhere
+        # among the top entries, provided it is level with the first one.
+        dominant = next((p for t, p in topk if t == tid), None)
         # Rounding of saved probabilities may differ at the last few digits.
-        consistent = bool(topk and topk[0][0] == tid and abs(topk[0][1] - probability) <= 0.001)
-        runner = topk[1] if consistent and len(topk) > 1 else None
+        consistent = (dominant is not None and topk[0][1] - dominant <= 0.001
+                      and abs(dominant - probability) <= 0.001)
+        others = [entry for entry in topk if entry[0] != tid] if consistent else []
+        runner = others[0] if others else None
         length = lengths.loc[idx] if min_words else None
         eligible.append({"index": idx, "o:id": string(row["o:id"]), "model_id": model_id,
                          "word_count": None if length is None or pd.isna(length) else int(length),
@@ -95,7 +101,8 @@ def topic_review(df, *, representatives=5, borderline=5, excerpt_chars=0,
                          "topic_probability": probability,
                          "runner_up_topic": runner[0] if runner else None,
                          "runner_up_probability": runner[1] if runner else None,
-                         "margin": probability - runner[1] if runner else None})
+                         # Both values from top-k, so at the same precision.
+                         "margin": max(0.0, dominant - runner[1]) if runner else None})
     records = []
     frame = pd.DataFrame(eligible)
     floor = {"min_words": min_words, "length_column": length_column if min_words else None,

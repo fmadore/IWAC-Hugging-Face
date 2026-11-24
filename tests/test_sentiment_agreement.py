@@ -116,6 +116,54 @@ def test_non_applicable_disagreement_lowers_the_inclusive_alpha(monkeypatch, tmp
     assert polarite["krippendorff_alpha_nominal_incl_non_applicable"] < 1
 
 
+def test_subjectivite_ordinal_reads_nullable_ints_as_float():
+    import numpy as np
+
+    values = sa.subjectivite_ordinal(pd.Series(pd.array([1, 2, pd.NA, 5, 9], dtype="Int64")))
+    assert values.dtype == float
+    assert np.isnan(values.to_numpy()).tolist() == [False, False, True, False, True]
+
+
+def test_generation_one_integer_subjectivity_runs(monkeypatch, tmp_path):
+    """Generation 1 stores subjectivité as nullable Int64; the report must not crash."""
+    members = generation(1)
+    rows = 3
+    data = {"o:id": [str(i) for i in range(rows)]}
+    for k, model in enumerate(members):
+        data[model.column("polarite")] = ["Neutre", "Positif", None]
+        data[model.column("centralite_islam_musulmans")] = ["Central", "Marginal", None]
+        data[model.subjectivite_column] = pd.array([3, 4 if k else 2, pd.NA], dtype="Int64")
+    monkeypatch.setattr(sa, "load_subset_dataframe", lambda *a, **k: pd.DataFrame(data))
+    monkeypatch.setattr(sa, "OUTPUT_DIR", tmp_path)
+    manifests = []
+    monkeypatch.setattr(sa, "write_run_manifest", lambda *a, **k: manifests.append(k["script"]))
+    monkeypatch.setattr("sys.argv", ["sentiment_agreement.py", "--source", "local", "--generation", "1"])
+    assert sa.main() == 0
+    report = json.loads((tmp_path / "sentiment_agreement_articles_g1.json").read_text(encoding="utf-8"))
+    assert report["dimensions"]["subjectivite"]["n_rated_by_all"] == 2
+    # One manifest per generation, so a g1 run cannot overwrite g2's latest.
+    assert manifests == ["sentiment_agreement_articles_g1"]
+
+
+def test_non_applicable_is_a_vote_not_a_missing_rating(monkeypatch, tmp_path):
+    rows = [[("Non applicable", "Central", "Mixte")] * 6, [("Positif", "Central", "Mixte")] * 6,
+            [("Positif", "Central", "Mixte")] * 5]
+    report, _ = run_report(monkeypatch, tmp_path, panel(rows))
+    first, last = generation(2)[0].prefix, generation(2)[-1].prefix
+    polarite = report["dimensions"]["polarite"]
+    assert polarite["n_non_applicable_by_model"][first] == 1
+    assert polarite["n_missing_by_model"][first] == 0
+    assert polarite["n_missing_by_model"][last] == 1  # the model that did not vote on row 3
+    assert "n_non_applicable_by_model" not in report["dimensions"]["centralite"]
+
+
+def test_non_applicable_is_not_a_centralite_vote(monkeypatch, tmp_path):
+    rows = [[("Neutre", "Non applicable", "Mixte")] * 3 + [("Neutre", "Central", "Mixte")] * 3]
+    _, consensus = run_report(monkeypatch, tmp_path, panel(rows))
+    # Only the three "Central" votes count; with them alone the label is "Central".
+    assert consensus.loc[0, consensus_columns(2)["consensus_centralite"]] == "Central"
+
+
 def test_push_declares_types_for_all_null_columns(monkeypatch):
     ds = Dataset.from_dict({"o:id": ["1", "2"]})
     types = {consensus_columns(2)[name]: pa.type_for_alias(alias) for name, alias in sa.CONSENSUS_TYPES.items()}

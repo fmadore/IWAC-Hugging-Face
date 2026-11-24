@@ -143,11 +143,13 @@ def resolve_consensus(df: pd.DataFrame, generation: int | None = None) -> pd.Dat
     generation = generation if generation is not None else max(m.generation for m in PANEL)
     models = models_for(generation)
     out = pd.DataFrame(index=df.index)
-    for key, suffix, mapping in (("pol", "polarite", POLARITY_ORDER),
-                                  ("cent", "centralite_islam_musulmans", CENTRALITY_ORDER)):
+    # "Non applicable" is a polarité answer only; centralité's floor is "Non abordé".
+    for key, suffix, mapping, extra in (
+            ("pol", "polarite", POLARITY_ORDER, ["Non applicable"]),
+            ("cent", "centralite_islam_musulmans", CENTRALITY_ORDER, [])):
         cols = [f"{m}_{suffix}" for m in models]
         votes = df.reindex(columns=cols).astype("string").apply(lambda col: col.str.strip())
-        votes = votes.where(votes.isin([*mapping, "Non applicable"]))
+        votes = votes.where(votes.isin([*mapping, *extra]))
         out[f"{key}_n_votes"] = votes.notna().sum(axis=1)
         out[f"{key}_label"] = consensus_label_series(votes, cols)
     cols = [f"{m}_subjectivite_score" for m in models]

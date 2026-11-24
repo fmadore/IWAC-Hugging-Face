@@ -172,6 +172,8 @@ DIMENSIONS = [
     ("centralite", "{m}_centralite_islam_musulmans", CENTRALITY_ORDER),
     ("subjectivite", "{m}_subjectivite_score", None),
 ]
+# Dimensions whose answer set includes "Non applicable" beside the scale.
+NON_APPLICABLE_DIMENSIONS = {"polarite": ("Non applicable",)}
 
 from iwac_common.paths import workspace_root
 
@@ -319,10 +321,12 @@ def subjectivite_ordinal(series: pd.Series) -> pd.Series:
     The union is unambiguous — a label never parses as a number and a number is
     not in :data:`SUBJECTIVITE_ORDER` — so no caller has to know which it holds.
     """
-    numeric = pd.to_numeric(series, errors="coerce")
+    # float, not a nullable Int64: the metrics run on numpy arrays, where a
+    # pd.NA cell makes np.isnan raise instead of reporting a missing rating.
+    numeric = pd.to_numeric(series, errors="coerce").astype(float)
     labels = to_ordinal(series, SUBJECTIVITE_ORDER)
     values = numeric.where(numeric.notna(), labels)
-    return values.where(values.isin(SUBJECTIVITY_SCALE))
+    return values.where(values.isin(SUBJECTIVITY_SCALE)).astype(float)
 
 
 def label_votes(row: pd.Series, cols: List[str]) -> List[str]:
@@ -516,7 +520,9 @@ def main() -> int:
         # --- consensus columns ---
         raw_votes = None
         if mapping is not None:
-            valid_labels = {*mapping, "Non applicable"}
+            # "Non applicable" is a polarité answer only; the centralité
+            # scale has its own floor ("Non abordé").
+            valid_labels = {*mapping, *(NON_APPLICABLE_DIMENSIONS.get(dim_key, ()))}
             raw_votes = df[cols].apply(
                 lambda r: [v for v in label_votes(r, cols) if v in valid_labels], axis=1
             )
@@ -527,9 +533,16 @@ def main() -> int:
             consensus_frame["consensus_subjectivite_score"] = consensus
 
         # Keys say "all", not "all_3": the panel is no longer fixed at three.
+        # Counts on the ordinal scale. For polarité a valid "Non applicable"
+        # vote is off that scale, so it is split out of n_missing_by_model
+        # rather than counted as an unannotated row.
+        non_applicable = {m: 0 for m in models}
+        if dim_key in NON_APPLICABLE_DIMENSIONS:
+            for m, c in zip(models, cols):
+                non_applicable[m] = int(df[c].astype("string").str.strip().eq("Non applicable").sum())
         report["dimensions"][dim_key] = {
             "n_rated_by_all": n_full,
-            "n_missing_by_model": {m: int(ordinal[m].isna().sum()) for m in models},
+            "n_missing_by_model": {m: int(ordinal[m].isna().sum()) - non_applicable[m] for m in models},
             "n_less_than_two_ratings": int((ordinal.notna().sum(axis=1) < 2).sum()),
             "n_rated_by_2plus": n_any2,
             "exact_agreement_all": all3,
@@ -539,6 +552,8 @@ def main() -> int:
             "krippendorff_alpha_nominal": alpha_nominal,
             "pairwise": pair_metrics,
         }
+        if dim_key in NON_APPLICABLE_DIMENSIONS:
+            report["dimensions"][dim_key]["n_non_applicable_by_model"] = non_applicable
         alpha_with_na = None
         if dim_key == "polarite" and raw_votes is not None:
             # "Non applicable" is off the ordinal scale, so the scale metrics
@@ -638,7 +653,7 @@ def main() -> int:
     console.print(f"[green]✓[/green] Report: [cyan]{out_json}[/cyan]")
     console.print(f"[green]✓[/green] Consensus columns: [cyan]{out_csv}[/cyan]")
     write_run_manifest(
-        OUTPUT_DIR, script=f"sentiment_agreement_{args.config}", repo_id=args.repo,
+        OUTPUT_DIR, script=f"sentiment_agreement_{args.config}_g{args.generation}", repo_id=args.repo,
         revision=source_revision, args=args, outputs=[out_json, out_csv],
     )
 
@@ -647,10 +662,6 @@ def main() -> int:
         console.print("[yellow]ℹ[/yellow] Report-only run. Use [bold]--push[/bold] to add "
                       "the consensus columns to the Hub dataset.")
         return 0
-
-    if args.source != "hub":
-        console.print("[red]✗[/red] --push requires --source hub (columns must align with live rows).")
-        return 1
 
     console.print("\n[bold cyan]Pushing consensus columns to the Hub...[/bold cyan]")
     ds = load_hub_dataset(

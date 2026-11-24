@@ -42,7 +42,14 @@ Uncertainty excludes archive selection, transcription and topic-model error.
   *within each year* → ``ci_low`` / ``ci_high`` (2.5/97.5 percentiles).
   ``--bootstrap-unit newspaper`` resamples whole outlet clusters within each
   year; years with fewer than ``_stats.MIN_BOOTSTRAP_CLUSTERS`` outlets get no band
-  (``ci_status = insufficient_clusters``). This does not resolve temporal dependence.
+  (``ci_status = insufficient_clusters``); a year with a single document gets
+  none either (``insufficient_docs``). Eligible rows are ordered by ``o:id``
+  first, so the bands do not depend on input row order. This does not
+  resolve temporal dependence.
+- Evidence floor: documents with fewer in-vocabulary tokens than
+  ``--min-vocab-tokens`` (default: the model's training floor, as used for
+  the Hub's ``lda_topic_id``) are left out and counted in
+  ``docs_below_min_evidence``; ``--min-vocab-tokens 0`` keeps them all.
 - The raw annual series pools every country and outlet, so a shift in which
   countries are archived moves it. ``--standardize country`` adds a directly
   standardised series beside it (fixed country weights = each country's share
@@ -79,8 +86,9 @@ try:
         language_mask, mann_kendall, weighted_least_squares_slope,
     )
     from iwac_pipeline.processing.lda_topic_modeling.modeling import (
-        get_topic_label, load_lda_model, tokenize_for_prediction, predict_document,
+        count_vocab_tokens, get_topic_label, load_lda_model, tokenize_for_prediction, predict_document,
     )
+    from iwac_pipeline.processing.lda_topic_modeling.constants import DEFAULT_MIN_TRAIN_TOKENS
     from iwac_pipeline.processing.lda_topic_modeling.artifacts import (
         resolve_bundle, load_preprocessing, prediction_tokenizer_kwargs, text_fingerprint,
         preprocessing_fingerprint, effective_model_identity,
@@ -99,8 +107,9 @@ except ModuleNotFoundError as exc:
     )
     # _research put post-processing/ on sys.path.
     from lda_topic_modeling.modeling import (  # noqa: E402
-        get_topic_label, load_lda_model, tokenize_for_prediction, predict_document,
+        count_vocab_tokens, get_topic_label, load_lda_model, tokenize_for_prediction, predict_document,
     )
+    from lda_topic_modeling.constants import DEFAULT_MIN_TRAIN_TOKENS  # noqa: E402
     from lda_topic_modeling.artifacts import (  # noqa: E402
         resolve_bundle, load_preprocessing, prediction_tokenizer_kwargs, text_fingerprint,
         preprocessing_fingerprint, effective_model_identity,
@@ -180,6 +189,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--year-max", type=int, default=2030)
     parser.add_argument("--standardize", choices=["none", "country"], default="none",
                         help="Also report a directly country-standardised annual series beside the raw one")
+    parser.add_argument("--min-vocab-tokens", type=int, default=None,
+                        help="Evidence floor: documents with fewer in-vocabulary tokens are left out, "
+                             "as their lda_topic_id is null on the Hub (default: the model's own "
+                             "training floor; 0 keeps every document)")
     return parser
 
 
@@ -191,8 +204,11 @@ def load_bundle(model_path, *, allow_legacy: bool) -> dict:
     n_topics = lda_model.num_topics
     saved_labels = saved_params.get("topic_labels", {})
     labels = {tid: saved_labels.get(str(tid), get_topic_label(lda_model, tid)) for tid in range(n_topics)}
+    # Models fitted before the floor was recorded all used the default.
+    floor = int(saved_params.get("extra", {}).get("min_train_tokens", DEFAULT_MIN_TRAIN_TOKENS))
     return {"dir": model_dir, "id": model_id, "preprocessing": preprocessing, "model": lda_model,
-            "dictionary": dictionary, "phraser": phraser, "n_topics": n_topics, "labels": labels}
+            "dictionary": dictionary, "phraser": phraser, "n_topics": n_topics, "labels": labels,
+            "min_vocab_tokens": floor}
 
 
 def eligibility(df: pd.DataFrame, language: str, args) -> tuple[pd.Series, pd.Series, dict]:
@@ -227,9 +243,17 @@ def outlet_clusters(df: pd.DataFrame, idx, unit: str) -> pd.Series | None:
                      index=outlets.index)
 
 
-def document_vectors(df: pd.DataFrame, idx, bundle: dict, reused: dict) -> tuple[list, np.ndarray]:
-    """Full topic distribution per eligible document; rows without model vocabulary drop out."""
-    kept, vectors = [], []
+def document_vectors(df: pd.DataFrame, idx, bundle: dict, reused: dict,
+                     min_vocab_tokens: int = 0) -> tuple[list, np.ndarray, int]:
+    """Full topic distribution per eligible document, and the number left out
+    below the evidence floor. Rows without model vocabulary drop out too.
+
+    Below ``min_vocab_tokens`` in-vocabulary tokens a document's theta sits
+    near the prior and the Hub leaves its ``lda_topic_id`` null; skipping it
+    here keeps the denominator the one topic_sentiment and topic_review use.
+    The floor is checked on the tokens, so a reused theta is filtered alike.
+    """
+    kept, vectors, below = [], [], 0
     tokenizer_kwargs = prediction_tokenizer_kwargs(bundle["preprocessing"])
     with Progress(
         SpinnerColumn(), TextColumn("[bold blue]{task.description}"), BarColumn(),
@@ -238,9 +262,15 @@ def document_vectors(df: pd.DataFrame, idx, bundle: dict, reused: dict) -> tuple
         task = progress.add_task("[cyan]Computing topic distributions", total=len(idx))
         for i in idx:
             vec = reused.get(str(df.at[i, "o:id"]))
-            if vec is None:
+            tokens = None
+            if vec is None or min_vocab_tokens:
                 tokens = tokenize_for_prediction(df.at[i, "lemma_nostop"], phraser=bundle["phraser"],
                                                  **tokenizer_kwargs)
+            if min_vocab_tokens and tokens and count_vocab_tokens(bundle["dictionary"], tokens) < min_vocab_tokens:
+                below += 1
+                progress.update(task, advance=1)
+                continue
+            if vec is None:
                 result = predict_document(bundle["model"], bundle["dictionary"], tokens,
                                           chunk_words=bundle["preprocessing"]["chunk_words"],
                                           return_distribution=True, topic_labels=bundle["labels"])
@@ -250,7 +280,7 @@ def document_vectors(df: pd.DataFrame, idx, bundle: dict, reused: dict) -> tuple
                 vectors.append(vec)
             progress.update(task, advance=1)
     n_topics = bundle["n_topics"]
-    return kept, (np.vstack(vectors) if vectors else np.empty((0, n_topics)))
+    return kept, (np.vstack(vectors) if vectors else np.empty((0, n_topics))), below
 
 
 def standard_weights(countries: pd.Series) -> dict:
@@ -272,7 +302,8 @@ def standardized_series(theta: np.ndarray, years: pd.Series, countries: pd.Serie
         in_year = (years == year).to_numpy()
         total, coverage = np.zeros(theta.shape[1]), 0.0
         for country, weight in weights.items():
-            rows = in_year & (countries == country).to_numpy()
+            # A missing country is NA, not False; it simply matches no stratum.
+            rows = in_year & (countries == country).fillna(False).to_numpy(dtype=bool)
             if rows.any():
                 total += weight * theta[rows].mean(axis=0)
                 coverage += weight
@@ -292,6 +323,9 @@ def yearly_prevalence(theta, years, clusters, bundle, args, standardized=None) -
             status, lo, hi = "disabled", None, None
         elif group is not None and n_clusters < MIN_BOOTSTRAP_CLUSTERS:
             status, lo, hi = "insufficient_clusters", None, None
+        elif m.shape[0] < 2:
+            # Resampling one document always returns it: a zero-width band.
+            status, lo, hi = "insufficient_docs", None, None
         else:
             # Deterministic per-year seed so re-runs reproduce the bands.
             lo, hi = bootstrap_mean_ci(m, args.bootstrap, seed=args.seed + int(y), clusters=group)
@@ -404,6 +438,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.bootstrap < 0 or args.min_docs_year < 1 or args.min_docs_cell < 1 or args.year_min > args.year_max:
         parser.error("Bootstrap must be nonnegative, count thresholds positive, and year bounds ordered")
+    if args.min_vocab_tokens is not None and args.min_vocab_tokens < 0:
+        parser.error("--min-vocab-tokens must be nonnegative")
     console.print(Panel.fit(
         "[bold cyan]Topic Prevalence Over Time[/bold cyan]\n"
         "[dim]Probability-weighted LDA topic shares per year / country[/dim]",
@@ -421,11 +457,17 @@ def main() -> None:
                   f"with text and a point year; {counts['dates']['excluded']:,} without a point date")
     if not mask.any():
         raise ValueError("No documents meet the language/text/date requirements")
-    idx = df.index[mask]
+    # Sorted by item id, so a fixed seed gives the same bands whatever the
+    # row order of the input.
+    idx = df.loc[mask].sort_values("o:id", key=lambda ids: ids.astype(str), kind="stable").index
+    min_vocab = bundle["min_vocab_tokens"] if args.min_vocab_tokens is None else args.min_vocab_tokens
     reused_theta = (load_theta_export(args.theta_path, bundle["id"], args.repo, args.config, df.loc[mask],
                                       n_topics, preprocessing) if args.theta_path else {})
     clusters_all = outlet_clusters(df, idx, args.bootstrap_unit)
-    kept, theta = document_vectors(df, idx, bundle, reused_theta)
+    kept, theta, below_floor = document_vectors(df, idx, bundle, reused_theta, min_vocab)
+    if below_floor:
+        console.print(f"[yellow]ℹ[/yellow] Left out {below_floor:,} document(s) below the evidence floor "
+                      f"({min_vocab} in-vocabulary tokens)")
     if not kept:
         raise ValueError("Eligible documents contain no vocabulary recognized by this model")
     doc_years = years.loc[kept].astype(int).reset_index(drop=True)
@@ -441,6 +483,7 @@ def main() -> None:
     if dropped_cells:
         console.print(f"[yellow]ℹ[/yellow] Dropped {dropped_cells} year×country cell(s) with < {args.min_docs_cell} docs")
     insufficient = prev_year.drop_duplicates("year")["ci_status"].eq("insufficient_clusters").sum()
+    single_doc_years = int(prev_year.drop_duplicates("year")["ci_status"].eq("insufficient_docs").sum())
     if insufficient:
         console.print(f"[yellow]⚠[/yellow] {insufficient} year(s) have fewer than {MIN_BOOTSTRAP_CLUSTERS} outlets: "
                       "no band reported (insufficient clusters, not zero width)")
@@ -461,6 +504,7 @@ def main() -> None:
         "bootstrap_seed": args.seed,
         "min_bootstrap_clusters": MIN_BOOTSTRAP_CLUSTERS if args.bootstrap_unit == "newspaper" else None,
         "years_with_insufficient_clusters": int(insufficient),
+        "years_with_insufficient_docs": single_doc_years,
         "trend_test": args.trend_test,
         "trend_test_assumption": "Independent annual observations" if args.trend_test != "none" else None,
         "trend_series": "raw (pooled) prevalence",
@@ -474,7 +518,9 @@ def main() -> None:
         "num_topics": n_topics,
         "docs_used": len(kept),
         **counts,
-        "docs_without_model_vocabulary": counts["docs_eligible"] - len(kept),
+        "min_vocab_tokens": min_vocab,
+        "docs_below_min_evidence": below_floor,
+        "docs_without_model_vocabulary": counts["docs_eligible"] - len(kept) - below_floor,
         "years_covered": [int(doc_years.min()), int(doc_years.max())],
         "trend_year_window": [solid_years[0], solid_years[-1]] if solid_years else None,
         "min_docs_year": args.min_docs_year,

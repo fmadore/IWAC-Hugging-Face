@@ -132,6 +132,20 @@ def test_topic_representatives_and_borderline_are_disjoint_and_model_scoped(corp
     assert all(sheet.approved_description.eq(""))
 
 
+@pytest.mark.parametrize("tid,topk", [
+    (5, "5:0.4000|2:0.4000|1:0.2000"),  # rounded tie, dominant id sorts second
+    (2, "2:0.4000|5:0.4000|1:0.2000"),  # mirrored: dominant id sorts first
+])
+def test_tied_top_two_topics_stay_borderline(tid, topk):
+    df = pd.DataFrame({"o:id": ["1"], "lda_topic_id": [tid], "lda_topic_prob": [0.40004],
+                       "lda_topic_topk": [topk], "lda_model_name": ["lda-sha256:" + "a" * 64]})
+    sheet, _, _ = topic_review(df, representatives=0, borderline=1, min_words=0)
+    row = sheet.iloc[0]
+    assert row.review_role == "borderline"
+    assert row.runner_up_topic == (2 if tid == 5 else 5)
+    assert row.margin == 0  # from the two top-k values, never negative
+
+
 def test_topic_malformed_topk_never_becomes_borderline(corpus):
     corpus["lda_topic_topk"] = "0:0.8|0:0.2"
     sheet, _, _ = topic_review(corpus, representatives=1, borderline=5)
@@ -323,6 +337,6 @@ def test_script_paths_run_without_the_installed_package(tmp_path, mode, script):
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
     result = subprocess.run([sys.executable, "-c", BLOCK_PACKAGE, mode, str(root / "analyses" / f"{script}.py")],
-                            capture_output=True, text=True, cwd=tmp_path)
+                            capture_output=True, text=True, encoding="utf-8", cwd=tmp_path)
     assert result.returncode == 0, result.stderr[-2000:]
     assert result.stdout.strip().endswith("ok")

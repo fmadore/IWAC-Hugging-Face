@@ -71,7 +71,8 @@ def mann_kendall(series: Sequence[float]) -> Tuple[float, float, float]:
         z = (s + 1) / np.sqrt(var_s)
     else:
         z = 0.0
-    p = 2.0 * (1.0 - stats.norm.cdf(abs(z)))
+    # The survival function keeps precision in the tail, where 1 - cdf rounds to 0.
+    p = 2.0 * stats.norm.sf(abs(z))
     return float(s), float(z), float(min(1.0, p))
 
 

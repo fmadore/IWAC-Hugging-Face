@@ -197,8 +197,10 @@ reproduce. Cosine scales differ between models: on any new vector space, run
 --min-cosine` (default 0.91), `related_articles.NEAR_DUP_THRESHOLD` (0.97, keyed
 to its config hash) and downstream reprint/related tools. Both defaults came
 from a per-pair split that leaked reprint families across halves; the
-calibration splits by connected component, and its figures for them are
-pending a re-run; do not quote the old recall/precision. The image resize must stay the Pillow path in
+calibration now splits by lexical reprint family into item-disjoint halves
+(the whole neighbour graph is one component, so splitting on it held nothing
+out), and its figures for them are pending a re-run; do not quote the old
+recall/precision. The image resize must stay the Pillow path in
 `image_patches`: transformers.js resizes differently (cosine down to 0.92
 against the reference). Consumers embed queries as
 `task: search result | query: {q}` (`_gemma_encoder.QUERY_PREFIX`). On a CPU a
