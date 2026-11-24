@@ -39,6 +39,7 @@ from rich.console import Console
 from iwac_common.omeka_client import (
     OmekaApiClient,
     fetch_iiif_thumbnail_url,
+    iiif_thumbnail_visible,
     item_page_url,
 )
 from iwac_common.field_mappers import (
@@ -115,9 +116,11 @@ async def map_index_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
     
     # An item without media has no canvas, hence no manifest thumbnail.
     thumbnail_url = ""
-    if item.get("o:primary_media"):
+    if item.get("o:primary_media") and iiif_thumbnail_visible(item):
         # index has no iiif_manifest column: a failure restricts the thumbnail only.
-        thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], affected_fields=("thumbnail",))
+        thumbnail_url = await fetch_iiif_thumbnail_url(
+            item["o:id"], affected_fields=("thumbnail",), cache=getattr(api, "cache", None)
+        )
     # get_value (linked/URI values too) where images reads literals only;
     # unifying either way would change values for some value type.
     coordinates = get_value(item, "curation:coordinates")

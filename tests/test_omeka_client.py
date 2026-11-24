@@ -214,6 +214,30 @@ class TestIIIFThumbnailRetry:
         assert asyncio.run(oc.fetch_iiif_thumbnail_url(7)) == "https://example.test/thumb.jpg"
         assert session.calls == 1
 
+    @pytest.mark.parametrize("outcome, expected", [
+        (_FakeResponse(200, MANIFEST), "https://example.test/thumb.jpg"),
+        (_FakeResponse(404), ""),
+    ])
+    def test_resolved_answers_are_cached(self, tmp_path, outcome, expected):
+        """Issue #49: a re-run within the TTL sends no manifest request."""
+        from iwac_common import omeka_client as oc
+
+        cache = oc.Cache(str(tmp_path))
+        session = _FakeSession(outcome)
+        assert self._fetch(session, cache=cache) == expected
+        assert self._fetch(session, cache=cache) == expected
+        assert session.calls == 1
+        assert (oc.media_stats.attempted, oc.media_stats.failed) == (1, 0)
+
+    def test_failures_are_not_cached(self, tmp_path):
+        from iwac_common import omeka_client as oc
+
+        cache = oc.Cache(str(tmp_path))
+        session = _FakeSession(_FakeResponse(500), _FakeResponse(200, MANIFEST))
+        assert self._fetch(session, max_tries=1, cache=cache) == ""
+        assert self._fetch(session, max_tries=1, cache=cache) == "https://example.test/thumb.jpg"
+        assert session.calls == 2
+
 
 class TestMediaPointers:
     """One helper for the file / thumbnail / manifest triple of five mappers."""
@@ -232,7 +256,7 @@ class TestMediaPointers:
         monkeypatch.delenv("IWAC_PUBLIC_BASE_URL", raising=False)
         calls = []
 
-        async def fake_thumbnail(omeka_id, session=None):
+        async def fake_thumbnail(omeka_id, session=None, **_kwargs):
             calls.append(omeka_id)
             return thumbnail
 
@@ -275,6 +299,31 @@ class TestMediaPointers:
             thumbnail_requires_file=False,
         )
         assert loose == ("", "T", "")
+
+    def test_private_item_skips_the_anonymous_lookup(self, monkeypatch):
+        item = {**self.MEDIA_ITEM, "o:is_public": False}
+        result, calls = self._run(
+            monkeypatch, item, self._Api("https://f/a.jpg"), thumbnail="T",
+            thumbnail_fallback=True,
+        )
+        assert calls == []
+        assert result == (
+            "https://f/a.jpg", "https://staging.example/large.jpg", self.MANIFEST_URL
+        )
+
+    def test_private_media_skips_the_anonymous_lookup(self, monkeypatch):
+        """Its manifest answers 200 without a thumbnail (checked live)."""
+
+        class PrivateMediaApi(self._Api):
+            async def fetch_media_data(self, media_id):
+                return {"o:is_public": False, "o:original_url": self.original_url}
+
+        item = dict(self.MEDIA_ITEM)
+        result, calls = self._run(
+            monkeypatch, item, PrivateMediaApi("https://f/a.pdf"), thumbnail="T"
+        )
+        assert calls == [] and item["_iwac_private_media"] is True
+        assert result == ("https://f/a.pdf", "", self.MANIFEST_URL)
 
 
 class TestMediaFetchGuard:

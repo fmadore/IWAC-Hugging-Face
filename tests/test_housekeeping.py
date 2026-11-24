@@ -37,3 +37,29 @@ def test_shingle_words_survive_nfd_and_combining_marks():
     assert words(nfd) == words("La mosquée célèbre de Lomé") == ["la", "mosquée", "célèbre", "de", "lomé"]
     assert words("بِسْمِ اللَّهِ") == ["بِسْمِ", "اللَّهِ"]
     assert shingles(nfd) == shingles("La mosquée célèbre de Lomé")
+
+
+def test_lda_script_runs_without_the_installed_package_mapping():
+    """Issue #52: direct runs resolve ``iwac_pipeline.processing`` from source."""
+    import os
+    import subprocess
+    import sys
+
+    script = ROOT / "post-processing" / "lda_topic_modeling" / "lda_topic_modeling.py"
+    code = (
+        "import runpy, sys\n"
+        "sys.modules['iwac_pipeline.processing'] = None  # as if not installed\n"
+        "script = sys.argv[1]\n"
+        "sys.argv = ['lda', '--help']\n"
+        "try:\n"
+        "    runpy.run_path(script, run_name='__main__')\n"
+        "except SystemExit as exc:\n"
+        "    assert exc.code == 0, exc.code\n"
+        "print(sys.modules['iwac_pipeline.processing.lda_topic_modeling.modeling'].__file__)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(script)], capture_output=True, text=True,
+        encoding="utf-8", env={**os.environ, "PYTHONUTF8": "1"}, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    assert Path(result.stdout.strip().splitlines()[-1]).parent == script.parent

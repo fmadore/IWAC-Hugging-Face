@@ -69,7 +69,10 @@ scale is needed for both.
 generation-specific columns: `consensus_g<n>_polarite`,
 `consensus_g<n>_centralite`, `consensus_g<n>_subjectivite_score`,
 `sentiment_g<n>_disagreement` and `consensus_g<n>_instrument_id`. The
-instrument id fingerprints the panel, prompt and `CONSENSUS_RULE_VERSION`.
+instrument id fingerprints each member's `INSTRUMENT_FIELDS` (model id,
+generation, sampling configuration, prompt fingerprint) and
+`CONSENSUS_RULE_VERSION`; column prefixes, labels, campaigns and Omeka
+properties are left out, so freezing a generation keeps its id.
 
 - A label consensus is the strict majority (more than half of the models that
   voted). It is `""` when at least two models rated the row and none has a

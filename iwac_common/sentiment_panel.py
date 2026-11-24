@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 #: The six per-model fields, as ``(column suffix, Omeka property suffix)``.
@@ -451,20 +451,32 @@ def label_subjectivite_columns() -> Tuple[str, ...]:
 #: v2: a row with fewer than two valid ratings on a dimension now gets a null
 #: consensus (v1 wrote ""), and the disagreement column is null when no
 #: dimension has two ratings, so single-rater rows no longer read as agreement.
-CONSENSUS_RULE_VERSION = "strict-majority-min2;subjectivity-median-min2;null-below-min2:v2"
+#: v3: the instrument id hashes only :data:`INSTRUMENT_FIELDS`, so freezing a
+#: generation or relabelling a model no longer changes it (issue #44). The rule
+#: itself is unchanged from v2; the bump marks the new id derivation.
+CONSENSUS_RULE_VERSION = "strict-majority-min2;subjectivity-median-min2;null-below-min2:v3"
+
+#: The fields that define what a panel member measured. ``prefix`` (a column
+#: name), ``label``, ``campaign`` and ``omeka_prefix`` (``None`` once frozen)
+#: are bookkeeping: changing them must not change the instrument's identity.
+INSTRUMENT_FIELDS = ("model_id", "generation", "run_config", "prompt_fingerprint")
 
 
 def instrument_id(gen: int) -> str:
     """Content-addressed identity of one panel, prompt and consensus rule.
 
-    The fingerprint changes if a model, campaign, prompt or sampling setting
-    changes, including revisions within a numbered generation.
+    The fingerprint changes if a model, prompt or sampling setting changes,
+    including revisions within a numbered generation; it ignores the
+    operational fields outside :data:`INSTRUMENT_FIELDS` and member order.
     """
     members = generation(gen)
     if not members:
         raise ValueError(f"Unknown sentiment generation: {gen}")
-    payload = {"generation": gen, "rule": CONSENSUS_RULE_VERSION,
-               "models": [asdict(m) for m in members]}
+    models = sorted(
+        ({name: getattr(m, name) for name in INSTRUMENT_FIELDS} for m in members),
+        key=lambda d: json.dumps(d, sort_keys=True),
+    )
+    payload = {"generation": gen, "rule": CONSENSUS_RULE_VERSION, "models": models}
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return "sentiment-sha256:" + hashlib.sha256(raw).hexdigest()
 
@@ -484,6 +496,7 @@ def consensus_columns(gen: int) -> Dict[str, str]:
 
 __all__ = [
     "CONSENSUS_RULE_VERSION",
+    "INSTRUMENT_FIELDS",
     "consensus_columns",
     "instrument_id",
     "DIMENSION_FIELDS",
