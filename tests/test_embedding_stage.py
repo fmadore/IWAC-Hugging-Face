@@ -79,6 +79,42 @@ def test_unchanged_run_skips_the_push(monkeypatch, tmp_path):
     assert encoder.calls == 1  # readiness probe only
 
 
+def test_identical_full_rerun_keeps_neighbours_and_skips_the_push(monkeypatch, tmp_path):
+    ds = Dataset.from_dict({"o:id": ["1", "2"], "OCR": ["source text", "other text"]})
+    code, pushed, _ = run(monkeypatch, text, ds, tmp_path, ["--config", "articles", "--update-mode", "all"])
+    assert code == 0 and len(pushed) == 1
+    with_neighbours = pushed[0].add_column("related_articles", ["2:0.9000", "1:0.9000"])
+    code, again, encoder = run(monkeypatch, text, with_neighbours, tmp_path,
+                               ["--config", "articles", "--update-mode", "all"])
+    assert code == 0
+    assert encoder.calls > 1  # the vectors really were recomputed
+    assert again == []  # ...and matched, so neither they nor the neighbours changed
+
+
+def test_changed_vector_still_invalidates_neighbours(monkeypatch, tmp_path):
+    ds = Dataset.from_dict({"o:id": ["1", "2"], "OCR": ["source text", "other text"]})
+    _, pushed, _ = run(monkeypatch, text, ds, tmp_path, ["--config", "articles", "--update-mode", "all"])
+    vectors = list(pushed[0]["embedding_OCR"])
+    vectors[0] = [0.5] * 768
+    stale = (pushed[0].remove_columns(["embedding_OCR"])
+             .add_column("embedding_OCR", vectors)
+             .add_column("related_articles", ["2:0.9000", "1:0.9000"]))
+    code, again, _ = run(monkeypatch, text, stale, tmp_path, ["--config", "articles", "--update-mode", "all"])
+    assert code == 0 and len(again) == 1
+    assert list(again[0]["related_articles"]) == [None, None]
+
+
+def test_identical_image_rerun_skips_the_push(monkeypatch, tmp_path):
+    ds = Dataset.from_dict({"o:id": ["1", "2"], "image_url": ["one", "two"]})
+    code, pushed, _ = run(monkeypatch, images, ds, tmp_path, ["--update-mode", "all"])
+    assert code == 0 and len(pushed) == 1
+    code, again, encoder = run(monkeypatch, images, pushed[0], tmp_path, ["--update-mode", "all"])
+    assert code == 0
+    assert encoder.calls > 1
+    assert again == []
+    assert list(tmp_path.glob("*.sqlite3")) == []  # the cache is cleared like after a push
+
+
 def test_retired_column_alone_still_pushes(monkeypatch, tmp_path):
     ds = Dataset.from_dict({"o:id": ["1"], "abstract": ["résumé"]})
     code, pushed, _ = run(monkeypatch, text, ds, tmp_path, ["--config", "references", "--update-mode", "all"])

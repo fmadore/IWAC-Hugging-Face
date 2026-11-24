@@ -132,12 +132,17 @@ SUSPECT_MAX_CHARS = 30_000
 
 def _value_text_len(v) -> int:
     """Character length of a value for the prose heuristic: strings count
-    directly; lists/tuples of strings count their joined length (a full text
-    stored as list[str] chunks must not evade the guard)."""
+    directly; sequences of strings count their joined length, nested ones
+    included (a full text stored as list[str] chunks must not evade the guard).
+
+    ``Dataset.to_pandas()`` delivers an Arrow ``list<string>`` cell as a
+    ``numpy.ndarray``, not a list, so arrays are unwrapped too."""
+    import numpy as np
+
     if isinstance(v, str):
         return len(v)
-    if isinstance(v, (list, tuple)):
-        return sum(len(x) for x in v if isinstance(x, str))
+    if isinstance(v, (list, tuple, np.ndarray)):
+        return sum(_value_text_len(x) for x in v)
     return 0
 
 
@@ -302,10 +307,22 @@ def persist_public_column_approvals(approved_by_config: dict[str, list[str]]) ->
         raw = json.load(f)
     for cfg, columns in approved_by_config.items():
         if columns:
-            raw[cfg] = sorted(set(raw[cfg]) | set(columns))
-    with open(PUBLIC_COLUMNS_FILE, "w", encoding="utf-8") as f:
-        json.dump(raw, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+            # Append in review order: the file's grouping is curated, so a
+            # re-sort would scatter related columns.
+            existing = raw.setdefault(cfg, [])
+            existing.extend(c for c in dict.fromkeys(columns) if c not in existing)
+    # Atomic replace: an interrupted write must not truncate the allowlist.
+    temporary = f"{PUBLIC_COLUMNS_FILE}.{os.getpid()}.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump(raw, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, PUBLIC_COLUMNS_FILE)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
     console.print(
         f"[yellow]⚠[/yellow] Recorded reviewed public columns in "
         f"{os.path.basename(PUBLIC_COLUMNS_FILE)} — commit this change."
@@ -499,6 +516,8 @@ def main() -> None:
                 expected_revision=target_revision,
                 mode="public_projection",
                 console=console,
+                # Reviewed this run; persisted only after the verified push.
+                approved_columns=approved_by_config,
             )
         console.print(
             f"[green]✓[/green] Published {len(prepared)} subset(s) together at {result.after_revision}"

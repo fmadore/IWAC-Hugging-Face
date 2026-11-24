@@ -73,6 +73,23 @@ class TestFindSuspectColumns:
         df = pd.DataFrame({"chunks": [[LONG[:3000], LONG[:3000]], [LONG]]})
         assert [s[0] for s in pp.find_suspect_columns(df, handled=set())] == ["chunks"]
 
+    def test_arrow_list_of_str_column_flagged_after_to_pandas(self):
+        # The real path converts with Dataset.to_pandas(), which turns an
+        # Arrow list<string> cell into a numpy array, not a Python list.
+        import numpy as np
+        from datasets import Dataset
+
+        ds = Dataset.from_dict({"chunks": [["x" * 5000, "y" * 5000], ["z" * 5000, "w" * 5000]]})
+        df = ds.to_pandas()
+        assert isinstance(df["chunks"][0], np.ndarray)
+        assert pp.find_suspect_columns(df, handled=set()) == [("chunks", 10_000, 10_000)]
+
+    def test_nested_sequences_are_unwrapped(self):
+        import numpy as np
+
+        df = pd.DataFrame({"nested": [[np.array([LONG]), [LONG]], None]})
+        assert [s[0] for s in pp.find_suspect_columns(df, handled=set())] == ["nested"]
+
     def test_pandas_string_dtype_flagged(self):
         df = pd.DataFrame({"typed_text": pd.array([LONG, LONG], dtype="string")})
         assert [s[0] for s in pp.find_suspect_columns(df, handled=set())] == ["typed_text"]
@@ -468,6 +485,67 @@ def test_successful_publication_records_approvals(monkeypatch, tmp_path):
                            lambda *a, **k: SimpleNamespace(after_revision="after"))
     pp.main()
     assert "new_metric" in json.loads(allow.read_text(encoding="utf-8"))["articles"]
+
+
+def test_approved_columns_pass_the_real_projection_validator(monkeypatch, tmp_path):
+    """The gateway re-reads the allowlist from disk, where the approval is not
+    yet recorded; main() must hand the reviewed columns to the validator."""
+    from types import SimpleNamespace
+    from iwac_common.write_policy import validate_public_projection
+
+    seen = {}
+
+    def push(prepared, **kwargs):
+        for cfg, ds in prepared.items():
+            validate_public_projection(ds, cfg, kwargs["approved_columns"].get(cfg, ()))
+        seen.update(kwargs["approved_columns"])
+        return SimpleNamespace(after_revision="after")
+
+    allow = _approval_main(monkeypatch, tmp_path, ["-y"], push)
+    pp.main()
+    assert seen == {"articles": ["new_metric"]}
+    assert "new_metric" in json.loads(allow.read_text(encoding="utf-8"))["articles"]
+
+
+def test_validator_refuses_unreviewed_columns_without_approval(monkeypatch, tmp_path):
+    from datasets import Dataset
+    import iwac_common.repos as repos
+    from iwac_common.write_policy import PublicationPolicyError, validate_public_projection
+
+    allow = tmp_path / "public_columns.json"
+    allow.write_text(json.dumps({"articles": ["o:id", "item_is_public", "private_fields"]}),
+                     encoding="utf-8")
+    monkeypatch.setattr(repos, "PUBLIC_COLUMNS_FILE", str(allow))
+    ds = Dataset.from_dict({"o:id": ["1"], "item_is_public": [True], "private_fields": [[]],
+                            "new_metric": [0.5]})
+    with pytest.raises(PublicationPolicyError, match="new_metric"):
+        validate_public_projection(ds, "articles")
+    # Approval for another subset does not leak into this one.
+    with pytest.raises(PublicationPolicyError, match="new_metric"):
+        validate_public_projection(ds, "articles", approved_columns=())
+    validate_public_projection(ds, "articles", approved_columns=["new_metric"])
+
+
+def test_gateway_refuses_approved_columns_outside_public_mode():
+    from datasets import Dataset
+    from iwac_common.hub import HubWriteError, push_datasets_verified
+
+    ds = Dataset.from_dict({"o:id": ["1"]})
+    with pytest.raises(HubWriteError, match="public projection"):
+        push_datasets_verified({"articles": ds}, repo_id="x/y", token="fake",
+                               commit_message="m", approved_columns={"articles": ["o:id"]})
+
+
+def test_recorded_approvals_keep_the_curated_order(monkeypatch, tmp_path):
+    allow = tmp_path / "public_columns.json"
+    allow.write_text(json.dumps({"_readme": ["keep me"], "articles": ["o:id", "zeta", "alpha"]}),
+                     encoding="utf-8")
+    monkeypatch.setattr(pp, "PUBLIC_COLUMNS_FILE", str(allow))
+    pp.persist_public_column_approvals({"articles": ["new_b", "alpha", "new_a", "new_b"]})
+    raw = json.loads(allow.read_text(encoding="utf-8"))
+    assert raw["articles"] == ["o:id", "zeta", "alpha", "new_b", "new_a"]
+    assert raw["_readme"] == ["keep me"]
+    assert [p.name for p in tmp_path.iterdir()] == ["public_columns.json"]
 
 
 def test_numpy_embeddings_give_the_same_arrow_column_as_float_lists():
