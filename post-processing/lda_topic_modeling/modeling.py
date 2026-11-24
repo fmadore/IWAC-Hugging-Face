@@ -17,7 +17,7 @@ import numpy as np
 from gensim.corpora import Dictionary
 from gensim.models import LdaModel, LdaMulticore, CoherenceModel
 from gensim.models.phrases import Phrases, Phraser
-from tqdm import tqdm
+from rich.progress import track
 
 import unicodedata
 
@@ -1222,7 +1222,7 @@ def find_optimal_topics(
     best_k = candidates[0]
     best_cv = -1.0
 
-    for k in tqdm(candidates, desc="Topic optimisation"):
+    for k in track(candidates, description="Topic optimisation"):
         seed_models: List[LdaModel] = []
         cv_per_seed: List[float | None] = []
         perplexities: List[float] = []

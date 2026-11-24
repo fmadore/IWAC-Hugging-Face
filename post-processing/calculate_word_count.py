@@ -41,7 +41,6 @@ import os
 import sys
 from typing import Any, Dict, List
 
-from dotenv import load_dotenv
 from rich import box
 from rich.console import Console
 from rich.logging import RichHandler
@@ -53,6 +52,7 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _THIS_DIR)
 sys.path.insert(0, os.path.dirname(_THIS_DIR))
 from _common import (  # noqa: E402
+    load_environment,
     confirm_full_recompute,
     PRIVATE_REPO_ID,
     add_update_mode_args,
@@ -64,14 +64,15 @@ from _common import (  # noqa: E402
     reorder_columns_after,
     resolve_config,
     resolve_update_mode,
-    workspace_root,
 )
 from iwac_common.enrichment import (  # noqa: E402
     changed_row_count, config_fingerprint, config_json, fingerprint, provenance_columns,
 )
 from iwac_common.text_utils import TOKENIZER_VERSION, count_words, language_labels  # noqa: E402
 
-load_dotenv(workspace_root() / ".env")
+# The shared loader honours IWAC_ENV_FILE; loading the checkout's .env a
+# second time would backfill keys a scratch env file leaves unset.
+load_environment()
 
 console = Console()
 

@@ -48,7 +48,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from iwac_common.hub import get_repo_revision, resolve_hf_token  # noqa: E402
 from iwac_common.paths import workspace_root  # noqa: E402
-from iwac_common.schema import ALL_CONFIGS  # noqa: E402
+from iwac_common.schema import ALL_CONFIGS, dataset_to_pandas  # noqa: E402
 from iwac_common.settings import (  # noqa: E402
     get_private_repo_id,
     get_public_repo_id,
@@ -108,7 +108,9 @@ def _write_config(dataset, path: Path, fmt: str) -> tuple[int, int]:
         table = dataset.with_format("arrow")[:]
         pq.write_table(table, path)
         return table.num_rows, table.num_columns
-    frame = dataset.to_pandas()
+    # Typed conversion: a bare to_pandas() turns nullable ints into float64
+    # (pub_year 1995 printed as 1995.0 in the CSV).
+    frame = dataset_to_pandas(dataset)
     for column in frame.columns:
         if frame[column].map(
             lambda value: isinstance(value, (list, tuple, np.ndarray))

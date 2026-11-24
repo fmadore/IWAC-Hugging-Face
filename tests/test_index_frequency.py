@@ -352,8 +352,10 @@ class TestIndexThumbnailGate:
 
         calls = []
 
-        async def fake_thumbnail(omeka_id, session=None):
+        async def fake_thumbnail(omeka_id, session=None, **kwargs):
             calls.append(omeka_id)
+            # index has no iiif_manifest column; a failure must not name one.
+            assert tuple(kwargs.get("affected_fields", ())) == ("thumbnail",)
             return "https://example.test/thumb.jpg"
 
         monkeypatch.setattr(idx, "fetch_iiif_thumbnail_url", fake_thumbnail)

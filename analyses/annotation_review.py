@@ -13,6 +13,7 @@ try:
         MISSING, METADATA, add_input_args, dates, load_input, metadata, save_reports,
         series, stable_rank, string,
     )
+    from iwac_pipeline.processing.sentiment_agreement import subjectivite_ordinal
 except ModuleNotFoundError as exc:
     if not (exc.name or "").startswith("iwac_pipeline"):
         raise
@@ -21,13 +22,15 @@ except ModuleNotFoundError as exc:
         MISSING, METADATA, add_input_args, dates, load_input, metadata, save_reports,
         series, stable_rank, string,
     )
+    # _research put post-processing/ on sys.path.
+    from sentiment_agreement import subjectivite_ordinal  # noqa: E402
 from iwac_common.sentiment_panel import generation, latest_generation  # noqa: E402
 
 DIMENSIONS = ("polarite", "subjectivite_score", "centralite_islam_musulmans")
 LABEL_FIELDS = ("polarity", "subjectivity", "centrality")
 CODING_FIELDS = ("evaluation_target", "quoted_stance", "negative_event", "uncertain", "notes")
 ANNOTATORS = ("annotator_a", "annotator_b")
-AUDIT_COLUMNS = ("o:id", "stable_rank", "sample_group", "selection_reason", "stratum",
+AUDIT_COLUMNS = ("o:id", "stable_rank", "display_rank", "sample_group", "selection_reason", "stratum",
                  "stratum_population", "stratum_sampled", "inclusion_probability",
                  "design_weight", "annotation_generation")
 DESIGN_COLUMNS = frozenset(AUDIT_COLUMNS) - {"o:id"}
@@ -42,7 +45,15 @@ def _strata_frame(df, strata, seed):
             raise ValueError(f"Stratum column is absent: {column}")
         work[column] = series(work, column).map(lambda value: string(value, MISSING))
     work["_rank"] = work["o:id"].astype(str).map(lambda item_id: stable_rank(seed, item_id))
+    # Sheet order needs its own hash: ordering by the selection rank would put
+    # low-rank probability items first and rank-blind challenge items last.
+    work["_display"] = work["o:id"].astype(str).map(lambda item_id: display_rank(seed, item_id))
     return work
+
+
+def display_rank(seed: int, item_id: str) -> str:
+    """Position on the blinded sheets, independent of the selection rank."""
+    return stable_rank(seed, f"display\0{item_id}")
 
 
 def _probability_sample(work, strata, per_stratum):
@@ -61,7 +72,14 @@ def _challenge_sample(work, models, chosen, difficult, challenge_size):
     disagreement = {}
     for dimension in DIMENSIONS:
         columns = [m.column(dimension) for m in models]
-        votes = work.reindex(columns=columns).apply(lambda col: col.map(string))
+        votes = work.reindex(columns=columns)
+        if dimension == "subjectivite_score":
+            # Compare scale points, not spellings: "3", "3.0" and the matching
+            # label are one vote (a float-typed load prints "3.0").
+            votes = votes.apply(lambda col: subjectivite_ordinal(col).map(
+                lambda v: "" if pd.isna(v) else str(int(v))))
+        else:
+            votes = votes.apply(lambda col: col.map(string))
         voted = votes.ne("")
         distinct = votes.where(voted).nunique(axis=1)
         disagreement[dimension] = voted.sum(axis=1).ge(2) & distinct.gt(1)
@@ -78,12 +96,13 @@ def _challenge_sample(work, models, chosen, difficult, challenge_size):
 
 
 def _sheets(work, selected, *, excerpt_chars, text_column):
-    """Blind per-annotator forms and an adjudication form, ordered by hash rank.
+    """Blind per-annotator forms and an adjudication form, in display-hash order.
 
     Probability and challenge cases are interleaved and carry no design or
     selection field, so neither annotator can tell why a source is present.
+    The order uses a hash independent of the one that selected the items.
     """
-    order = sorted(selected, key=lambda item: (work.at[item[0], "_rank"], str(work.at[item[0], "o:id"])))
+    order = sorted(selected, key=lambda item: (work.at[item[0], "_display"], str(work.at[item[0], "o:id"])))
     base = [metadata(work.loc[idx], excerpt_chars=excerpt_chars, text_column=text_column)
             for idx, *_ in order]
     meta_columns = [*METADATA, *(["text_excerpt"] if excerpt_chars else [])]
@@ -127,6 +146,7 @@ def annotation_sample(df, *, per_stratum=3, challenge_size=30, seed=42,
     sheets, order = _sheets(work, selected, excerpt_chars=excerpt_chars, text_column=text_column)
     audit = pd.DataFrame([{
         "o:id": str(work.at[idx, "o:id"]), "stable_rank": work.at[idx, "_rank"],
+        "display_rank": work.at[idx, "_display"],
         "sample_group": group, "selection_reason": reason,
         "stratum": "|".join(string(work.at[idx, c], MISSING) for c in strata),
         "stratum_population": population, "stratum_sampled": sampled,
@@ -139,7 +159,8 @@ def annotation_sample(df, *, per_stratum=3, challenge_size=30, seed=42,
                "challenge_sample": int(audit["sample_group"].eq("challenge_nonprobability").sum()),
                "annotation_generation": models[0].generation,
                "models": [{"id": m.model_id, "prompt_fingerprint": m.prompt_fingerprint} for m in models],
-               "blinding": "Annotator and adjudication sheets share one hash-ranked order and omit sample "
+               "blinding": "Annotator and adjudication sheets share one order, from a hash independent of "
+                           "the selection rank (display_rank), and omit sample "
                            "group, stratum, weights and selection reasons; join the selection audit on o:id "
                            "only after annotation.",
                "interpretation": "Blank independent annotation forms; no gold labels or accuracy estimates. Analyze challenge set separately; use design weights for probability-sample estimates."}
