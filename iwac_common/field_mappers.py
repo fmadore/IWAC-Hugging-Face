@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 import re
 from datetime import date
-from functools import lru_cache
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
@@ -181,13 +180,6 @@ def is_content_public(item: Dict[str, Any], field: str = "bibo:content") -> bool
     return bool(text_vals) and all(v.get("is_public") is True for v in text_vals)
 
 
-@lru_cache(maxsize=1)
-def _privacy_columns():
-    from .repos import load_public_columns
-
-    return load_public_columns()
-
-
 def visibility_metadata(item: Dict[str, Any], config_name: str) -> Dict[str, Any]:
     """Carry source rights into the flat record without dropping private data.
 
@@ -196,7 +188,7 @@ def visibility_metadata(item: Dict[str, Any], config_name: str) -> Dict[str, Any
     not explicitly public. This applies to prose, labels, IDs, coordinates,
     dates and live annotation properties, not just OCR.
     """
-    from .schema import SOURCE_FIELD_COLUMNS
+    from .schema import SOURCE_FIELD_COLUMNS, SOURCE_PRIVACY_COLUMNS
     from .sentiment_panel import DIMENSION_FIELDS, active_models
 
     mapping = dict(SOURCE_FIELD_COLUMNS)
@@ -210,7 +202,12 @@ def visibility_metadata(item: Dict[str, Any], config_name: str) -> Dict[str, Any
             for suffix, omeka_suffix in DIMENSION_FIELDS:
                 mapping[model.omeka_property(omeka_suffix)] = (model.column(suffix),)
 
-    present = _privacy_columns()[config_name]
+    # The subset's own source columns (schema), never the publication
+    # allowlist: a privacy flag must not depend on what gets published.
+    present = set(SOURCE_PRIVACY_COLUMNS[config_name])
+    if config_name == "articles":
+        present.update(model.column(suffix) for model in active_models()
+                       for suffix, _ in DIMENSION_FIELDS)
     private = set()
     for source, columns in mapping.items():
         raw = item.get(source)

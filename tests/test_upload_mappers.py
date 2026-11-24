@@ -86,6 +86,23 @@ def mapped(monkeypatch):
 
 
 @pytest.mark.parametrize("subset", list(UPLOAD_MODULES))
+def test_every_source_mapped_column_is_in_the_privacy_registry(mapped, subset):
+    """A mapped column a private Omeka value can restrict must be in the
+    subset's SOURCE_PRIVACY_COLUMNS, or its flag would be dropped (issue #36)."""
+    from iwac_common.schema import SOURCE_FIELD_COLUMNS, SOURCE_PRIVACY_COLUMNS
+
+    source_columns = set().union(*SOURCE_FIELD_COLUMNS.values()) | {
+        "PDF", "image_url", "thumbnail", "iiif_manifest"}
+    # country comes from a source property only here (elsewhere: item sets).
+    if subset in ("articles", "publications", "audiovisual"):
+        source_columns.add("country")
+    if subset == "audiovisual":
+        source_columns.add("source_type")
+    row = mapped(subset)
+    assert (set(row) & source_columns) <= SOURCE_PRIVACY_COLUMNS[subset]
+
+
+@pytest.mark.parametrize("subset", list(UPLOAD_MODULES))
 def test_every_mapped_column_is_publicly_allowlisted(mapped, subset):
     row = mapped(subset)
     assert set(row) <= load_public_columns()[subset]

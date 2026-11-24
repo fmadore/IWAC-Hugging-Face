@@ -11,7 +11,7 @@ import argparse
 import hashlib
 import json
 import math
-import re
+import unicodedata
 import sys
 from pathlib import Path
 from urllib.parse import quote
@@ -357,7 +357,20 @@ def stable_rank(seed: int, item_id: str) -> str:
 
 
 def words(text: str) -> list[str]:
-    return re.findall(r"[^\W_]+", text.casefold(), flags=re.UNICODE)
+    """Casefolded words for shingling: NFC first, so an NFD ``mosquée``
+    matches the composed one, and combining marks that do not compose
+    (Arabic harakat, tone marks) stay inside their word, as in
+    ``iwac_common.text_utils``. Apostrophes and hyphens separate words."""
+    found, current = [], []
+    for char in unicodedata.normalize("NFC", text).casefold():
+        if char.isalnum() or (current and unicodedata.category(char).startswith("M")):
+            current.append(char)
+        elif current:
+            found.append("".join(current))
+            current = []
+    if current:
+        found.append("".join(current))
+    return found
 
 
 def shingles(text: str, size=3) -> set[tuple[str, ...]]:

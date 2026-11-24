@@ -59,7 +59,7 @@ import unicodedata
 from datasets import Dataset
 import spacy
 from iwac_common.enrichment import compatible_rows, config_fingerprint, provenance_columns, invalidate_columns, config_json
-from iwac_common.text_utils import language_labels
+from iwac_common.text_utils import NAME_PREFIX_CLITICS, begins_with_consonant, language_labels
 from iwac_common.paths import workspace_root
 
 # Make ``post-processing/_common.py`` and ``_embedding_utils.py`` importable.
@@ -168,7 +168,8 @@ FRENCH_ELIDED_CLITICS = frozenset({
     "l", "d", "j", "m", "n", "s", "t", "c",
     "qu", "jusqu", "lorsqu", "puisqu", "quoiqu", "quelqu",
 })
-NAME_PREFIXES = frozenset({"N", "M"})
+# quelqu'un is one (stop) word, not the clitic quelqu' + un.
+LEXICALISED_APOSTROPHE_WORDS = frozenset({"quelqu'un", "quelqu'une", "quelqu'uns", "quelqu'unes"})
 ENGLISH_CLITICS = frozenset({"'s", "'re", "'ve", "'ll", "'d", "'m", "n't"})
 _WORD_SEPARATORS = re.compile(r"[-']")
 
@@ -194,12 +195,20 @@ def _surface(token) -> str:
     return (getattr(token, "text", None) or token.lemma_).translate(_APOSTROPHE_TRANSLATION)
 
 
+def _vocab_is_stop(doc, word: str) -> bool:
+    vocab = getattr(doc, "vocab", None)
+    return bool(vocab is not None and vocab[word].is_stop)
+
+
 def token_lemmas(doc) -> List[tuple]:
     """``(lemma, is_stop)`` pairs for the kept tokens of one spaCy ``Doc``.
 
     Stop-word status is spaCy's ``token.is_stop`` on the SURFACE token, not a
     test of the lemma against the surface-form stop-word list. A blank
     pipeline has no lemmatizer, so an empty lemma falls back to the surface.
+    Two exceptions: a word rejoined at its apostrophe takes the joined word's
+    stop status (``quelqu'un``), and a token negated by an attached ``n't``
+    takes its lemma's (``wo`` + ``n't`` → ``will``, a stop word).
     """
     tokens = list(doc)
     pairs: List[tuple] = []
@@ -213,15 +222,19 @@ def token_lemmas(doc) -> List[tuple]:
         if attached and text.lower() in FRENCH_ELIDED_CLITICS and _surface(following) == "'":
             i += 2  # ``l'`` followed by a space is tokenized ``l`` + ``'``
             continue
-        # ``N'Guessan``, ``N'Djamena``, ``M'Bow``: a capital N/M before a
-        # capitalised word is a West African name, not the clitic ne/me.
-        is_name = head in NAME_PREFIXES and attached and _surface(following)[:1].isupper()
+        # ``N'Guessan``, ``N'diaye``, ``M'BOW``: ne/me elide only before a
+        # vowel or mute h, so n'/m' before a consonant is a name, whatever
+        # its case; ``N'EST`` (all caps) is the clitic.
+        is_name = (head.lower() in NAME_PREFIX_CLITICS and attached
+                   and begins_with_consonant(_surface(following)))
+        joined = f"{text}{_surface(following)}".lower() if following is not None else ""
         if (text.endswith("'") and following is not None
                 and not getattr(token, "whitespace_", " ")
                 and is_lemma_word(head)
-                and (is_name or head.lower() not in FRENCH_ELIDED_CLITICS)
+                and (is_name or joined in LEXICALISED_APOSTROPHE_WORDS
+                     or head.lower() not in FRENCH_ELIDED_CLITICS)
                 and is_lemma_word(_surface(following))):
-            pairs.append((f"{text}{_surface(following)}".lower(), False))
+            pairs.append((joined, _vocab_is_stop(doc, joined)))
             i += 2
             continue
         i += 1
@@ -230,7 +243,11 @@ def token_lemmas(doc) -> List[tuple]:
         lemma = (token.lemma_ or text).translate(_APOSTROPHE_TRANSLATION).lower()
         if not is_lemma_word(lemma):
             lemma = text.lower()
-        pairs.append((lemma, bool(token.is_stop)))
+        is_stop = bool(token.is_stop)
+        if (following is not None and attached and _surface(following).lower() == "n't"
+                and not is_stop):
+            is_stop = _vocab_is_stop(doc, lemma)  # "wo" (won't) → "will"
+        pairs.append((lemma, is_stop))
     return pairs
 
 # Cap the characters handed to spaCy in a single call. A full periodical issue
@@ -251,8 +268,12 @@ CHECKPOINT_EVERY = 100
 # part of the resume-cache name and of the persisted provenance hash, so
 # incremental mode recomputes every row. History: 2 = stop-word check on the
 # surface token (token.is_stop); 3 = hyphenated/apostrophe words kept whole,
-# bare clitics dropped, transliterations split at the apostrophe rejoined.
-LEMMA_LOGIC_VERSION = 3
+# bare clitics dropped, transliterations split at the apostrophe rejoined;
+# 4 = n'/m' before a consonant is a name whatever the case (all-caps
+# "N'EST" is the clitic), quelqu'un kept whole, a word broken by a line-end
+# hyphen rejoined when the model's lexicon knows the joined form, and a
+# token negated by an attached "n't" takes its lemma's stop status.
+LEMMA_LOGIC_VERSION = 4
 
 
 def cache_fingerprint(spacy_model: str, model_version: str) -> str:
@@ -269,7 +290,37 @@ def cache_fingerprint(spacy_model: str, model_version: str) -> str:
     return f"{safe_model}-{model_version}_spacy{spacy.__version__}_v{LEMMA_LOGIC_VERSION}"
 
 
-def normalize(text: str) -> str:
+# A word broken across a line by a hyphen: "organi-\nsation". The right part
+# must start with a lowercase letter (a capital starts a new name or sentence).
+RE_LINE_BREAK_HYPHEN = re.compile(r"([^\W\d_]+)-[ \t]*\r?\n[ \t]*([^\W\d_]+)")
+
+
+def dehyphenate_line_breaks(text: str, is_known) -> str:
+    """Rejoin ``organi-\nsation`` → ``organisation`` when ``is_known`` (the
+    lemmatiser's lexicon) knows the joined, lowercased word; otherwise the
+    hyphen is a real compound broken at the line end and stays:
+    ``sous-\npréfet`` → ``sous-préfet``. Only the line break is removed."""
+    def join(match):
+        left, right = match.groups()
+        if right[0].islower() and is_known((left + right).lower()):
+            return left + right
+        return f"{left}-{right}"
+
+    return RE_LINE_BREAK_HYPHEN.sub(join, text)
+
+
+def known_word_predicate(nlp):
+    """``word -> bool`` from the pipeline's vectors; a pipeline without
+    vectors knows no word, so no line-end hyphen is ever rejoined."""
+    vocab = getattr(nlp, "vocab", None)
+    if vocab is None:
+        return lambda word: False
+    return lambda word: not vocab[word].is_oov
+
+
+def normalize(text: str, is_known=None) -> str:
+    """NFC, ASCII quotes (curly apostrophes included), ligatures, dashes, then
+    line-end hyphenation (with ``is_known``) and runs of spaces."""
     if not text:  # None or empty string (e.g. blank OCR rows) → nothing to lemmatise
         return ""
     text = unicodedata.normalize("NFC", text)
@@ -277,6 +328,8 @@ def normalize(text: str) -> str:
         text = text.replace(old, new)
     text = text.translate(MAP_LIG)
     text = RE_DASH.sub("-", text).replace("\u00a0", " ")
+    if is_known is not None:
+        text = dehyphenate_line_breaks(text, is_known)
     return RE_SPACE.sub(" ", text).strip()
 
 
@@ -547,6 +600,7 @@ def lemmatise_dataset(
 
     since_ckpt = 0
     pending: dict = {}
+    is_known = known_word_predicate(nlp)
     if indices_to_process:
         with Progress(
             SpinnerColumn(),
@@ -559,7 +613,7 @@ def lemmatise_dataset(
             task = progress.add_task("[cyan]lemmatising", total=len(indices_to_process))
             token_lists = lemmatise_many(
                 nlp,
-                (normalize(texts[i]) for i in indices_to_process),
+                (normalize(texts[i], is_known) for i in indices_to_process),
                 batch_size=batch_size,
                 n_process=n_process,
             )

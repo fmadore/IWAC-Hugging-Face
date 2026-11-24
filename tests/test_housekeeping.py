@@ -25,3 +25,15 @@ def test_tqdm_is_not_a_direct_dependency():
 
 def test_logs_are_ignored():
     assert "logs/" in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+
+
+def test_shingle_words_survive_nfd_and_combining_marks():
+    """Issue #41: NFD text and Arabic harakat must not split words."""
+    import unicodedata
+
+    from iwac_pipeline.analyses._research import shingles, words
+
+    nfd = unicodedata.normalize("NFD", "La mosquée célèbre de Lomé")
+    assert words(nfd) == words("La mosquée célèbre de Lomé") == ["la", "mosquée", "célèbre", "de", "lomé"]
+    assert words("بِسْمِ اللَّهِ") == ["بِسْمِ", "اللَّهِ"]
+    assert shingles(nfd) == shingles("La mosquée célèbre de Lomé")

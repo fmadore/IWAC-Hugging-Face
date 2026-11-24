@@ -205,3 +205,29 @@ class TestFallback:
         # tagged 'fr' first, then the first value of any kind.
         item = _item(_lit("Sans tag."))
         assert get_value_by_language(item, FIELD, "fr", fallback=True) == "Sans tag."
+
+
+def test_private_fields_do_not_depend_on_the_publication_allowlist(monkeypatch):
+    """Issue #36: an empty or stale public_columns.json must not drop a flag."""
+    import iwac_common.repos as repos
+    from iwac_common.field_mappers import visibility_metadata
+
+    monkeypatch.setattr(repos, "load_public_columns", lambda: {})
+    metadata = visibility_metadata({
+        "o:is_public": True,
+        "dcterms:date": [{"@value": "2001", "is_public": False}],
+        "bibo:content": [{"@value": "texte", "is_public": False}],
+    }, "articles")
+    assert {"OCR", "pub_date", "hijri_year"} <= set(metadata["private_fields"])
+
+
+def test_private_fields_name_only_the_subsets_own_columns():
+    from iwac_common.field_mappers import visibility_metadata
+
+    metadata = visibility_metadata({
+        "o:is_public": True,
+        "dcterms:title": [{"@value": "x", "is_public": False}],
+        "dcterms:creator": [{"display_title": "A", "value_resource_id": 2, "is_public": False}],
+    }, "articles")
+    # "Titre" is index's title column, "creator" audiovisual's author column.
+    assert set(metadata["private_fields"]) == {"title", "author", "author_ids"}

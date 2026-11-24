@@ -102,3 +102,23 @@ def test_capital_n_m_names_count_as_one_word():
     assert tokenize_words("N'Guessan n'est pas à N'Djamena", language="Français") == [
         "n'guessan", "n'", "est", "pas", "à", "n'djamena",
     ]
+
+
+@pytest.mark.parametrize("apostrophe", ["'", "’"])
+def test_all_caps_contractions_split_and_mixed_case_names_stay_whole(apostrophe):
+    """Issue #41: an all-caps headline must not turn n'est into a name for the
+    whole document, and N'diaye is a name though its stem is lowercase."""
+    from iwac_common.text_utils import tokenize_words
+
+    text = "L'ISLAM N'EST PAS UN DANGER. Il n'est pas vrai. N'diaye, M'BOW, n'golo.".replace("'", apostrophe)
+    assert tokenize_words(text, language="Français") == [
+        "l'", "islam", "n'", "est", "pas", "un", "danger", "il", "n'", "est", "pas", "vrai",
+        "n'diaye", "m'bow", "n'golo",
+    ]
+    assert tokenize_words(f"Quelqu{apostrophe}unes", language="Français") == ["quelqu'unes"]
+
+
+def test_tokenizer_version_bumped_for_the_name_rule():
+    from iwac_common.text_utils import TOKENIZER_VERSION
+
+    assert TOKENIZER_VERSION == 4
