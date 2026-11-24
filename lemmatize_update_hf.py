@@ -66,7 +66,8 @@ from iwac_common.paths import workspace_root
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "post-processing"))
 try:
     from iwac_pipeline.processing._common import (
-    confirm_full_recompute,
+        load_environment,
+        confirm_full_recompute,
         PRIVATE_REPO_ID,
         add_update_mode_args,
         ensure_hf_token,
@@ -88,7 +89,8 @@ except ModuleNotFoundError as exc:
     if exc.name not in {"iwac_pipeline", "iwac_pipeline.processing"}:
         raise
     from _common import (
-    confirm_full_recompute,
+        load_environment,
+        confirm_full_recompute,
         PRIVATE_REPO_ID,
         add_update_mode_args,
         ensure_hf_token,
@@ -114,11 +116,12 @@ from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich.logging import RichHandler
 from rich import box
-from dotenv import load_dotenv
 
 # Load .env so a non-interactive run finds HF_TOKEN instead of falling through
 # to an interactive login that cannot read stdin.
-load_dotenv(workspace_root() / ".env")
+# The shared loader honours IWAC_ENV_FILE; loading the checkout's .env a
+# second time would backfill keys a scratch env file leaves unset.
+load_environment()
 
 # Initialize Rich console
 console = Console()

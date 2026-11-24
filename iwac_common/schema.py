@@ -235,6 +235,7 @@ COUNTRY_ITEM_SETS: dict[str, dict[int, str]] = {
     "audiovisual": {
         2194: "Benin",           # Vidéos YouTube (Bénin)
         108260: "Burkina Faso",  # Vidéos YouTube (Burkina Faso)
+        110812: "Togo",          # Vidéos YouTube (Togo)
     },
     "images": {
         2192: "Benin", 2211: "Burkina Faso", 2216: "Côte d'Ivoire",

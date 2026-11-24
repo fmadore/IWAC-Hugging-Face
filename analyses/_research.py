@@ -109,8 +109,12 @@ def sha256(path: Path) -> str:
 
 
 def source_link(row) -> str:
+    """The row's ``iwac_url``, else the public item page built the same way the
+    upload builds it (site slug and ``IWAC_PUBLIC_BASE_URL`` included)."""
+    from iwac_common.omeka_client import item_page_url
+
     url = string(row.get("iwac_url"))
-    return url or "https://islam.zmo.de/s/westafrica/item/" + quote(string(row["o:id"]), safe="")
+    return url or item_page_url(quote(string(row["o:id"]), safe=""))
 
 
 def metadata(row, *, excerpt_chars=0, text_column="OCR") -> dict:

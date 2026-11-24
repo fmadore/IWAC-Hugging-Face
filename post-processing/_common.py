@@ -257,7 +257,10 @@ def load_subset_dataframe(
                     repo_id, name=config_name, split="train", token=token,
                     revision=revision,
                 )
-                df = ds.to_pandas()
+                from iwac_common.schema import dataset_to_pandas
+
+                # Same dtypes as the columns= path: nullable ints stay Int64.
+                df = dataset_to_pandas(ds)
         df.attrs["iwac_source_revision"] = revision
     else:
         raise ValueError(f"Unknown source '{source}' (expected 'hub', 'local' or 'csv').")

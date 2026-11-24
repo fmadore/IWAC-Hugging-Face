@@ -4,8 +4,9 @@ upload_index_hf.py
 ==================
 
 Extrait les données d'index depuis l'API Omeka S d'IWAC, calcule les statistiques
-de fréquence depuis les datasets articles et publications, et pousse le tout
-sur le Hugging Face Hub.
+de fréquence depuis les datasets articles, publications, references et
+audiovisual (voir ``FREQUENCY_SOURCE_FIELDS``), et pousse le tout sur le
+Hugging Face Hub.
 
 Usage
 -----
@@ -115,7 +116,8 @@ async def map_index_item(item: Dict[str, Any], api: OmekaApiClient) -> Dict[str,
     # An item without media has no canvas, hence no manifest thumbnail.
     thumbnail_url = ""
     if item.get("o:primary_media"):
-        thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"])
+        # index has no iiif_manifest column: a failure restricts the thumbnail only.
+        thumbnail_url = await fetch_iiif_thumbnail_url(item["o:id"], affected_fields=("thumbnail",))
     # get_value (linked/URI values too) where images reads literals only;
     # unifying either way would change values for some value type.
     coordinates = get_value(item, "curation:coordinates")
@@ -272,10 +274,8 @@ def _accumulate_term_stats(
     ``private`` names the row's private columns (its ``private_fields``): a
     private field, its ``_ids`` companion, date or country contributes nothing.
     """
-    date_value = next(
-        (row.get(c) for c in ('pub_date', 'date') if c not in private and row.get(c)),
-        None,
-    )
+    # frequency_input_columns loads ``pub_date`` only, the one date column.
+    date_value = None if 'pub_date' in private else (row.get('pub_date') or None)
     first, last = _occurrence_bounds(date_value)
     countries = [] if 'country' in private else extract_terms_from_field(row.get('country'))
     fields = [f for f in fields if f not in private and f"{f}_ids" not in private]

@@ -68,3 +68,15 @@ def test_cli_parses_and_dispatches(mirror, monkeypatch):
 
 def test_unknown_format_is_refused(mirror):
     assert mirror.main(dataset_id="owner/repo", label="public", fmt="xlsx") == 2
+
+
+def test_csv_mirror_keeps_nullable_ints(mirror, tmp_path):
+    import pyarrow as pa
+    from datasets import Dataset
+
+    ds = Dataset(pa.table({"o:id": ["1", "2"], "pub_year": pa.array([1995, None], pa.int64())}))
+    path = tmp_path / "articles.csv"
+    mirror._write_config(ds, path, "csv")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[1].endswith(",1995")  # not 1995.0
+    assert lines[2].endswith(",")

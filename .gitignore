@@ -17,6 +17,7 @@ data/.iwac-mirror-*/
 lda_model*/
 .agents/
 analyses/output/
+logs/
 *.egg-info/
 .pytest_cache/
 .iwac_locks/

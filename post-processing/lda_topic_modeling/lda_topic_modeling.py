@@ -43,6 +43,7 @@ from iwac_pipeline.processing._common import (  # type: ignore  # noqa: E402
     choose_config,
     ensure_hf_token,
     get_available_configs,
+    load_environment,
     load_hub_dataset,
     push_dataset,
     write_run_manifest,
@@ -95,6 +96,9 @@ from iwac_pipeline.processing.lda_topic_modeling.artifacts import (  # noqa: E40
     preprocessing_fingerprint, effective_model_identity,
 )
 from iwac_common.paths import workspace_root  # noqa: E402
+
+# Same .env resolution as every other stage (honours IWAC_ENV_FILE).
+load_environment()
 
 console = Console(force_terminal=True)
 

@@ -84,13 +84,10 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-from dotenv import load_dotenv
-from iwac_common.paths import workspace_root
 from rich import box
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
-from rich.prompt import Confirm
 from rich.table import Table
 
 # Make ``post-processing/_common.py`` and ``iwac_common`` importable.
@@ -98,6 +95,8 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _THIS_DIR)
 sys.path.insert(0, os.path.dirname(_THIS_DIR))
 from _common import (  # noqa: E402
+    load_environment,
+    confirm_full_recompute,
     PRIVATE_REPO_ID,
     add_update_mode_args,
     ensure_hf_token,
@@ -111,7 +110,9 @@ from _common import (  # noqa: E402
 )
 from iwac_common.enrichment import changed_row_count  # noqa: E402
 
-load_dotenv(workspace_root() / ".env")
+# The shared loader honours IWAC_ENV_FILE; loading the checkout's .env a
+# second time would backfill keys a scratch env file leaves unset.
+load_environment()
 
 console = Console()
 
@@ -378,16 +379,9 @@ def main() -> int:
         return 1
 
     already = [c for c in HIJRI_COLUMNS if c in ds.column_names]
-    if (already and update_mode == "all" and not (args.yes or args.dry_run)
-            and sys.stdin.isatty()):
-        console.print(f"\n[yellow]⚠[/yellow] Already present: [bold]{', '.join(already)}[/bold]")
-        try:
-            if not Confirm.ask("Recompute them for every row?", default=False):
-                console.print("[yellow]ℹ[/yellow] Cancelled; existing values kept.")
-                return 0
-        except KeyboardInterrupt:
-            console.print("\n[yellow]⚠[/yellow] Cancelled.")
-            return 0
+    if already and not confirm_full_recompute(args, update_mode, ", ".join(already)):
+        console.print("[yellow]ℹ[/yellow] Cancelled; existing values kept.")
+        return 0
 
     from datasets import Value
 

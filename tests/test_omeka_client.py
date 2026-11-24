@@ -168,6 +168,13 @@ class TestIIIFThumbnailRetry:
         assert oc.media_stats.failed == 1
         assert oc.media_stats.failed_fields_by_item == {"7": {"thumbnail", "iiif_manifest"}}
 
+    def test_failure_restricts_only_the_fields_the_caller_names(self):
+        from iwac_common import omeka_client as oc
+
+        session = _FakeSession(_FakeResponse(500))
+        assert self._fetch(session, max_tries=1, affected_fields=("thumbnail",)) == ""
+        assert oc.media_stats.failed_fields_by_item == {"7": {"thumbnail"}}
+
     @pytest.mark.parametrize("status", [404, 410])
     def test_absence_is_not_retried_or_failed(self, status):
         from iwac_common import omeka_client as oc

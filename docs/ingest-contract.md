@@ -110,8 +110,12 @@ no baseline cannot be reconstructed and still aborts.
 ## Derived values and durable recovery
 
 Uploads invalidate stale derived cells **by default**. The source dependency
-registry covers text, table of contents, language, image URL/thumbnail, and
-publication date. Language changes invalidate language-dependent lemmas,
+registry covers text, title (it is embedded with the text, so it also moves
+`related_articles`), table of contents, the `references` abstract, language,
+image URL/thumbnail, publication date, and each panel model's raw sentiment
+columns (`<model>_polarite`, `_centralite_islam_musulmans`,
+`_subjectivite_score`), whose change invalidates that generation's consensus
+columns and the legacy generic ones. Language changes invalidate language-dependent lemmas,
 lexical/readability measures and topic assignments. Associated input/config
 hashes are invalidated with their output. Mapper-produced values are already
 fresh and are not overwritten by invalidation. Related-article rankings are

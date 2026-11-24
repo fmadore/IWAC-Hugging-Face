@@ -306,6 +306,26 @@ class TestMergeSteps:
             merge_with_hub_dataset(_new(2), "repo", "articles",
                                    preserve_existing_ids=["99"])
 
+    def test_failed_media_on_a_new_item_aborts(self, hub):
+        """docs/ingest-contract.md: a failed new item with no baseline still aborts."""
+        hub(_existing(2))
+        fresh = _new(3)
+        fresh["thumbnail"] = ["a", "b", "fallback.jpg"]  # item 3 is new; its lookup failed
+        with pytest.raises(HubBaselineUnavailableError, match="cannot be reconstructed"):
+            merge_with_hub_dataset(fresh, "repo", "articles",
+                                   preserve_fields_by_id={"3": {"thumbnail"}})
+
+    def test_failed_media_with_an_empty_baseline_aborts(self, hub):
+        hub(pd.DataFrame({"o:id": pd.Series([], dtype=str), "title": pd.Series([], dtype=str)}))
+        with pytest.raises(HubBaselineUnavailableError, match="cannot be reconstructed"):
+            merge_with_hub_dataset(_new(2), "repo", "articles",
+                                   preserve_fields_by_id={"1": {"thumbnail"}})
+
+    def test_empty_baseline_without_failures_still_initializes(self, hub):
+        hub(pd.DataFrame({"o:id": pd.Series([], dtype=str), "title": pd.Series([], dtype=str)}))
+        out = merge_with_hub_dataset(_new(2), "repo", "articles", preserve_fields_by_id={})
+        assert len(out) == 2
+
     def test_preserved_rows_count_towards_the_shrink_guard(self, hub):
         hub(_existing(20))
         out = merge_with_hub_dataset(
