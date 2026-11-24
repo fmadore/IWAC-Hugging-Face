@@ -160,11 +160,15 @@ def prepare_public_projection(df: pd.DataFrame, config_name: str) -> tuple[pd.Da
     return result, int((~keep).sum())
 
 
-def validate_public_projection(ds, config_name: str) -> None:
-    """Check the *already projected* data immediately before committing it."""
+def validate_public_projection(ds, config_name: str, approved_columns=None) -> None:
+    """Check the *already projected* data immediately before committing it.
+
+    ``approved_columns`` holds columns reviewed with ``--approve-columns`` for
+    this one publication. They are recorded in the allowlist file only after
+    the verified push, so the validator has to accept them here explicitly."""
     from .repos import load_public_columns
 
-    allow = load_public_columns().get(config_name, set())
+    allow = load_public_columns().get(config_name, set()) | set(approved_columns or ())
     unknown = set(ds.column_names) - allow
     if unknown:
         raise PublicationPolicyError(f"Unreviewed public columns in '{config_name}': {sorted(unknown)}")

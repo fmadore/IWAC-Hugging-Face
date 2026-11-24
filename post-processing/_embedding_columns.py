@@ -77,8 +77,32 @@ def set_embedding_column(ds, column: str, all_embeddings: List[Any]):
     return ds.add_column(column, pa_array)
 
 
+def same_vector(old: Any, new: Any) -> bool:
+    """Whether two embedding cells hold the same vector, bit for bit (both
+    empty counts as the same). Exact, like the Arrow comparison that decides
+    whether a stage pushes at all."""
+    if is_empty_embedding(old) or is_empty_embedding(new):
+        return is_empty_embedding(old) and is_empty_embedding(new)
+    return np.array_equal(np.asarray(old, dtype=np.float32), np.asarray(new, dtype=np.float32))
+
+
+def changed_columns(before, after, columns: Sequence[str]) -> List[str]:
+    """Columns added or removed, plus listed columns whose Arrow values differ."""
+    changed = set(before.column_names) ^ set(after.column_names)
+    for column in columns:
+        if column in changed or column not in after.column_names:
+            continue
+        old = _as_chunked(before.with_format("arrow")[column])
+        new = _as_chunked(after.with_format("arrow")[column])
+        if old.type != new.type or not old.equals(new):
+            changed.add(column)
+    return sorted(changed)
+
+
 __all__ = [
     "column_vectors",
     "build_embedding_array",
     "set_embedding_column",
+    "same_vector",
+    "changed_columns",
 ]

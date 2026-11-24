@@ -87,7 +87,7 @@ from _embedding_utils import (  # noqa: E402
     repo_slug,
     save_cache,
 )
-from _embedding_columns import column_vectors, set_embedding_column  # noqa: E402
+from _embedding_columns import changed_columns, column_vectors, set_embedding_column  # noqa: E402
 from _gemma_encoder import (  # noqa: E402
     DIMENSION,
     IMAGE_PROCESSING,
@@ -367,6 +367,10 @@ def main() -> int:
     ds_out = set_provenance(ds_out, EMBEDDING_COLUMN, fingerprints, configuration,
                             [not is_empty_embedding(e) for e in all_embeddings], settings=configuration_settings)
 
+    changed = changed_columns(ds, ds_out, [
+        EMBEDDING_COLUMN, *provenance_columns(EMBEDDING_COLUMN), f"{EMBEDDING_COLUMN}_config_json",
+    ])
+
     ds_out = reorder_columns_after(ds_out, [EMBEDDING_COLUMN], SOURCE_COLUMN, console=console)
 
     valid = sum(1 for e in all_embeddings if not is_empty_embedding(e))
@@ -378,8 +382,20 @@ def main() -> int:
 
     # --- Step 5: Push ---
     if dry_run:
-        print_dry_run_panel(repo_id=repo_id, config_name=CONFIG_NAME, n_rows=len(ds_out),
-                            extra=f"Embeddings cached in {cache_file}.", console=console)
+        print_dry_run_panel(
+            repo_id=repo_id, config_name=CONFIG_NAME, n_rows=len(ds_out), console=console,
+            extra=(f"Changed columns: {', '.join(changed) or 'none (nothing would be pushed)'}\n"
+                   f"Embeddings cached in {cache_file}."),
+        )
+        return 0
+    if not changed:
+        console.print(Panel(
+            "[green]Nothing changed: every vector and provenance cell already matches the Hub.[/green]\n\n"
+            "No commit was made.",
+            title="Push skipped",
+            border_style="green",
+        ))
+        delete_cache(cache_file)
         return 0
 
     console.print("\n[bold cyan]Step 5:[/bold cyan] Pushing to Hugging Face Hub...")

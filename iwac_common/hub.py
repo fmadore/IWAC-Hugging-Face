@@ -550,6 +550,7 @@ def push_datasets_verified(
     expected_revision: Optional[str] = None,
     console=None,
     mode: str = "full",
+    approved_columns: Optional[dict] = None,
 ) -> HubWriteResult:
     """Commit all selected configs and their exact card metadata atomically.
 
@@ -557,6 +558,8 @@ def push_datasets_verified(
     ``parent_commit`` is enforced by the Hub, closing the check-then-push race
     across machines. Full writes require a verified private destination; public
     projection writes independently revalidate item/property visibility.
+    ``approved_columns`` (``{config: columns}``, public mode only) admits
+    columns reviewed for this publication but not yet in the allowlist file.
     """
     import tempfile
     from datasets import Dataset
@@ -567,6 +570,8 @@ def push_datasets_verified(
 
     if not datasets_by_config:
         raise HubWriteError("Refusing an empty publication plan")
+    if approved_columns and mode != "public_projection":
+        raise HubWriteError("approved_columns applies to public projection writes only")
     console = console or Console()
     token = resolve_hf_token(token)
     prepared = {}
@@ -577,7 +582,9 @@ def push_datasets_verified(
             if not isinstance(ds, Dataset):
                 raise DataContractError("The write gateway requires an Arrow-backed Dataset")
             if mode == "public_projection":
-                validate_public_projection(ds, config_name)
+                validate_public_projection(
+                    ds, config_name, (approved_columns or {}).get(config_name, ()),
+                )
             prepared[config_name] = ds
     except (DataContractError, PublicationPolicyError) as exc:
         raise HubWriteError(f"Refusing invalid publication: {exc}") from exc

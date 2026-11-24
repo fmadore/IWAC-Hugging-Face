@@ -94,7 +94,9 @@ from _embedding_utils import (  # noqa: E402
     repo_slug,
     save_cache,
 )
-from _embedding_columns import column_vectors, set_embedding_column  # noqa: E402
+from _embedding_columns import (  # noqa: E402
+    changed_columns, column_vectors, same_vector, set_embedding_column,
+)
 from _gemma_encoder import (  # noqa: E402
     DIMENSION,
     MODEL_ID,
@@ -393,36 +395,20 @@ def pool_rows(plan: RowPlan, row_chunks, chunk_vectors) -> tuple[int, int]:
 
 
 def apply_outputs(ds, plan: RowPlan, embedding_column: str, configuration: str,
-                  settings: Dict[str, Any], config_name: str, update_mode: str):
+                  settings: Dict[str, Any], config_name: str):
     """The dataset with vectors, provenance, invalidated neighbours and retired
     columns removed; returns ``(dataset, retired_columns)``."""
     ds_out = set_embedding_column(ds, embedding_column, plan.vectors)
     ds_out = set_provenance(ds_out, embedding_column, plan.fingerprints, configuration,
                             [not is_empty_embedding(e) for e in plan.vectors], settings=settings)
-    vector_changed = any(
-        (not is_empty_embedding(old) or not is_empty_embedding(new))
-        and (not ok or update_mode == "all" or is_empty_embedding(new))
-        for old, new, ok in zip(plan.existing, plan.vectors, plan.compatible, strict=True)
+    # Compare the vectors themselves: a full re-run that reproduces every
+    # vector must not wipe the neighbour lists (and thereby force a push).
+    vector_changed = not all(
+        same_vector(old, new) for old, new in zip(plan.existing, plan.vectors, strict=True)
     )
     # A neighbor rank depends on all vectors, not just on its own document.
     ds_out = invalidate_columns(ds_out, ["related_articles"], [vector_changed] * len(ds))
     return drop_retired_columns(ds_out, config_name)
-
-
-def changed_columns(before, after, columns: Sequence[str]) -> List[str]:
-    """Columns added or removed, plus listed columns whose Arrow values differ."""
-    import pyarrow as pa
-
-    changed = set(before.column_names) ^ set(after.column_names)
-    for column in columns:
-        if column in changed or column not in after.column_names:
-            continue
-        old, new = (before.with_format("arrow")[column], after.with_format("arrow")[column])
-        old = old if isinstance(old, pa.ChunkedArray) else pa.chunked_array([old])
-        new = new if isinstance(new, pa.ChunkedArray) else pa.chunked_array([new])
-        if old.type != new.type or not old.equals(new):
-            changed.add(column)
-    return sorted(changed)
 
 
 def touched_columns(embedding_column: str) -> List[str]:
@@ -622,7 +608,7 @@ def main() -> int:
     # --- Update the dataset ---
     console.print("\n[bold cyan]Step 6:[/bold cyan] Updating dataset...")
     ds_processed, retired = apply_outputs(ds, plan, embedding_column, configuration,
-                                          configuration_settings, config_name, update_mode)
+                                          configuration_settings, config_name)
     if retired:
         console.print(f"[blue]→[/blue] Removing retired columns: {', '.join(retired)}")
     changed = changed_columns(ds, ds_processed, touched_columns(embedding_column))
