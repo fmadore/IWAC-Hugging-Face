@@ -22,7 +22,7 @@ def main():
             code = f"from iwac_pipeline.cli import {function}; raise SystemExit({function}({arguments!r}))"
             result = subprocess.run(
                 [sys.executable, "-I", "-c", code], cwd=directory,
-                capture_output=True, text=True, timeout=90,
+                capture_output=True, text=True, encoding="utf-8", timeout=90,
             )
             if result.returncode:
                 raise SystemExit(f"{function} {arguments}:\n{result.stdout}\n{result.stderr}")

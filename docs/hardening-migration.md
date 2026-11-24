@@ -206,9 +206,9 @@ iwac-mirror --dataset private
 iwac-analyze similarity-calibration
 ```
 
-The calibration now splits by connected component and reports bootstrap
-intervals; the figures previously quoted for 0.91 and 0.97 came from a per-pair
-split and are pending this re-run (see
+The calibration now splits by lexical reprint family into item-disjoint halves
+(`SPLIT_VERSION` 3) and reports bootstrap intervals; the figures previously
+quoted for 0.91 and 0.97 came from a per-pair split and are pending this re-run (see
 [the research validation protocol](research-validation.md)). Re-run any
 analysis whose output you cite, since word counts, lemmas, topics, consensus,
 neighbours and the shared date rule (`analyses/_research.py:point_years`) all

@@ -28,4 +28,12 @@ Modules:
 Installable via ``pip install -e . --no-deps`` (see pyproject.toml), which
 makes ``iwac_common`` and ``country_mapper`` importable without sys.path
 manipulation.
+
+Importing the package forces UTF-8 standard streams (``stdio``): every
+script imports it, so a direct run with redirected output on Windows does not
+fall back to cp1252 and lose its rich output.
 """
+
+from .stdio import force_utf8_stdio
+
+force_utf8_stdio()

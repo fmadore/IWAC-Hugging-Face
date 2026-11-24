@@ -167,18 +167,31 @@ iwac-analyze similarity-calibration --source hub
 
 It scores the stored `related_articles` neighbour pairs by trigram Jaccard, chooses
 the cosine prefilter for recall and the cosine-only near-duplicate cutoff for
-precision on one half of the pairs, and reports both on the other half. The
-halves are whole connected components of the pair graph, so a reprint family
-never sits on both sides, and the held-out figures carry bootstrap intervals
-resampling whole components (none below `MIN_BOOTSTRAP_CLUSTERS` components).
-Because `related_articles` lists public neighbours only, the calibration
-describes the public pool.
+precision on one half of the pairs, and reports both on the other half.
+
+The halves are built from reprint *families* (`SPLIT_VERSION` 3). A family is a
+connected component of the label edges alone, the pairs whose Jaccard reaches
+`--label-jaccard`; that link does not depend on the cosine being calibrated.
+The whole top-k neighbour graph cannot serve: thematic neighbours chain it into
+a single component (measured 2026-11-24 on `articles`: 130,193 pairs, one
+component), which left one half empty. Linked on the label instead, the same
+pairs form 626 families of at most 7 items (median 2). Families are dealt to
+the halves in hashed order, each to the half with fewer positive pairs so far,
+so the positives stay balanced; an item in no family takes a side from the hash
+of its own id. A pair whose two items fall on different sides is excluded from
+both halves and counted (`pairs_excluded_straddling`), so no item appears in
+both halves. Held-out figures carry bootstrap intervals resampling whole units,
+a pair's family or else the pair itself (none below `MIN_BOOTSTRAP_CLUSTERS`
+units); two non-family pairs sharing an item are resampled independently, a
+dependence the interval does not model. Because `related_articles` lists public
+neighbours only, the calibration describes the public pool.
 
 The current defaults, 0.91 for the prefilter and 0.97 for the near-duplicate
 cutoff, were chosen in 2026-10 on the EmbeddingGemma 2 article vectors by an
 earlier version of this command that split individual pairs. That split let a
 family sit on both halves, so the recall and precision it reported for those
-thresholds were optimistic and are not quoted here. **Re-run the calibration
+thresholds were optimistic and are not quoted here. The component split that
+replaced it (version 2) never produced held-out figures on the real corpus. **Re-run the calibration
 before citing a figure for either threshold**; the thresholds stay the defaults
 until then.
 The label is a lexical proxy over top-k neighbours, not an adjudicated reprint. Semantic similarity without

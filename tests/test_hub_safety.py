@@ -1,6 +1,7 @@
 """Behavioral contracts for atomic, privacy-aware Hugging Face writes."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -293,6 +294,43 @@ def test_local_lock_blocks_overlapping_writer(atomic_hub):
         with pytest.raises(hub.HubWriteLockedError):
             with hub.hub_write_lock("owner/repo"):
                 pass
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows OpenProcess semantics")
+def test_windows_liveness_treats_access_denied_as_alive():
+    assert hub._process_alive(os.getpid())
+    # The System process cannot be opened from an unelevated run (error 5);
+    # that is a live process, not a dead one.
+    assert hub._process_alive(4)
+    assert not hub._process_alive(0x7FFFFFF0)  # no such process: error 87
+
+
+def test_lock_release_retries_a_transient_permission_error(monkeypatch, tmp_path):
+    path = tmp_path / "x.lock"
+    path.write_text("pid=1\n", encoding="utf-8")
+    real_unlink, calls = Path.unlink, []
+
+    def flaky(self, *args, **kwargs):
+        calls.append(self)
+        if len(calls) < 3:
+            raise PermissionError("held by a reader")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", flaky)
+    hub._remove_lock_file(path, delay=0)
+    assert len(calls) == 3 and not path.exists()
+
+
+def test_lock_release_never_raises_after_the_write(monkeypatch, tmp_path, caplog):
+    path = tmp_path / "x.lock"
+    path.write_text("pid=1\n", encoding="utf-8")
+
+    def stuck(self, *args, **kwargs):
+        raise PermissionError("held")
+
+    monkeypatch.setattr(Path, "unlink", stuck)
+    hub._remove_lock_file(path, attempts=2, delay=0)
+    assert "Could not remove the write lock" in caplog.text
 
 
 def test_stale_lock_from_dead_local_process_is_reclaimed(monkeypatch, atomic_hub):
