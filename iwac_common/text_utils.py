@@ -24,7 +24,10 @@ from typing import AbstractSet, Iterable, List
 # 3 = elided clitics are tokens of their own (``l'église`` = 2, like
 # ``la mosquée``), the split applies only to rows whose language includes
 # French, and apostrophes inside a word keep it whole (``da'wa``).
-TOKENIZER_VERSION = 3
+# 4 = ``n'``/``m'`` before a consonant is a name (``N'diaye``, ``M'BOW``),
+# whatever the case; before a vowel it is the clitic, all-caps headlines
+# included (``N'EST`` → ``n'`` + ``est``).
+TOKENIZER_VERSION = 4
 
 #: Language labels / codes under which the French elision split applies.
 FRENCH_LANGUAGE_LABELS = frozenset({"Français", "fr", "fra"})
@@ -36,7 +39,23 @@ _APOSTROPHES = str.maketrans({"’": "'", "‘": "'", "‛": "'",
 _ELIDED_CLITIC_RE = re.compile(r"(qu|jusqu|lorsqu|puisqu|quoiqu|quelqu|[ldjmnstc])'(?=.)")
 # Lexicalised forms whose apostrophe follows a clitic-shaped head but which
 # are one word (``aujourd'hui`` never matches: its head is ``aujourd``).
-_LEXICALISED_APOSTROPHE_WORDS = frozenset({"quelqu'un", "quelqu'une"})
+_LEXICALISED_APOSTROPHE_WORDS = frozenset({"quelqu'un", "quelqu'une", "quelqu'uns", "quelqu'unes"})
+
+# French elides ne/me (and every other clitic) only before a vowel or a mute
+# h, so ``N'`` or ``M'`` before a consonant cannot be the clitic: it is a West
+# African name (``N'Guessan``, ``N'diaye``, ``N'Djamena``, ``M'Bow``). The
+# test is on the letter, not its case, so all-caps headlines (``N'EST``) and
+# lowercase OCR (``n'golo``) are read alike.
+_ELISION_ONSETS = frozenset("aeiouyhæœ")
+NAME_PREFIX_CLITICS = frozenset({"n", "m"})
+
+
+def begins_with_consonant(word: str) -> bool:
+    """Whether ``word`` starts with a consonant letter (accents ignored)."""
+    if not word or not word[0].isalpha():
+        return False
+    base = unicodedata.normalize("NFD", word[0].lower())[0]
+    return base not in _ELISION_ONSETS
 
 
 def simple_tokenize(
@@ -98,15 +117,17 @@ def _iter_words(text: str) -> Iterable[str]:
         yield "".join(current)
 
 
-_NAME_PREFIX_RE = re.compile(r"(?<!\w)[NM]'[^\W\d_a-zà-ÿ][^\W\d_]*")
-
-
 def _split_elision(word: str) -> List[str]:
-    """``l'église`` → ``["l'", "église"]``; ``jusqu'à`` → ``["jusqu'", "à"]``."""
+    """``l'église`` → ``["l'", "église"]``; ``jusqu'à`` → ``["jusqu'", "à"]``.
+
+    ``n'``/``m'`` before a consonant is a name and stays whole
+    (:func:`begins_with_consonant`)."""
     parts: List[str] = []
     while word not in _LEXICALISED_APOSTROPHE_WORDS:
         match = _ELIDED_CLITIC_RE.match(word)
         if not match:
+            break
+        if match.group(1) in NAME_PREFIX_CLITICS and begins_with_consonant(word[match.end():]):
             break
         parts.append(word[:match.end()])
         word = word[match.end():]
@@ -129,17 +150,13 @@ def tokenize_words(text: str, language: object = "Français") -> List[str]:
     """
     if not text:
         return []
+    # Curly and other typographic apostrophes become ASCII first, so every
+    # rule below sees one apostrophe.
     normalised = unicodedata.normalize("NFC", str(text)).translate(_APOSTROPHES)
     words = _iter_words(normalised.lower())
     if not applies_french_elision(language):
         return list(words)
-    # ``N'Guessan``, ``N'Djamena``, ``M'Bow`` are names, not ne/me + word.
-    names = {match.lower() for match in _NAME_PREFIX_RE.findall(normalised)}
-    return [
-        part
-        for word in words
-        for part in ([word] if word in names else _split_elision(word))
-    ]
+    return [part for word in words for part in _split_elision(word)]
 
 
 def count_words(text: object, language: object = "Français") -> int:
@@ -158,5 +175,5 @@ def count_words(text: object, language: object = "Français") -> int:
 
 __all__ = [
     "simple_tokenize", "tokenize_words", "count_words", "applies_french_elision",
-    "language_labels", "TOKENIZER_VERSION",
+    "language_labels", "TOKENIZER_VERSION", "begins_with_consonant", "NAME_PREFIX_CLITICS",
 ]

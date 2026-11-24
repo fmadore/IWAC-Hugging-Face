@@ -64,18 +64,27 @@ configuration hashes are otherwise unchanged by this commit.
 
 ### 2. Word count, then lexical metrics
 
-For each of `articles`, `publications`, `documents`, `references` and
-`audiovisual`:
+Word count on each of `articles`, `publications`, `documents`, `references`
+and `audiovisual`; lexical metrics on `articles` only:
 
 ```bash
-iwac-process word-count --config articles -y
+iwac-process word-count --config <subset> -y   # all five text subsets
 iwac-process lexical --config articles -y
 ```
 
-What changes: tokenizer version 3 (`TOKENIZER_VERSION` in
+`Richesse_Lexicale_OCR` and `Lisibilite_OCR` are allowlisted for `articles`
+only (`iwac_common/public_columns.json`), and on 2026-11-24 no other subset
+carried them, even privately. Running `lexical` elsewhere would add columns
+that `iwac-publish-public` refuses as unreviewed; publishing them would need a
+rights review per subset, not a silenced guard.
+
+What changes: tokenizer version 4 (`TOKENIZER_VERSION` in
 `iwac_common/text_utils.py`). For a row whose languages include French an
 elided clitic is a word of its own (`l'église` counts 2, like `la mosquée`);
-other languages keep an apostrophe inside the word. `nb_mots` and the MATTR
+other languages keep an apostrophe inside the word. `n'`/`m'` before a
+consonant is a name and stays one word whatever its case (`N'diaye`,
+`M'BOW`), since French elides only before a vowel or mute h; before a vowel it
+is the clitic, so an all-caps `N'EST` splits like `n'est`. `nb_mots` and the MATTR
 token stream come from the same function with the row language. `nb_mots` now
 carries private provenance columns, and both stages compare stored provenance
 with the current text, language and configuration, so the default `missing`
@@ -98,13 +107,19 @@ iwac-process lemmas --config references --language Anglais -y
 ```
 
 The default language is `Français`; `references` needs the second, English
-pass. What changes: `LEMMA_LOGIC_VERSION` 3 keeps hyphenated and apostrophe
-words whole (`côte-d'ivoire`, `sous-préfet`, `aujourd'hui`), rejoins
-transliterations the French tokenizer splits (`jama'at`, `da'wa`, `qur'an`),
-keeps capitalised N'/M' names (`n'guessan`, `n'djamena`), drops bare elided
-clitics and normalises typographic apostrophes; a lemma never contains
-whitespace. The version is part of the provenance hash, so `missing` mode
-recomputes every row: on a CPU this is a long run. The resume cache is SQLite
+pass. What changes: `LEMMA_LOGIC_VERSION` 4. Hyphenated and apostrophe words
+stay whole (`côte-d'ivoire`, `sous-préfet`, `aujourd'hui`, `quelqu'un`);
+transliterations the French tokenizer splits are rejoined (`jama'at`, `da'wa`,
+`qur'an`); N'/M' before a consonant is a name whatever its case (`n'guessan`,
+`n'diaye`, `m'bow`), while an all-caps `N'EST` is the clitic; a word broken by
+a line-end hyphen is rejoined when the model's vectors know the joined form
+(`organi-`/`sation` → `organisation`, while `sous-`/`préfet` keeps its hyphen);
+a token negated by an attached `n't` takes its lemma's stop status (`won't` →
+`will`); bare elided clitics are dropped and typographic apostrophes
+normalised; a lemma never contains whitespace. Word counts do not rejoin
+line-end hyphens, since `nb_mots` has no lexicon. The version is part of the
+provenance hash, so `missing` mode recomputes every row: on a CPU this is a
+long run. The resume cache is SQLite
 (`.cache_lemmas/*.sqlite3`) and is checkpointed incrementally, so an
 interrupted run resumes by re-running the same command. `--dry-run` prints the
 plan without running spaCy.
@@ -169,8 +184,11 @@ The lock regenerated on 2026-11-16 moves `onnxruntime` to 1.32.0 and Pillow to
 13.0.0. Pillow 13.0.0 gave decoded pixels and model patches bit-identical to
 12.3.0 on 23 synthetic images (JPEG, PNG, WebP, TIFF; Linux, Python 3.12);
 Windows and real photographs were not checked, and no vector was compared
-under the new `onnxruntime`. Before embedding new rows, re-embed a few stored
-rows and confirm the vectors match what is on the Hub. No step in this plan
+under the new `onnxruntime`. The lock's `tokenizers` 0.23.3 gave token ids
+identical to the verified 0.22.1 on 404 texts (400 `articles` rows in document
+format, 403,878 tokens, plus Arabic, NFD and emoji cases and the image token
+sequence; 2026-11-24). Before embedding new rows, re-embed a few stored rows
+and confirm the vectors match what is on the Hub. No step in this plan
 re-embeds unless an upload cleared embedding cells.
 
 ### 7. Related items
@@ -180,8 +198,9 @@ iwac-process related --config articles --push
 iwac-process related --config documents --push
 ```
 
-`publications` takes the same command where its `related_articles` column is
-in use. What changes: the neighbour pool is the public items only
+`publications` is not in this step: it carries no `related_articles` column
+today, and the column is not allowlisted for it, so adding one would stop the
+publication step until reviewed. What changes: the neighbour pool is the public items only
 (`item_is_public` exactly true); private rows get null; a public item whose OCR
 is private remains a neighbour. Run this after steps 1 and any embedding refill,
 because both visibility and vectors define the pool.

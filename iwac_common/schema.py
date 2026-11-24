@@ -222,6 +222,66 @@ SOURCE_FIELD_COLUMNS = {
     "foaf:birthday": ("Naissance",),
 }
 
+#: Source-derived columns each subset carries, i.e. the columns a private
+#: Omeka value can restrict through ``field_mappers.visibility_metadata``.
+#: ``SOURCE_FIELD_COLUMNS`` names columns across every subset ("Titre" is
+#: index's title, "creator" audiovisual's author), so a row's private_fields
+#: is cut to its own subset's columns here. This is an ingestion registry,
+#: deliberately independent of the publication allowlist
+#: (``public_columns.json``): a privacy flag must never depend on whether a
+#: column is published. The Hijri columns are computed later from
+#: ``dcterms:date`` but inherit its restriction, so they are listed. The live
+#: sentiment panel's columns are added for ``articles`` at mapping time.
+SOURCE_PRIVACY_COLUMNS: dict[str, frozenset[str]] = {
+    "articles": frozenset({
+        "OCR", "PDF", "URL", "author", "author_ids", "country", "descriptionAI",
+        "descriptionAI_en", *_HIJRI, "identifier", "iiif_manifest", "language",
+        "nb_pages", "newspaper", "newspaper_ids", "pub_date", "pub_date_precision",
+        "pub_year", "source", "spatial", "spatial_ids", "subject", "subject_ids",
+        "thumbnail", "title",
+    }),
+    "publications": frozenset({
+        "OCR", "PDF", "URL", "author", "author_ids", "country", *_HIJRI, "identifier",
+        "iiif_manifest", "issue", "language", "nb_pages", "newspaper", "newspaper_ids",
+        "pub_date", "pub_date_precision", "pub_year", "source", "spatial", "spatial_ids",
+        "subject", "subject_ids", "tableOfContents", "thumbnail", "title",
+    }),
+    "references": frozenset({
+        "OCR", "URL", "abstract", "abstract_en", "author", "author_ids", "book_title",
+        "chapter", "doi", "edition", "editor", "editor_ids", "extent", "identifier",
+        "is_part_of", "issue", "language", "nb_pages", "page_end", "page_start",
+        "provenance", "pub_date", "pub_date_precision", "pub_year", "publisher",
+        "publisher_ids", "review_of", "spatial", "spatial_ids", "subject", "subject_ids",
+        "title", "type", "volume",
+    }),
+    "documents": frozenset({
+        "OCR", "PDF", "author", "author_ids", "contributor", "descriptionAI",
+        "descriptionAI_en", *_HIJRI, "identifier", "iiif_manifest", "language",
+        "nb_pages", "pub_date", "pub_date_precision", "pub_year", "rights", "source",
+        "spatial", "spatial_ids", "subject", "subject_ids", "thumbnail", "title", "type",
+    }),
+    "audiovisual": frozenset({
+        "OCR", "PDF", "URL", "contributor", "country", "creator", "creator_ids",
+        "description", "descriptionAI", "descriptionAI_en", "duration_seconds", "extent",
+        *_HIJRI, "identifier", "iiif_manifest", "is_part_of", "issue", "language",
+        "medium", "pub_date", "pub_date_precision", "pub_year", "publisher",
+        "publisher_ids", "rights", "source", "source_type", "spatial", "spatial_ids",
+        "subject", "subject_ids", "thumbnail", "title", "type", "volume",
+    }),
+    "images": frozenset({
+        "coordinates", "creator", "creator_ids", "description", *_HIJRI, "identifier",
+        "iiif_manifest", "image_url", "latitude", "longitude", "pub_date",
+        "pub_date_precision", "pub_year", "rights", "spatial", "spatial_ids", "subject",
+        "subject_ids", "thumbnail", "title", "type",
+    }),
+    "index": frozenset({
+        "A une partie", "Coordonnées", "Date création", "Description", "Genre",
+        "Naissance", "Nom", "Partie de", "Prénom", "Relation", "Remplacé par", "Titre",
+        "Titre alternatif", "date", "identifier", "latitude", "longitude", "spatial",
+        "thumbnail",
+    }),
+}
+
 #: Country-specific Omeka item sets, per subset → the canonical country label
 #: (the un-accented ``Benin``/``Nigeria`` that country_mapper emits). Format
 #: collections (e.g. audiovisual 2183/2184) are absent on purpose: they group
@@ -636,6 +696,7 @@ __all__ = [
     "COUNTRY_ITEM_SETS",
     "DERIVED_FROM",
     "SOURCE_FIELD_COLUMNS",
+    "SOURCE_PRIVACY_COLUMNS",
     "EMBEDDING_VALUE_TYPE",
     "DataContractError",
     "DuplicateIdError",

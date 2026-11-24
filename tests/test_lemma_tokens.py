@@ -79,8 +79,8 @@ def test_batched_path_matches_the_reference_on_real_tokens(fr, monkeypatch):
 
 
 def test_logic_version_bumped():
-    assert lemma.LEMMA_LOGIC_VERSION == 3
-    assert "_v3" in lemma.cache_fingerprint("fr_core_news_lg", "3.8.0")
+    assert lemma.LEMMA_LOGIC_VERSION == 4
+    assert "_v4" in lemma.cache_fingerprint("fr_core_news_lg", "3.8.0")
 
 
 # --- lemmatise_dataset ----------------------------------------------------
@@ -229,3 +229,51 @@ def test_capital_n_m_names_are_not_clitics():
     lemmas = [lemma for lemma, _ in token_lemmas(nlp("M. N'Guessan arrive à N'Djamena, il n'est pas M'Bow."))]
     assert "n'guessan" in lemmas and "n'djamena" in lemmas and "m'bow" in lemmas
     assert "n'est" not in lemmas and "est" in lemmas
+
+
+@pytest.mark.parametrize("apostrophe", ["'", "’"])
+def test_n_m_names_follow_the_elision_rule_in_any_case(apostrophe):
+    """ne/me elide only before a vowel or mute h (issue #41), with straight or
+    curly apostrophes alike."""
+    nlp = spacy.blank("fr")
+    text = ("L'ISLAM N'EST PAS UN DANGER. Il n'est pas là. N'diaye à N'djamena, "
+            "M'BOW et N'Guessan.").replace("'", apostrophe)
+    pairs = lemma.token_lemmas(nlp(lemma.normalize(text)))
+    lemmas = [value for value, _ in pairs]
+    assert "n'est" not in lemmas and "est" in lemmas
+    assert {"n'diaye", "n'djamena", "m'bow", "n'guessan"} <= set(lemmas)
+    assert "djamena" not in lemmas and "diaye" not in lemmas
+
+
+@pytest.mark.parametrize("apostrophe", ["'", "’"])
+def test_quelqu_un_stays_whole(apostrophe):
+    nlp = spacy.blank("fr")
+    pairs = lemma.token_lemmas(nlp(lemma.normalize(f"Quelqu{apostrophe}un est venu")))
+    assert pairs[0][0] == "quelqu'un"
+    assert "un" not in [value for value, _ in pairs]
+
+
+def test_line_end_hyphen_rejoins_only_known_words():
+    known = {"organisation"}.__contains__
+    text = "L'organi-\nsation du sous-\npréfet et de N'Dia-\nMalik"
+    out = lemma.dehyphenate_line_breaks(text, known)
+    assert "organisation" in out
+    assert "sous-préfet" in out
+    assert "Dia-Malik" in out  # capital after the break: never joined
+    assert "\n" not in lemma.normalize(text, known)
+    assert "organisation" not in lemma.normalize(text)  # no lexicon given: no join
+
+
+def test_known_word_predicate_uses_the_vectors():
+    fr_lg = pytest.importorskip("fr_core_news_lg")
+    nlp = fr_lg.load(disable=["parser", "ner", "textcat"])
+    known = lemma.known_word_predicate(nlp)
+    assert known("organisation") and not known("souspréfet")
+    assert lemma.known_word_predicate(object())("organisation") is False
+
+
+def test_negated_modal_takes_its_lemmas_stop_status():
+    en_lg = pytest.importorskip("en_core_web_lg")
+    nlp = en_lg.load(disable=["parser", "ner", "textcat"])
+    pairs = dict(lemma.token_lemmas(nlp(lemma.normalize("They won’t stay."))))
+    assert pairs["will"] is True

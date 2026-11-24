@@ -175,9 +175,9 @@ them (spaCy model + `LEMMA_LOGIC_VERSION`; embedding model revision + export +
 prompt/chunking settings) and by the repository, and every entry carries a hash
 of its input text (`_embedding_utils.make_entry`), so a cache from a different
 configuration, repo or text version is ignored rather than silently mixed in —
-no manual date-checking needed. Bump `LEMMA_LOGIC_VERSION` (currently 3) whenever
+no manual date-checking needed. Bump `LEMMA_LOGIC_VERSION` (currently 4) whenever
 the lemmatisation output changes for identical input, and `TOKENIZER_VERSION`
-(`iwac_common/text_utils.py`, currently 3) whenever `nb_mots`/MATTR tokenization does;
+(`iwac_common/text_utils.py`, currently 4) whenever `nb_mots`/MATTR tokenization does;
 both feed persisted provenance, so `missing` mode then recomputes. The text embedding cache
 holds one entry per *chunk*, written after every batch: an interrupted run
 resumes by re-running the same command, in either update mode
