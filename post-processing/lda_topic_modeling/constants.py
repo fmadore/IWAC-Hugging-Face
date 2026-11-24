@@ -73,6 +73,10 @@ DOMAIN_STOPWORDS = {
     # French dictionary (spaCy fr lemmatises the verb to "être"), only in the
     # English references model. Still deliberately NOT included: vol (theft),
     # son (sound).
+    # Known limitation: "un" and "au" also strip the English acronyms UN and
+    # AU. The lemmatiser lowercases, so "the UN and the AU" and "un imam au
+    # Mali" yield the same tokens; an English exemption would bring the French
+    # residue back. Fixing it needs case-aware lemmas (a lemma-logic change).
     "la", "le", "les", "des", "du", "de", "un", "une", "et", "ou",
     "au", "aux", "dans", "sur", "par", "pour", "que", "qui",
     "sont", "ce", "cette", "ces", "sa", "ses", "leur", "leurs",
@@ -96,9 +100,9 @@ DOMAIN_STOPWORDS = {
     # topic. Stripping them here, pre-phrase, is what dissolves the whole
     # citation family: "paris" alone anchors 32 compounds in the French
     # references model (paris_armand_colin, paris_cnrs, afrique_noir_paris),
-    # and "london_hurst" is another publisher. "new"/"york" are listed
-    # separately because matching happens before phrase detection, when
-    # "new_york" does not yet exist as a token.
+    # and "london_hurst" is another publisher. "york" alone is listed here;
+    # "new" is a post-phrase fragment (it heads new_media, new_testament,
+    # new_religious_movement), and new_york is caught whole after phrasing.
     #
     # The university-press cities below occur ONLY in the references
     # subsets, never in the press articles — the signature of apparatus
@@ -107,7 +111,7 @@ DOMAIN_STOPWORDS = {
     # real news subjects, and the Berlin Conference is part of the history
     # this collection studies.
     "karthala", "harmattan", "brill", "routledge",
-    "paris", "london", "new", "york",
+    "paris", "london", "york",
     "oxford", "cambridge", "leiden", "princeton", "stanford",
     "edinburgh", "chicago", "bloomington", "boulder",
 
@@ -207,6 +211,10 @@ FRAGMENT_STOPWORDS = {
     "année", "annee",
     "heure",          # heure_prière
     "période", "periode",  # période_coloniale
+
+    # English
+    "new",            # new_testament, new_religious_movement, new_media
+    "coast",          # gold_coast; "ivory" itself is a geo stopword
 }
 
 # ── Junk compounds (also removed AFTER phrase detection) ───────────
@@ -289,6 +297,7 @@ JUNK_COMPOUND_STOPWORDS = {
     "op_cit", "de_la", "de_l", "a_la",
     "burkina_faso", "côte_ivoire", "cote_ivoire",
     "bobo_dioulasso", "porto_novo",
+    "new_york", "ivory_coast",
 }
 
 # What the post-phrase pass actually filters.
@@ -310,18 +319,22 @@ ARTIFACT_LABEL_STOPWORDS = {
     # names are named by the bibliography, not discussed by the text.
     "frédérick", "frederick", "madore",
     "gomez", "perez", "hanretta", "weiss",
+    "leblanc", "muriel", "sean", "caleb",
+    # porto_novo_république reached a references_en label: the city parts
+    # are pre-phrase stopwords now, this keeps older models' labels clean.
+    "porto", "novo",
 }
 
 # ── Label-only stopwords ───────────────────────────────────────────
 # Dropped from topic LABELS only (keeps labels readable); these words
 # still participate in training.
 LABEL_ONLY_STOPWORDS = {
+    # Words already in a modelling set (DOMAIN, GEO, GENERIC, FRAGMENT,
+    # JUNK) are not repeated here: the label filter unions them all.
     # A. Devotional formulae (abbreviations that are hard to interpret in labels)
     "psl", "saw", "swt",
 
     # B. ENGLISH stopwords (from OCR/non-French docs leaking through)
-    "the", "of", "to", "and", "in", "for", "is", "on", "that", "by",
-    "this", "with", "are", "from", "or", "an", "be", "as", "at", "was",
     "which", "have", "has", "their", "it", "its", "they", "will", "can",
     "all", "we", "been", "would", "were", "there", "who", "what", "more",
     "but", "if", "not", "so", "when", "other", "than", "no", "also", "into",
@@ -330,48 +343,31 @@ LABEL_ONLY_STOPWORDS = {
     "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
     "janvier", "février", "fevrier", "mars", "avril", "mai", "juin", "juillet",
     "août", "aout", "septembre", "octobre", "novembre", "décembre", "decembre",
-    "année", "annee", "jour",
-    "aujourd'hui", "hier", "demain",
+    "aujourd'hui",
 
     # D. Currency/quantities (numbers, not concepts)
     "fcfa", "franc", "francs", "cfa",
     "montant", "montants", "somme", "sommes",
     "millier", "milliers", "million", "millions", "milliard", "milliards",
 
-    # E. Generic boilerplate (not domain-specific)
-    "monsieur", "madame", "excellence",
-    "communiqué", "communique",
-    "chers", "cher", "chère", "chere",
-
     # F. OCR artifacts & abbreviations (garbage tokens)
-    "lp", "bf", "dr", "mr", "mme", "mm", "wa",
+    "dr", "mr", "mme", "mm",
     "ii", "iii", "iv", "vi", "vii", "viii", "ix", "xi", "xii",
-    "octet", "sem", "adj",
 
     # G. Generic location words (not specific places)
     "place", "rond", "point",
 
-    # H. Very generic words that don't add meaning to labels
-    "grand", "mondial", "international", "national", "régional", "regional",
-
     # I. Generic French functional/filler words that leak through lemmatization
-    "ensuite", "puis", "donc", "aussi", "toujours", "encore", "bien",
-    "tout", "tres", "très", "avoir", "etre", "être", "plus", "entre",
-    "apres", "après", "avant", "autre", "autres", "même", "meme",
-    "deja", "déjà", "selon", "lors", "ainsi", "car", "vers",
-    "depuis", "pendant", "contre", "sous", "sans", "chez",
+    "deja", "déjà", "lors",
+    "sous",
     "cela", "ceci", "celle", "ceux", "celui",
-    "aller", "falloir", "vouloir", "savoir", "voir", "celer",
-    "el",  # fragment from "El Hadj"
     "quelque", "quelques", "certain", "certains", "certaine", "certaines",
     "chaque", "tel", "telle", "tels", "telles",
-    "beaucoup", "peu", "assez", "trop", "combien",
-    "comme", "comment", "pourquoi", "quand",
-    "premier", "première", "premiere", "deuxième", "deuxieme",
-    "dernier", "dernière", "derniere",
-    "nouveau", "nouvelle", "nouveaux",
+    "peu", "assez", "trop", "combien",
+    "comment", "pourquoi", "quand",
+    "deuxième", "deuxieme",
     "seul", "seule", "seuls", "seules",
-    "petit", "petite", "petits", "petites",
+    "petits", "petites",
 }
 
 # ── Geographic stopwords ───────────────────────────────────────────
@@ -428,6 +424,15 @@ LDA_GEO_STOPWORDS = {
     "nigérien", "nigerien", "nigérienne", "nigerienne",
     "malien", "malienne",
     "ghanéen", "ghaneen", "ghanéenne", "ghaneenne",
+    "nigérian", "nigerian", "nigériane", "nigeriane", "nigérians", "nigerians",
+    # English forms: English labels kept the geography the French ones lose
+    # (references_en topic 0 read "… - dioula - ivorian - marriage").
+    "ivorian", "ivorians", "beninese", "togolese", "burkinabes",
+    "malian", "malians", "ghanaian", "ghanaians", "nigeriens",
+    "senegalese",
+    # "ivory" alone: "coast" heads gold_coast (colonial Ghana), so it is a
+    # post-phrase fragment instead (FRAGMENT_STOPWORDS).
+    "ivory",
 }
 
 # ── Generic functional stopwords ──────────────────────────────────
@@ -504,8 +509,7 @@ CUSTOM_COLLOCATIONS: list[tuple[str, ...]] = [
     ("societe", "civile"),
     ("conseil", "supérieur"),         # supreme council
     ("conseil", "superieur"),         # (unaccented variant)
-    ("oeuvre", "social"),             # social work (lemma)
-    ("œuvre", "social"),              # (ligature spelling)
+    ("oeuvre", "social"),             # social work (lemma; "œ" is folded to "oe")
     ("oeuvre", "sociale"),            # (surface form)
     ("voile", "islamique"),           # Islamic veil
     ("état", "civil"),                # civil registry

@@ -203,7 +203,8 @@ def load_bundle(model_path, *, allow_legacy: bool) -> dict:
     lda_model, dictionary, phraser = load_lda_model(model_dir, logging.getLogger(__name__))
     n_topics = lda_model.num_topics
     saved_labels = saved_params.get("topic_labels", {})
-    labels = {tid: saved_labels.get(str(tid), get_topic_label(lda_model, tid)) for tid in range(n_topics)}
+    labels = {tid: saved_labels.get(str(tid), get_topic_label(lda_model, tid, language=preprocessing["language"]))
+              for tid in range(n_topics)}
     # Models fitted before the floor was recorded all used the default.
     floor = int(saved_params.get("extra", {}).get("min_train_tokens", DEFAULT_MIN_TRAIN_TOKENS))
     return {"dir": model_dir, "id": model_id, "preprocessing": preprocessing, "model": lda_model,
@@ -273,6 +274,8 @@ def document_vectors(df: pd.DataFrame, idx, bundle: dict, reused: dict,
             if vec is None:
                 result = predict_document(bundle["model"], bundle["dictionary"], tokens,
                                           chunk_words=bundle["preprocessing"]["chunk_words"],
+                                          chunk_weighting=bundle["preprocessing"].get(
+                                              "chunk_weighting", "all_tokens"),
                                           return_distribution=True, topic_labels=bundle["labels"])
                 vec = np.asarray(result[4]) if result[4] is not None else None
             if vec is not None:
