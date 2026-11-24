@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
 import tempfile
 from collections import Counter
@@ -90,7 +91,7 @@ from iwac_pipeline.processing.lda_topic_modeling.modeling import (  # type: igno
     HOLDOUT_METRIC_NOTE,
 )
 from iwac_pipeline.processing.lda_topic_modeling.artifacts import (  # noqa: E402
-    frozen_preprocessing, load_preprocessing, prediction_tokenizer_kwargs,
+    chunk_weighting, frozen_preprocessing, load_preprocessing, prediction_tokenizer_kwargs,
     publish_bundle, resolve_bundle, split_document_indices, digest_file, text_fingerprint,
     preprocessing_fingerprint, effective_model_identity,
 )
@@ -367,7 +368,13 @@ def prepare_training_corpus(texts, preprocessing, no_below, no_above, groups=Non
                                   groups=chunk_groups if by_source else None)
     if not len(dictionary):
         raise ValueError("Dictionary is empty after frequency filtering")
-    return chunks, phraser, dictionary, build_corpus(dictionary, chunks)
+    # A chunk left with no dictionary token is dropped, as in evaluation: an
+    # empty bag would still count in num_docs and the alpha="auto" update.
+    kept = [(chunk, bow) for chunk, bow in zip(chunks, build_corpus(dictionary, chunks)) if bow]
+    if not kept:
+        raise ValueError("No training chunk keeps a dictionary token")
+    chunks, corpus = (list(part) for part in zip(*kept))
+    return chunks, phraser, dictionary, corpus
 
 
 def prepare_evaluation(texts, groups, preprocessing, no_below, no_above, holdout):
@@ -788,6 +795,7 @@ def fit_and_publish(args, settings: RunSettings, docs: TrainingDocuments, prepro
         tid: get_topic_label(
             lda_model, tid, top_n=args.topic_label_words,
             lambda_relevance=lambda_relevance, word_probs=word_probs,
+            language=preprocessing["language"],
         ) for tid in range(lda_model.num_topics)
     }
     logger.info("Top topics:")
@@ -799,61 +807,66 @@ def fit_and_publish(args, settings: RunSettings, docs: TrainingDocuments, prepro
     # recovers p(w) for relevance labels without the training corpus.
     settings.model_root.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".fit-", dir=settings.model_root))
-    save_lda_model(lda_model, dictionary, staging, logger, phraser=phraser)
+    # A failed fit must not leave its staging directory beside the bundles.
+    try:
+        save_lda_model(lda_model, dictionary, staging, logger, phraser=phraser)
 
-    coherence_metrics = None
-    if not args.skip_coherence:
-        logger.info("Computing coherence metrics...")
-        coherence_metrics = compute_coherence(lda_model, tokenized_valid, dictionary, corpus, logger)
-        _display_coherence(coherence_metrics)
+        coherence_metrics = None
+        if not args.skip_coherence:
+            logger.info("Computing coherence metrics...")
+            coherence_metrics = compute_coherence(lda_model, tokenized_valid, dictionary, corpus, logger)
+            _display_coherence(coherence_metrics)
 
-    extra_info: dict = {
-        "config_name": settings.config_name,
-        "num_training_docs": len(docs.texts),
-        "num_training_chunks": len(tokenized_valid),
-        "dictionary_size": len(dictionary),
-        "chunk_words": settings.chunk_words,
-        "max_chunks_per_doc": settings.max_chunks_per_doc,
-        "phrase_min_docs": settings.phrase_min_docs,
-        "document_frequency_unit": f"source document ({args.holdout_group_column})",
-        "min_train_tokens": args.min_train_tokens,
-        "k_source": settings.k_source,
-        "language": settings.language,
-        "repo_id": settings.repo_id,
-        "source_revision": source_revision,
-        "training_document_ids": docs.ids,
-        "include_unknown_language": args.include_unknown_language,
-    }
-    if sweep is not None:
-        extra_info["topic_optimization"] = {
-            **_sweep_record(args, settings, sweep),
-            "method": "C_v coherence grid search (explicit --select-k-from-sweep)",
-            "best_k": settings.num_topics,
+        extra_info: dict = {
+            "config_name": settings.config_name,
+            "num_training_docs": len(docs.texts),
+            "num_training_chunks": len(tokenized_valid),
+            "dictionary_size": len(dictionary),
+            "chunk_words": settings.chunk_words,
+            "max_chunks_per_doc": settings.max_chunks_per_doc,
+            "phrase_min_docs": settings.phrase_min_docs,
+            "document_frequency_unit": f"source document ({args.holdout_group_column})",
+            "min_train_tokens": args.min_train_tokens,
+            "k_source": settings.k_source,
+            "language": settings.language,
+            "repo_id": settings.repo_id,
+            "source_revision": source_revision,
+            "training_document_ids": docs.ids,
+            "include_unknown_language": args.include_unknown_language,
         }
-    save_model_parameters(
-        staging,
-        num_topics=settings.num_topics,
-        passes=args.passes,
-        iterations=args.iterations,
-        chunksize=args.chunksize,
-        no_below=args.no_below,
-        no_above=args.no_above,
-        stopwords_used=sorted(stopwords),
-        coherence_metrics=coherence_metrics,
-        extra_info=extra_info,
-        logger=logger,
-        alpha="asymmetric" if args.workers and args.workers > 1 else "auto",
-        lambda_relevance=lambda_relevance,
-        evaluation={
-            "sweep_n_seeds": args.stability_seeds,
-            "holdout_fraction": args.holdout,
-            "performed": sweep is not None,
-            "split": sweep.evaluation_split if sweep is not None else None,
-        },
-        preprocessing=preprocessing,
-        topic_labels=topic_labels,
-    )
-    model_dir, model_id = publish_bundle(staging, settings.model_root)
+        if sweep is not None:
+            extra_info["topic_optimization"] = {
+                **_sweep_record(args, settings, sweep),
+                "method": "C_v coherence grid search (explicit --select-k-from-sweep)",
+                "best_k": settings.num_topics,
+            }
+        save_model_parameters(
+            staging,
+            num_topics=settings.num_topics,
+            passes=args.passes,
+            iterations=args.iterations,
+            chunksize=args.chunksize,
+            no_below=args.no_below,
+            no_above=args.no_above,
+            stopwords_used=sorted(stopwords),
+            coherence_metrics=coherence_metrics,
+            extra_info=extra_info,
+            logger=logger,
+            alpha="asymmetric" if args.workers and args.workers > 1 else "auto",
+            lambda_relevance=lambda_relevance,
+            evaluation={
+                "sweep_n_seeds": args.stability_seeds,
+                "holdout_fraction": args.holdout,
+                "performed": sweep is not None,
+                "split": sweep.evaluation_split if sweep is not None else None,
+            },
+            preprocessing=preprocessing,
+            topic_labels=topic_labels,
+        )
+        model_dir, model_id = publish_bundle(staging, settings.model_root)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     logger.info(f"Immutable model bundle: {model_id} ({model_dir})")
     return LoadedModel(lda_model, dictionary, phraser, topic_labels, word_probs, lambda_relevance,
                        preprocessing, model_dir, model_id, set(stopwords))
@@ -927,6 +940,7 @@ def predict_dataset(ds, args, settings: RunSettings, model: LoadedModel, logger)
             min_token_length=preprocessing["min_token_length"],
             custom_collocations=[tuple(c) for c in preprocessing["custom_collocations"]],
             fragment_stopwords=set(preprocessing["fragment_stopwords"]),
+            chunk_weighting=chunk_weighting(preprocessing),
             topic_labels=model.topic_labels,
             include_unknown_language=args.include_unknown_language,
             min_vocab_tokens=settings.min_predict_tokens,
@@ -1120,6 +1134,8 @@ def main() -> int:
         preprocessing = frozen_preprocessing(
             stopwords, settings.language, settings.chunk_words, settings.max_chunks_per_doc,
             phrase_min_docs=settings.phrase_min_docs,
+            # New fits weight chunks by in-vocabulary tokens (issue #43).
+            chunk_weighting="in_vocabulary_tokens",
         )
         docs = select_training_documents(ds, args, settings, logger)
         sweep = None

@@ -227,3 +227,49 @@ class TestTopicTableAndVersion:
         from lda_topic_modeling.modeling import pipeline_version
 
         assert pipeline_version() == metadata.version("iwac-hugging-face")
+
+
+class TestIssue42Tiers:
+    """English geography, the "new" tier and language-aware labels (issue #42)."""
+
+    def test_english_demonyms_are_geo_stopwords(self):
+        for language in ("Français", "Anglais"):
+            stop = modeling_stopwords(language)
+            for word in ("ivorian", "beninese", "togolese", "malian", "ghanaian",
+                         "nigerian", "nigérian", "ivory", "senegalese"):
+                assert word in stop, (language, word)
+
+    def test_new_heads_english_compounds_but_not_new_york(self):
+        assert "new" not in modeling_stopwords("Anglais")
+        assert "new" in FRAGMENT_STOPWORDS
+        assert "new_york" in JUNK_COMPOUND_STOPWORDS
+        assert drop_fragments(["new", "new_testament", "new_york", "coast", "gold_coast"]) == [
+            "new_testament", "gold_coast"]
+
+    def test_label_filter_honours_language_exemptions(self):
+        from types import SimpleNamespace
+
+        from lda_topic_modeling.modeling import get_topic_label
+
+        model = SimpleNamespace(show_topic=lambda t, topn: [("die", 0.5), ("islam", 0.3), ("ivorian", 0.2)])
+        assert "die" in get_topic_label(model, 0, top_n=3, language="Anglais")
+        assert "die" not in get_topic_label(model, 0, top_n=3, language="Français")
+        assert "die" not in get_topic_label(model, 0, top_n=3)  # no language: every set applies
+        assert "ivorian" not in get_topic_label(model, 0, top_n=3, language="Anglais")
+
+    def test_older_porto_novo_compounds_are_vetoed_in_labels(self):
+        assert _contains_artifact(_normalize_token("porto_novo_république"))
+        assert _contains_artifact(_normalize_token("marie_nathalie_leblanc"))
+
+    def test_collocations_are_reachable_after_ligature_folding(self):
+        from lda_topic_modeling.constants import CUSTOM_COLLOCATIONS
+
+        assert not any("œ" in word for pair in CUSTOM_COLLOCATIONS for word in pair)
+
+    def test_label_only_set_has_no_duplicates(self):
+        from lda_topic_modeling.constants import (
+            LABEL_ONLY_STOPWORDS, LDA_GENERIC_STOPWORDS, LDA_GEO_STOPWORDS,
+        )
+
+        others = DOMAIN_STOPWORDS | POST_PHRASE_STOPWORDS | LDA_GEO_STOPWORDS | LDA_GENERIC_STOPWORDS
+        assert LABEL_ONLY_STOPWORDS.isdisjoint(others)

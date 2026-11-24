@@ -41,14 +41,16 @@ def digest_file(path: Path) -> str:
 
 
 def frozen_preprocessing(stopwords, language, chunk_words, max_chunks_per_doc=None,
-                         phrase_min_docs=None) -> dict:
+                         phrase_min_docs=None, chunk_weighting=None) -> dict:
     """Settings that define a model's input transform.
 
     ``phrase_min_docs`` (source-document floor for learned compounds) is
     training-only — the pruned phrase models are saved — but it shapes the
     model, so it is recorded and bumps the settings to version 2. Like the
     chunk cap, it is recorded only when given, so reconstructed legacy
-    settings keep their earlier fingerprint.
+    settings keep their earlier fingerprint. ``chunk_weighting`` (how chunk
+    distributions are averaged at inference) likewise: absent means the
+    legacy ``all_tokens`` weighting, so existing bundles infer as before.
     """
     settings = {
         "version": 1, "stopwords": sorted(stopwords),
@@ -68,7 +70,14 @@ def frozen_preprocessing(stopwords, language, chunk_words, max_chunks_per_doc=No
         settings["phrase_min_docs"] = int(phrase_min_docs)
         # v2 fits count dictionary document frequency per source document.
         settings["document_frequency_unit"] = "source_document"
+    if chunk_weighting is not None:
+        settings["chunk_weighting"] = chunk_weighting
     return settings
+
+
+def chunk_weighting(preprocessing: dict) -> str:
+    """The bundle's inference weighting; legacy bundles weight by all tokens."""
+    return preprocessing.get("chunk_weighting", "all_tokens")
 
 
 def prediction_tokenizer_kwargs(preprocessing: dict) -> dict:

@@ -9,9 +9,14 @@ JSON-serializable value — ``lemmatize_update_hf.py`` caches string pairs
 through them, the embedding scripts cache float vectors (as lists on disk;
 callers convert to ``float32`` arrays on restore).
 
-Note on stored embeddings: vectors are cached and pushed to the Hub RAW,
-NOT L2-normalized. Consumers computing cosine similarity must normalize at
-read time (``related_articles.py`` does).
+Note on stored embeddings: single-chunk text vectors and image vectors are
+unit-norm (the encoder L2-normalizes, ``_gemma_encoder``). A multi-chunk
+document is the length-weighted mean of its unit chunk vectors and is NOT
+re-normalized, so its norm is below 1 (two orthogonal chunks pool to 0.707).
+Consumers computing cosine similarity must normalize at read time
+(``related_articles.py`` does); an inner product would penalise long
+documents. Whether to normalize pooled vectors is left to the next full
+re-embed, since it changes every multi-chunk vector (issue #40).
 """
 
 from __future__ import annotations
