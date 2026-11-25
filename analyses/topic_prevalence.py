@@ -6,9 +6,16 @@ topic_prevalence.py
 Probability-weighted LDA topic prevalence over time.
 
 Instead of counting dominant topics (noisy: a 0.34/0.33/0.33 article counts
-fully for one topic), this loads the saved LDA model from ``lda_model/``,
-computes the *full* topic distribution for every French article, and
-aggregates mean topic probability per year and per year x country.
+fully for one topic), this loads the subset's saved LDA bundle, computes the
+*full* topic distribution for every eligible document, and aggregates mean
+topic probability per year and per year x country.
+
+Model choice: ``--model-path`` defaults to the ``--config`` subset's
+``CONFIG_PRESETS`` model (``--language`` picks the per-language model, e.g.
+``--config references --language Anglais``). The bundle's recorded training
+subset and language must match the request; a mismatch aborts unless
+``--allow-cross-corpus-model`` is given, and the comparison is recorded in the
+summary and run manifest either way (``model_training_match``).
 
 Outputs (written to analyses/output/):
 - topic_prevalence_year.csv          year, topic_id, label, prevalence,
@@ -88,7 +95,7 @@ try:
     from iwac_pipeline.processing.lda_topic_modeling.modeling import (
         count_vocab_tokens, get_topic_label, load_lda_model, tokenize_for_prediction, predict_document,
     )
-    from iwac_pipeline.processing.lda_topic_modeling.constants import DEFAULT_MIN_TRAIN_TOKENS
+    from iwac_pipeline.processing.lda_topic_modeling.constants import DEFAULT_MIN_TRAIN_TOKENS, resolve_preset
     from iwac_pipeline.processing.lda_topic_modeling.artifacts import (
         resolve_bundle, load_preprocessing, prediction_tokenizer_kwargs, text_fingerprint,
         preprocessing_fingerprint, effective_model_identity,
@@ -109,7 +116,7 @@ except ModuleNotFoundError as exc:
     from lda_topic_modeling.modeling import (  # noqa: E402
         count_vocab_tokens, get_topic_label, load_lda_model, tokenize_for_prediction, predict_document,
     )
-    from lda_topic_modeling.constants import DEFAULT_MIN_TRAIN_TOKENS  # noqa: E402
+    from lda_topic_modeling.constants import DEFAULT_MIN_TRAIN_TOKENS, resolve_preset  # noqa: E402
     from lda_topic_modeling.artifacts import (  # noqa: E402
         resolve_bundle, load_preprocessing, prediction_tokenizer_kwargs, text_fingerprint,
         preprocessing_fingerprint, effective_model_identity,
@@ -171,7 +178,15 @@ def eligible_years(values):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Probability-weighted topic prevalence over time.")
     add_input_args(parser, source_default="hub", output_dir=OUTPUT_DIR, cohort=True, seed=True)
-    parser.add_argument("--model-path", default=str(workspace_root() / "lda_model"))
+    parser.add_argument("--model-path", default=None,
+                        help="LDA model root or bundle (default: the --config subset's preset model "
+                             "for --language, as the LDA stage resolves it)")
+    parser.add_argument("--language", default=None,
+                        help="Model language for subsets with one model per language (references: "
+                             "'Français' or 'Anglais'). Default: the subset preset's language")
+    parser.add_argument("--allow-cross-corpus-model", action="store_true",
+                        help="Deliberately apply a bundle trained on another subset or language; "
+                             "recorded in the summary and run manifest")
     parser.add_argument("--theta-path", help="Reuse a verified doc_topics.parquet export; infer only missing rows")
     parser.add_argument("--allow-legacy-preprocessing", action="store_true")
     parser.add_argument("--include-unknown-language", action="store_true")
@@ -196,6 +211,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def default_model_path(config: str, language: str | None = None) -> tuple[Path, str]:
+    """``(model root, language)`` the LDA stage uses for this subset and language."""
+    language, preset = resolve_preset(config, language)
+    return workspace_root() / preset.get("model_path", "lda_model"), language
+
+
+def training_match(bundle: dict, config: str, language: str) -> dict:
+    """Compare the bundle's recorded training subset/language with the request.
+
+    A field the bundle does not record counts as a mismatch: the check fails
+    closed rather than trusting an unlabelled model.
+    """
+    trained = {"config_name": bundle.get("trained_config"), "language": bundle.get("trained_language")}
+    requested = {"config_name": config, "language": language}
+    mismatched = sorted(k for k in trained if trained[k] != requested[k])
+    return {"trained": trained, "requested": requested, "mismatched_fields": mismatched}
+
+
+def check_training_match(bundle: dict, config: str, language: str, *, allow_cross_corpus: bool) -> dict:
+    """Abort on a subset/language mismatch unless cross-corpus use is explicit."""
+    match = training_match(bundle, config, language)
+    match["cross_corpus_allowed"] = bool(allow_cross_corpus)
+    if match["mismatched_fields"] and not allow_cross_corpus:
+        raise SystemExit(
+            f"LDA bundle {bundle['id']} was trained on config={match['trained']['config_name']!r}, "
+            f"language={match['trained']['language']!r}; this run requests config={config!r}, "
+            f"language={language!r}. Its topics do not describe these documents' lda_topic_id. "
+            "Omit --model-path to use the subset's own model, or pass --allow-cross-corpus-model "
+            "to apply it deliberately (recorded in the run manifest)."
+        )
+    return match
+
+
 def load_bundle(model_path, *, allow_legacy: bool) -> dict:
     model_dir, model_id = resolve_bundle(Path(model_path))
     preprocessing, saved_params = load_preprocessing(model_dir, allow_legacy=allow_legacy)
@@ -206,10 +254,12 @@ def load_bundle(model_path, *, allow_legacy: bool) -> dict:
     labels = {tid: saved_labels.get(str(tid), get_topic_label(lda_model, tid, language=preprocessing["language"]))
               for tid in range(n_topics)}
     # Models fitted before the floor was recorded all used the default.
-    floor = int(saved_params.get("extra", {}).get("min_train_tokens", DEFAULT_MIN_TRAIN_TOKENS))
+    extra = saved_params.get("extra", {})
+    floor = int(extra.get("min_train_tokens", DEFAULT_MIN_TRAIN_TOKENS))
     return {"dir": model_dir, "id": model_id, "preprocessing": preprocessing, "model": lda_model,
             "dictionary": dictionary, "phraser": phraser, "n_topics": n_topics, "labels": labels,
-            "min_vocab_tokens": floor}
+            "min_vocab_tokens": floor, "trained_config": extra.get("config_name"),
+            "trained_language": extra.get("language", preprocessing.get("language"))}
 
 
 def eligibility(df: pd.DataFrame, language: str, args) -> tuple[pd.Series, pd.Series, dict]:
@@ -449,7 +499,14 @@ def main() -> None:
         border_style="cyan",
     ))
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    bundle = load_bundle(args.model_path, allow_legacy=args.allow_legacy_preprocessing)
+    default_path, language = default_model_path(args.config, args.language)
+    model_path = Path(args.model_path) if args.model_path else default_path
+    bundle = load_bundle(model_path, allow_legacy=args.allow_legacy_preprocessing)
+    training = check_training_match(bundle, args.config, language,
+                                    allow_cross_corpus=args.allow_cross_corpus_model)
+    if training["mismatched_fields"]:
+        console.print(f"[yellow]⚠[/yellow] Cross-corpus model (explicit): trained on "
+                      f"{training['trained']}, applied to {training['requested']}")
     preprocessing, n_topics = bundle["preprocessing"], bundle["n_topics"]
 
     loaded = load_input(args, loader=load_subset_dataframe, columns=[
@@ -501,6 +558,7 @@ def main() -> None:
     summary = {
         "model_dir": str(bundle["dir"]),
         "model_id": bundle["id"],
+        "model_training_match": training,
         "estimand": "Mean topic probability among eligible archived documents, conditional on the fitted model",
         "uncertainty": "Conditional resampling; excludes archive selection, OCR and fitted-model uncertainty",
         "bootstrap_unit": args.bootstrap_unit,
@@ -535,6 +593,7 @@ def main() -> None:
                  {"year": prev_year, "year_country": prev_yc, "topic_labels.csv": labels_df}, summary,
                  writer=write_run_manifest, inputs={
                      "model_dir": str(bundle["dir"]), "model_id": bundle["id"],
+                     "model_training_match": training,
                      "preprocessing_sha256": preprocessing_fingerprint(preprocessing),
                      "theta_sha256": sha256(Path(args.theta_path)) if args.theta_path else None,
                      "training_parameters": json.loads(params.read_text(encoding="utf-8")) if params.exists() else None,

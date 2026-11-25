@@ -701,3 +701,16 @@ CONFIG_PRESETS: dict[str, dict] = {
         },
     },
 }
+
+
+def resolve_preset(config_name: str, language: str | None = None) -> tuple[str, dict]:
+    """``(language, preset)`` for a subset, with that language's overrides folded in.
+
+    The language defaults to the preset's own, else ``"Français"``. Shared by
+    the LDA stage and the analyses that load its bundles, so both resolve the
+    same model directory for a given subset and language.
+    """
+    preset = CONFIG_PRESETS.get(config_name, {})
+    language = language or preset.get("language", "Français")
+    merged = {**preset, **preset.get("language_overrides", {}).get(language, {})}
+    return language, merged

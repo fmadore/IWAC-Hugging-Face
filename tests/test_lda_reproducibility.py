@@ -361,3 +361,73 @@ def test_prevalence_dates_do_not_guess_ambiguous_years():
     assert years.iloc[:4].isna().all()
     assert years.iloc[4:].tolist() == [2000, 2000]
     assert precision.iloc[0] == "range"
+
+
+# ── Prevalence model selection (issue #61) ─────────────────────────
+
+
+def test_prevalence_default_model_follows_subset_preset(tmp_path, monkeypatch):
+    monkeypatch.setattr(prevalence, "workspace_root", lambda: tmp_path)
+    assert prevalence.default_model_path("articles") == (tmp_path / "lda_model", "Français")
+    assert prevalence.default_model_path("publications") == (tmp_path / "lda_model_publications", "Français")
+    assert prevalence.default_model_path("references") == (tmp_path / "lda_model_references", "Français")
+    assert prevalence.default_model_path("references", "Anglais") == (tmp_path / "lda_model_references_en", "Anglais")
+
+
+def test_prevalence_training_check_fails_closed():
+    bundle = {"id": "lda-sha256:x", "trained_config": "articles", "trained_language": "Français"}
+    assert prevalence.check_training_match(bundle, "articles", "Français",
+                                           allow_cross_corpus=False)["mismatched_fields"] == []
+    with pytest.raises(SystemExit, match="allow-cross-corpus-model"):
+        prevalence.check_training_match(bundle, "publications", "Français", allow_cross_corpus=False)
+    with pytest.raises(SystemExit, match="language"):
+        prevalence.check_training_match({**bundle, "trained_config": "references"}, "references", "Anglais",
+                                        allow_cross_corpus=False)
+    # A bundle that records no training subset is not trusted.
+    with pytest.raises(SystemExit):
+        prevalence.check_training_match({**bundle, "trained_config": None}, "articles", "Français",
+                                        allow_cross_corpus=False)
+    allowed = prevalence.check_training_match(bundle, "publications", "Français", allow_cross_corpus=True)
+    assert allowed["mismatched_fields"] == ["config_name"] and allowed["cross_corpus_allowed"]
+
+
+def _prevalence_cli(state, tmp_path, monkeypatch, *argv):
+    frame = state["dataset"].to_pandas()
+    frame.attrs["iwac_source_revision"] = "test-source-revision"
+    manifests = []
+    monkeypatch.setattr(prevalence, "load_subset_dataframe", lambda *a, **kw: frame)
+    monkeypatch.setattr(prevalence, "write_run_manifest", lambda *a, **kw: manifests.append(kw))
+    monkeypatch.setattr(sys, "argv", [
+        "prevalence", "--repo", "test/repo", "--source", "csv", "--bootstrap", "0",
+        "--min-docs-year", "1", "--output-dir", str(tmp_path / "results"), *argv,
+    ])
+    prevalence.main()
+    summary = json.loads((tmp_path / "results" / "topic_prevalence_summary.json").read_text(encoding="utf-8"))
+    return summary, manifests[-1]["inputs"]
+
+
+def test_prevalence_resolves_the_periodical_bundle_by_default(fitted_model, tmp_path, monkeypatch):
+    press_root, state = fitted_model
+    workspace = tmp_path / "workspace"
+    periodical_root = workspace / "lda_model_publications"
+    monkeypatch.setattr(sys, "argv", [
+        "lda", "--repo", "test/repo", "--config", "publications", "--mode", "fit", "--yes",
+        "--model-path", str(periodical_root), "--num-topics", "2", "--passes", "1", "--iterations", "20",
+        "--no-below", "1", "--no-above", "1.0", "--skip-coherence", "--holdout", "0",
+    ])
+    assert cli.main() == 0
+    periodical_dir, periodical_id = resolve_bundle(periodical_root)
+    monkeypatch.setattr(prevalence, "workspace_root", lambda: workspace)
+    summary, inputs = _prevalence_cli(state, tmp_path, monkeypatch, "--config", "publications")
+    assert summary["model_id"] == periodical_id and summary["model_dir"] == str(periodical_dir)
+    assert summary["model_training_match"]["trained"] == {"config_name": "publications", "language": "Français"}
+    assert inputs["model_training_match"]["mismatched_fields"] == []
+    # The press bundle passed explicitly is refused for the periodicals...
+    with pytest.raises(SystemExit, match="trained on config='articles'"):
+        _prevalence_cli(state, tmp_path, monkeypatch, "--config", "publications", "--model-path", str(press_root))
+    # ...unless cross-corpus use is explicit, which the manifest records.
+    summary, inputs = _prevalence_cli(state, tmp_path, monkeypatch, "--config", "publications",
+                                      "--model-path", str(press_root), "--allow-cross-corpus-model")
+    assert inputs["model_training_match"]["cross_corpus_allowed"] is True
+    assert inputs["model_training_match"]["mismatched_fields"] == ["config_name"]
+    assert inputs["model_training_match"]["trained"]["config_name"] == "articles"

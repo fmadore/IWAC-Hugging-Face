@@ -111,6 +111,12 @@ iwac-analyze topics --model-path lda_model \
   --theta-path lda_model/predictions/<run>/doc_topics.parquet
 ```
 
+Without `--model-path`, prevalence loads the `--config` subset's preset model
+(`--language Anglais` for the English references model), as the LDA stage
+resolves it. A bundle whose recorded training subset or language differs from
+the request is refused; `--allow-cross-corpus-model` applies it deliberately
+and the comparison is recorded in the summary and run manifest.
+
 Reuse checks the model identity, dataset repository/configuration, file hash,
 document IDs, text hashes and distribution values. A changed dataset revision
 is acceptable only insofar as those item inputs still match; newly eligible

@@ -67,7 +67,7 @@ from iwac_pipeline.processing._common import (  # type: ignore  # noqa: E402
 )
 
 from iwac_pipeline.processing.lda_topic_modeling.constants import (  # type: ignore
-    CONFIG_PRESETS,
+    resolve_preset,
     modeling_stopwords,
     DEFAULT_MIN_TRAIN_TOKENS,
     DEFAULT_PHRASE_MIN_DOCS,
@@ -502,13 +502,11 @@ def validate_args(args) -> None:
 
 
 def resolve_settings(args, config_name: str, mode: str, logger) -> RunSettings:
-    preset = CONFIG_PRESETS.get(config_name, {})
-    language: str = args.language or preset.get("language", "Français")
     # One config can serve several languages from separate models, so fold
     # this language's overrides in before anything else reads the preset —
     # notably model_path, which otherwise defaults to the other language's
     # model and overwrites it.
-    preset = {**preset, **preset.get("language_overrides", {}).get(language, {})}
+    language, preset = resolve_preset(config_name, args.language)
     model_root = Path(args.model_path) if args.model_path else workspace_root() / preset.get("model_path", "lda_model")
     if mode == "fit" and (model_root / "bundle.json").exists():
         raise ValueError("Fit requires a model root, not an immutable bundle directory")
