@@ -95,7 +95,7 @@ try:
     from iwac_pipeline.processing.lda_topic_modeling.modeling import (
         count_vocab_tokens, get_topic_label, load_lda_model, tokenize_for_prediction, predict_document,
     )
-    from iwac_pipeline.processing.lda_topic_modeling.constants import DEFAULT_MIN_TRAIN_TOKENS, resolve_preset
+    from iwac_pipeline.processing.lda_topic_modeling.constants import DEFAULT_MIN_TRAIN_TOKENS, resolve_preset, topic_model_exclusions
     from iwac_pipeline.processing.lda_topic_modeling.artifacts import (
         resolve_bundle, load_preprocessing, prediction_tokenizer_kwargs, text_fingerprint,
         preprocessing_fingerprint, effective_model_identity,
@@ -116,7 +116,7 @@ except ModuleNotFoundError as exc:
     from lda_topic_modeling.modeling import (  # noqa: E402
         count_vocab_tokens, get_topic_label, load_lda_model, tokenize_for_prediction, predict_document,
     )
-    from lda_topic_modeling.constants import DEFAULT_MIN_TRAIN_TOKENS, resolve_preset  # noqa: E402
+    from lda_topic_modeling.constants import DEFAULT_MIN_TRAIN_TOKENS, resolve_preset, topic_model_exclusions  # noqa: E402
     from lda_topic_modeling.artifacts import (  # noqa: E402
         resolve_bundle, load_preprocessing, prediction_tokenizer_kwargs, text_fingerprint,
         preprocessing_fingerprint, effective_model_identity,
@@ -263,18 +263,26 @@ def load_bundle(model_path, *, allow_legacy: bool) -> dict:
 
 
 def eligibility(df: pd.DataFrame, language: str, args) -> tuple[pd.Series, pd.Series, dict]:
-    """``(mask, years, counts)`` for model language, nonblank text and a point year in window."""
+    """``(mask, years, counts)`` for model language, nonblank text and a point year in window.
+
+    Rows in the subset's reviewed topic-model exclusion registry are left
+    out and counted, as the LDA stage leaves their ``lda_topic_id`` null.
+    """
     years, precision = eligible_years(df["pub_date"])
     language_ok = language_mask(df["language"], language, include_unknown=args.include_unknown_language)
     has_text = df["lemma_nostop"].astype("string").fillna("").str.strip().ne("")
     valid_year = in_window(years, args.year_min, args.year_max)
-    mask = language_ok & has_text & valid_year
+    registry = set(topic_model_exclusions(getattr(args, "config", "") or ""))
+    excluded = (df["o:id"].astype(str).isin(registry) if "o:id" in df
+                else pd.Series(False, index=df.index))
+    mask = language_ok & has_text & valid_year & ~excluded
     counts = {"docs_loaded": int(len(df)), "docs_eligible": int(mask.sum()),
               "dates": date_exclusions(precision),
               "docs_outside_year_window": int((years.notna() & ~valid_year).sum()),
               "docs_excluded_language": int((~language_ok).sum()),
               "excluded_language_labels": excluded_language_counts(df["language"], language_ok),
-              "docs_without_text": int((language_ok & ~has_text).sum())}
+              "docs_without_text": int((language_ok & ~has_text).sum()),
+              "docs_excluded_by_registry": int((language_ok & has_text & valid_year & excluded).sum())}
     return mask, years, counts
 
 

@@ -90,6 +90,30 @@ but keeps `lda_model_name`, so a reader can tell "assessed, too little
 evidence" from "not processed". The theta export records `n_vocab_tokens` and
 `below_min_evidence` for every document.
 
+## Reviewed exclusions
+
+`TOPIC_MODEL_EXCLUSIONS` in `constants.py` lists, per subset and `o:id`, rows
+that stay in the dataset (public where they are public) but never enter topic
+modelling, each with its reviewed reason. A fit drops them before phrase
+detection and dictionary building and records the applied list as
+`topic_model_exclusions` in `training_parameters.json`. Prediction applies the
+registry from current code whatever bundle it loads: an excluded row gets null
+topic columns but keeps `lda_model_name`, like a row below the evidence floor,
+and carries no theta (the export metadata lists `excluded_document_ids`).
+`iwac-analyze topics` leaves the same rows out and counts them
+(`docs_excluded_by_registry`).
+
+The list is deliberately not part of the frozen preprocessing: it selects rows
+rather than transforming text, so existing bundles keep their identity and
+their theta exports stay reusable, and a bundle fitted before an entry was added
+still nulls that row at its next prediction.
+
+Eight `publications` rows are excluded: the Islam Info issues 23757, 24190,
+24233, 24234, 24635, 25286, 25287 and 25289. Their text is mostly tabular lists
+of pilgrims' names, which formed a spurious name-list topic (topic 18 of the
+periodical bundle fitted before the exclusion). They must stay excluded unless
+the lists are removed from their text.
+
 Coherence is a diagnostic, not a universal quality grade. Inspect seed
 stability, alternative preprocessing, representative documents and borderline
 assignments before interpreting a topic historically. These checks do not

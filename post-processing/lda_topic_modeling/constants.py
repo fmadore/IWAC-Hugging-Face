@@ -714,3 +714,35 @@ def resolve_preset(config_name: str, language: str | None = None) -> tuple[str, 
     language = language or preset.get("language", "Français")
     merged = {**preset, **preset.get("language_overrides", {}).get(language, {})}
     return language, merged
+
+
+# ── Topic-model exclusions (reviewed) ──────────────────────────────
+# Rows that stay in the dataset (and public, where they are) but must never
+# enter topic modelling, keyed by subset and o:id (as a string), each with the
+# reviewed reason. An excluded row is dropped from training before phrase
+# detection and dictionary building, and at prediction it gets null topic
+# columns while keeping lda_model_name, the shape the --min-predict-tokens
+# evidence floor gives a row the model declined.
+#
+# The registry is applied at prediction from current code, whatever bundle is
+# loaded, so an older bundle (trained with these rows in) still nulls them; a
+# fit records the exclusions it applied in training_parameters.json.
+#
+# Add an entry only after reading the item; remove one only when the reason no
+# longer holds (for the Islam Info issues: once the lists are removed from
+# their text).
+_PILGRIM_LISTS = (
+    "Islam Info issue whose text is mostly tabular lists of pilgrims' names; "
+    "these lists form a spurious name-list topic (topic 18 of periodical bundle lda-sha256:bd68e625...)"
+)
+TOPIC_MODEL_EXCLUSIONS: dict[str, dict[str, str]] = {
+    "publications": {
+        oid: _PILGRIM_LISTS
+        for oid in ("23757", "24190", "24233", "24234", "24635", "25286", "25287", "25289")
+    },
+}
+
+
+def topic_model_exclusions(config_name: str) -> dict[str, str]:
+    """``{o:id: reason}`` excluded from topic modelling for this subset."""
+    return dict(TOPIC_MODEL_EXCLUSIONS.get(config_name, {}))
