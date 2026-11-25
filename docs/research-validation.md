@@ -175,7 +175,8 @@ connected component of the label edges alone, the pairs whose Jaccard reaches
 The whole top-k neighbour graph cannot serve: thematic neighbours chain it into
 a single component (measured 2026-11-24 on `articles`: 130,193 pairs, one
 component), which left one half empty. Linked on the label instead, the same
-pairs form 626 families of at most 7 items (median 2). Families are dealt to
+pairs form 626 families of at most 7 items (median 2); 627 on the 2026-11-25
+run below. Families are dealt to
 the halves in hashed order, each to the half with fewer positive pairs so far,
 so the positives stay balanced; an item in no family takes a side from the hash
 of its own id. A pair whose two items fall on different sides is excluded from
@@ -191,9 +192,29 @@ cutoff, were chosen in 2026-10 on the EmbeddingGemma 2 article vectors by an
 earlier version of this command that split individual pairs. That split let a
 family sit on both halves, so the recall and precision it reported for those
 thresholds were optimistic and are not quoted here. The component split that
-replaced it (version 2) never produced held-out figures on the real corpus. **Re-run the calibration
-before citing a figure for either threshold**; the thresholds stay the defaults
-until then.
+replaced it (version 2) never produced held-out figures on the real corpus.
+
+The first family-split run (2026-11-25, `articles`, private revision
+`94d357461d2da01d9cfc24667206b3cc7d7ceda3`, code `92a553a`, 130,193 scored
+pairs, 1,096 lexical duplicates at Jaccard ≥ 0.45) dealt 298 families to the
+calibration half and 329 to the held-out half, 548 positive pairs each, and
+excluded 64,969 straddling pairs. On the calibration half it chose 0.91 for the
+prefilter and 0.965 for the near-duplicate cutoff. On the held-out half, with
+95% bootstrap intervals over 7,010 units:
+
+| Threshold | Selected | Precision | Recall |
+|---|---|---|---|
+| 0.91 (prefilter) | 4,192 | 0.127 (0.113–0.144) | 0.974 (0.956–0.991) |
+| 0.965 (near-duplicate) | 436 | 0.904 (0.870–0.932) | 0.719 (0.661–0.776) |
+
+The prefilter default is confirmed. The near-duplicate default stays 0.97,
+0.005 above the chosen cutoff: changing it changes the `related_articles`
+configuration hash and so needs a re-run of that stage, and the held-out
+figures were reported for 0.965, not 0.97. No held-out figure exists for 0.97
+itself; the pooled curve (`similarity_calibration_curve.csv`, both halves,
+not held out) gives 0.936 precision and 0.664 recall there, so quote it only as
+pooled. These figures describe agreement with the lexical label, not adjudicated
+reprints; adjudicate pairs before citing reprint counts.
 The label is a lexical proxy over top-k neighbours, not an adjudicated reprint. Semantic similarity without
 lexical overlap suggests shared subject matter, not necessarily copying. OCR errors,
 abridgments, translations and boilerplate can respectively hide or create matches.

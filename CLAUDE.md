@@ -199,8 +199,9 @@ to its config hash) and downstream reprint/related tools. Both defaults came
 from a per-pair split that leaked reprint families across halves; the
 calibration now splits by lexical reprint family into item-disjoint halves
 (the whole neighbour graph is one component, so splitting on it held nothing
-out), and its figures for them are pending a re-run; do not quote the old
-recall/precision. The image resize must stay the Pillow path in
+out); do not quote the old recall/precision. Its first run (2026-11-25)
+confirmed 0.91 and chose 0.965 for the near-duplicate cutoff; 0.97 was kept
+(see `docs/research-validation.md` for the held-out figures and why). The image resize must stay the Pillow path in
 `image_patches`: transformers.js resizes differently (cosine down to 0.92
 against the reference). Consumers embed queries as
 `task: search result | query: {q}` (`_gemma_encoder.QUERY_PREFIX`). On a CPU a
