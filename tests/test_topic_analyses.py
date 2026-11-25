@@ -40,9 +40,67 @@ def test_range_dates_leave_the_over_time_table():
 
 def test_console_ranking_is_sorted_by_scored_rows():
     summary = pd.DataFrame({"lda_model_name": ["m", "m", "m"], "lda_topic_id": [0, 1, 2],
-                            "n_polarity_scored": [60, 300, 120]})
+                            "n_consensus_max": [60, 300, 120]})
     assert ts.ranked_topics(summary, 50)["lda_topic_id"].tolist() == [1, 2, 0]
     assert ts.ranked_topics(summary, 100)["lda_topic_id"].tolist() == [1, 2]
+
+
+def coverage_frame():
+    """Topic 0: six rows, four with a centrality consensus (two of them central),
+    two single-rater rows; polarity "Non applicable" throughout (issue #46)."""
+    models = list(generation(2))
+    rows = pd.DataFrame({"lda_model_name": ["lda-sha256:a"] * 6, "lda_topic_id": [0] * 6,
+                         "lda_topic_label": ["A"] * 6, "country": ["Bénin"] * 6, "pub_date": ["2000"] * 6})
+    centrality = ["Central", "Très central", "Marginal", "Marginal", None, None]
+    subjectivity = [2, 2, 4, 4, None, None]
+    for index, model in enumerate(models):
+        first = index == 0
+        rows[model.column("polarite")] = ["Non applicable"] * 4 + (["Non applicable"] * 2 if first else [None] * 2)
+        rows[model.column("centralite_islam_musulmans")] = [
+            c if c is not None else ("Central" if first else None) for c in centrality]
+        rows[model.subjectivite_column] = [s if s is not None else (5 if first else None) for s in subjectivity]
+    return rows
+
+
+def test_centrality_and_subjectivity_have_of_scored_denominators():
+    summary = ts.summarize_cells(ts.prepare_articles(coverage_frame(), 2), []).iloc[0]
+    assert summary["n"] == 6
+    assert summary["n_centrality_scored"] == 4 and summary["n_subjectivity_scored"] == 4
+    assert summary["central_share"] == pytest.approx(2 / 6)
+    assert summary["central_share_of_scored"] == pytest.approx(0.5)
+    assert summary["share_centrality_marginal"] == pytest.approx(2 / 6)
+    assert summary["share_centrality_marginal_of_scored"] == pytest.approx(0.5)
+    assert summary["share_subjectivity_2"] == pytest.approx(2 / 6)
+    assert summary["share_subjectivity_2_of_scored"] == pytest.approx(0.5)
+    # Naming: polarity consensus includes "Non applicable"; the ordinal count does not.
+    assert summary["n_polarity_consensus"] == summary["n_scored"] == 4
+    assert summary["n_polarity_scored"] == 0
+    assert summary["n_consensus_max"] == 4
+
+
+def test_of_scored_shares_are_null_without_a_consensus():
+    frame = coverage_frame().iloc[4:]
+    summary = ts.summarize_cells(ts.prepare_articles(frame, 2), []).iloc[0]
+    assert summary["n_centrality_scored"] == 0
+    assert summary["central_share_of_scored"] is None
+    assert summary["share_subjectivity_5_of_scored"] is None
+
+
+def test_non_applicable_topics_stay_in_country_year_and_ranking_tables(tmp_path, monkeypatch):
+    frame = coverage_frame()
+    frame["o:id"] = [str(i) for i in range(len(frame))]
+    frame.attrs["iwac_source_revision"] = "test-revision"
+    monkeypatch.setattr(ts, "load_subset_dataframe", lambda *a, **kw: frame)
+    monkeypatch.setattr(ts, "write_run_manifest", lambda *a, **kw: None)
+    monkeypatch.setattr("sys.argv", ["topic_sentiment.py", "--source", "csv", "--output-dir", str(tmp_path),
+                                     "--min-topic-n", "4", "--min-cell-n", "4", "--min-year-n", "4"])
+    ts.main()
+    for name in ("topic_sentiment_by_country.csv", "topic_sentiment_over_time.csv"):
+        table = pd.read_csv(tmp_path / name)
+        # No ordinal polarity at all, yet the topic is well covered: it stays.
+        assert table["n_polarity_scored"].tolist() == [0] and table["n_consensus_max"].tolist() == [4]
+    summary = pd.read_csv(tmp_path / "topic_sentiment_summary.csv")
+    assert len(ts.ranked_topics(summary, 4)) == 1
 
 
 def test_direct_standardisation_fixes_country_weights():

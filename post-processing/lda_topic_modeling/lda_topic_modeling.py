@@ -67,7 +67,8 @@ from iwac_pipeline.processing._common import (  # type: ignore  # noqa: E402
 )
 
 from iwac_pipeline.processing.lda_topic_modeling.constants import (  # type: ignore
-    CONFIG_PRESETS,
+    resolve_preset,
+    topic_model_exclusions,
     modeling_stopwords,
     DEFAULT_MIN_TRAIN_TOKENS,
     DEFAULT_PHRASE_MIN_DOCS,
@@ -297,7 +298,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def _export_theta(ds, theta_col, model_dir, model_name, num_topics, language, logger,
                   source_revision=None, repo_id=None, config_name=None, preprocessing=None,
-                  evidence_col=None, min_vocab_tokens=None):
+                  evidence_col=None, min_vocab_tokens=None, excluded_ids=None):
     """Write the full document-topic matrix (theta) for rows this pass
     computed to ``doc_topics.parquet`` in *model_dir* (the prediction run
     directory, ``<model root>/predictions/<timestamp>/``) so downstream
@@ -337,6 +338,8 @@ def _export_theta(ds, theta_col, model_dir, model_name, num_topics, language, lo
         "preprocessing_sha256": preprocessing_fingerprint(preprocessing) if preprocessing is not None else None,
         "min_vocab_tokens": min_vocab_tokens,
         "n_below_min_evidence": int(sum(r["below_min_evidence"] for r in rows)),
+        # Registry rows carry no theta; listed so a reader can tell them apart.
+        "excluded_document_ids": sorted(excluded_ids or ()),
     }, indent=2) + "\n", encoding="utf-8")
     logger.info(f"Exported document-topic matrix: {out_path} ({len(rows)} docs this pass)")
 
@@ -449,6 +452,8 @@ class RunSettings:
     range_step: int
     lambda_relevance: float | None
     min_predict_tokens: int
+    # Reviewed topic-model exclusions {o:id: reason}, from current code.
+    exclusions: dict = field(default_factory=dict)
     model_id: str | None = None
     saved_preprocessing: dict | None = None
     saved_params: dict | None = None
@@ -502,13 +507,11 @@ def validate_args(args) -> None:
 
 
 def resolve_settings(args, config_name: str, mode: str, logger) -> RunSettings:
-    preset = CONFIG_PRESETS.get(config_name, {})
-    language: str = args.language or preset.get("language", "Français")
     # One config can serve several languages from separate models, so fold
     # this language's overrides in before anything else reads the preset —
     # notably model_path, which otherwise defaults to the other language's
     # model and overwrites it.
-    preset = {**preset, **preset.get("language_overrides", {}).get(language, {})}
+    language, preset = resolve_preset(config_name, args.language)
     model_root = Path(args.model_path) if args.model_path else workspace_root() / preset.get("model_path", "lda_model")
     if mode == "fit" and (model_root / "bundle.json").exists():
         raise ValueError("Fit requires a model root, not an immutable bundle directory")
@@ -555,6 +558,7 @@ def resolve_settings(args, config_name: str, mode: str, logger) -> RunSettings:
         # LDAvis-style relevance weight for labels (None = pure probability).
         lambda_relevance=None if args.no_relevance_labels else DEFAULT_LAMBDA_RELEVANCE,
         min_predict_tokens=args.min_predict_tokens if args.min_predict_tokens is not None else args.min_train_tokens,
+        exclusions=topic_model_exclusions(config_name),
     )
     if mode == "predict":
         _apply_frozen_settings(settings, args)
@@ -693,9 +697,14 @@ def select_training_documents(ds, args, settings: RunSettings, logger) -> Traini
     view = ds.select_columns(columns)
     languages = view["language"] if "language" in columns else [None] * len(view)
     texts, ids, groups = [], [], []
+    excluded = 0
     for text, lang, oid, group in zip(view[TEXT_COLUMN], languages, view["o:id"], view[group_col]):
         unknown = not str(lang or "").strip()
         if not (lang == language or (args.include_unknown_language and unknown)):
+            continue
+        # Reviewed exclusions leave before phrase detection and the dictionary.
+        if str(oid) in settings.exclusions:
+            excluded += 1
             continue
         if not text or not str(text).strip() or len(str(text).split()) < args.min_train_tokens:
             continue
@@ -703,6 +712,8 @@ def select_training_documents(ds, args, settings: RunSettings, logger) -> Traini
         ids.append(str(oid))
         groups.append(group)
     logger.info(f"{language} docs for training: {len(texts)}")
+    if excluded:
+        logger.info(f"Left out by the topic-model exclusion registry: {excluded}")
     if args.max_documents and len(texts) > args.max_documents:
         logger.info(f"Limiting to {args.max_documents} docs")
         texts, ids, groups = (texts[: args.max_documents], ids[: args.max_documents],
@@ -850,6 +861,7 @@ def fit_and_publish(args, settings: RunSettings, docs: TrainingDocuments, prepro
             "source_revision": source_revision,
             "training_document_ids": docs.ids,
             "include_unknown_language": args.include_unknown_language,
+            "topic_model_exclusions": dict(sorted(settings.exclusions.items())),
         }
         if sweep is not None:
             extra_info["topic_optimization"] = {
@@ -962,6 +974,7 @@ def predict_dataset(ds, args, settings: RunSettings, model: LoadedModel, logger)
             include_unknown_language=args.include_unknown_language,
             min_vocab_tokens=settings.min_predict_tokens,
             evidence_col=EVIDENCE_COL,
+            excluded_ids=frozenset(settings.exclusions),
         ),
         batched=True,
         batch_size=args.batch_size,
@@ -986,6 +999,7 @@ def export_prediction_run(ds_processed, args, settings: RunSettings, model: Load
             lda_model.num_topics, settings.language, logger, source_revision, settings.repo_id,
             settings.config_name, model.preprocessing,
             evidence_col=EVIDENCE_COL, min_vocab_tokens=settings.min_predict_tokens,
+            excluded_ids=settings.exclusions,
         )
 
     topic_ids = ds_processed[TOPIC_ID_COL]
@@ -1009,6 +1023,12 @@ def export_prediction_run(ds_processed, args, settings: RunSettings, model: Load
     )
     if suppressed:
         logger.info(f"Below the evidence floor ({floor} in-vocabulary tokens), left without a topic: {suppressed}")
+    excluded = 0
+    if settings.exclusions and "o:id" in ds_processed.column_names:
+        ids = list(ds_processed["o:id"])
+        excluded = sum(1 for i in own_rows if str(ids[i]) in settings.exclusions)
+    if excluded:
+        logger.info(f"Topic-model exclusion registry, left without a topic: {excluded}")
 
     valid_ids = [topic_ids[i] for i in own_rows if topic_ids[i] is not None]
     if valid_ids:
@@ -1039,14 +1059,15 @@ def export_prediction_run(ds_processed, args, settings: RunSettings, model: Load
         revision=source_revision, args=args,
         inputs={"model_id": model.model_id, "model_dir": str(model.model_dir),
                 "preprocessing": model.preprocessing,
-                "min_vocab_tokens": settings.min_predict_tokens},
+                "min_vocab_tokens": settings.min_predict_tokens,
+                "topic_model_exclusions": dict(sorted(settings.exclusions.items()))},
         outputs=list(run_dir.glob("*.parquet")) + list(run_dir.glob("*.csv")) + list(run_dir.glob("*.metadata.json")),
     )
     ds_processed = ds_processed.remove_columns(
         [c for c in (THETA_COL, EVIDENCE_COL) if c in ds_processed.column_names]
     )
     ds_processed = _reorder_columns(ds_processed, logger)
-    stats = {"processed": processed, "skipped": skipped, "suppressed": suppressed}
+    stats = {"processed": processed, "skipped": skipped, "suppressed": suppressed, "excluded": excluded}
     return ds_processed, stats
 
 
@@ -1076,6 +1097,7 @@ def push_predictions(ds_processed, args, settings: RunSettings, model: LoadedMod
         commit_message=(
             f"Add LDA topic modeling columns ({', '.join(NEW_COLUMNS)}); "
             f"model {model.model_id}, min in-vocabulary tokens {settings.min_predict_tokens}"
+            + (f", {len(settings.exclusions)} reviewed exclusion(s)" if settings.exclusions else "")
         ),
         token=token,
         max_shard_size=args.max_shard_size,
@@ -1101,6 +1123,7 @@ def print_summary(ds, args, settings: RunSettings, model: LoadedModel, stats: di
     table.add_row("Docs with topics", str(stats["processed"]))
     table.add_row("Docs without topics", str(stats["skipped"]))
     table.add_row("  of which below evidence floor", str(stats["suppressed"]))
+    table.add_row("  of which excluded (registry)", str(stats["excluded"]))
     table.add_row("Total docs", str(len(ds)))
     table.add_row("Model saved", str(model.model_dir))
     if settings.mode == "fit":

@@ -154,6 +154,14 @@ from the `articles` (press) dictionary but present in `references` is citation
 apparatus, which is how `oxford`/`indiana`/`press` were cleared and why
 `berlin` and `licence` were not.
 
+**Some rows are excluded from topic modelling on purpose.**
+`TOPIC_MODEL_EXCLUSIONS` (`lda_topic_modeling/constants.py`) holds eight
+`publications` rows, Islam Info issues whose text is mostly tabular lists of
+pilgrims' names; they formed a spurious name-list topic. They stay in the
+dataset and stay public, but fits skip them and prediction gives them null
+topic columns (keeping `lda_model_name`). Keep them excluded unless the lists
+are removed from their text. See `docs/lda-model-bundles.md`.
+
 **Uploads merge rather than overwrite.** Each upload fetches from Omeka, loads
 the existing Hub rows, identifies columns present only on the Hub (the computed
 ones), and merges them back on `o:id`. That is what keeps embeddings and topics

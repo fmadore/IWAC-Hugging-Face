@@ -824,6 +824,7 @@ def predict_batch(
     min_vocab_tokens: int | None = None,
     evidence_col: str | None = None,
     chunk_weighting: str = "all_tokens",
+    excluded_ids: set[str] | frozenset[str] | None = None,
 ) -> Dict[str, List[Any]]:
     """Predict topics for a HuggingFace dataset batch (batched map function).
 
@@ -846,6 +847,10 @@ def predict_batch(
     *model_name*, recording that this model declined it). *evidence_col*,
     when set, receives each computed row's in-vocabulary token count.
 
+    *excluded_ids* (``o:id`` strings from the reviewed topic-model exclusion
+    registry) get the same shape without inference: null topic columns, the
+    *model_name*, and no theta or evidence count.
+
     When *theta_col* is set, the full document-topic distribution (list of
     ``num_topics`` floats) is stored for computed rows (None elsewhere),
     including rows below the evidence floor — the caller extracts it into
@@ -857,6 +862,9 @@ def predict_batch(
     """
     texts = batch[text_col]
     languages = batch.get("language", [None] * len(texts))
+    if excluded_ids and "o:id" not in batch:
+        raise ValueError("Topic-model exclusions need an 'o:id' column")
+    ids = batch.get("o:id", [None] * len(texts))
 
     def _existing(col: str | None) -> List[Any]:
         vals = batch.get(col) if col else None
@@ -881,6 +889,12 @@ def predict_batch(
         if not text or not str(text).strip():
             # A removed source text must not retain an old topic assignment.
             topics[i] = probabilities[i] = labels[i] = topks[i] = model_names[i] = None
+            continue
+        if excluded_ids and str(ids[i]) in excluded_ids:
+            # Reviewed exclusion: assessed by this model, deliberately left
+            # without a topic (as below the evidence floor).
+            topics[i] = probabilities[i] = labels[i] = topks[i] = None
+            model_names[i] = model_name
             continue
 
         tokens = tokenize_for_prediction(

@@ -20,11 +20,35 @@ Stored unidentified consensus values are never reused. Every real topic row is
 retained for missingness denominators. Topics are keyed by immutable model identity
 and topic ID; category shares and ordinal medians are the default summaries.
 
+Counts and denominators (every table):
+- ``n``                       every assigned row in the cell; denominator of
+                              the plain ``share_*`` columns.
+- ``n_polarity_consensus``    rows whose polarity panel reached a consensus
+                              label, "Non applicable" included; denominator
+                              of ``share_<polarity>_of_scored``. ``n_scored``
+                              is the same count under its historical name.
+- ``n_polarity_scored``       rows with an *ordinal* polarity consensus
+                              ("Non applicable" excluded); the base of
+                              ``median_polarity``.
+- ``n_centrality_scored``     rows with a centrality consensus label;
+                              denominator of ``share_centrality_*_of_scored``
+                              and ``central_share_of_scored``.
+- ``n_subjectivity_scored``   rows with a subjectivity median (>= 2 scores);
+                              denominator of ``share_subjectivity_*_of_scored``.
+- ``n_consensus_max``         max(n_polarity_consensus, n_centrality_scored):
+                              the count the ranking, country and year tables
+                              filter on, so a well-powered topic whose finding
+                              is "Non applicable" polarity or low centrality
+                              stays in them.
+The ``*_of_scored`` shares do not move just because the panel covered more or
+fewer rows of a cell; the plain shares keep missing and disputed rows in.
+
 Outputs (analyses/output/):
-- topic_sentiment_summary.csv     per topic: n, polarity label shares (of all
-                                  assigned rows and of rows with a polarity
-                                  consensus), ordinal medians, missingness
-                                  counts, share of Central/Très central rows
+- topic_sentiment_summary.csv     per topic: n, polarity, centrality and
+                                  subjectivity shares (of all assigned rows
+                                  and of rows with a consensus), ordinal
+                                  medians, missingness counts, share of
+                                  Central/Très central rows
 - topic_sentiment_by_country.csv  topic x country cells (shares, medians, missingness)
 - topic_sentiment_over_time.csv   topic x year cells (+ decade; point dates only)
 - topic_sentiment_summary.json, topic_sentiment.manifest.json
@@ -79,6 +103,10 @@ console = Console()
 
 # Centrality labels counted as "central" for the per-topic central share.
 CENTRAL_LABELS = {"Central", "Très central"}
+# The count the ranking, country and year tables filter and sort on: it
+# includes "Non applicable" polarity and every centrality consensus, so a
+# topic whose finding is precisely that is not dropped (issue #46).
+FILTER_COUNT = "n_consensus_max"
 
 
 # ---------------------------------------------------------------------------
@@ -177,11 +205,17 @@ def prepare_articles(df: pd.DataFrame, generation: int) -> pd.DataFrame:
     return out
 
 
-def summarize_cells(df: pd.DataFrame, dimensions: List[str], *, ordinal_means=False) -> pd.DataFrame:
-    """Category shares use all assigned articles; medians use applicable consensus.
+def _share(count, denominator):
+    return count / denominator if denominator else None
 
-    ``n`` is the complete cell, including insufficient votes and disagreement.
-    Means are available only as an explicit equal-spacing sensitivity summary.
+
+def summarize_cells(df: pd.DataFrame, dimensions: List[str], *, ordinal_means=False) -> pd.DataFrame:
+    """Per-cell shares over all assigned rows and over each dimension's consensus rows.
+
+    ``n`` is the complete cell, including insufficient votes and disagreement;
+    the module docstring lists every count and the shares it divides. Medians
+    use applicable consensus. Means are available only as an explicit
+    equal-spacing sensitivity summary.
     """
     keys = ["lda_model_name", "lda_topic_id", *dimensions]
     rows = []
@@ -203,31 +237,42 @@ def summarize_cells(df: pd.DataFrame, dimensions: List[str], *, ordinal_means=Fa
             "median_polarity": group["pol_ord"].median(),
             "median_subjectivity": group["subj_score"].median(),
         })
-        # n_scored: rows whose polarity panel reached a consensus label
-        # (including "Non applicable"). The *_of_scored shares use it as the
-        # denominator, so they do not move just because the panel has covered
-        # more or fewer rows of a topic; the plain shares keep n.
-        n_scored = int(group["pol_label"].ne("").sum())
-        row["n_scored"] = n_scored
+        # Each dimension's of-scored shares divide by the rows where that
+        # dimension reached a consensus, so they do not move just because the
+        # panel has covered more or fewer rows of a cell; plain shares keep n.
+        n_pol = int(group["pol_label"].ne("").sum())
+        n_cent = int(group["cent_label"].ne("").sum())
+        n_subj = row["n_subjectivity_scored"]
+        row["n_polarity_consensus"] = n_pol
+        row["n_scored"] = n_pol  # historical name of n_polarity_consensus
+        row["n_centrality_scored"] = n_cent
+        row[FILTER_COUNT] = max(n_pol, n_cent)
         for label in POLARITY_ORDER:
             count = group["pol_label"].eq(label).sum()
             row[f"share_{slug(label)}"] = count / n
-            row[f"share_{slug(label)}_of_scored"] = count / n_scored if n_scored else None
+            row[f"share_{slug(label)}_of_scored"] = _share(count, n_pol)
         count = group["pol_label"].eq("Non applicable").sum()
         row["share_non_applicable"] = count / n
-        row["share_non_applicable_of_scored"] = count / n_scored if n_scored else None
+        row["share_non_applicable_of_scored"] = _share(count, n_pol)
         row["share_no_consensus"] = row["n_polarity_no_consensus"] / n
         row["share_insufficient_votes"] = row["n_polarity_insufficient_votes"] / n
         for label in CENTRALITY_ORDER:
-            row[f"share_centrality_{slug(label)}"] = group["cent_label"].eq(label).sum() / n
+            count = group["cent_label"].eq(label).sum()
+            row[f"share_centrality_{slug(label)}"] = count / n
+            row[f"share_centrality_{slug(label)}_of_scored"] = _share(count, n_cent)
         for rank in [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5]:
-            row[f"share_subjectivity_{str(rank).replace('.', '_')}"] = group["subj_score"].eq(rank).sum() / n
-        row["central_share"] = group["cent_label"].isin(CENTRAL_LABELS).sum() / n
+            count = group["subj_score"].eq(rank).sum()
+            key = f"share_subjectivity_{str(rank).replace('.', '_')}"
+            row[key] = count / n
+            row[f"{key}_of_scored"] = _share(count, n_subj)
+        count = group["cent_label"].isin(CENTRAL_LABELS).sum()
+        row["central_share"] = count / n
+        row["central_share_of_scored"] = _share(count, n_cent)
         if ordinal_means:
             row["mean_polarity_equal_spacing"] = group["pol_ord"].mean()
             row["mean_subjectivity_equal_spacing"] = group["subj_score"].mean()
         rows.append(row)
-    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=[*keys, "n", "n_polarity_scored"])
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=[*keys, "n", FILTER_COUNT])
 
 
 # ---------------------------------------------------------------------------
@@ -241,11 +286,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_input_args(parser, source_default="hub", output_dir=OUTPUT_DIR, cohort=True)
     parser.add_argument("--min-topic-n", type=int, default=50,
-                        help="Min scored rows per topic for the ranked tables (default 50)")
+                        help=f"Min {FILTER_COUNT} (rows with a polarity or centrality consensus, "
+                             "whichever is larger) per topic for the ranked table (default 50)")
     parser.add_argument("--min-cell-n", type=int, default=20,
-                        help="Min scored rows per topic x country cell (default 20)")
+                        help=f"Min {FILTER_COUNT} per topic x country cell (default 20)")
     parser.add_argument("--min-year-n", type=int, default=10,
-                        help="Min scored rows per topic x year cell (default 10)")
+                        help=f"Min {FILTER_COUNT} per topic x year cell (default 10)")
     parser.add_argument("--generation", type=int, choices=sorted({m.generation for m in PANEL}),
                         default=max(m.generation for m in PANEL), help="One annotation instrument; newest by default")
     parser.add_argument("--ordinal-means", action="store_true",
@@ -254,24 +300,29 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def ranked_topics(summary: pd.DataFrame, min_topic_n: int, limit: int = 25) -> pd.DataFrame:
-    """Console ranking: most polarity-scored articles first (model, topic break ties)."""
-    eligible = summary[summary["n_polarity_scored"] >= min_topic_n]
-    return eligible.sort_values(["n_polarity_scored", "lda_model_name", "lda_topic_id"],
+    """Console ranking: most consensus-scored articles first (model, topic break ties)."""
+    eligible = summary[summary[FILTER_COUNT] >= min_topic_n]
+    return eligible.sort_values([FILTER_COUNT, "lda_model_name", "lda_topic_id"],
                                 ascending=[False, True, True]).head(limit)
 
 
 def print_ranking(summary: pd.DataFrame, min_topic_n: int) -> None:
-    table = Table(title="Topic sentiment, by number of polarity-scored articles "
+    table = Table(title="Topic sentiment, by number of consensus-scored articles "
                         "(conditional on this corpus and instrument)", box=box.ROUNDED)
-    for heading in ("Model / topic", "Label", "All articles", "Scored", "Median polarity"):
+    for heading in ("Model / topic", "Label", "All articles", "Polarity consensus",
+                    "Centrality consensus", "Median polarity", "Central (of scored)"):
         table.add_column(heading)
     for row in ranked_topics(summary, min_topic_n).to_dict("records"):
+        central = row["central_share_of_scored"]
         table.add_row(f"{row['lda_model_name'][-12:]} / {row['lda_topic_id']}", str(row["label"]),
-                      str(row["n"]), str(row["n_polarity_scored"]), str(row["median_polarity"]))
+                      str(row["n"]), str(row["n_polarity_consensus"]), str(row["n_centrality_scored"]),
+                      str(row["median_polarity"]),
+                      "—" if central is None or pd.isna(central) else f"{central:.0%}")
     console.print(table)
     console.print("[yellow]share_* columns include missing and disputed rows in the denominator; "
-                  "share_*_of_scored divide by n_scored. Ordinal medians do not assume equal spacing; "
-                  "model agreement is not human validation.[/yellow]")
+                  "share_*_of_scored divide by that dimension's consensus count (n_polarity_consensus, "
+                  "n_centrality_scored, n_subjectivity_scored). Ordinal medians do not assume equal "
+                  "spacing; model agreement is not human validation.[/yellow]")
 
 
 def main() -> None:
@@ -298,9 +349,9 @@ def main() -> None:
         abort("Mutable legacy lda_model_name detected; regenerate predictions from a verified model bundle before comparing topics.")
     summary = summarize_cells(df, [], ordinal_means=args.ordinal_means)
     by_country = summarize_cells(df, ["country"], ordinal_means=args.ordinal_means)
-    by_country = by_country[by_country["n_polarity_scored"] >= args.min_cell_n]
+    by_country = by_country[by_country[FILTER_COUNT] >= args.min_cell_n]
     over_time = summarize_cells(df[df["year"].notna()], ["year"], ordinal_means=args.ordinal_means)
-    over_time = over_time[over_time["n_polarity_scored"] >= args.min_year_n]
+    over_time = over_time[over_time[FILTER_COUNT] >= args.min_year_n]
     over_time["decade"] = (over_time["year"] // 10) * 10
 
     print_ranking(summary, args.min_topic_n)
@@ -308,10 +359,19 @@ def main() -> None:
         "generation": args.generation, "instrument_id": instrument_id(args.generation),
         "rows_loaded": int(len(loaded)), "rows_with_valid_topic": int(len(df)),
         "over_time_dates": date_exclusions(df["date_precision"]),
-        "denominators": {"share_*": "n, every assigned article in the cell",
-                         "share_*_of_scored": "n_scored, articles whose polarity panel reached a "
-                                              "consensus label (including Non applicable)"},
-        "console_ranking": "n_polarity_scored descending, then model and topic",
+        "denominators": {
+            "share_*": "n, every assigned article in the cell",
+            "share_<polarity>_of_scored": "n_polarity_consensus (alias n_scored), articles whose polarity "
+                                          "panel reached a consensus label (including Non applicable)",
+            "share_centrality_*_of_scored, central_share_of_scored": "n_centrality_scored, articles with "
+                                                                     "a centrality consensus label",
+            "share_subjectivity_*_of_scored": "n_subjectivity_scored, articles with a subjectivity median",
+            "median_polarity": "n_polarity_scored, articles with an ordinal polarity consensus "
+                               "(Non applicable excluded)",
+        },
+        "table_filter": f"{FILTER_COUNT} = max(n_polarity_consensus, n_centrality_scored) >= "
+                        "--min-topic-n (ranking), --min-cell-n (country), --min-year-n (year)",
+        "console_ranking": f"{FILTER_COUNT} descending, then model and topic",
         "interpretation": "Conditional on this corpus, topic model and annotation instrument; model "
                           "agreement is not human validation.",
     }

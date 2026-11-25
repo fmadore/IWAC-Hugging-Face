@@ -361,3 +361,169 @@ def test_prevalence_dates_do_not_guess_ambiguous_years():
     assert years.iloc[:4].isna().all()
     assert years.iloc[4:].tolist() == [2000, 2000]
     assert precision.iloc[0] == "range"
+
+
+# ── Prevalence model selection (issue #61) ─────────────────────────
+
+
+def test_prevalence_default_model_follows_subset_preset(tmp_path, monkeypatch):
+    monkeypatch.setattr(prevalence, "workspace_root", lambda: tmp_path)
+    assert prevalence.default_model_path("articles") == (tmp_path / "lda_model", "Français")
+    assert prevalence.default_model_path("publications") == (tmp_path / "lda_model_publications", "Français")
+    assert prevalence.default_model_path("references") == (tmp_path / "lda_model_references", "Français")
+    assert prevalence.default_model_path("references", "Anglais") == (tmp_path / "lda_model_references_en", "Anglais")
+
+
+def test_prevalence_training_check_fails_closed():
+    bundle = {"id": "lda-sha256:x", "trained_config": "articles", "trained_language": "Français"}
+    assert prevalence.check_training_match(bundle, "articles", "Français",
+                                           allow_cross_corpus=False)["mismatched_fields"] == []
+    with pytest.raises(SystemExit, match="allow-cross-corpus-model"):
+        prevalence.check_training_match(bundle, "publications", "Français", allow_cross_corpus=False)
+    with pytest.raises(SystemExit, match="language"):
+        prevalence.check_training_match({**bundle, "trained_config": "references"}, "references", "Anglais",
+                                        allow_cross_corpus=False)
+    # A bundle that records no training subset is not trusted.
+    with pytest.raises(SystemExit):
+        prevalence.check_training_match({**bundle, "trained_config": None}, "articles", "Français",
+                                        allow_cross_corpus=False)
+    allowed = prevalence.check_training_match(bundle, "publications", "Français", allow_cross_corpus=True)
+    assert allowed["mismatched_fields"] == ["config_name"] and allowed["cross_corpus_allowed"]
+
+
+def _prevalence_cli(state, tmp_path, monkeypatch, *argv):
+    frame = state["dataset"].to_pandas()
+    frame.attrs["iwac_source_revision"] = "test-source-revision"
+    manifests = []
+    monkeypatch.setattr(prevalence, "load_subset_dataframe", lambda *a, **kw: frame)
+    monkeypatch.setattr(prevalence, "write_run_manifest", lambda *a, **kw: manifests.append(kw))
+    monkeypatch.setattr(sys, "argv", [
+        "prevalence", "--repo", "test/repo", "--source", "csv", "--bootstrap", "0",
+        "--min-docs-year", "1", "--output-dir", str(tmp_path / "results"), *argv,
+    ])
+    prevalence.main()
+    summary = json.loads((tmp_path / "results" / "topic_prevalence_summary.json").read_text(encoding="utf-8"))
+    return summary, manifests[-1]["inputs"]
+
+
+def test_prevalence_resolves_the_periodical_bundle_by_default(fitted_model, tmp_path, monkeypatch):
+    press_root, state = fitted_model
+    workspace = tmp_path / "workspace"
+    periodical_root = workspace / "lda_model_publications"
+    monkeypatch.setattr(sys, "argv", [
+        "lda", "--repo", "test/repo", "--config", "publications", "--mode", "fit", "--yes",
+        "--model-path", str(periodical_root), "--num-topics", "2", "--passes", "1", "--iterations", "20",
+        "--no-below", "1", "--no-above", "1.0", "--skip-coherence", "--holdout", "0",
+    ])
+    assert cli.main() == 0
+    periodical_dir, periodical_id = resolve_bundle(periodical_root)
+    monkeypatch.setattr(prevalence, "workspace_root", lambda: workspace)
+    summary, inputs = _prevalence_cli(state, tmp_path, monkeypatch, "--config", "publications")
+    assert summary["model_id"] == periodical_id and summary["model_dir"] == str(periodical_dir)
+    assert summary["model_training_match"]["trained"] == {"config_name": "publications", "language": "Français"}
+    assert inputs["model_training_match"]["mismatched_fields"] == []
+    # The press bundle passed explicitly is refused for the periodicals...
+    with pytest.raises(SystemExit, match="trained on config='articles'"):
+        _prevalence_cli(state, tmp_path, monkeypatch, "--config", "publications", "--model-path", str(press_root))
+    # ...unless cross-corpus use is explicit, which the manifest records.
+    summary, inputs = _prevalence_cli(state, tmp_path, monkeypatch, "--config", "publications",
+                                      "--model-path", str(press_root), "--allow-cross-corpus-model")
+    assert inputs["model_training_match"]["cross_corpus_allowed"] is True
+    assert inputs["model_training_match"]["mismatched_fields"] == ["config_name"]
+    assert inputs["model_training_match"]["trained"]["config_name"] == "articles"
+
+
+# ── Reviewed topic-model exclusions ────────────────────────────────
+
+
+def test_exclusion_registry_lists_the_islam_info_issues():
+    from iwac_pipeline.processing.lda_topic_modeling.constants import (
+        TOPIC_MODEL_EXCLUSIONS, topic_model_exclusions,
+    )
+
+    assert set(TOPIC_MODEL_EXCLUSIONS) == {"publications"}
+    registry = topic_model_exclusions("publications")
+    assert sorted(registry) == ["23757", "24190", "24233", "24234", "24635", "25286", "25287", "25289"]
+    assert all("tabular lists of pilgrims' names" in reason for reason in registry.values())
+    assert topic_model_exclusions("articles") == {}
+    registry.clear()  # a copy: callers cannot edit the registry
+    assert len(topic_model_exclusions("publications")) == 8
+
+
+def _exclude(monkeypatch, ids):
+    monkeypatch.setattr(cli, "topic_model_exclusions",
+                        lambda config: {oid: "test reason" for oid in ids} if config == "articles" else {})
+
+
+def test_excluded_rows_never_reach_phrases_or_dictionary(fitted_model, monkeypatch, tmp_path):
+    _, state = fitted_model
+    data = state["dataset"].to_dict()
+    data["lemma_nostop"][0] += " namelistmarker namelistmarker namelistmarker"
+    data["lemma_nostop"][3] += " namelistmarker"
+    state["dataset"] = Dataset.from_dict(data)
+    _exclude(monkeypatch, ["0"])
+    root = tmp_path / "excluded"
+    monkeypatch.setattr(sys, "argv", [
+        "lda", "--repo", "test/repo", "--config", "articles", "--mode", "fit", "--yes",
+        "--model-path", str(root), "--num-topics", "2", "--passes", "1", "--iterations", "20",
+        "--no-below", "2", "--no-above", "1.0", "--skip-coherence", "--holdout", "0",
+    ])
+    assert cli.main() == 0
+    directory, model_id = resolve_bundle(root)
+    _, params = load_preprocessing(directory)
+    assert "0" not in params["extra"]["training_document_ids"]
+    assert params["extra"]["topic_model_exclusions"] == {"0": "test reason"}
+    # With row 0 gone the marker occurs in one source document, below no_below=2.
+    _, dictionary, _ = load_lda_model(root)
+    assert "namelistmarker" not in dictionary.token2id
+    result = state["dataset"]
+    assert result["lda_topic_id"][0] is None and result["lda_topic_label"][0] is None
+    assert result["lda_topic_topk"][0] is None and result["lda_topic_prob"][0] is None
+    assert result["lda_model_name"][0] == model_id
+    assert all(t is not None for t in result["lda_topic_id"][1:])
+    run = max((root / "predictions").iterdir())
+    assert "0" not in set(pd.read_parquet(run / "doc_topics.parquet")["o:id"])
+    metadata = json.loads((run / "doc_topics.metadata.json").read_text(encoding="utf-8"))
+    assert metadata["excluded_document_ids"] == ["0"]
+    assert "1 reviewed exclusion(s)" in state["push"]["commit_message"]
+
+
+def test_existing_bundle_predicts_with_registry_rows_nulled(fitted_model, monkeypatch):
+    model_root, state = fitted_model
+    directory, model_id = resolve_bundle(model_root)
+    _, params = load_preprocessing(directory)
+    assert "0" in params["extra"]["training_document_ids"]  # trained before the exclusion
+    original = {p.name: digest_file(p) for p in directory.iterdir() if p.is_file()}
+    before = list(state["dataset"]["lda_topic_id"])
+    _exclude(monkeypatch, ["0", "absent-id"])
+    monkeypatch.setattr(sys, "argv", [
+        "lda", "--repo", "test/repo", "--config", "articles", "--mode", "predict", "--yes",
+        "--model-path", str(model_root),
+    ])
+    assert cli.main() == 0
+    result = state["dataset"]
+    assert result["lda_topic_id"][0] is None and result["lda_model_name"][0] == model_id
+    assert list(result["lda_topic_id"][1:]) == before[1:]
+    assert original == {p.name: digest_file(p) for p in directory.iterdir() if p.is_file()}
+
+
+def test_predict_batch_exclusions_require_ids(fitted_model):
+    from iwac_pipeline.processing.lda_topic_modeling.modeling import predict_batch
+
+    root, _ = fitted_model
+    model, dictionary, phraser = load_lda_model(root)
+    with pytest.raises(ValueError, match="o:id"):
+        predict_batch(model, dictionary, {"lemma_nostop": ["imam mosque"], "language": ["Français"]},
+                      "lemma_nostop", "t", "p", "l", excluded_ids={"1"})
+
+
+def test_prevalence_leaves_registry_rows_out():
+    from types import SimpleNamespace
+
+    df = pd.DataFrame({"o:id": ["23757", "1"], "pub_date": ["2000", "2000"],
+                       "language": ["Français", "Français"], "lemma_nostop": ["kone traore", "imam"]})
+    args = SimpleNamespace(include_unknown_language=False, year_min=1900, year_max=2030, config="publications")
+    mask, _, counts = prevalence.eligibility(df, "Français", args)
+    assert mask.tolist() == [False, True] and counts["docs_excluded_by_registry"] == 1
+    args.config = "articles"
+    assert prevalence.eligibility(df, "Français", args)[0].tolist() == [True, True]

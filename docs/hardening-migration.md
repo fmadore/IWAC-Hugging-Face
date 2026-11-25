@@ -404,7 +404,13 @@ labels yield undefined chance-corrected agreement. Undefined values are not
 zero agreement or perfect reliability.
 
 Topic sentiment groups by immutable model identity plus topic ID. Medians,
-category shares, sample sizes and missingness are primary. `--ordinal-means`
+category shares, sample sizes and missingness are primary. Polarity,
+centrality and subjectivity each export plain shares (over every assigned row,
+`n`) and `*_of_scored` shares (over that dimension's consensus count:
+`n_polarity_consensus`, `n_centrality_scored`, `n_subjectivity_scored`). The
+ranking, country and year tables filter on `n_consensus_max`, the larger of the
+polarity (Non applicable included) and centrality consensus counts, so a topic
+whose finding is low centrality is not dropped. `--ordinal-means`
 explicitly assumes equal scale spacing. Agreement among related LLMs is not a
 human-validated accuracy estimate.
 
